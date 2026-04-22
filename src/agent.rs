@@ -215,11 +215,34 @@ impl Supervisor {
                                     // later stderr buffering and stops the startup watchdog.
                                     claude_started.store(true, Ordering::Relaxed);
 
-                                    // Filter heavy messages (tool results, rate limits) without
-                                    // a full JSON parse — they can be multi-MB of base64/file content.
+                                    // Skip frames the UI never renders so they don't flicker
+                                    // the chat-list preview to empty between visible messages.
+                                    // Substring match: tool_result bodies can be multi-MB, so
+                                    // we avoid a full JSON parse on every line. Filtered:
+                                    //   stream_event                — per-token deltas, high-freq
+                                    //   system (non-status)         — init/shutdown frames
+                                    //   user, rate_limit_event      — never shown
+                                    //   assistant with only thinking — SpawnerMessageDescriber
+                                    //     returns nil for these, so they contribute nothing to
+                                    //     ChatView and would otherwise clobber `last_agent_body`
+                                    //     with unreadable content (chat list falls back to
+                                    //     "Thinking…" even though prior text/tool_use exists).
+                                    //     JSON-string-escaping renders \"type\":\"text\" as
+                                    //     `\"type\":\"text\"` in the source, so the substring
+                                    //     below only matches structural block types.
                                     let mut skip = false;
                                     if line.starts_with('{') {
-                                        if line.contains("\"type\":\"user\"") || line.contains("\"type\":\"rate_limit_event\"") {
+                                        if line.contains("\"type\":\"stream_event\"")
+                                            || (line.contains("\"type\":\"system\"")
+                                                && !line.contains("\"subtype\":\"status\""))
+                                            || line.contains("\"type\":\"user\"")
+                                            || line.contains("\"type\":\"rate_limit_event\"")
+                                        {
+                                            skip = true;
+                                        } else if line.contains("\"type\":\"assistant\"")
+                                            && !line.contains("\"type\":\"text\"")
+                                            && !line.contains("\"type\":\"tool_use\"")
+                                        {
                                             skip = true;
                                         } else if !has_result && line.contains("\"type\":\"result\"") {
                                             has_result = true;

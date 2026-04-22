@@ -31,6 +31,7 @@ pub type TokenFetcher =
 #[derive(Debug, Clone)]
 pub enum WriteEvent {
     AgentLine { chat_id: String, content: String },
+    ChatStatus { chat_id: String, status: &'static str },
     Heartbeat { machine_id: Uuid },
 }
 
@@ -86,8 +87,8 @@ struct BatchReq<'a> {
     ops: &'a [BatchOp],
 }
 
-fn encode_event(event: &WriteEvent, dev_key: Option<&DevKey>) -> BatchOp {
-    match event {
+fn encode_event(event: &WriteEvent, dev_key: Option<&DevKey>) -> Option<BatchOp> {
+    Some(match event {
         WriteEvent::AgentLine { chat_id, content } => BatchOp {
             op: "PUT",
             table: "messages",
@@ -98,6 +99,21 @@ fn encode_event(event: &WriteEvent, dev_key: Option<&DevKey>) -> BatchOp {
                 "body": encrypt_field_b64(dev_key, content),
             })),
         },
+        WriteEvent::ChatStatus { chat_id, status } => {
+            let id = match Uuid::parse_str(chat_id) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(chat_id = %chat_id, error = %e, "ChatStatus chat_id is not a UUID, dropping");
+                    return None;
+                }
+            };
+            BatchOp {
+                op: "PATCH",
+                table: "chats",
+                id,
+                data: Some(serde_json::json!({ "agent_status": status })),
+            }
+        }
         WriteEvent::Heartbeat { machine_id } => BatchOp {
             op: "PATCH",
             table: "machines",
@@ -105,7 +121,7 @@ fn encode_event(event: &WriteEvent, dev_key: Option<&DevKey>) -> BatchOp {
             // Server stamps now() for last_heartbeat_at; the null is just a presence marker.
             data: Some(serde_json::json!({ "last_heartbeat_at": null })),
         },
-    }
+    })
 }
 
 async fn run(
@@ -124,16 +140,20 @@ async fn run(
     let mut backoff = INITIAL_BACKOFF;
     let mut channel_closed = false;
 
+    let enqueue = |ev: WriteEvent, pending: &mut VecDeque<BatchOp>| {
+        if let Some(op) = encode_event(&ev, dev_key.as_ref()) {
+            pending.push_back(op);
+            pending_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+
     loop {
         if pending.is_empty() {
             if channel_closed {
                 return;
             }
             match rx.recv().await {
-                Some(ev) => {
-                    pending.push_back(encode_event(&ev, dev_key.as_ref()));
-                    pending_counter.fetch_add(1, Ordering::Relaxed);
-                }
+                Some(ev) => enqueue(ev, &mut pending),
                 None => {
                     info!("writer channel closed, exiting");
                     return;
@@ -143,10 +163,7 @@ async fn run(
 
         while pending.len() < MAX_OPS_PER_BATCH {
             match rx.try_recv() {
-                Ok(ev) => {
-                    pending.push_back(encode_event(&ev, dev_key.as_ref()));
-                    pending_counter.fetch_add(1, Ordering::Relaxed);
-                }
+                Ok(ev) => enqueue(ev, &mut pending),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     channel_closed = true;

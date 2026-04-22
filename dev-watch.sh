@@ -34,6 +34,16 @@ cargo build --release --target "$RUST_TARGET"
 
 install -m 755 "target/${RUST_TARGET}/release/zucchini-spawner" "$DEST/${BIN_NAME}.new"
 xattr -c "$DEST/${BIN_NAME}.new" 2>/dev/null || true
+
+# Codesign darwin builds with Developer ID + hardened runtime so TCC's
+# designated requirement (identifier + team ID) stays stable across rebuilds.
+# Cargo's default ad-hoc signing has a CDHash-only DR — every rebuild shifts
+# the hash and macOS re-prompts for folder access on each auto-update.
+if [ "$PLATFORM_OS" = "darwin" ] && command -v codesign >/dev/null 2>&1; then
+  codesign --sign "Developer ID Application: Hayaku Tech Limited (UGHY643XCA)" \
+    --options runtime --timestamp --force "$DEST/${BIN_NAME}.new"
+fi
+
 mv -f "$DEST/${BIN_NAME}.new" "$DEST/${BIN_NAME}"
 
 # Monotonic per-build version — the spawner compares against last-applied

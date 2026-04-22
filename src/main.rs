@@ -124,6 +124,7 @@ async fn handle_sync_event(
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
     dev_key: Option<&DevKey>,
+    write_tx: &mpsc::Sender<WriteEvent>,
 ) -> bool {
     match event {
         SyncEvent::Put { table, id, data } => match table.as_str() {
@@ -136,7 +137,7 @@ async fn handle_sync_event(
                 false
             }
             "messages" => {
-                handle_message_put(&data, mirror, supervisor, dev_key).await;
+                handle_message_put(&data, mirror, supervisor, dev_key, write_tx).await;
                 false
             }
             _ => false,
@@ -169,6 +170,7 @@ async fn handle_message_put(
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
     dev_key: Option<&DevKey>,
+    write_tx: &mpsc::Sender<WriteEvent>,
 ) {
     let row: serde_json::Value = match serde_json::from_str(data) {
         Ok(v) => v,
@@ -226,11 +228,52 @@ async fn handle_message_put(
         return;
     };
 
+    // A new user message interrupts any agent still running on this chat:
+    // kill it, publish an interrupted result so the UI flips to "done", then
+    // fall through to either handle /stop or start the new agent.
+    let was_running = supervisor.is_running(&chat_id);
+    if was_running {
+        info!(chat_id = %chat_id, "aborting running agent before handling new message");
+        supervisor.abort_agent(&chat_id).await;
+        let _ = write_tx
+            .send(WriteEvent::AgentLine {
+                chat_id: chat_id.clone(),
+                content: INTERRUPTED_RESULT.to_string(),
+            })
+            .await;
+    }
+
+    if prompt.trim() == "/stop" {
+        info!(chat_id = %chat_id, "stop command received");
+        let _ = write_tx
+            .send(WriteEvent::ChatStatus {
+                chat_id: chat_id.clone(),
+                status: "idle",
+            })
+            .await;
+        if let Some(chat) = mirror.chats.get_mut(&chat_id) {
+            chat.last_processed_seq = seq;
+        }
+        return;
+    }
+
     let Some(project_path) = mirror.projects.get(&project_id).cloned() else {
         warn!(chat_id = %chat_id, project_id = %project_id, "project not yet synced, skipping message");
         return;
     };
 
+    // Only PATCH when transitioning idle→running. The abort-then-respawn path
+    // (was_running==true) leaves agent_status already set to "running" from
+    // the prior spawn — re-sending it would fan out a no-op write to every
+    // listening client and re-trigger their chat-list re-decrypt.
+    if !was_running {
+        let _ = write_tx
+            .send(WriteEvent::ChatStatus {
+                chat_id: chat_id.clone(),
+                status: "running",
+            })
+            .await;
+    }
     supervisor.spawn_agent(chat_id.clone(), prompt, Some(project_path));
 
     if let Some(chat) = mirror.chats.get_mut(&chat_id) {
@@ -356,7 +399,7 @@ async fn main() {
                 supervisor.cleanup();
             }
             Some(event) = sync_rx.recv() => {
-                let changed = handle_sync_event(event, &mut mirror, &mut supervisor, read_key.as_ref()).await;
+                let changed = handle_sync_event(event, &mut mirror, &mut supervisor, read_key.as_ref(), &write_tx).await;
                 if changed {
                     save_mirror(&state_path, &mirror);
                 }
@@ -378,6 +421,12 @@ async fn main() {
                                 })
                                 .await;
                         }
+                        let _ = write_tx
+                            .send(WriteEvent::ChatStatus {
+                                chat_id: topic.clone(),
+                                status: "idle",
+                            })
+                            .await;
                         supervisor.remove(&topic);
                     }
                 }
