@@ -17,11 +17,13 @@ use powersync::{SyncConfig, SyncEvent};
 use state::Mirror;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use sentry_tracing::EventFilter;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use writer::{WriteEvent, Writer, WriterConfig};
 
+const SENTRY_DSN: &str = "https://05d5deab2efce04e4f801af41ea39def@o4511216603234304.ingest.de.sentry.io/4511216616669264";
 const INTERRUPTED_RESULT: &str = r#"{"type":"result","subtype":"interrupted"}"#;
 const PROD_BASE_URL: &str = "https://api.zucchini.chat";
 const DEV_SYNC_BASE_URL: &str = "http://localhost:8080";
@@ -34,9 +36,14 @@ const UPDATE_DRAIN_POLL: Duration = Duration::from_millis(100);
 fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,zucchini_spawner=debug"));
+    let sentry_layer = sentry_tracing::layer().event_filter(|md| match *md.level() {
+        tracing::Level::ERROR => EventFilter::Event,
+        _ => EventFilter::Ignore,
+    });
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        .with(sentry_layer)
         .init();
 }
 
@@ -327,6 +334,15 @@ async fn wait_for_writer_idle(writer: &Writer) -> bool {
 
 #[tokio::main]
 async fn main() {
+    let _sentry_guard = sentry::init((
+        SENTRY_DSN,
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            send_default_pii: true,
+            ..Default::default()
+        },
+    ));
+
     init_logging();
     info!("zucchini-spawner starting");
 

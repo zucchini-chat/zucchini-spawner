@@ -9,7 +9,7 @@ set -eu
 # Usage: ./uninstall.sh
 
 INSTALL_DIR="${HOME}/.zucchini-spawner"
-SERVICE_NAME="tech.hayaku.zucchini-spawner"
+SERVICE_NAME="chat.zucchini.spawner"
 
 OS="$(uname -s)"
 case "$OS" in
