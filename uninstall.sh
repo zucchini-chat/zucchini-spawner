@@ -36,7 +36,7 @@ if [ "$PLATFORM" = "darwin" ]; then
   fi
 
 elif [ "$PLATFORM" = "linux" ]; then
-  LINUX_SERVICE="zucchini-spawner-$(whoami)"
+  LINUX_SERVICE="${SERVICE_NAME}-$(whoami)"
   UNIT_PATH="/etc/systemd/system/${LINUX_SERVICE}.service"
 
   if [ -f "$UNIT_PATH" ]; then
