@@ -15,6 +15,7 @@ use chacha20poly1305::{
 };
 use tracing::warn;
 
+#[derive(Clone)]
 pub struct DevKey([u8; 32]);
 
 impl DevKey {
@@ -26,7 +27,7 @@ impl DevKey {
                 warn!(
                     error = %e,
                     path = %path.display(),
-                    "no dev key found; ciphertext fields will be passed as utf-8-lossy bytes"
+                    "no dev key found"
                 );
                 return None;
             }
@@ -76,24 +77,13 @@ pub fn encrypt_field_b64(key: Option<&DevKey>, plaintext: &str) -> String {
     B64.encode(&bytes)
 }
 
-pub fn decrypt(key: &DevKey, ciphertext: &[u8]) -> Option<String> {
+/// Decrypt a `nonce‖ct‖tag` blob. Used for both message-envelope JSON
+/// (caller `serde_json::from_slice`s the bytes) and binary R2 blobs.
+pub fn decrypt_bytes(key: &DevKey, ciphertext: &[u8]) -> Option<Vec<u8>> {
     if ciphertext.len() < 24 {
         return None;
     }
     let (nonce_bytes, body) = ciphertext.split_at(24);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key.0));
-    let plaintext = cipher.decrypt(XNonce::from_slice(nonce_bytes), body).ok()?;
-    String::from_utf8(plaintext).ok()
-}
-
-/// Decode PowerSync's string representation of a BYTEA column (base64) and decrypt it.
-/// Without a dev key, returns the raw ciphertext bytes as a UTF-8-lossy string so
-/// the spawner still works end-to-end without crypto.
-pub fn decrypt_field(key: Option<&DevKey>, field: &serde_json::Value) -> Option<String> {
-    let s = field.as_str()?;
-    let bytes = B64.decode(s).ok()?;
-    match key {
-        Some(k) => decrypt(k, &bytes),
-        None => Some(String::from_utf8_lossy(&bytes).into_owned()),
-    }
+    cipher.decrypt(XNonce::from_slice(nonce_bytes), body).ok()
 }

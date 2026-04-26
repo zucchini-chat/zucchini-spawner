@@ -1,6 +1,8 @@
 mod agent;
 mod auth;
+mod blobs;
 mod crypto;
+mod envelope;
 mod powersync;
 mod state;
 mod updater;
@@ -12,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use agent::{AgentResponse, Supervisor};
 use auth::AuthClient;
+use blobs::BlobDownloader;
 use crypto::DevKey;
 use powersync::{SyncConfig, SyncEvent};
 use state::Mirror;
@@ -115,12 +118,11 @@ fn save_mirror(path: &Path, mirror: &Mirror) {
     }
 }
 
-fn build_writer_config(prod: Option<&ProdConfig>) -> WriterConfig {
-    let (base_url, fetch_token) = match prod {
+fn api_base_and_token(prod: Option<&ProdConfig>) -> (String, writer::TokenFetcher) {
+    match prod {
         Some(p) => (PROD_BASE_URL.to_string(), auth::token_fetcher(p.auth.clone())),
         None => (DEV_API_BASE_URL.to_string(), dev_token_fetcher()),
-    };
-    WriterConfig { base_url, fetch_token }
+    }
 }
 
 /// Returns true when the op mutated persistent state (projects) and the caller
@@ -130,7 +132,7 @@ async fn handle_sync_event(
     event: SyncEvent,
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
-    dev_key: Option<&DevKey>,
+    blobs: Option<&BlobDownloader>,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) -> bool {
     match event {
@@ -144,7 +146,7 @@ async fn handle_sync_event(
                 false
             }
             "messages" => {
-                handle_message_put(&data, mirror, supervisor, dev_key, write_tx).await;
+                handle_message_put(&data, mirror, supervisor, blobs, write_tx).await;
                 false
             }
             _ => false,
@@ -176,7 +178,7 @@ async fn handle_message_put(
     data: &str,
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
-    dev_key: Option<&DevKey>,
+    blobs: Option<&BlobDownloader>,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
     let row: serde_json::Value = match serde_json::from_str(data) {
@@ -214,7 +216,7 @@ async fn handle_message_put(
         return;
     }
 
-    let Some(body_field) = row.get("body") else {
+    let Some(body_str) = row.get("body").and_then(|v| v.as_str()) else {
         let keys: Vec<&String> = row.as_object().map(|o| o.keys().collect()).unwrap_or_default();
         warn!(
             chat_id = %chat_id,
@@ -225,14 +227,21 @@ async fn handle_message_put(
         );
         return;
     };
-    let Some(prompt) = crypto::decrypt_field(dev_key, body_field) else {
-        warn!(
-            chat_id = %chat_id,
-            seq,
-            body_field = %body_field,
-            "failed to decrypt message body (dump of body field)"
-        );
+    let Some(blobs) = blobs else {
+        warn!(chat_id = %chat_id, seq, "no dev key configured, cannot decode envelope");
         return;
+    };
+    let envelope = match blobs.decode_envelope(body_str) {
+        Ok(env) => env,
+        Err(e) => {
+            warn!(
+                chat_id = %chat_id,
+                seq,
+                error = %e,
+                "failed to decode message envelope"
+            );
+            return;
+        }
     };
 
     // A new user message interrupts any agent still running on this chat:
@@ -250,7 +259,7 @@ async fn handle_message_put(
             .await;
     }
 
-    if prompt.trim() == "/stop" {
+    if envelope.attachments.is_empty() && envelope.text.trim() == "/stop" {
         info!(chat_id = %chat_id, "stop command received");
         let _ = write_tx
             .send(WriteEvent::ChatStatus {
@@ -268,6 +277,20 @@ async fn handle_message_put(
         warn!(chat_id = %chat_id, project_id = %project_id, "project not yet synced, skipping message");
         return;
     };
+
+    let downloaded = match blobs.fetch_all(&envelope.attachments).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                chat_id = %chat_id,
+                seq,
+                error = %e,
+                "failed to download attachments, skipping message"
+            );
+            return;
+        }
+    };
+    let prompt = blobs::build_prompt(&envelope.text, &downloaded);
 
     // Only PATCH when transitioning idle→running. The abort-then-respawn path
     // (was_running==true) leaves agent_status already set to "running" from
@@ -370,9 +393,17 @@ async fn main() {
     );
     let mut sync_rx = powersync::start(sync_config);
 
-    let writer_config = build_writer_config(prod.as_ref());
-    info!(base_url = %writer_config.base_url, "starting write API sender");
-    let writer = writer::start(writer_config, DevKey::load_or_warn());
+    let dev_key = DevKey::load_or_warn();
+    if dev_key.is_none() {
+        warn!("no dev key — incoming user messages cannot be decoded");
+    }
+
+    let (writer_base_url, writer_token) = api_base_and_token(prod.as_ref());
+    info!(base_url = %writer_base_url, "starting write API sender");
+    let writer = writer::start(
+        WriterConfig { base_url: writer_base_url, fetch_token: writer_token },
+        dev_key.clone(),
+    );
     let write_tx = writer.tx.clone();
 
     let heartbeat_cancel = CancellationToken::new();
@@ -385,7 +416,10 @@ async fn main() {
     tokio::spawn(updater::run_update_loop(update_tx));
     let mut update_pending: Option<String> = None;
 
-    let read_key = DevKey::load_or_warn();
+    let blob_downloader = dev_key.map(|k| {
+        let (base_url, fetch_token) = api_base_and_token(prod.as_ref());
+        BlobDownloader::new(&base_url, fetch_token, Arc::new(k))
+    });
 
     let (response_tx, mut response_rx) = mpsc::channel::<AgentResponse>(256);
     let mut supervisor = Supervisor::new(response_tx);
@@ -415,7 +449,7 @@ async fn main() {
                 supervisor.cleanup();
             }
             Some(event) = sync_rx.recv() => {
-                let changed = handle_sync_event(event, &mut mirror, &mut supervisor, read_key.as_ref(), &write_tx).await;
+                let changed = handle_sync_event(event, &mut mirror, &mut supervisor, blob_downloader.as_ref(), &write_tx).await;
                 if changed {
                     save_mirror(&state_path, &mirror);
                 }
