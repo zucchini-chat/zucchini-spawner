@@ -23,7 +23,6 @@ use tracing::warn;
 pub struct ChatState {
     pub id: String,
     pub project_id: String,
-    pub last_processed_seq: i64,
     pub worktree: bool,
 }
 
@@ -51,11 +50,6 @@ impl Mirror {
             return;
         };
 
-        let last_processed_seq = self
-            .chats
-            .get(&id)
-            .map(|c| c.last_processed_seq)
-            .unwrap_or(0);
         // PowerSync's sync stream serializes Postgres BOOLEAN as JSON Number
         // (0/1), not bool — `as_bool()` returns None and silently falls back to
         // false. `as_i64() == Some(1)` is the form that actually lands.
@@ -66,7 +60,6 @@ impl Mirror {
             ChatState {
                 id,
                 project_id: project_id.to_string(),
-                last_processed_seq,
                 worktree,
             },
         );

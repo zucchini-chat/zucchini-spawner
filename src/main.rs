@@ -205,16 +205,13 @@ async fn handle_message_put(
         return;
     }
 
-    let (project_id, last_processed, worktree) = match mirror.chats.get(&chat_id) {
-        Some(c) => (c.project_id.clone(), c.last_processed_seq, c.worktree),
+    let (project_id, worktree) = match mirror.chats.get(&chat_id) {
+        Some(c) => (c.project_id.clone(), c.worktree),
         None => {
             warn!(chat_id = %chat_id, "message arrived before chat row, skipping");
             return;
         }
     };
-    if seq <= last_processed {
-        return;
-    }
 
     let Some(body_str) = row.get("body").and_then(|v| v.as_str()) else {
         let keys: Vec<&String> = row.as_object().map(|o| o.keys().collect()).unwrap_or_default();
@@ -263,9 +260,6 @@ async fn handle_message_put(
                 status: "idle",
             })
             .await;
-        if let Some(chat) = mirror.chats.get_mut(&chat_id) {
-            chat.last_processed_seq = seq;
-        }
         return;
     }
 
@@ -300,12 +294,8 @@ async fn handle_message_put(
             })
             .await;
     }
-    let is_resume = last_processed > 0;
+    let is_resume = seq > 1;
     supervisor.spawn_agent(chat_id.clone(), prompt, Some(project_path), worktree, is_resume);
-
-    if let Some(chat) = mirror.chats.get_mut(&chat_id) {
-        chat.last_processed_seq = seq;
-    }
 }
 
 fn json_to_i64(v: &serde_json::Value) -> Option<i64> {
