@@ -304,7 +304,8 @@ async fn handle_message_put(
             })
             .await;
     }
-    supervisor.spawn_agent(chat_id.clone(), prompt, Some(project_path), worktree);
+    let is_resume = last_processed > 0;
+    supervisor.spawn_agent(chat_id.clone(), prompt, Some(project_path), worktree, is_resume);
 
     if let Some(chat) = mirror.chats.get_mut(&chat_id) {
         chat.last_processed_seq = seq;

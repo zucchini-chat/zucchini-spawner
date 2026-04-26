@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -16,18 +15,6 @@ const AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum AgentResponse {
     Line { topic: String, content: String },
     Done { topic: String, has_result: bool },
-}
-
-/// Claude stores session transcripts at `~/.claude/projects/<encoded-path>/<session-id>.jsonl`,
-/// where `encoded-path` is the absolute project path with every `/` turned into `-`. The file's
-/// existence is our source of truth for "is this a first message" vs "resume an existing session":
-/// passing `--session-id <uuid>` on an existing session fails ("Session ID already in use"), and
-/// passing `--resume <uuid>` on a fresh one fails too. Checking the file removes the need to track
-/// that bit in the mirror (and so it survives spawner restarts without extra persistence).
-fn claude_session_file(project_path: &str, chat_id: &str) -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    let encoded = project_path.replace('/', "-");
-    home.join(".claude").join("projects").join(encoded).join(format!("{chat_id}.jsonl"))
 }
 
 pub struct Supervisor {
@@ -74,6 +61,7 @@ impl Supervisor {
         prompt: String,
         project_path: Option<String>,
         worktree: bool,
+        is_resume: bool,
     ) {
         let tx = self.response_tx.clone();
         let topic_clone = topic.clone();
@@ -81,12 +69,6 @@ impl Supervisor {
         let token_clone = token.clone();
 
         let handle = tokio::spawn(async move {
-            // chat_id doubles as the claude session id — on the first message we create the
-            // session with `--session-id <topic>`, on later messages we `--resume <topic>`.
-            let is_resume = project_path
-                .as_deref()
-                .map(|pp| claude_session_file(pp, &topic_clone).exists())
-                .unwrap_or(false);
             info!(topic = %topic_clone, resume = is_resume, project_path = ?project_path, worktree, "spawning claude agent");
 
             // Write prompt to a temp file so it never touches the shell command string
@@ -95,11 +77,7 @@ impl Supervisor {
             let prompt_file = format!("/tmp/zucchini-prompt-{}.txt", unique);
             if let Err(e) = tokio::fs::write(&prompt_file, &prompt).await {
                 error!("failed to write prompt file: {}", e);
-                let _ = tx.send(AgentResponse::Line {
-                    topic: topic_clone.clone(),
-                    content: format!("Error: failed to write prompt file: {}", e),
-                }).await;
-                let _ = tx.send(AgentResponse::Done { topic: topic_clone, has_result: false }).await;
+                fail_agent(&tx, &topic_clone, format!("failed to write prompt file: {}", e)).await;
                 return;
             }
 
@@ -108,6 +86,8 @@ impl Supervisor {
                 claude_cmd.push_str(&format!("cd {} && ", shell_escape(pp)));
             }
             claude_cmd.push_str(&format!("cat {} | claude", shell_escape(&prompt_file)));
+            // chat_id doubles as the claude session id: first message creates the
+            // session with --session-id, every subsequent message resumes it.
             let session_flag = if is_resume { "--resume" } else { "--session-id" };
             claude_cmd.push_str(&format!(" {} {}", session_flag, shell_escape(&topic_clone)));
             if worktree {
@@ -130,14 +110,7 @@ impl Supervisor {
                 Err(e) => {
                     error!("failed to spawn claude: {}", e);
                     let _ = tokio::fs::remove_file(&prompt_file).await;
-                    let _ = tx.send(AgentResponse::Line {
-                        topic: topic_clone.clone(),
-                        content: format!("Error: failed to spawn claude: {}", e),
-                    }).await;
-                    let _ = tx.send(AgentResponse::Done {
-                        topic: topic_clone,
-                        has_result: false,
-                    }).await;
+                    fail_agent(&tx, &topic_clone, format!("failed to spawn claude: {}", e)).await;
                     return;
                 }
             };
@@ -338,4 +311,15 @@ async fn await_agent_exit(handle: tokio::task::JoinHandle<()>, topic: &str) {
 
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+async fn fail_agent(tx: &mpsc::Sender<AgentResponse>, topic: &str, msg: String) {
+    let _ = tx.send(AgentResponse::Line {
+        topic: topic.to_string(),
+        content: format!("Error: {}", msg),
+    }).await;
+    let _ = tx.send(AgentResponse::Done {
+        topic: topic.to_string(),
+        has_result: false,
+    }).await;
 }

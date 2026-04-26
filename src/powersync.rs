@@ -73,7 +73,10 @@ enum SyncFrame {
     Checkpoint { checkpoint: Checkpoint },
     CheckpointDiff { checkpoint_diff: CheckpointDiff },
     Data { data: DataFrame },
-    CheckpointComplete { checkpoint_complete: CheckpointComplete },
+    CheckpointComplete {
+        #[serde(rename = "checkpoint_complete")]
+        _checkpoint_complete: serde::de::IgnoredAny,
+    },
     Keepalive(Keepalive),
 }
 
@@ -120,9 +123,6 @@ enum OpKind {
     Move,
     Clear,
 }
-
-#[derive(Debug, Deserialize)]
-struct CheckpointComplete {}
 
 #[derive(Debug, Deserialize)]
 struct Keepalive {
