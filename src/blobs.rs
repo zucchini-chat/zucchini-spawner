@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::crypto::{self, DevKey};
+use crate::crypto::{self, KUser};
 use crate::envelope::{self, EnvelopeAttachment, MessageEnvelope};
 use crate::writer::TokenFetcher;
 
@@ -26,7 +26,7 @@ pub struct BlobDownloader {
     http: reqwest::Client,
     download_url_endpoint: String,
     fetch_token: TokenFetcher,
-    key: Arc<DevKey>,
+    key: Arc<KUser>,
 }
 
 #[derive(Serialize)]
@@ -49,7 +49,7 @@ impl BlobDownloader {
         envelope::decode(body_b64, &self.key)
     }
 
-    pub fn new(api_base_url: &str, fetch_token: TokenFetcher, key: Arc<DevKey>) -> Self {
+    pub fn new(api_base_url: &str, fetch_token: TokenFetcher, key: Arc<KUser>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()

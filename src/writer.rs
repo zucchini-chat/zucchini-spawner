@@ -18,7 +18,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::crypto::{encrypt_field_b64, DevKey};
+use crate::crypto::{encrypt_field_b64, KUser};
 
 const MAX_OPS_PER_BATCH: usize = 32;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
@@ -61,12 +61,12 @@ impl Writer {
     }
 }
 
-pub fn start(config: WriterConfig, dev_key: Option<DevKey>) -> Writer {
+pub fn start(config: WriterConfig, k_user: KUser) -> Writer {
     let (tx, rx) = mpsc::channel::<WriteEvent>(1024);
     let pending = Arc::new(AtomicUsize::new(0));
     let pending_for_task = pending.clone();
     tokio::spawn(async move {
-        run(config, dev_key, rx, pending_for_task).await;
+        run(config, k_user, rx, pending_for_task).await;
     });
     Writer { tx, pending }
 }
@@ -87,7 +87,7 @@ struct BatchReq<'a> {
     ops: &'a [BatchOp],
 }
 
-fn encode_event(event: &WriteEvent, dev_key: Option<&DevKey>) -> Option<BatchOp> {
+fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
     Some(match event {
         WriteEvent::AgentLine { chat_id, content } => BatchOp {
             op: "PUT",
@@ -96,7 +96,7 @@ fn encode_event(event: &WriteEvent, dev_key: Option<&DevKey>) -> Option<BatchOp>
             data: Some(serde_json::json!({
                 "chat_id": chat_id,
                 "sender": "agent",
-                "body": encrypt_field_b64(dev_key, content),
+                "body": encrypt_field_b64(k_user, content),
             })),
         },
         WriteEvent::ChatStatus { chat_id, status } => {
@@ -126,7 +126,7 @@ fn encode_event(event: &WriteEvent, dev_key: Option<&DevKey>) -> Option<BatchOp>
 
 async fn run(
     config: WriterConfig,
-    dev_key: Option<DevKey>,
+    k_user: KUser,
     mut rx: mpsc::Receiver<WriteEvent>,
     pending_counter: Arc<AtomicUsize>,
 ) {
@@ -141,7 +141,7 @@ async fn run(
     let mut channel_closed = false;
 
     let enqueue = |ev: WriteEvent, pending: &mut VecDeque<BatchOp>| {
-        if let Some(op) = encode_event(&ev, dev_key.as_ref()) {
+        if let Some(op) = encode_event(&ev, &k_user) {
             pending.push_back(op);
             pending_counter.fetch_add(1, Ordering::Relaxed);
         }

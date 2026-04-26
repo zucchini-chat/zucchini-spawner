@@ -1,63 +1,45 @@
-//! Dev-only symmetric crypto for PowerSync ciphertext fields.
+//! Symmetric crypto for PowerSync ciphertext fields.
 //!
-//! Loads a 32-byte key from `~/.zucchini-spawner/dev_key` (base64) — user-level, shared with the apps.
+//! Loads K_user (32-byte secret) from `~/.zucchini-spawner/key` (base64) — user-level, shared with the apps.
 //! Nonce convention: first 24 bytes
 //! of the ciphertext are the XChaCha20-Poly1305 nonce, the remainder is the AEAD ciphertext.
-//! Real key management (K_user, pairing) will replace this later.
+//! Pairing (proper key transfer between devices) will replace the file-on-disk later.
 
 use std::fs;
 use std::path::PathBuf;
 
+use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     AeadCore, Key, XChaCha20Poly1305, XNonce,
 };
-use tracing::warn;
 
 #[derive(Clone)]
-pub struct DevKey([u8; 32]);
+pub struct KUser([u8; 32]);
 
-impl DevKey {
-    pub fn load_or_warn() -> Option<Self> {
-        let path = key_path()?;
-        let contents = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "no dev key found"
-                );
-                return None;
-            }
-        };
-        let decoded = match B64.decode(contents.trim()) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = %e, "dev key is not valid base64");
-                return None;
-            }
-        };
-        if decoded.len() != 32 {
-            warn!(len = decoded.len(), "dev key must decode to exactly 32 bytes");
-            return None;
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        Some(DevKey(key))
+impl KUser {
+    pub fn load() -> Result<Self> {
+        let path = key_path().ok_or_else(|| anyhow!("HOME not set"))?;
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("read key file {}", path.display()))?;
+        let decoded = B64.decode(contents.trim()).context("key is not valid base64")?;
+        let bytes: [u8; 32] = decoded
+            .try_into()
+            .map_err(|v: Vec<u8>| anyhow!("key must decode to 32 bytes, got {}", v.len()))?;
+        Ok(KUser(bytes))
     }
 }
 
 fn key_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".zucchini-spawner").join("dev_key"))
+    Some(PathBuf::from(home).join(".zucchini-spawner").join("key"))
 }
 
 /// Encrypt a plaintext string into PowerSync's BYTEA ciphertext convention:
 /// 24-byte nonce prefix + AEAD ciphertext. Returns the raw bytes — callers base64
 /// them for the JSON wire format.
-pub fn encrypt(key: &DevKey, plaintext: &[u8]) -> Vec<u8> {
+pub fn encrypt(key: &KUser, plaintext: &[u8]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key.0));
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
     let mut out = Vec::with_capacity(24 + plaintext.len() + 16);
@@ -67,19 +49,13 @@ pub fn encrypt(key: &DevKey, plaintext: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Encrypt and base64-encode. When no key is available (dev fallback),
-/// falls back to raw UTF-8 bytes so the end-to-end path still works.
-pub fn encrypt_field_b64(key: Option<&DevKey>, plaintext: &str) -> String {
-    let bytes = match key {
-        Some(k) => encrypt(k, plaintext.as_bytes()),
-        None => plaintext.as_bytes().to_vec(),
-    };
-    B64.encode(&bytes)
+pub fn encrypt_field_b64(key: &KUser, plaintext: &str) -> String {
+    B64.encode(encrypt(key, plaintext.as_bytes()))
 }
 
 /// Decrypt a `nonce‖ct‖tag` blob. Used for both message-envelope JSON
 /// (caller `serde_json::from_slice`s the bytes) and binary R2 blobs.
-pub fn decrypt_bytes(key: &DevKey, ciphertext: &[u8]) -> Option<Vec<u8>> {
+pub fn decrypt_bytes(key: &KUser, ciphertext: &[u8]) -> Option<Vec<u8>> {
     if ciphertext.len() < 24 {
         return None;
     }

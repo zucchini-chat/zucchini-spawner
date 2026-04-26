@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::crypto::{self, DevKey};
+use crate::crypto::{self, KUser};
 
 #[derive(Debug, Deserialize)]
 pub struct MessageEnvelope {
@@ -26,7 +26,7 @@ pub struct EnvelopeAttachment {
     pub name: String,
 }
 
-pub fn decode(body_b64: &str, key: &DevKey) -> Result<MessageEnvelope> {
+pub fn decode(body_b64: &str, key: &KUser) -> Result<MessageEnvelope> {
     let bytes = B64.decode(body_b64).context("body is not valid base64")?;
     let plaintext = crypto::decrypt_bytes(key, &bytes)
         .ok_or_else(|| anyhow!("AEAD decrypt failed for messages.body"))?;

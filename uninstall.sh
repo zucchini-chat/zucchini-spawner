@@ -3,7 +3,7 @@ set -eu
 
 # Zucchini spawner uninstaller.
 # Removes the launchd/systemd service, binary, config, and logs installed
-# by install.sh. Leaves ~/.zucchini-spawner/dev_key alone (it's user-level,
+# by install.sh. Leaves ~/.zucchini-spawner/key alone (it's user-level,
 # shared with the apps).
 #
 # Usage: ./uninstall.sh
@@ -55,18 +55,18 @@ elif [ "$PLATFORM" = "linux" ]; then
   fi
 fi
 
-# ---------- remove install dir (preserving dev_key) ----------
+# ---------- remove install dir (preserving key) ----------
 
 if [ -d "$INSTALL_DIR" ]; then
   rm -rf "$INSTALL_DIR/bin"
   rm -f "$INSTALL_DIR/config.env" "$INSTALL_DIR/sync_cursor.json" "$INSTALL_DIR/spawner.log"
-  # Only the user-level dev_key (shared with the apps) should remain. If nothing
+  # Only the user-level key (shared with the apps) should remain. If nothing
   # else is left, drop the dir too so we don't leave an empty ~/.zucchini-spawner.
   if [ -z "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
     rmdir "$INSTALL_DIR"
     echo "Removed ${INSTALL_DIR}"
   else
-    echo "Cleaned ${INSTALL_DIR} (kept dev_key / other user files)"
+    echo "Cleaned ${INSTALL_DIR} (kept key / other user files)"
   fi
 else
   echo "${INSTALL_DIR} not found, skipping."

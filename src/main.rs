@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use agent::{AgentResponse, Supervisor};
 use auth::AuthClient;
 use blobs::BlobDownloader;
-use crypto::DevKey;
+use crypto::KUser;
 use powersync::{SyncConfig, SyncEvent};
 use state::Mirror;
 use tokio::sync::mpsc;
@@ -132,7 +132,7 @@ async fn handle_sync_event(
     event: SyncEvent,
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
-    blobs: Option<&BlobDownloader>,
+    blobs: &BlobDownloader,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) -> bool {
     match event {
@@ -178,7 +178,7 @@ async fn handle_message_put(
     data: &str,
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
-    blobs: Option<&BlobDownloader>,
+    blobs: &BlobDownloader,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
     let row: serde_json::Value = match serde_json::from_str(data) {
@@ -225,10 +225,6 @@ async fn handle_message_put(
             raw = %data,
             "message row missing body (dump of raw PowerSync row)"
         );
-        return;
-    };
-    let Some(blobs) = blobs else {
-        warn!(chat_id = %chat_id, seq, "no dev key configured, cannot decode envelope");
         return;
     };
     let envelope = match blobs.decode_envelope(body_str) {
@@ -394,16 +390,19 @@ async fn main() {
     );
     let mut sync_rx = powersync::start(sync_config);
 
-    let dev_key = DevKey::load_or_warn();
-    if dev_key.is_none() {
-        warn!("no dev key — incoming user messages cannot be decoded");
-    }
+    let k_user = match KUser::load() {
+        Ok(k) => k,
+        Err(e) => {
+            error!(error = %e, "failed to load K_user — pair this machine first");
+            std::process::exit(1);
+        }
+    };
 
     let (writer_base_url, writer_token) = api_base_and_token(prod.as_ref());
     info!(base_url = %writer_base_url, "starting write API sender");
     let writer = writer::start(
         WriterConfig { base_url: writer_base_url, fetch_token: writer_token },
-        dev_key.clone(),
+        k_user.clone(),
     );
     let write_tx = writer.tx.clone();
 
@@ -417,10 +416,10 @@ async fn main() {
     tokio::spawn(updater::run_update_loop(update_tx));
     let mut update_pending: Option<String> = None;
 
-    let blob_downloader = dev_key.map(|k| {
+    let blob_downloader = {
         let (base_url, fetch_token) = api_base_and_token(prod.as_ref());
-        BlobDownloader::new(&base_url, fetch_token, Arc::new(k))
-    });
+        BlobDownloader::new(&base_url, fetch_token, Arc::new(k_user))
+    };
 
     let (response_tx, mut response_rx) = mpsc::channel::<AgentResponse>(256);
     let mut supervisor = Supervisor::new(response_tx);
@@ -450,7 +449,7 @@ async fn main() {
                 supervisor.cleanup();
             }
             Some(event) = sync_rx.recv() => {
-                let changed = handle_sync_event(event, &mut mirror, &mut supervisor, blob_downloader.as_ref(), &write_tx).await;
+                let changed = handle_sync_event(event, &mut mirror, &mut supervisor, &blob_downloader, &write_tx).await;
                 if changed {
                     save_mirror(&state_path, &mirror);
                 }
