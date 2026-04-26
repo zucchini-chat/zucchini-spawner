@@ -24,6 +24,7 @@ pub struct ChatState {
     pub id: String,
     pub project_id: String,
     pub last_processed_seq: i64,
+    pub worktree: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -55,6 +56,10 @@ impl Mirror {
             .get(&id)
             .map(|c| c.last_processed_seq)
             .unwrap_or(0);
+        // PowerSync's sync stream serializes Postgres BOOLEAN as JSON Number
+        // (0/1), not bool — `as_bool()` returns None and silently falls back to
+        // false. `as_i64() == Some(1)` is the form that actually lands.
+        let worktree = v.get("worktree").and_then(|f| f.as_i64()) == Some(1);
 
         self.chats.insert(
             id.clone(),
@@ -62,6 +67,7 @@ impl Mirror {
                 id,
                 project_id: project_id.to_string(),
                 last_processed_seq,
+                worktree,
             },
         );
     }

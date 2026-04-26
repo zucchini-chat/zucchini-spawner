@@ -68,7 +68,13 @@ impl Supervisor {
         self.agents.get(topic).is_some_and(|(h, _)| !h.is_finished())
     }
 
-    pub fn spawn_agent(&mut self, topic: String, prompt: String, project_path: Option<String>) {
+    pub fn spawn_agent(
+        &mut self,
+        topic: String,
+        prompt: String,
+        project_path: Option<String>,
+        worktree: bool,
+    ) {
         let tx = self.response_tx.clone();
         let topic_clone = topic.clone();
         let token = CancellationToken::new();
@@ -81,7 +87,7 @@ impl Supervisor {
                 .as_deref()
                 .map(|pp| claude_session_file(pp, &topic_clone).exists())
                 .unwrap_or(false);
-            info!(topic = %topic_clone, resume = is_resume, project_path = ?project_path, "spawning claude agent");
+            info!(topic = %topic_clone, resume = is_resume, project_path = ?project_path, worktree, "spawning claude agent");
 
             // Write prompt to a temp file so it never touches the shell command string
             let unique = format!("{}-{}", std::process::id(), SystemTime::now()
@@ -104,6 +110,9 @@ impl Supervisor {
             claude_cmd.push_str(&format!("cat {} | claude", shell_escape(&prompt_file)));
             let session_flag = if is_resume { "--resume" } else { "--session-id" };
             claude_cmd.push_str(&format!(" {} {}", session_flag, shell_escape(&topic_clone)));
+            if worktree {
+                claude_cmd.push_str(&format!(" --worktree {}", shell_escape(&topic_clone)));
+            }
             claude_cmd.push_str(" --print --verbose --output-format stream-json --dangerously-skip-permissions");
 
             let user_shell = std::env::var("USER_SHELL").unwrap_or_else(|_| "/bin/sh".to_string());

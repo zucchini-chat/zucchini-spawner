@@ -205,8 +205,8 @@ async fn handle_message_put(
         return;
     }
 
-    let (project_id, last_processed) = match mirror.chats.get(&chat_id) {
-        Some(c) => (c.project_id.clone(), c.last_processed_seq),
+    let (project_id, last_processed, worktree) = match mirror.chats.get(&chat_id) {
+        Some(c) => (c.project_id.clone(), c.last_processed_seq, c.worktree),
         None => {
             warn!(chat_id = %chat_id, "message arrived before chat row, skipping");
             return;
@@ -304,7 +304,7 @@ async fn handle_message_put(
             })
             .await;
     }
-    supervisor.spawn_agent(chat_id.clone(), prompt, Some(project_path));
+    supervisor.spawn_agent(chat_id.clone(), prompt, Some(project_path), worktree);
 
     if let Some(chat) = mirror.chats.get_mut(&chat_id) {
         chat.last_processed_seq = seq;
