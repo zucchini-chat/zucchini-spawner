@@ -94,7 +94,9 @@ impl Supervisor {
             let session_flag = if is_resume { "--resume" } else { "--session-id" };
             claude_cmd.push_str(&format!(" {} {}", session_flag, shell_escape(&topic_clone)));
             if worktree {
-                claude_cmd.push_str(&format!(" --worktree {}", shell_escape(&topic_clone)));
+                // Use the chat_id prefix so the worktree directory name stays short.
+                let worktree_name: String = topic_clone.chars().take(8).collect();
+                claude_cmd.push_str(&format!(" --worktree {}", shell_escape(&worktree_name)));
             }
             claude_cmd.push_str(" --print --verbose --output-format stream-json --dangerously-skip-permissions");
 
