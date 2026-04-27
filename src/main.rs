@@ -451,6 +451,11 @@ async fn main() {
                             .send(WriteEvent::AgentLine { chat_id: topic, content })
                             .await;
                     }
+                    AgentResponse::ContextTokens { topic, tokens } => {
+                        let _ = write_tx
+                            .send(WriteEvent::ContextTokens { chat_id: topic, tokens })
+                            .await;
+                    }
                     AgentResponse::Done { topic, has_result } => {
                         info!(topic = %topic, has_result, "agent done");
                         if !has_result {

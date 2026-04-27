@@ -6,14 +6,17 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use std::time::{Duration, SystemTime};
 
 const AGENT_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap to skip full-line scans on multi-MB tool_result frames; usage frames are tiny.
+const MAX_USAGE_FRAME_BYTES: usize = 65_536;
 
 pub enum AgentResponse {
     Line { topic: String, content: String },
+    ContextTokens { topic: String, tokens: i64 },
     Done { topic: String, has_result: bool },
 }
 
@@ -143,6 +146,10 @@ impl Supervisor {
             };
 
             let mut has_result = false;
+            // Per-turn usage often repeats across consecutive frames (e.g. a
+            // thinking frame and the text frame after it). Dedupe so the
+            // writer doesn't fire a redundant /api/writes PATCH on each one.
+            let mut last_emitted_tokens: Option<i64> = None;
 
             if let Some(stdout) = child.stdout.take() {
                 let reader = BufReader::new(stdout);
@@ -196,6 +203,22 @@ impl Supervisor {
                                     // First stdout line means claude is alive — silences any
                                     // later stderr buffering and stops the startup watchdog.
                                     claude_started.store(true, Ordering::Relaxed);
+
+                                    // Pre-skip-filter: thinking-only frames also carry usage.
+                                    if line.len() < MAX_USAGE_FRAME_BYTES
+                                        && line.starts_with('{')
+                                        && line.contains("\"type\":\"assistant\"")
+                                    {
+                                        if let Some(tokens) = parse_assistant_usage(&line) {
+                                            if last_emitted_tokens != Some(tokens) {
+                                                last_emitted_tokens = Some(tokens);
+                                                let _ = tx.send(AgentResponse::ContextTokens {
+                                                    topic: topic_clone.clone(),
+                                                    tokens,
+                                                }).await;
+                                            }
+                                        }
+                                    }
 
                                     // Skip frames the UI never renders so they don't flicker
                                     // the chat-list preview to empty between visible messages.
@@ -322,4 +345,29 @@ async fn fail_agent(tx: &mpsc::Sender<AgentResponse>, topic: &str, msg: String) 
         topic: topic.to_string(),
         has_result: false,
     }).await;
+}
+
+/// Cumulative for the current turn — caller overwrites `chats.context_tokens`
+/// with each emission. Uses a narrow Deserialize struct so serde skips the rest
+/// of the frame (text blocks, tool calls) without allocating it.
+fn parse_assistant_usage(line: &str) -> Option<i64> {
+    #[derive(serde::Deserialize)]
+    struct Frame { message: Message }
+    #[derive(serde::Deserialize)]
+    struct Message { usage: Usage }
+    #[derive(serde::Deserialize, Default)]
+    struct Usage {
+        #[serde(default)] input_tokens: i64,
+        #[serde(default)] cache_creation_input_tokens: i64,
+        #[serde(default)] cache_read_input_tokens: i64,
+    }
+    match serde_json::from_str::<Frame>(line) {
+        Ok(f) => Some(f.message.usage.input_tokens
+            + f.message.usage.cache_creation_input_tokens
+            + f.message.usage.cache_read_input_tokens),
+        Err(e) => {
+            debug!("failed to parse assistant frame for usage: {}", e);
+            None
+        }
+    }
 }

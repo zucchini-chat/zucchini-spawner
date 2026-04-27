@@ -32,6 +32,7 @@ pub type TokenFetcher =
 pub enum WriteEvent {
     AgentLine { chat_id: String, content: String },
     ChatStatus { chat_id: String, status: &'static str },
+    ContextTokens { chat_id: String, tokens: i64 },
     Heartbeat { machine_id: Uuid },
 }
 
@@ -100,19 +101,10 @@ fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
             })),
         },
         WriteEvent::ChatStatus { chat_id, status } => {
-            let id = match Uuid::parse_str(chat_id) {
-                Ok(u) => u,
-                Err(e) => {
-                    warn!(chat_id = %chat_id, error = %e, "ChatStatus chat_id is not a UUID, dropping");
-                    return None;
-                }
-            };
-            BatchOp {
-                op: "PATCH",
-                table: "chats",
-                id,
-                data: Some(serde_json::json!({ "agent_status": status })),
-            }
+            chats_patch(chat_id, "ChatStatus", serde_json::json!({ "agent_status": status }))?
+        }
+        WriteEvent::ContextTokens { chat_id, tokens } => {
+            chats_patch(chat_id, "ContextTokens", serde_json::json!({ "context_tokens": tokens }))?
         }
         WriteEvent::Heartbeat { machine_id } => BatchOp {
             op: "PATCH",
@@ -122,6 +114,16 @@ fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
             data: Some(serde_json::json!({ "last_heartbeat_at": null })),
         },
     })
+}
+
+fn chats_patch(chat_id: &str, label: &str, data: serde_json::Value) -> Option<BatchOp> {
+    match Uuid::parse_str(chat_id) {
+        Ok(id) => Some(BatchOp { op: "PATCH", table: "chats", id, data: Some(data) }),
+        Err(e) => {
+            warn!(chat_id = %chat_id, error = %e, "{} chat_id is not a UUID, dropping", label);
+            None
+        }
+    }
 }
 
 async fn run(
