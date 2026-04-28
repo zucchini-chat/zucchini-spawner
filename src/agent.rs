@@ -97,6 +97,18 @@ impl Supervisor {
                 // Use the chat_id prefix so the worktree directory name stays short.
                 let worktree_name: String = topic_clone.chars().take(8).collect();
                 claude_cmd.push_str(&format!(" --worktree {}", shell_escape(&worktree_name)));
+                // Plug the path-containment hole in --worktree: the harness chdirs into
+                // the worktree but doesn't tell the agent (or its subagents) to stay
+                // there, so absolute paths into the parent repo "just work" and edits
+                // leak out. Inject the absolute worktree path with an explicit rule.
+                if let Some(ref pp) = project_path {
+                    let worktree_abs = format!("{}/.claude/worktrees/{}", pp.trim_end_matches('/'), worktree_name);
+                    let sys = format!(
+                        "You are running inside a git worktree at:\n  {}\nThe parent repo is at {}. By default, do work inside the worktree — that's the whole point of running with --worktree. If you delegate to a subagent, pass the worktree path along; tools accept absolute paths and won't enforce containment for you.",
+                        worktree_abs, pp
+                    );
+                    claude_cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
+                }
             }
             claude_cmd.push_str(" --print --verbose --output-format stream-json --dangerously-skip-permissions");
 
