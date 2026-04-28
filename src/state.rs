@@ -24,6 +24,10 @@ pub struct ChatState {
     pub id: String,
     pub project_id: String,
     pub worktree: bool,
+    /// `chats.last_seq` from Postgres: the seq of the most recent message in
+    /// this chat. Used to skip replayed historical user messages — see
+    /// `handle_message_put` in main.rs.
+    pub last_seq: i64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -55,12 +59,15 @@ impl Mirror {
         // false. `as_i64() == Some(1)` is the form that actually lands.
         let worktree = v.get("worktree").and_then(|f| f.as_i64()) == Some(1);
 
+        let last_seq = v.get("last_seq").and_then(crate::json_to_i64).unwrap_or(0);
+
         self.chats.insert(
             id.clone(),
             ChatState {
                 id,
                 project_id: project_id.to_string(),
                 worktree,
+                last_seq,
             },
         );
     }

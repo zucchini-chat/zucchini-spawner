@@ -205,13 +205,23 @@ async fn handle_message_put(
         return;
     }
 
-    let (project_id, worktree) = match mirror.chats.get(&chat_id) {
-        Some(c) => (c.project_id.clone(), c.worktree),
+    let (project_id, worktree, chat_last_seq) = match mirror.chats.get(&chat_id) {
+        Some(c) => (c.project_id.clone(), c.worktree, c.last_seq),
         None => {
             warn!(chat_id = %chat_id, "message arrived before chat row, skipping");
             return;
         }
     };
+
+    // chats.last_seq is the bucket-authoritative "latest message in chat".
+    // A user message with seq < last_seq is a replayed copy of an
+    // already-answered prompt — happens when PowerSync re-streams the bucket
+    // from op_id 0 (e.g. sync-rules rename, fresh state.json). Without this
+    // guard every replayed user message respawns its long-finished agent.
+    if seq < chat_last_seq {
+        info!(chat_id = %chat_id, seq, chat_last_seq, "skipping replayed user message");
+        return;
+    }
 
     let Some(body_str) = row.get("body").and_then(|v| v.as_str()) else {
         let keys: Vec<&String> = row.as_object().map(|o| o.keys().collect()).unwrap_or_default();
@@ -298,7 +308,7 @@ async fn handle_message_put(
     supervisor.spawn_agent(chat_id.clone(), prompt, Some(project_path), worktree, is_resume);
 }
 
-fn json_to_i64(v: &serde_json::Value) -> Option<i64> {
+pub(crate) fn json_to_i64(v: &serde_json::Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
@@ -344,6 +354,11 @@ async fn wait_for_writer_idle(writer: &Writer) -> bool {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let _sentry_guard = sentry::init((
         SENTRY_DSN,
         sentry::ClientOptions {
@@ -400,6 +415,9 @@ async fn main() {
     if let Some(p) = &prod {
         info!(machine_id = %p.machine_id, "starting heartbeat task");
         spawn_heartbeat(p.machine_id, write_tx.clone(), heartbeat_cancel.clone());
+        let _ = write_tx
+            .send(WriteEvent::ReportVersion { machine_id: p.machine_id })
+            .await;
     }
 
     let (update_tx, mut update_rx) = mpsc::channel::<String>(1);

@@ -34,6 +34,9 @@ pub enum WriteEvent {
     ChatStatus { chat_id: String, status: &'static str },
     ContextTokens { chat_id: String, tokens: i64 },
     Heartbeat { machine_id: Uuid },
+    /// Sent once per process, right after startup. Version only changes on
+    /// auto-update (which restarts the spawner), so re-sending is wasted work.
+    ReportVersion { machine_id: Uuid },
 }
 
 pub struct WriterConfig {
@@ -112,6 +115,12 @@ fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
             id: *machine_id,
             // Server stamps now() for last_heartbeat_at; the null is just a presence marker.
             data: Some(serde_json::json!({ "last_heartbeat_at": null })),
+        },
+        WriteEvent::ReportVersion { machine_id } => BatchOp {
+            op: "PATCH",
+            table: "machines",
+            id: *machine_id,
+            data: Some(serde_json::json!({ "spawner_version": env!("CARGO_PKG_VERSION") })),
         },
     })
 }
