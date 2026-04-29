@@ -265,9 +265,9 @@ async fn handle_message_put(
     if envelope.attachments.is_empty() && envelope.text.trim() == "/stop" {
         info!(chat_id = %chat_id, "stop command received");
         let _ = write_tx
-            .send(WriteEvent::ChatStatus {
+            .send(WriteEvent::ChatRunning {
                 chat_id: chat_id.clone(),
-                status: "idle",
+                agent_running: false,
             })
             .await;
         return;
@@ -293,14 +293,14 @@ async fn handle_message_put(
     let prompt = blobs::build_prompt(&envelope.text, &downloaded);
 
     // Only PATCH when transitioning idle→running. The abort-then-respawn path
-    // (was_running==true) leaves agent_status already set to "running" from
-    // the prior spawn — re-sending it would fan out a no-op write to every
-    // listening client and re-trigger their chat-list re-decrypt.
+    // (was_running==true) leaves agent_running already true from the prior
+    // spawn — re-sending it would fan out a no-op write to every listening
+    // client and re-trigger their chat-list re-decrypt.
     if !was_running {
         let _ = write_tx
-            .send(WriteEvent::ChatStatus {
+            .send(WriteEvent::ChatRunning {
                 chat_id: chat_id.clone(),
-                status: "running",
+                agent_running: true,
             })
             .await;
     }
@@ -485,9 +485,9 @@ async fn main() {
                                 .await;
                         }
                         let _ = write_tx
-                            .send(WriteEvent::ChatStatus {
+                            .send(WriteEvent::ChatRunning {
                                 chat_id: topic.clone(),
-                                status: "idle",
+                                agent_running: false,
                             })
                             .await;
                         supervisor.remove(&topic);

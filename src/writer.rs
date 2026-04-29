@@ -31,7 +31,7 @@ pub type TokenFetcher =
 #[derive(Debug, Clone)]
 pub enum WriteEvent {
     AgentLine { chat_id: String, content: String },
-    ChatStatus { chat_id: String, status: &'static str },
+    ChatRunning { chat_id: String, agent_running: bool },
     ContextTokens { chat_id: String, tokens: i64 },
     Heartbeat { machine_id: Uuid },
     /// Sent once per process, right after startup. Version only changes on
@@ -103,8 +103,8 @@ fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
                 "body": encrypt_field_b64(k_user, content),
             })),
         },
-        WriteEvent::ChatStatus { chat_id, status } => {
-            chats_patch(chat_id, "ChatStatus", serde_json::json!({ "agent_status": status }))?
+        WriteEvent::ChatRunning { chat_id, agent_running } => {
+            chats_patch(chat_id, "ChatRunning", serde_json::json!({ "agent_running": agent_running }))?
         }
         WriteEvent::ContextTokens { chat_id, tokens } => {
             chats_patch(chat_id, "ContextTokens", serde_json::json!({ "context_tokens": tokens }))?
