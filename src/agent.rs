@@ -72,6 +72,7 @@ impl Supervisor {
         let token_clone = token.clone();
 
         let handle = tokio::spawn(async move {
+            let _power_assertion = crate::power::AgentPowerAssertion::acquire();
             info!(topic = %topic_clone, resume = is_resume, project_path = ?project_path, worktree, "spawning claude agent");
 
             // Write prompt to a temp file so it never touches the shell command string

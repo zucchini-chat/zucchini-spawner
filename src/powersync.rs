@@ -22,6 +22,8 @@ use tokio::sync::mpsc;
 use tokio_util::io::StreamReader;
 use tracing::{debug, error, info, warn};
 
+use crate::power::WakeSignal;
+
 const TOKEN_REFRESH_THRESHOLD_SECS: i64 = 60;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -55,6 +57,15 @@ pub struct SyncConfig {
     pub client_id: String,
     pub initial_buckets: HashMap<String, String>,
     pub fetch_token: TokenFetcher,
+    /// Fired when the system resumes from sleep; aborts the current sync stream so
+    /// the outer loop reconnects immediately instead of waiting for TCP to time out.
+    pub wake_signal: WakeSignal,
+}
+
+enum ConnectExit {
+    Eof,
+    TokenRefresh,
+    Wake,
 }
 
 pub fn start(config: SyncConfig) -> mpsc::Receiver<SyncEvent> {
@@ -158,23 +169,39 @@ async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
     info!(buckets = buckets.len(), "starting sync stream");
 
     loop {
-        match connect_and_stream(&http, &config, &mut buckets, &tx).await {
-            Ok(()) => {
-                info!("sync stream ended cleanly");
-                backoff = INITIAL_BACKOFF;
-            }
-            Err(e) => {
-                error!(error = %e, ?backoff, "sync stream failed, backing off");
-            }
-        }
+        let exit = connect_and_stream(&http, &config, &mut buckets, &tx).await;
 
         if tx.is_closed() {
             info!("receiver dropped, stopping sync");
             return;
         }
 
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+        match exit {
+            Ok(reason) => {
+                backoff = INITIAL_BACKOFF;
+                match reason {
+                    ConnectExit::Wake => {
+                        info!("sync stream aborted by wake signal, reconnecting immediately");
+                        continue;
+                    }
+                    ConnectExit::TokenRefresh => info!("sync stream ended for token refresh"),
+                    ConnectExit::Eof => info!("sync stream ended cleanly"),
+                }
+            }
+            Err(e) => {
+                error!(error = %e, ?backoff, "sync stream failed, backing off");
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+            _ = config.wake_signal.notified() => {
+                info!("wake signal during backoff, reconnecting immediately");
+                backoff = INITIAL_BACKOFF;
+            }
+        }
     }
 }
 
@@ -183,7 +210,7 @@ async fn connect_and_stream(
     config: &SyncConfig,
     buckets: &mut HashMap<String, String>,
     tx: &mpsc::Sender<SyncEvent>,
-) -> Result<(), anyhow::Error> {
+) -> Result<ConnectExit, anyhow::Error> {
     let token = (config.fetch_token)().await?;
 
     let body = StreamingSyncRequest {
@@ -220,7 +247,21 @@ async fn connect_and_stream(
     let reader = StreamReader::new(byte_stream);
     let mut lines = tokio::io::BufReader::new(reader).lines();
 
-    while let Some(line) = lines.next_line().await? {
+    // Pin a single Notified future for the whole stream — re-creating it every
+    // iteration would race wakes that fire between iterations.
+    let wake = config.wake_signal.notified();
+    tokio::pin!(wake);
+
+    loop {
+        let line = tokio::select! {
+            biased;
+            _ = &mut wake => return Ok(ConnectExit::Wake),
+            line = lines.next_line() => line?,
+        };
+        let line = match line {
+            Some(l) => l,
+            None => return Ok(ConnectExit::Eof),
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -262,14 +303,14 @@ async fn connect_and_stream(
                                     .await
                                     .is_err()
                                 {
-                                    return Ok(());
+                                    return Ok(ConnectExit::Eof);
                                 }
                             }
                         }
                         OpKind::Remove => {
                             if let (Some(table), Some(id)) = (entry.object_type, entry.object_id) {
                                 if tx.send(SyncEvent::Remove { table, id }).await.is_err() {
-                                    return Ok(());
+                                    return Ok(ConnectExit::Eof);
                                 }
                             }
                         }
@@ -287,7 +328,7 @@ async fn connect_and_stream(
                     .await
                     .is_err()
                 {
-                    return Ok(());
+                    return Ok(ConnectExit::Eof);
                 }
                 debug!("checkpoint complete, emitted snapshot");
             }
@@ -297,11 +338,9 @@ async fn connect_and_stream(
                         expires_in = k.token_expires_in,
                         "token near expiry, reconnecting with fresh token"
                     );
-                    return Ok(());
+                    return Ok(ConnectExit::TokenRefresh);
                 }
             }
         }
     }
-
-    Ok(())
 }

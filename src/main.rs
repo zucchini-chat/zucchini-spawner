@@ -3,6 +3,7 @@ mod auth;
 mod blobs;
 mod crypto;
 mod envelope;
+mod power;
 mod powersync;
 mod state;
 mod updater;
@@ -16,6 +17,7 @@ use agent::{AgentResponse, Supervisor};
 use auth::AuthClient;
 use blobs::BlobDownloader;
 use crypto::KUser;
+use power::WakeSignal;
 use powersync::{SyncConfig, SyncEvent};
 use state::Mirror;
 use tokio::sync::mpsc;
@@ -94,6 +96,7 @@ fn dev_token_fetcher() -> Box<
 fn build_sync_config(
     prod: Option<&ProdConfig>,
     initial_buckets: std::collections::HashMap<String, String>,
+    wake_signal: WakeSignal,
 ) -> SyncConfig {
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
     let (base_url, fetch_token) = match prod {
@@ -105,6 +108,7 @@ fn build_sync_config(
         client_id: format!("zucchini-spawner-{}", hostname),
         initial_buckets,
         fetch_token,
+        wake_signal,
     }
 }
 
@@ -387,7 +391,8 @@ async fn main() {
         "loaded persisted state"
     );
 
-    let sync_config = build_sync_config(prod.as_ref(), mirror.buckets.clone());
+    let wake_signal = power::start_wake_watcher();
+    let sync_config = build_sync_config(prod.as_ref(), mirror.buckets.clone(), wake_signal);
     info!(
         base_url = %sync_config.base_url,
         client_id = %sync_config.client_id,
