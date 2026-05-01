@@ -3,7 +3,7 @@
 //! Opens `POST {base_url}/sync/stream`, streams NDJSON frames, maintains a per-bucket
 //! cursor in memory, and forwards row operations + checkpoint snapshots to the caller
 //! as `SyncEvent`s. Persistence of the cursor is the caller's concern (see `main.rs`
-//! + `state::Mirror`), so the cursor stays consistent with whatever else the caller
+//! and `state::Mirror`), so the cursor stays consistent with whatever else the caller
 //! persists (e.g. the projects mirror) in a single on-disk write.
 //!
 //! Scope is deliberately narrow: no SQLite, no CRUD upload, no conflict resolution.

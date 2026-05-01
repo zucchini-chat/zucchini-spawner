@@ -257,11 +257,9 @@ impl Supervisor {
                                                 && !line.contains("\"subtype\":\"status\""))
                                             || line.contains("\"type\":\"user\"")
                                             || line.contains("\"type\":\"rate_limit_event\"")
-                                        {
-                                            skip = true;
-                                        } else if line.contains("\"type\":\"assistant\"")
-                                            && !line.contains("\"type\":\"text\"")
-                                            && !line.contains("\"type\":\"tool_use\"")
+                                            || (line.contains("\"type\":\"assistant\"")
+                                                && !line.contains("\"type\":\"text\"")
+                                                && !line.contains("\"type\":\"tool_use\""))
                                         {
                                             skip = true;
                                         } else if !has_result && line.contains("\"type\":\"result\"") {
