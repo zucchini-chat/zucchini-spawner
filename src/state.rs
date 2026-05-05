@@ -42,13 +42,7 @@ pub struct Mirror {
 
 impl Mirror {
     pub fn upsert_chat(&mut self, id: String, row_json: &str) {
-        let v: serde_json::Value = match serde_json::from_str(row_json) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, chat_id = %id, "failed to parse chat row");
-                return;
-            }
-        };
+        let Some(v) = parse_row_json(row_json, "chat", &id) else { return };
         let Some(project_id) = v.get("project_id").and_then(|p| p.as_str()) else {
             warn!(chat_id = %id, "chat row missing project_id");
             return;
@@ -73,13 +67,7 @@ impl Mirror {
     }
 
     pub fn upsert_project(&mut self, id: String, row_json: &str) {
-        let v: serde_json::Value = match serde_json::from_str(row_json) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, project_id = %id, "failed to parse project row");
-                return;
-            }
-        };
+        let Some(v) = parse_row_json(row_json, "project", &id) else { return };
         let Some(path) = v.get("path").and_then(|f| f.as_str()) else {
             warn!(project_id = %id, "project row missing path");
             return;
@@ -117,5 +105,15 @@ impl Mirror {
         let bytes = serde_json::to_vec_pretty(self).expect("serialize mirror");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)
+    }
+}
+
+fn parse_row_json(row_json: &str, table: &'static str, id: &str) -> Option<serde_json::Value> {
+    match serde_json::from_str(row_json) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(error = %e, table, %id, "failed to parse row");
+            None
+        }
     }
 }
