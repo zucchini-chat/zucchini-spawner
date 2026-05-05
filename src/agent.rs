@@ -105,7 +105,7 @@ impl Supervisor {
                 if let Some(ref pp) = project_path {
                     let worktree_abs = format!("{}/.claude/worktrees/{}", pp.trim_end_matches('/'), worktree_name);
                     let sys = format!(
-                        "You are running inside a git worktree at:\n  {}\nThe parent repo is at {}. By default, do work inside the worktree — that's the whole point of running with --worktree. If you delegate to a subagent, pass the worktree path along; tools accept absolute paths and won't enforce containment for you.",
+                        "Worktree: {}\nParent repo: {} (do not touch unless the user explicitly asks).\nKeep all edits and Bash commands inside the worktree. If a path under the parent repo appears in context, rewrite it to the worktree before calling Edit/Write/Bash. When delegating via Task, repeat this rule and the worktree path — subagents don't inherit it.",
                         worktree_abs, pp
                     );
                     claude_cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
