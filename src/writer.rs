@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -30,13 +31,57 @@ pub type TokenFetcher =
 /// High-level event the main loop hands to the writer.
 #[derive(Debug, Clone)]
 pub enum WriteEvent {
-    AgentLine { chat_id: String, content: String },
+    /// `created_at` is `Some` only on the importer path — backdated to the
+    /// transcript timestamp; live writes leave it `None` so the server stamps `now()`.
+    /// `imported` is true only on the importer path; the spawner's sync consumer
+    /// skips imported rows so re-streaming our own bucket doesn't re-spawn an
+    /// agent for every backfilled user prompt.
+    PutMessage {
+        chat_id: String,
+        sender: &'static str,
+        content: String,
+        created_at: Option<DateTime<Utc>>,
+        imported: bool,
+    },
     ChatRunning { chat_id: String, agent_running: bool },
     ContextTokens { chat_id: String, tokens: i64 },
     Heartbeat { machine_id: Uuid },
     /// Sent once per process, right after startup. Version only changes on
     /// auto-update (which restarts the spawner), so re-sending is wasted work.
     ReportVersion { machine_id: Uuid },
+    /// Importer-only.
+    PutChat {
+        id: Uuid,
+        project_id: Uuid,
+        title: String,
+        created_at: DateTime<Utc>,
+    },
+    /// Importer-only.
+    PutProject {
+        id: Uuid,
+        machine_id: Uuid,
+        name: String,
+        path: String,
+    },
+    /// Importer-only: machines.PATCH carrying the import progress string
+    /// (`requested` | `running-N` | `finished`).
+    ImportStatus { machine_id: Uuid, status: String },
+}
+
+impl WriteEvent {
+    pub fn agent_line(chat_id: String, content: String) -> Self {
+        WriteEvent::PutMessage {
+            chat_id,
+            sender: "agent",
+            content,
+            created_at: None,
+            imported: false,
+        }
+    }
+
+    pub fn chat_running(chat_id: String, agent_running: bool) -> Self {
+        WriteEvent::ChatRunning { chat_id, agent_running }
+    }
 }
 
 pub struct WriterConfig {
@@ -93,16 +138,18 @@ struct BatchReq<'a> {
 
 fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
     Some(match event {
-        WriteEvent::AgentLine { chat_id, content } => BatchOp {
-            op: "PUT",
-            table: "messages",
-            id: Uuid::now_v7(),
-            data: Some(serde_json::json!({
+        WriteEvent::PutMessage { chat_id, sender, content, created_at, imported } => {
+            let mut data = serde_json::json!({
                 "chat_id": chat_id,
-                "sender": "agent",
+                "sender": sender,
                 "body": encrypt_field_b64(k_user, content),
-            })),
-        },
+                "imported": imported,
+            });
+            if let Some(ts) = created_at {
+                data["created_at"] = serde_json::Value::String(ts.to_rfc3339());
+            }
+            BatchOp { op: "PUT", table: "messages", id: Uuid::now_v7(), data: Some(data) }
+        }
         WriteEvent::ChatRunning { chat_id, agent_running } => {
             chats_patch(chat_id, "ChatRunning", serde_json::json!({ "agent_running": agent_running }))?
         }
@@ -121,6 +168,33 @@ fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
             table: "machines",
             id: *machine_id,
             data: Some(serde_json::json!({ "spawner_version": env!("CARGO_PKG_VERSION") })),
+        },
+        WriteEvent::PutChat { id, project_id, title, created_at } => BatchOp {
+            op: "PUT",
+            table: "chats",
+            id: *id,
+            data: Some(serde_json::json!({
+                "project_id": project_id.to_string(),
+                "title": encrypt_field_b64(k_user, title),
+                "worktree": false,
+                "created_at": created_at.to_rfc3339(),
+            })),
+        },
+        WriteEvent::PutProject { id, machine_id, name, path } => BatchOp {
+            op: "PUT",
+            table: "projects",
+            id: *id,
+            data: Some(serde_json::json!({
+                "machine_id": machine_id.to_string(),
+                "name": name,
+                "path": path,
+            })),
+        },
+        WriteEvent::ImportStatus { machine_id, status } => BatchOp {
+            op: "PATCH",
+            table: "machines",
+            id: *machine_id,
+            data: Some(serde_json::json!({ "claude_history_import_status": status })),
         },
     })
 }

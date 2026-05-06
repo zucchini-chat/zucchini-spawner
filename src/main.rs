@@ -3,6 +3,7 @@ mod auth;
 mod blobs;
 mod crypto;
 mod envelope;
+mod import;
 mod power;
 mod powersync;
 mod state;
@@ -129,31 +130,59 @@ fn api_base_and_token(prod: Option<&ProdConfig>) -> (String, writer::TokenFetche
     }
 }
 
-/// Returns true when the op mutated persistent state (projects) and the caller
-/// should save `mirror` to disk. Cursor/buckets are persisted on CheckpointComplete
-/// instead — per-row saves would multiply disk writes for no durability gain.
+pub(crate) enum SyncEventOutcome {
+    Nothing,
+    StateChanged,
+    ImportRequested,
+    ImportAborted,
+}
+
 async fn handle_sync_event(
     event: SyncEvent,
+    machine_id: Option<Uuid>,
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
     blobs: &BlobDownloader,
     write_tx: &mpsc::Sender<WriteEvent>,
-) -> bool {
+) -> SyncEventOutcome {
     match event {
         SyncEvent::Put { table, id, data } => match table.as_str() {
             "projects" => {
                 mirror.upsert_project(id, &data);
-                true
+                SyncEventOutcome::StateChanged
             }
             "chats" => {
                 mirror.upsert_chat(id, &data);
-                false
+                SyncEventOutcome::Nothing
             }
             "messages" => {
                 handle_message_put(&data, mirror, supervisor, blobs, write_tx).await;
-                false
+                SyncEventOutcome::Nothing
             }
-            _ => false,
+            "machines" => {
+                // Defense-in-depth: the bucket already scopes to this spawner.
+                let is_self = machine_id
+                    .map(|m| Uuid::parse_str(&id).map(|x| x == m).unwrap_or(false))
+                    .unwrap_or(false);
+                if !is_self {
+                    return SyncEventOutcome::Nothing;
+                }
+                let Some(row) = state::parse_row_json(&data, "machine", &id) else {
+                    return SyncEventOutcome::Nothing;
+                };
+                let status = row
+                    .get("claude_history_import_status")
+                    .and_then(|f| f.as_str());
+                if !mirror.set_import_status(status) {
+                    return SyncEventOutcome::Nothing;
+                }
+                match status {
+                    Some("requested") => SyncEventOutcome::ImportRequested,
+                    Some("aborted") => SyncEventOutcome::ImportAborted,
+                    _ => SyncEventOutcome::Nothing,
+                }
+            }
+            _ => SyncEventOutcome::Nothing,
         },
         SyncEvent::Remove { table, id } => match table.as_str() {
             "chats" => {
@@ -163,17 +192,17 @@ async fn handle_sync_event(
                 // signal (TODO: debounce until CheckpointComplete shows the row is
                 // really gone, or add a chats.deleted_at column).
                 mirror.remove_chat(&id);
-                false
+                SyncEventOutcome::Nothing
             }
             "projects" => {
                 mirror.remove_project(&id);
-                true
+                SyncEventOutcome::StateChanged
             }
-            _ => false,
+            _ => SyncEventOutcome::Nothing,
         },
         SyncEvent::CheckpointComplete { buckets } => {
             mirror.buckets = buckets;
-            true
+            SyncEventOutcome::StateChanged
         }
     }
 }
@@ -206,6 +235,15 @@ async fn handle_message_put(
     };
     let sender = row.get("sender").and_then(|v| v.as_str()).unwrap_or("");
     if sender != "user" {
+        return;
+    }
+    // Server-stamped marker for rows backfilled by the claude-history importer.
+    // We subscribe to our own by_machine bucket, so every imported message
+    // round-trips back as a sync PUT — without this skip the importer would
+    // re-spawn an agent for every imported user prompt (potentially thousands
+    // concurrent on first import). Postgres BOOLEAN serializes as JSON 1/0
+    // through PowerSync's stream, same shape as `chats.worktree`.
+    if row.get("imported").and_then(|v| v.as_i64()) == Some(1) {
         return;
     }
 
@@ -259,20 +297,14 @@ async fn handle_message_put(
         info!(chat_id = %chat_id, "aborting running agent before handling new message");
         supervisor.abort_agent(&chat_id).await;
         let _ = write_tx
-            .send(WriteEvent::AgentLine {
-                chat_id: chat_id.clone(),
-                content: INTERRUPTED_RESULT.to_string(),
-            })
+            .send(WriteEvent::agent_line(chat_id.clone(), INTERRUPTED_RESULT.to_string()))
             .await;
     }
 
     if envelope.attachments.is_empty() && envelope.text.trim() == "/stop" {
         info!(chat_id = %chat_id, "stop command received");
         let _ = write_tx
-            .send(WriteEvent::ChatRunning {
-                chat_id: chat_id.clone(),
-                agent_running: false,
-            })
+            .send(WriteEvent::chat_running(chat_id.clone(), false))
             .await;
         return;
     }
@@ -302,10 +334,7 @@ async fn handle_message_put(
     // client and re-trigger their chat-list re-decrypt.
     if !was_running {
         let _ = write_tx
-            .send(WriteEvent::ChatRunning {
-                chat_id: chat_id.clone(),
-                agent_running: true,
-            })
+            .send(WriteEvent::chat_running(chat_id.clone(), true))
             .await;
     }
     let is_resume = seq > 1;
@@ -431,11 +460,16 @@ async fn main() {
 
     let blob_downloader = {
         let (base_url, fetch_token) = api_base_and_token(prod.as_ref());
-        BlobDownloader::new(&base_url, fetch_token, Arc::new(k_user))
+        BlobDownloader::new(&base_url, fetch_token, Arc::new(k_user.clone()))
     };
 
     let (response_tx, mut response_rx) = mpsc::channel::<AgentResponse>(256);
     let mut supervisor = Supervisor::new(response_tx);
+    // One-shot: spawned on ImportRequested, aborted on ImportAborted. After the
+    // task finishes naturally the slot stays Some(handle), but the FSM's
+    // terminal `finished` blocks any further ImportRequested, so it never gets
+    // reused. Aborting an already-finished JoinHandle is a no-op.
+    let mut import_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to register SIGTERM handler");
@@ -462,17 +496,49 @@ async fn main() {
                 supervisor.cleanup();
             }
             Some(event) = sync_rx.recv() => {
-                let changed = handle_sync_event(event, &mut mirror, &mut supervisor, &blob_downloader, &write_tx).await;
-                if changed {
-                    save_mirror(&state_path, &mirror);
+                let machine_id = prod.as_ref().map(|p| p.machine_id);
+                let outcome = handle_sync_event(
+                    event,
+                    machine_id,
+                    &mut mirror,
+                    &mut supervisor,
+                    &blob_downloader,
+                    &write_tx,
+                ).await;
+                match outcome {
+                    SyncEventOutcome::StateChanged => save_mirror(&state_path, &mirror),
+                    SyncEventOutcome::ImportRequested => {
+                        if let Some(mid) = machine_id {
+                            info!(machine_id = %mid, "claude history import requested by user");
+                            let tx_clone = write_tx.clone();
+                            let handle = tokio::spawn(async move {
+                                if let Err(e) = import::run(mid, tx_clone).await {
+                                    error!(error = %e, "claude history import failed");
+                                }
+                            });
+                            // FSM only allows NotStarted→Requested once, so any
+                            // pre-existing handle here is a leftover from a
+                            // finished run — abort is a no-op on it.
+                            if let Some(prev) = import_task.replace(handle) {
+                                prev.abort();
+                            }
+                        } else {
+                            warn!("import requested but spawner is in dev mode (no machine id) — ignoring");
+                        }
+                    }
+                    SyncEventOutcome::ImportAborted => {
+                        if let Some(handle) = import_task.take() {
+                            info!("user aborted import — cancelling import task");
+                            handle.abort();
+                        }
+                    }
+                    SyncEventOutcome::Nothing => {}
                 }
             }
             Some(resp) = response_rx.recv() => {
                 match resp {
                     AgentResponse::Line { topic, content } => {
-                        let _ = write_tx
-                            .send(WriteEvent::AgentLine { chat_id: topic, content })
-                            .await;
+                        let _ = write_tx.send(WriteEvent::agent_line(topic, content)).await;
                     }
                     AgentResponse::ContextTokens { topic, tokens } => {
                         let _ = write_tx
@@ -483,17 +549,11 @@ async fn main() {
                         info!(topic = %topic, has_result, "agent done");
                         if !has_result {
                             let _ = write_tx
-                                .send(WriteEvent::AgentLine {
-                                    chat_id: topic.clone(),
-                                    content: INTERRUPTED_RESULT.to_string(),
-                                })
+                                .send(WriteEvent::agent_line(topic.clone(), INTERRUPTED_RESULT.to_string()))
                                 .await;
                         }
                         let _ = write_tx
-                            .send(WriteEvent::ChatRunning {
-                                chat_id: topic.clone(),
-                                agent_running: false,
-                            })
+                            .send(WriteEvent::chat_running(topic.clone(), false))
                             .await;
                         supervisor.remove(&topic);
                     }

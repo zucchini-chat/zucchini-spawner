@@ -38,6 +38,11 @@ pub struct Mirror {
     pub projects: HashMap<String, String>,
     #[serde(default)]
     pub buckets: HashMap<String, String>,
+    /// Re-streamed on every boot, so not persisted. The `set_import_status`
+    /// change-detection guard is what keeps re-emissions of the same status
+    /// (heartbeat-driven, ~every 10s) from re-firing the importer.
+    #[serde(skip)]
+    pub claude_history_import_status: Option<String>,
 }
 
 impl Mirror {
@@ -64,6 +69,16 @@ impl Mirror {
                 last_seq,
             },
         );
+    }
+
+    /// Returns true if the status actually changed. The machines row is re-emitted
+    /// every ~30s on heartbeats, so most calls during a spawner's lifetime are no-ops.
+    pub fn set_import_status(&mut self, status: Option<&str>) -> bool {
+        if self.claude_history_import_status.as_deref() == status {
+            return false;
+        }
+        self.claude_history_import_status = status.map(str::to_string);
+        true
     }
 
     pub fn upsert_project(&mut self, id: String, row_json: &str) {
@@ -108,7 +123,7 @@ impl Mirror {
     }
 }
 
-fn parse_row_json(row_json: &str, table: &'static str, id: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_row_json(row_json: &str, table: &'static str, id: &str) -> Option<serde_json::Value> {
     match serde_json::from_str(row_json) {
         Ok(v) => Some(v),
         Err(e) => {

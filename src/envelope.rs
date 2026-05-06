@@ -8,19 +8,19 @@
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::crypto::{self, KUser};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MessageEnvelope {
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<EnvelopeAttachment>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EnvelopeAttachment {
     pub blob_key: Uuid,
     pub name: String,
