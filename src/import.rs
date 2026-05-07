@@ -9,6 +9,12 @@
 //! thinking-only frames, sidechain (subagent) transcripts, and
 //! `queue-operation`/`last-prompt`/`attachment`. `ai-title` is harvested into
 //! chats.title.
+//!
+//! User strings also get a synthetic-wrapper screen (see `is_synthetic_wrapper`):
+//! the TUI logs `/exit`, `/clear`, `/compact`, `<system-reminder>`, etc. as
+//! pseudo-user rows that the user never typed and the model never sees.
+//! Custom slash commands (`<command-message>`-prefixed) are kept — those go
+//! to the model and produce real assistant replies.
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -350,10 +356,18 @@ enum UserContent {
 }
 
 fn classify_user(entry: &serde_json::Value) -> UserContent {
+    // isMeta=true is claude-code's marker for system-injected user messages
+    // (slash-command caveats, "Continue from where you left off." pads, etc.).
+    if entry.get("isMeta").and_then(|v| v.as_bool()) == Some(true) {
+        return UserContent::Empty;
+    }
     let Some(content) = entry.get("message").and_then(|m| m.get("content")) else {
         return UserContent::Empty;
     };
     if let Some(s) = content.as_str() {
+        if is_synthetic_wrapper(s) {
+            return UserContent::Empty;
+        }
         return UserContent::Prompt(s.to_string());
     }
     if content.as_array().is_some() {
@@ -361,6 +375,26 @@ fn classify_user(entry: &serde_json::Value) -> UserContent {
         return UserContent::ToolResult;
     }
     UserContent::Empty
+}
+
+/// User-content strings that claude-code wraps in these tags are synthetic —
+/// either local CLI commands handled by the TUI (`<command-name>`,
+/// `<local-command-stdout>`, `<local-command-stderr>`, `<local-command-caveat>`)
+/// or harness-injected reminders/notifications (`<system-reminder>`,
+/// `<task-notification>`). None of them are user-typed prompts, and the TUI
+/// itself strips them before rendering. `<command-message>` is the contrast
+/// case: it's how custom slash commands like `/simplify` introduce a real
+/// prompt that gets sent to the model — keep those.
+fn is_synthetic_wrapper(s: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<command-name>",
+        "<system-reminder>",
+        "<task-notification>",
+    ];
+    PREFIXES.iter().any(|p| s.starts_with(p))
 }
 
 enum AssistantContent {
