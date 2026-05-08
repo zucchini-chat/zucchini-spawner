@@ -46,9 +46,14 @@ pub enum WriteEvent {
     ChatRunning { chat_id: String, agent_running: bool },
     ContextTokens { chat_id: String, tokens: i64 },
     Heartbeat { machine_id: Uuid },
-    /// Sent once per process, right after startup. Version only changes on
-    /// auto-update (which restarts the spawner), so re-sending is wasted work.
-    ReportVersion { machine_id: Uuid },
+    /// Sent once per process startup. Re-evaluating on each restart picks up
+    /// `claude /login` after a service kick — without that, the iOS app would
+    /// never see auth flips.
+    ReportStartupInfo {
+        machine_id: Uuid,
+        claude_code_installed: bool,
+        claude_code_authenticated: bool,
+    },
     /// Importer-only.
     PutChat {
         id: Uuid,
@@ -163,11 +168,15 @@ fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
             // Server stamps now() for last_heartbeat_at; the null is just a presence marker.
             data: Some(serde_json::json!({ "last_heartbeat_at": null })),
         },
-        WriteEvent::ReportVersion { machine_id } => BatchOp {
+        WriteEvent::ReportStartupInfo { machine_id, claude_code_installed, claude_code_authenticated } => BatchOp {
             op: "PATCH",
             table: "machines",
             id: *machine_id,
-            data: Some(serde_json::json!({ "spawner_version": env!("CARGO_PKG_VERSION") })),
+            data: Some(serde_json::json!({
+                "spawner_version": env!("CARGO_PKG_VERSION"),
+                "claude_code_installed": claude_code_installed,
+                "claude_code_authenticated": claude_code_authenticated,
+            })),
         },
         WriteEvent::PutChat { id, project_id, title, created_at } => BatchOp {
             op: "PUT",

@@ -1,11 +1,13 @@
 mod agent;
 mod auth;
 mod blobs;
+mod claude_code;
 mod crypto;
 mod envelope;
 mod import;
 mod power;
 mod powersync;
+mod shell;
 mod state;
 mod updater;
 mod writer;
@@ -345,6 +347,26 @@ pub(crate) fn json_to_i64(v: &serde_json::Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
+/// Off the main task — the login-shell probe in `is_installed` is hundreds of
+/// ms and we don't want to delay select-loop entry.
+fn spawn_startup_info_report(machine_id: Uuid, write_tx: mpsc::Sender<WriteEvent>) {
+    tokio::spawn(async move {
+        let (installed, authenticated) = tokio::join!(
+            claude_code::is_installed(),
+            tokio::task::spawn_blocking(claude_code::is_authenticated),
+        );
+        let authenticated = authenticated.unwrap_or(false);
+        info!(installed, authenticated, "reporting startup info");
+        let _ = write_tx
+            .send(WriteEvent::ReportStartupInfo {
+                machine_id,
+                claude_code_installed: installed,
+                claude_code_authenticated: authenticated,
+            })
+            .await;
+    });
+}
+
 fn spawn_heartbeat(
     machine_id: Uuid,
     write_tx: mpsc::Sender<WriteEvent>,
@@ -449,9 +471,7 @@ async fn main() {
     if let Some(p) = &prod {
         info!(machine_id = %p.machine_id, "starting heartbeat task");
         spawn_heartbeat(p.machine_id, write_tx.clone(), heartbeat_cancel.clone());
-        let _ = write_tx
-            .send(WriteEvent::ReportVersion { machine_id: p.machine_id })
-            .await;
+        spawn_startup_info_report(p.machine_id, write_tx.clone());
     }
 
     let (update_tx, mut update_rx) = mpsc::channel::<String>(1);

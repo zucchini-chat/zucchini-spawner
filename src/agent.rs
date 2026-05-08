@@ -113,7 +113,7 @@ impl Supervisor {
             }
             claude_cmd.push_str(" --print --verbose --output-format stream-json --dangerously-skip-permissions");
 
-            let user_shell = std::env::var("USER_SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            let user_shell = crate::shell::user_login_shell();
             info!(shell = %user_shell, "spawning claude via login shell");
 
             let mut cmd = Command::new(&user_shell);
