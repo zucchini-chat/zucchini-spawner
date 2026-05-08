@@ -36,7 +36,7 @@ const INTERRUPTED_RESULT: &str = r#"{"type":"result","subtype":"interrupted"}"#;
 const PROD_BASE_URL: &str = "https://api.zucchini.chat";
 const DEV_SYNC_BASE_URL: &str = "http://localhost:8080";
 const DEV_API_BASE_URL: &str = "http://localhost:3100";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 // Cap the wait so a server that won't accept writes can't block the update forever.
 const UPDATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_DRAIN_POLL: Duration = Duration::from_millis(100);
