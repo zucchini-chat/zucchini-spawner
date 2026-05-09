@@ -53,10 +53,7 @@ impl Mirror {
             return;
         };
 
-        // PowerSync's sync stream serializes Postgres BOOLEAN as JSON Number
-        // (0/1), not bool — `as_bool()` returns None and silently falls back to
-        // false. `as_i64() == Some(1)` is the form that actually lands.
-        let worktree = v.get("worktree").and_then(|f| f.as_i64()) == Some(1);
+        let worktree = crate::json_pg_bool(v.get("worktree"));
 
         let last_seq = v.get("last_seq").and_then(crate::json_to_i64).unwrap_or(0);
 

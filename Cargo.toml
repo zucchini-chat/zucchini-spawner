@@ -14,13 +14,18 @@ anyhow = "1"
 nix = { version = "0.29", features = ["signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls", "tracing"] }
+sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "native-tls", "tracing"] }
 sentry-tracing = "0.48"
 chacha20poly1305 = "0.10"
 base64 = "0.22"
 gethostname = "0.5"
 uuid = { version = "1", features = ["v5", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+# Force vendored OpenSSL on Linux so cross-builds don't need libssl-dev in the
+# Docker image. Pulled in transitively by sentry → reqwest-0.13 → native-tls.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = "0.8"

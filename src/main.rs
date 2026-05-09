@@ -9,6 +9,7 @@ mod power;
 mod powersync;
 mod shell;
 mod state;
+mod uninstall;
 mod updater;
 mod writer;
 
@@ -137,6 +138,7 @@ pub(crate) enum SyncEventOutcome {
     StateChanged,
     ImportRequested,
     ImportAborted,
+    UninstallRequested,
 }
 
 async fn handle_sync_event(
@@ -172,6 +174,9 @@ async fn handle_sync_event(
                 let Some(row) = state::parse_row_json(&data, "machine", &id) else {
                     return SyncEventOutcome::Nothing;
                 };
+                if json_pg_bool(row.get("to_uninstall")) {
+                    return SyncEventOutcome::UninstallRequested;
+                }
                 let status = row
                     .get("claude_history_import_status")
                     .and_then(|f| f.as_str());
@@ -243,9 +248,8 @@ async fn handle_message_put(
     // We subscribe to our own by_machine bucket, so every imported message
     // round-trips back as a sync PUT — without this skip the importer would
     // re-spawn an agent for every imported user prompt (potentially thousands
-    // concurrent on first import). Postgres BOOLEAN serializes as JSON 1/0
-    // through PowerSync's stream, same shape as `chats.worktree`.
-    if row.get("imported").and_then(|v| v.as_i64()) == Some(1) {
+    // concurrent on first import).
+    if json_pg_bool(row.get("imported")) {
         return;
     }
 
@@ -345,6 +349,12 @@ async fn handle_message_put(
 
 pub(crate) fn json_to_i64(v: &serde_json::Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// PowerSync serializes Postgres BOOLEAN as JSON Number 0/1, not bool — `as_bool()`
+/// returns None and silently falls through to `false`. Treat absent fields as false.
+pub(crate) fn json_pg_bool(v: Option<&serde_json::Value>) -> bool {
+    v.and_then(|x| x.as_i64()) == Some(1)
 }
 
 /// Off the main task — the login-shell probe in `is_installed` is hundreds of
@@ -551,6 +561,14 @@ async fn main() {
                             info!("user aborted import — cancelling import task");
                             handle.abort();
                         }
+                    }
+                    SyncEventOutcome::UninstallRequested => {
+                        info!("to_uninstall=true — running self-uninstall and exiting");
+                        supervisor.shutdown_all().await;
+                        heartbeat_cancel.cancel();
+                        let _ = wait_for_writer_idle(&writer).await;
+                        uninstall::spawn_detached_cleanup();
+                        break 'main_loop;
                     }
                     SyncEventOutcome::Nothing => {}
                 }
