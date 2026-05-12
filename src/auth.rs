@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 const REFRESH_SLACK_SECS: i64 = 60;
 
@@ -31,6 +33,8 @@ pub struct AuthClient {
     endpoint: String,
     spawner_token: String,
     cache: Mutex<Option<Cache>>,
+    /// Cancelled when /auth/token returns 410; main loop awaits this to self-uninstall.
+    revoked: CancellationToken,
 }
 
 impl AuthClient {
@@ -44,7 +48,13 @@ impl AuthClient {
             endpoint: format!("{}/auth/token", api_base_url.trim_end_matches('/')),
             spawner_token,
             cache: Mutex::new(None),
+            revoked: CancellationToken::new(),
         }
+    }
+
+    /// Shared cancellation token the main loop awaits. Cancelled when fetch_jwt sees 410.
+    pub fn revoked_signal(&self) -> CancellationToken {
+        self.revoked.clone()
     }
 
     pub async fn fetch_jwt(&self) -> Result<String> {
@@ -63,8 +73,14 @@ impl AuthClient {
             .send()
             .await
             .context("POST /auth/token")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        if status == StatusCode::GONE {
+            // Drop cached JWT so a concurrent fetcher doesn't reuse an orphaned token.
+            *guard = None;
+            self.revoked.cancel();
+            return Err(anyhow!("/auth/token 410 Gone — spawner revoked"));
+        }
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(anyhow!("/auth/token {}: {}", status, body));
         }

@@ -417,6 +417,20 @@ async fn wait_for_writer_idle(writer: &Writer) -> bool {
     false
 }
 
+/// Shared shutdown path used by both the `to_uninstall` PowerSync signal
+/// and the 410-from-/auth/token revoked signal. Caller breaks the main
+/// loop after this returns.
+async fn run_uninstall(
+    supervisor: &mut Supervisor,
+    heartbeat_cancel: &CancellationToken,
+    writer: &Writer,
+) {
+    supervisor.shutdown_all().await;
+    heartbeat_cancel.cancel();
+    let _ = wait_for_writer_idle(writer).await;
+    uninstall::spawn_detached_cleanup();
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -506,6 +520,12 @@ async fn main() {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("failed to register SIGINT handler");
 
+    // In dev mode there's no AuthClient; an unsignalled token never cancels.
+    let revoked_token = prod
+        .as_ref()
+        .map(|p| p.auth.revoked_signal())
+        .unwrap_or_else(CancellationToken::new);
+
     info!("zucchini-spawner ready, waiting for sync + agent responses");
 
     'main_loop: loop {
@@ -519,6 +539,11 @@ async fn main() {
                 info!("received SIGINT, shutting down");
                 supervisor.shutdown_all().await;
                 break;
+            }
+            _ = revoked_token.cancelled() => {
+                info!("auth revoked (410 from /auth/token) — running self-uninstall and exiting");
+                run_uninstall(&mut supervisor, &heartbeat_cancel, &writer).await;
+                break 'main_loop;
             }
             Some(new_version) = update_rx.recv(), if update_pending.is_none() => {
                 info!(new_version = %new_version, "update available, will apply when idle");
@@ -564,10 +589,7 @@ async fn main() {
                     }
                     SyncEventOutcome::UninstallRequested => {
                         info!("to_uninstall=true — running self-uninstall and exiting");
-                        supervisor.shutdown_all().await;
-                        heartbeat_cancel.cancel();
-                        let _ = wait_for_writer_idle(&writer).await;
-                        uninstall::spawn_detached_cleanup();
+                        run_uninstall(&mut supervisor, &heartbeat_cancel, &writer).await;
                         break 'main_loop;
                     }
                     SyncEventOutcome::Nothing => {}
