@@ -370,9 +370,27 @@ fn classify_user(entry: &serde_json::Value) -> UserContent {
         }
         return UserContent::Prompt(s.to_string());
     }
-    if content.as_array().is_some() {
-        // tool_result or other block-shaped content the live spawner skips too.
-        return UserContent::ToolResult;
+    // The CLI entrypoint writes typed prompts as a bare string, but the
+    // VS Code extension (`entrypoint:"claude-vscode"`) always wraps them as
+    // `[{type:"text", text:"..."}]`. Join text blocks back into a string;
+    // arrays without any text blocks are tool_result echoes and skipped.
+    if let Some(blocks) = content.as_array() {
+        let mut parts: Vec<&str> = Vec::new();
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    parts.push(t);
+                }
+            }
+        }
+        if parts.is_empty() {
+            return UserContent::ToolResult;
+        }
+        let joined = parts.join("\n");
+        if is_synthetic_wrapper(&joined) {
+            return UserContent::Empty;
+        }
+        return UserContent::Prompt(joined);
     }
     UserContent::Empty
 }
