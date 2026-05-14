@@ -94,6 +94,13 @@ impl Supervisor {
             // session with --session-id, every subsequent message resumes it.
             let session_flag = if is_resume { "--resume" } else { "--session-id" };
             claude_cmd.push_str(&format!(" {} {}", session_flag, shell_escape(&topic_clone)));
+            // claude --print is one-shot; once the result frame emits, the process
+            // exits and the spawner stops reading stdout. Background work has no
+            // way to reach the chat afterwards, so steer agents away from it.
+            let mut sys = String::from(
+                "You are spawned via a harness, no background subagents will wake you when finished, use subagents with `run_in_background: false` only."
+            );
+
             if worktree {
                 // Use the chat_id prefix so the worktree directory name stays short.
                 let worktree_name: String = topic_clone.chars().take(8).collect();
@@ -104,14 +111,14 @@ impl Supervisor {
                 // leak out. Inject the absolute worktree path with an explicit rule.
                 if let Some(ref pp) = project_path {
                     let worktree_abs = format!("{}/.claude/worktrees/{}", pp.trim_end_matches('/'), worktree_name);
-                    let sys = format!(
-                        "Worktree: {}\nParent repo: {} (do not touch unless the user explicitly asks).\nKeep all edits and Bash commands inside the worktree. If a path under the parent repo appears in context, rewrite it to the worktree before calling Edit/Write/Bash. When delegating via Task, repeat this rule and the worktree path — subagents don't inherit it.",
+                    sys.push_str(&format!(
+                        "\n\nWorktree: {}\nParent repo: {} (do not touch unless the user explicitly asks).\nKeep all edits and Bash commands inside the worktree. If a path under the parent repo appears in context, rewrite it to the worktree before calling Edit/Write/Bash. When delegating via Task, repeat this rule and the worktree path — subagents don't inherit it.",
                         worktree_abs, pp
-                    );
-                    claude_cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
+                    ));
                 }
             }
-            claude_cmd.push_str(" --print --verbose --output-format stream-json --dangerously-skip-permissions");
+            claude_cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
+            claude_cmd.push_str(" --print --verbose --output-format stream-json --dangerously-skip-permissions --disallowedTools AskUserQuestion");
 
             let user_shell = crate::shell::user_login_shell();
             info!(shell = %user_shell, "spawning claude via login shell");
