@@ -37,6 +37,13 @@ pub enum WriteEvent {
     /// skips imported rows so re-streaming our own bucket doesn't re-spawn an
     /// agent for every backfilled user prompt.
     PutMessage {
+        /// When `Some`, used verbatim as `messages.id`. The importer passes the
+        /// claude-code `entry.uuid` here so replays of the same conversation
+        /// entry (claude rewrites the .jsonl on every `--continue`/`--resume`,
+        /// preserving entry uuids) collapse via the backend's
+        /// `INSERT ... ON CONFLICT (id) DO NOTHING` clause. Live writes leave
+        /// it `None` and the writer mints a fresh `Uuid::now_v7()`.
+        id: Option<Uuid>,
         chat_id: String,
         sender: &'static str,
         content: String,
@@ -76,6 +83,7 @@ pub enum WriteEvent {
 impl WriteEvent {
     pub fn agent_line(chat_id: String, content: String) -> Self {
         WriteEvent::PutMessage {
+            id: None,
             chat_id,
             sender: "agent",
             content,
@@ -143,7 +151,7 @@ struct BatchReq<'a> {
 
 fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
     Some(match event {
-        WriteEvent::PutMessage { chat_id, sender, content, created_at, imported } => {
+        WriteEvent::PutMessage { id, chat_id, sender, content, created_at, imported } => {
             let mut data = serde_json::json!({
                 "chat_id": chat_id,
                 "sender": sender,
@@ -153,7 +161,12 @@ fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
             if let Some(ts) = created_at {
                 data["created_at"] = serde_json::Value::String(ts.to_rfc3339());
             }
-            BatchOp { op: "PUT", table: "messages", id: Uuid::now_v7(), data: Some(data) }
+            BatchOp {
+                op: "PUT",
+                table: "messages",
+                id: id.unwrap_or_else(Uuid::now_v7),
+                data: Some(data),
+            }
         }
         WriteEvent::ChatRunning { chat_id, agent_running } => {
             chats_patch(chat_id, "ChatRunning", serde_json::json!({ "agent_running": agent_running }))?

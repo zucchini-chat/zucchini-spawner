@@ -278,18 +278,26 @@ async fn import_session(
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
+        // Claude code preserves the entry uuid across `--continue`/`--resume`
+        // replays of the same conversation entry — we thread it into
+        // `WriteEvent::PutMessage::id` so replays dedup.
+        let entry_uuid = entry
+            .get("uuid")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+
         let imported = match entry_type {
             "user" => match classify_user(&entry) {
                 UserContent::Prompt(text) => {
                     if title.is_none() {
                         title = Some(collapse_title(&text));
                     }
-                    Some(ImportedMsg::user(text))
+                    Some(ImportedMsg::user(text, entry_uuid))
                 }
                 UserContent::ToolResult | UserContent::Empty => None,
             },
             "assistant" => match classify_assistant(&entry) {
-                AssistantContent::Renderable(body) => Some(ImportedMsg::agent(body)),
+                AssistantContent::Renderable(body) => Some(ImportedMsg::agent(body, entry_uuid)),
                 AssistantContent::Skip => None,
             },
             _ => None,
@@ -321,6 +329,7 @@ async fn import_session(
     for (ts, msg) in keepers {
         let _ = write_tx
             .send(WriteEvent::PutMessage {
+                id: msg.uuid,
                 chat_id: chat_id.to_string(),
                 sender: msg.sender,
                 content: msg.body,
@@ -336,16 +345,21 @@ async fn import_session(
 struct ImportedMsg {
     sender: &'static str,
     body: String,
+    uuid: Option<Uuid>,
 }
 
 impl ImportedMsg {
-    fn user(text: String) -> Self {
+    fn user(text: String, uuid: Option<Uuid>) -> Self {
         let env = MessageEnvelope { text, attachments: Vec::new() };
-        Self { sender: "user", body: serde_json::to_string(&env).expect("envelope serializable") }
+        Self {
+            sender: "user",
+            body: serde_json::to_string(&env).expect("envelope serializable"),
+            uuid,
+        }
     }
 
-    fn agent(stream_json_frame: String) -> Self {
-        Self { sender: "agent", body: stream_json_frame }
+    fn agent(stream_json_frame: String, uuid: Option<Uuid>) -> Self {
+        Self { sender: "agent", body: stream_json_frame, uuid }
     }
 }
 
