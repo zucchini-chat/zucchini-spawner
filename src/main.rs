@@ -101,6 +101,7 @@ fn build_sync_config(
     prod: Option<&ProdConfig>,
     initial_buckets: std::collections::HashMap<String, String>,
     wake_signal: WakeSignal,
+    revoked: CancellationToken,
 ) -> SyncConfig {
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
     let (base_url, fetch_token) = match prod {
@@ -113,6 +114,7 @@ fn build_sync_config(
         initial_buckets,
         fetch_token,
         wake_signal,
+        revoked,
     }
 }
 
@@ -466,8 +468,19 @@ async fn main() {
         "loaded persisted state"
     );
 
+    // In dev mode there's no AuthClient; an unsignalled token never cancels.
+    let revoked_token = prod
+        .as_ref()
+        .map(|p| p.auth.revoked_signal())
+        .unwrap_or_else(CancellationToken::new);
+
     let wake_signal = power::start_wake_watcher();
-    let sync_config = build_sync_config(prod.as_ref(), mirror.buckets.clone(), wake_signal);
+    let sync_config = build_sync_config(
+        prod.as_ref(),
+        mirror.buckets.clone(),
+        wake_signal,
+        revoked_token.clone(),
+    );
     info!(
         base_url = %sync_config.base_url,
         client_id = %sync_config.client_id,
@@ -519,12 +532,6 @@ async fn main() {
         .expect("failed to register SIGTERM handler");
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("failed to register SIGINT handler");
-
-    // In dev mode there's no AuthClient; an unsignalled token never cancels.
-    let revoked_token = prod
-        .as_ref()
-        .map(|p| p.auth.revoked_signal())
-        .unwrap_or_else(CancellationToken::new);
 
     info!("zucchini-spawner ready, waiting for sync + agent responses");
 

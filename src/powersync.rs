@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 use tokio_util::io::StreamReader;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::power::WakeSignal;
@@ -60,6 +61,10 @@ pub struct SyncConfig {
     /// Fired when the system resumes from sleep; aborts the current sync stream so
     /// the outer loop reconnects immediately instead of waiting for TCP to time out.
     pub wake_signal: WakeSignal,
+    /// Cancelled when `/auth/token` returns 410 (spawner permanently revoked).
+    /// The run loop checks it after each failed connect and exits cleanly;
+    /// main's revoked-handler runs the self-uninstall in parallel.
+    pub revoked: CancellationToken,
 }
 
 enum ConnectExit {
@@ -189,6 +194,13 @@ async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
                 }
             }
             Err(e) => {
+                // Auth permanently revoked — main's revoked-handler is already
+                // running the self-uninstall in parallel. Stop here so we don't
+                // spam Sentry with 410 errors during the writer-drain window.
+                if config.revoked.is_cancelled() {
+                    info!(error = %e, "sync stream stopping (spawner revoked)");
+                    return;
+                }
                 error!(error = %e, ?backoff, "sync stream failed, backing off");
             }
         }
@@ -200,6 +212,10 @@ async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
             _ = config.wake_signal.notified() => {
                 info!("wake signal during backoff, reconnecting immediately");
                 backoff = INITIAL_BACKOFF;
+            }
+            _ = config.revoked.cancelled() => {
+                info!("sync stream stopping (spawner revoked) during backoff");
+                return;
             }
         }
     }
