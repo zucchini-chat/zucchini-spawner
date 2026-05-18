@@ -25,6 +25,25 @@ fn spawn_linux() {
     // `systemd-run --user --no-block` launches the script in its own
     // transient unit (separate cgroup) so it survives the teardown.
     //
+    // Stage the script under the install dir and invoke `/bin/sh <path>`
+    // instead of `/bin/sh -c <content>`. systemd performs `${VAR}` expansion
+    // on every ExecStart= argv element before execve — braced `${VAR}` unset
+    // in the unit env collapses to empty (only `REMOVE_KEY`/`SILENT` are set
+    // here), so embedding the script body as argv silently rewrote every
+    // `${SERVICE_NAME}` in `uninstall.sh` and left the user unit file behind
+    // in a `Restart=always` loop forever. Pulling the body off argv sidesteps
+    // it. The script unlinks `INSTALL_DIR` at the end; that's fine — sh holds
+    // the inode open until exit.
+    let staged_path = crate::zucchini_spawner_dir().join("uninstall.sh");
+    if let Err(e) = std::fs::write(&staged_path, UNINSTALL_SCRIPT) {
+        warn!(error = %e, path = %staged_path.display(), "failed to stage uninstall script");
+        return;
+    }
+    let Some(staged_path_str) = staged_path.to_str() else {
+        warn!(path = %staged_path.display(), "uninstall script path is not valid utf-8");
+        return;
+    };
+
     // Clear any stale `failed` state from a prior cleanup attempt first:
     // --collect only reaps the unit *after* it reaches inactive/failed; it
     // doesn't bypass the unit-name uniqueness check at queue time, so a
@@ -50,8 +69,7 @@ fn spawn_linux() {
         "--setenv=REMOVE_KEY=1",
         "--setenv=SILENT=1",
         "/bin/sh",
-        "-c",
-        UNINSTALL_SCRIPT,
+        staged_path_str,
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
