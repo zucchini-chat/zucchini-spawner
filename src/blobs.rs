@@ -5,7 +5,6 @@
 //! for the life of the process (TTL/GC is out of MVP scope per attachements_plan.md).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -15,7 +14,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::crypto::{self, KUser};
-use crate::envelope::{self, EnvelopeAttachment, MessageEnvelope};
+use crate::envelope::EnvelopeAttachment;
 use crate::writer::TokenFetcher;
 
 fn attachment_dir() -> PathBuf {
@@ -26,7 +25,6 @@ pub struct BlobDownloader {
     http: reqwest::Client,
     download_url_endpoint: String,
     fetch_token: TokenFetcher,
-    key: Arc<KUser>,
 }
 
 #[derive(Serialize)]
@@ -45,11 +43,7 @@ pub struct DownloadedAttachment {
 }
 
 impl BlobDownloader {
-    pub fn decode_envelope(&self, body_b64: &str) -> Result<MessageEnvelope> {
-        envelope::decode(body_b64, &self.key)
-    }
-
-    pub fn new(api_base_url: &str, fetch_token: TokenFetcher, key: Arc<KUser>) -> Self {
+    pub fn new(api_base_url: &str, fetch_token: TokenFetcher) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
@@ -61,7 +55,6 @@ impl BlobDownloader {
                 api_base_url.trim_end_matches('/')
             ),
             fetch_token,
-            key,
         }
     }
 
@@ -71,6 +64,7 @@ impl BlobDownloader {
     pub async fn fetch_all(
         &self,
         attachments: &[EnvelopeAttachment],
+        key: &KUser,
     ) -> Result<Vec<DownloadedAttachment>> {
         if attachments.is_empty() {
             return Ok(Vec::new());
@@ -86,7 +80,7 @@ impl BlobDownloader {
                 // The updater guard keeps the spawner from exiting mid-fetch, so
                 // a half-written file from a crash isn't a realistic concern.
                 if !path.exists() {
-                    self.download_one(&att.blob_key, &path).await?;
+                    self.download_one(&att.blob_key, &path, key).await?;
                 }
                 Ok::<_, anyhow::Error>(DownloadedAttachment { path, name: att.name.clone() })
             }
@@ -94,7 +88,12 @@ impl BlobDownloader {
         .await
     }
 
-    async fn download_one(&self, blob_key: &Uuid, dest: &Path) -> Result<()> {
+    async fn download_one(
+        &self,
+        blob_key: &Uuid,
+        dest: &Path,
+        key: &KUser,
+    ) -> Result<()> {
         let token = (self.fetch_token)().await?;
         let resp = self
             .http
@@ -124,7 +123,7 @@ impl BlobDownloader {
         }
         let ciphertext = blob.bytes().await.context("read R2 body")?;
 
-        let plaintext = crypto::decrypt_bytes(&self.key, &ciphertext)
+        let plaintext = crypto::decrypt_bytes(key, &ciphertext)
             .ok_or_else(|| anyhow!("AEAD decrypt failed for blob {}", blob_key))?;
 
         tokio::fs::write(dest, &plaintext)

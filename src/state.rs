@@ -18,10 +18,12 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+use uuid::Uuid;
 
 #[allow(dead_code)]
 pub struct ChatState {
     pub id: String,
+    pub user_id: Uuid,
     pub project_id: String,
     pub worktree: bool,
     /// `chats.last_seq` from Postgres: the seq of the most recent message in
@@ -38,6 +40,10 @@ pub struct Mirror {
     pub projects: HashMap<String, String>,
     #[serde(default)]
     pub buckets: HashMap<String, String>,
+    /// Harvested from the first `machines` PUT in the `by_machine` bucket;
+    /// `None` until that lands. Needed to scope `key_<user_id>` lookups.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
     /// Re-streamed on every boot, so not persisted. The `set_import_status`
     /// change-detection guard is what keeps re-emissions of the same status
     /// (heartbeat-driven, ~every 10s) from re-firing the importer.
@@ -52,6 +58,14 @@ impl Mirror {
             warn!(chat_id = %id, "chat row missing project_id");
             return;
         };
+        let Some(user_id) = v
+            .get("user_id")
+            .and_then(|p| p.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        else {
+            warn!(chat_id = %id, "chat row missing or invalid user_id");
+            return;
+        };
 
         let worktree = crate::json_pg_bool(v.get("worktree"));
 
@@ -61,11 +75,27 @@ impl Mirror {
             id.clone(),
             ChatState {
                 id,
+                user_id,
                 project_id: project_id.to_string(),
                 worktree,
                 last_seq,
             },
         );
+    }
+
+    /// Returns true if `user_id` transitioned from `None` to `Some` — i.e. this
+    /// is the first machines row we've ever seen for this spawner. The machines
+    /// row is re-emitted on every heartbeat, so subsequent calls with the same
+    /// `uid` are no-ops. A `uid` change (re-pair under the same machine_id) is
+    /// not expected — the spawner token is per-(machine, user) and a re-pair
+    /// goes through 410-from-/auth/token + self-uninstall; treat any change as
+    /// a no-op rather than overwriting silently.
+    pub fn set_user_id(&mut self, uid: Uuid) -> bool {
+        if self.user_id.is_some() {
+            return false;
+        }
+        self.user_id = Some(uid);
+        true
     }
 
     /// Returns true if the status actually changed. The machines row is re-emitted

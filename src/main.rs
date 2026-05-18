@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use agent::{AgentResponse, Supervisor};
 use auth::AuthClient;
 use blobs::BlobDownloader;
-use crypto::KUser;
+use crypto::KeyStore;
 use power::WakeSignal;
 use powersync::{SyncConfig, SyncEvent};
 use state::Mirror;
@@ -63,21 +63,34 @@ pub(crate) fn zucchini_spawner_dir() -> PathBuf {
 
 /// Prod vs dev auth mode. Prod needs both MACHINE_ID and SPAWNER_TOKEN — one without
 /// the other is an install bug, so we fall through to dev rather than half-configuring.
+///
+/// Note: `user_id` deliberately does NOT live here. Older `install.sh` runs (pre
+/// per-user keys) never wrote `ZUCCHINI_USER_ID` into `config.env`, and binary-only
+/// upgrades don't re-run the installer, so any boot-time env-seed would be `None`
+/// for a non-trivial slice of prod hosts. We harvest user_id lazily from the first
+/// `machines` PUT in the by_machine bucket (`Mirror::user_id`) instead — single
+/// source of truth, no two-paths split. `install.sh` keeps writing the env var; the
+/// spawner just ignores it.
 struct ProdConfig {
     machine_id: Uuid,
     auth: Arc<AuthClient>,
 }
 
-fn load_prod_config() -> Option<ProdConfig> {
-    let machine_id = std::env::var("ZUCCHINI_MACHINE_ID").ok()?;
-    let spawner_token = std::env::var("ZUCCHINI_SPAWNER_TOKEN").ok()?;
-    let machine_id = match Uuid::parse_str(&machine_id) {
-        Ok(u) => u,
+/// Parse the named env var as a UUID. Returns `None` if unset or unparseable
+/// (with a warn! on parse failure).
+fn env_uuid(name: &str) -> Option<Uuid> {
+    std::env::var(name).ok().and_then(|s| match Uuid::parse_str(&s) {
+        Ok(u) => Some(u),
         Err(e) => {
-            warn!(error = %e, "ZUCCHINI_MACHINE_ID not a valid UUID, falling back to dev");
-            return None;
+            warn!(env = name, error = %e, "env var is not a valid UUID, ignoring");
+            None
         }
-    };
+    })
+}
+
+fn load_prod_config() -> Option<ProdConfig> {
+    let spawner_token = std::env::var("ZUCCHINI_SPAWNER_TOKEN").ok()?;
+    let machine_id = env_uuid("ZUCCHINI_MACHINE_ID")?;
     Some(ProdConfig {
         machine_id,
         auth: Arc::new(AuthClient::new(PROD_BASE_URL, spawner_token)),
@@ -97,6 +110,16 @@ fn dev_token_fetcher() -> Box<
     })
 }
 
+/// Pairs the right base URL with the matching token fetcher. Prod arm is
+/// identical for sync and API surfaces (same auth client, same PROD_BASE_URL);
+/// only the dev URL differs.
+fn base_and_token(prod: Option<&ProdConfig>, dev_url: &str) -> (String, writer::TokenFetcher) {
+    match prod {
+        Some(p) => (PROD_BASE_URL.to_string(), auth::token_fetcher(p.auth.clone())),
+        None => (dev_url.to_string(), dev_token_fetcher()),
+    }
+}
+
 fn build_sync_config(
     prod: Option<&ProdConfig>,
     initial_buckets: std::collections::HashMap<String, String>,
@@ -104,10 +127,7 @@ fn build_sync_config(
     revoked: CancellationToken,
 ) -> SyncConfig {
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
-    let (base_url, fetch_token) = match prod {
-        Some(p) => (PROD_BASE_URL.to_string(), auth::token_fetcher(p.auth.clone())),
-        None => (DEV_SYNC_BASE_URL.to_string(), dev_token_fetcher()),
-    };
+    let (base_url, fetch_token) = base_and_token(prod, DEV_SYNC_BASE_URL);
     SyncConfig {
         base_url,
         client_id: format!("zucchini-spawner-{}", hostname),
@@ -128,13 +148,6 @@ fn save_mirror(path: &Path, mirror: &Mirror) {
     }
 }
 
-fn api_base_and_token(prod: Option<&ProdConfig>) -> (String, writer::TokenFetcher) {
-    match prod {
-        Some(p) => (PROD_BASE_URL.to_string(), auth::token_fetcher(p.auth.clone())),
-        None => (DEV_API_BASE_URL.to_string(), dev_token_fetcher()),
-    }
-}
-
 pub(crate) enum SyncEventOutcome {
     Nothing,
     StateChanged,
@@ -149,6 +162,7 @@ async fn handle_sync_event(
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
     blobs: &BlobDownloader,
+    keys: &KeyStore,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) -> SyncEventOutcome {
     match event {
@@ -162,7 +176,7 @@ async fn handle_sync_event(
                 SyncEventOutcome::Nothing
             }
             "messages" => {
-                handle_message_put(&data, mirror, supervisor, blobs, write_tx).await;
+                handle_message_put(&data, mirror, supervisor, blobs, keys, write_tx).await;
                 SyncEventOutcome::Nothing
             }
             "machines" => {
@@ -176,18 +190,26 @@ async fn handle_sync_event(
                 let Some(row) = state::parse_row_json(&data, "machine", &id) else {
                     return SyncEventOutcome::Nothing;
                 };
+                // Harvest user_id from the row (sync-rules.yaml `by_machine`
+                // bucket includes machines.user_id via SELECT *). First-time
+                // transition persists to state.json so subsequent boots have
+                // it ready synchronously, before the by_machine round-trip.
+                let user_id_changed = row
+                    .get("user_id")
+                    .and_then(|p| p.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .map(|uid| mirror.set_user_id(uid))
+                    .unwrap_or(false);
                 if json_pg_bool(row.get("to_uninstall")) {
                     return SyncEventOutcome::UninstallRequested;
                 }
                 let status = row
                     .get("claude_history_import_status")
                     .and_then(|f| f.as_str());
-                if !mirror.set_import_status(status) {
-                    return SyncEventOutcome::Nothing;
-                }
-                match status {
-                    Some("requested") => SyncEventOutcome::ImportRequested,
-                    Some("aborted") => SyncEventOutcome::ImportAborted,
+                match (mirror.set_import_status(status), status) {
+                    (true, Some("requested")) => SyncEventOutcome::ImportRequested,
+                    (true, Some("aborted")) => SyncEventOutcome::ImportAborted,
+                    _ if user_id_changed => SyncEventOutcome::StateChanged,
                     _ => SyncEventOutcome::Nothing,
                 }
             }
@@ -221,6 +243,7 @@ async fn handle_message_put(
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
     blobs: &BlobDownloader,
+    keys: &KeyStore,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
     let row: serde_json::Value = match serde_json::from_str(data) {
@@ -255,8 +278,8 @@ async fn handle_message_put(
         return;
     }
 
-    let (project_id, worktree, chat_last_seq) = match mirror.chats.get(&chat_id) {
-        Some(c) => (c.project_id.clone(), c.worktree, c.last_seq),
+    let (project_id, worktree, chat_last_seq, user_id) = match mirror.chats.get(&chat_id) {
+        Some(c) => (c.project_id.clone(), c.worktree, c.last_seq, c.user_id),
         None => {
             warn!(chat_id = %chat_id, "message arrived before chat row, skipping");
             return;
@@ -284,7 +307,14 @@ async fn handle_message_put(
         );
         return;
     };
-    let envelope = match blobs.decode_envelope(body_str) {
+    let key = match keys.get(&user_id) {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(chat_id = %chat_id, seq, error = %e, "no key for user, skipping message");
+            return;
+        }
+    };
+    let envelope = match envelope::decode(body_str, &key) {
         Ok(env) => env,
         Err(e) => {
             warn!(
@@ -305,7 +335,7 @@ async fn handle_message_put(
         info!(chat_id = %chat_id, "aborting running agent before handling new message");
         supervisor.abort_agent(&chat_id).await;
         let _ = write_tx
-            .send(WriteEvent::agent_line(chat_id.clone(), INTERRUPTED_RESULT.to_string()))
+            .send(WriteEvent::agent_line(chat_id.clone(), user_id, INTERRUPTED_RESULT.to_string()))
             .await;
     }
 
@@ -322,7 +352,7 @@ async fn handle_message_put(
         return;
     };
 
-    let downloaded = match blobs.fetch_all(&envelope.attachments).await {
+    let downloaded = match blobs.fetch_all(&envelope.attachments, &key).await {
         Ok(d) => d,
         Err(e) => {
             warn!(
@@ -419,6 +449,25 @@ async fn wait_for_writer_idle(writer: &Writer) -> bool {
     false
 }
 
+/// Drops the op with a warn when the chat's user_id isn't mirrored yet.
+async fn send_agent_line(
+    write_tx: &mpsc::Sender<WriteEvent>,
+    mirror: &Mirror,
+    chat_id: &str,
+    content: String,
+) {
+    match mirror.chats.get(chat_id).map(|c| c.user_id) {
+        Some(user_id) => {
+            let _ = write_tx
+                .send(WriteEvent::agent_line(chat_id.to_string(), user_id, content))
+                .await;
+        }
+        None => {
+            warn!(chat_id = %chat_id, "agent op for chat without mirrored user_id, dropping");
+        }
+    }
+}
+
 /// Shared shutdown path used by both the `to_uninstall` PowerSync signal
 /// and the 410-from-/auth/token revoked signal. Caller breaks the main
 /// loop after this returns.
@@ -472,7 +521,7 @@ async fn main() {
     let revoked_token = prod
         .as_ref()
         .map(|p| p.auth.revoked_signal())
-        .unwrap_or_else(CancellationToken::new);
+        .unwrap_or_default();
 
     let wake_signal = power::start_wake_watcher();
     let sync_config = build_sync_config(
@@ -488,19 +537,13 @@ async fn main() {
     );
     let mut sync_rx = powersync::start(sync_config);
 
-    let k_user = match KUser::load() {
-        Ok(k) => k,
-        Err(e) => {
-            error!(error = %e, "failed to load K_user — pair this machine first");
-            std::process::exit(1);
-        }
-    };
+    let keys = Arc::new(KeyStore::new());
 
-    let (writer_base_url, writer_token) = api_base_and_token(prod.as_ref());
+    let (writer_base_url, writer_token) = base_and_token(prod.as_ref(), DEV_API_BASE_URL);
     info!(base_url = %writer_base_url, "starting write API sender");
     let writer = writer::start(
         WriterConfig { base_url: writer_base_url, fetch_token: writer_token },
-        k_user.clone(),
+        keys.clone(),
     );
     let write_tx = writer.tx.clone();
 
@@ -516,8 +559,8 @@ async fn main() {
     let mut update_pending: Option<String> = None;
 
     let blob_downloader = {
-        let (base_url, fetch_token) = api_base_and_token(prod.as_ref());
-        BlobDownloader::new(&base_url, fetch_token, Arc::new(k_user.clone()))
+        let (base_url, fetch_token) = base_and_token(prod.as_ref(), DEV_API_BASE_URL);
+        BlobDownloader::new(&base_url, fetch_token)
     };
 
     let (response_tx, mut response_rx) = mpsc::channel::<AgentResponse>(256);
@@ -565,27 +608,42 @@ async fn main() {
                     &mut mirror,
                     &mut supervisor,
                     &blob_downloader,
+                    &keys,
                     &write_tx,
                 ).await;
                 match outcome {
                     SyncEventOutcome::StateChanged => save_mirror(&state_path, &mirror),
-                    SyncEventOutcome::ImportRequested => {
-                        if let Some(mid) = machine_id {
-                            info!(machine_id = %mid, "claude history import requested by user");
-                            let tx_clone = write_tx.clone();
-                            let handle = tokio::spawn(async move {
-                                if let Err(e) = import::run(mid, tx_clone).await {
-                                    error!(error = %e, "claude history import failed");
-                                }
-                            });
-                            // FSM only allows NotStarted→Requested once, so any
-                            // pre-existing handle here is a leftover from a
-                            // finished run — abort is a no-op on it.
-                            if let Some(prev) = import_task.replace(handle) {
-                                prev.abort();
-                            }
-                        } else {
+                    // Claude-history import is a one-shot triggered ONLY from
+                    // iOS AddMachineView, immediately after the machine row is
+                    // created (see SyncStore::requestClaudeHistoryImport, sole
+                    // call site AddMachineView::startImport). There is no
+                    // "Import History" button anywhere else. user_id is
+                    // sourced from `mirror.user_id`, harvested from the
+                    // by_machine bucket's machines row — the same PUT that
+                    // flipped claude_history_import_status to `requested`
+                    // already populated it, so the guard below is a safety
+                    // net for the impossible case where they ever diverge.
+                    SyncEventOutcome::ImportRequested => 'arm: {
+                        let Some(mid) = machine_id else {
                             warn!("import requested but spawner is in dev mode (no machine id) — ignoring");
+                            break 'arm;
+                        };
+                        let Some(uid) = mirror.user_id else {
+                            warn!("import requested but mirror.user_id not populated yet — ignoring");
+                            break 'arm;
+                        };
+                        info!(machine_id = %mid, user_id = %uid, "claude history import requested by user");
+                        let tx_clone = write_tx.clone();
+                        let handle = tokio::spawn(async move {
+                            if let Err(e) = import::run(mid, uid, tx_clone).await {
+                                error!(error = %e, "claude history import failed");
+                            }
+                        });
+                        // FSM only allows NotStarted→Requested once, so any
+                        // pre-existing handle here is a leftover from a
+                        // finished run — abort is a no-op on it.
+                        if let Some(prev) = import_task.replace(handle) {
+                            prev.abort();
                         }
                     }
                     SyncEventOutcome::ImportAborted => {
@@ -605,7 +663,7 @@ async fn main() {
             Some(resp) = response_rx.recv() => {
                 match resp {
                     AgentResponse::Line { topic, content } => {
-                        let _ = write_tx.send(WriteEvent::agent_line(topic, content)).await;
+                        send_agent_line(&write_tx, &mirror, &topic, content).await;
                     }
                     AgentResponse::ContextTokens { topic, tokens } => {
                         let _ = write_tx
@@ -615,9 +673,7 @@ async fn main() {
                     AgentResponse::Done { topic, has_result } => {
                         info!(topic = %topic, has_result, "agent done");
                         if !has_result {
-                            let _ = write_tx
-                                .send(WriteEvent::agent_line(topic.clone(), INTERRUPTED_RESULT.to_string()))
-                                .await;
+                            send_agent_line(&write_tx, &mirror, &topic, INTERRUPTED_RESULT.to_string()).await;
                         }
                         let _ = write_tx
                             .send(WriteEvent::chat_running(topic.clone(), false))

@@ -7,6 +7,7 @@
 //! them returns 2xx, so a network flap doesn't lose messages.
 
 use std::collections::VecDeque;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -19,7 +20,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::crypto::{encrypt_field_b64, KUser};
+use crate::crypto::{encrypt_field_b64, KUser, KeyStore};
 
 const MAX_OPS_PER_BATCH: usize = 32;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
@@ -45,6 +46,8 @@ pub enum WriteEvent {
         /// it `None` and the writer mints a fresh `Uuid::now_v7()`.
         id: Option<Uuid>,
         chat_id: String,
+        /// Owner of the chat — picks which per-user key encrypts `body`.
+        user_id: Uuid,
         sender: &'static str,
         content: String,
         created_at: Option<DateTime<Utc>>,
@@ -65,6 +68,7 @@ pub enum WriteEvent {
     PutChat {
         id: Uuid,
         project_id: Uuid,
+        user_id: Uuid,
         title: String,
         created_at: DateTime<Utc>,
     },
@@ -81,10 +85,11 @@ pub enum WriteEvent {
 }
 
 impl WriteEvent {
-    pub fn agent_line(chat_id: String, content: String) -> Self {
+    pub fn agent_line(chat_id: String, user_id: Uuid, content: String) -> Self {
         WriteEvent::PutMessage {
             id: None,
             chat_id,
+            user_id,
             sender: "agent",
             content,
             created_at: None,
@@ -123,12 +128,12 @@ impl Writer {
     }
 }
 
-pub fn start(config: WriterConfig, k_user: KUser) -> Writer {
+pub fn start(config: WriterConfig, keys: Arc<KeyStore>) -> Writer {
     let (tx, rx) = mpsc::channel::<WriteEvent>(1024);
     let pending = Arc::new(AtomicUsize::new(0));
     let pending_for_task = pending.clone();
     tokio::spawn(async move {
-        run(config, k_user, rx, pending_for_task).await;
+        run(config, keys, rx, pending_for_task).await;
     });
     Writer { tx, pending }
 }
@@ -149,13 +154,29 @@ struct BatchReq<'a> {
     ops: &'a [BatchOp],
 }
 
-fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
+fn resolve_key_or_warn(
+    keys: &KeyStore,
+    user_id: &Uuid,
+    chat_id: impl Display,
+    label: &str,
+) -> Option<Arc<KUser>> {
+    match keys.get(user_id) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            warn!(%user_id, chat_id = %chat_id, error = %e, "no key for user, dropping {}", label);
+            None
+        }
+    }
+}
+
+fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
     Some(match event {
-        WriteEvent::PutMessage { id, chat_id, sender, content, created_at, imported } => {
+        WriteEvent::PutMessage { id, chat_id, user_id, sender, content, created_at, imported } => {
+            let k = resolve_key_or_warn(keys, user_id, chat_id, "message")?;
             let mut data = serde_json::json!({
                 "chat_id": chat_id,
                 "sender": sender,
-                "body": encrypt_field_b64(k_user, content),
+                "body": encrypt_field_b64(&k, content),
                 "imported": imported,
             });
             if let Some(ts) = created_at {
@@ -191,17 +212,20 @@ fn encode_event(event: &WriteEvent, k_user: &KUser) -> Option<BatchOp> {
                 "claude_code_authenticated": claude_code_authenticated,
             })),
         },
-        WriteEvent::PutChat { id, project_id, title, created_at } => BatchOp {
-            op: "PUT",
-            table: "chats",
-            id: *id,
-            data: Some(serde_json::json!({
-                "project_id": project_id.to_string(),
-                "title": encrypt_field_b64(k_user, title),
-                "worktree": false,
-                "created_at": created_at.to_rfc3339(),
-            })),
-        },
+        WriteEvent::PutChat { id, project_id, user_id, title, created_at } => {
+            let k = resolve_key_or_warn(keys, user_id, id, "chat")?;
+            BatchOp {
+                op: "PUT",
+                table: "chats",
+                id: *id,
+                data: Some(serde_json::json!({
+                    "project_id": project_id.to_string(),
+                    "title": encrypt_field_b64(&k, title),
+                    "worktree": false,
+                    "created_at": created_at.to_rfc3339(),
+                })),
+            }
+        }
         WriteEvent::PutProject { id, machine_id, name, path } => BatchOp {
             op: "PUT",
             table: "projects",
@@ -233,7 +257,7 @@ fn chats_patch(chat_id: &str, label: &str, data: serde_json::Value) -> Option<Ba
 
 async fn run(
     config: WriterConfig,
-    k_user: KUser,
+    keys: Arc<KeyStore>,
     mut rx: mpsc::Receiver<WriteEvent>,
     pending_counter: Arc<AtomicUsize>,
 ) {
@@ -248,7 +272,7 @@ async fn run(
     let mut channel_closed = false;
 
     let enqueue = |ev: WriteEvent, pending: &mut VecDeque<BatchOp>| {
-        if let Some(op) = encode_event(&ev, &k_user) {
+        if let Some(op) = encode_event(&ev, &keys) {
             pending.push_back(op);
             pending_counter.fetch_add(1, Ordering::Relaxed);
         }

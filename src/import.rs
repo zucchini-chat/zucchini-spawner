@@ -43,6 +43,7 @@ const PROJECT_NS: Uuid = Uuid::from_bytes([
 /// path — contention isn't possible by construction.
 pub async fn run(
     machine_id: Uuid,
+    user_id: Uuid,
     write_tx: mpsc::Sender<WriteEvent>,
 ) -> Result<()> {
     let projects_dir = claude_projects_dir().context("locate ~/.claude/projects")?;
@@ -133,7 +134,7 @@ pub async fn run(
             .await;
 
         for jsonl in sessions {
-            if let Err(e) = import_session(&jsonl, project_id, &write_tx).await {
+            if let Err(e) = import_session(&jsonl, project_id, user_id, &write_tx).await {
                 warn!(file = %jsonl.display(), error = %e, "session import failed, skipping");
             }
             done_sessions += 1;
@@ -225,6 +226,7 @@ fn mint_project_id(machine_id: Uuid, path: &str) -> Uuid {
 async fn import_session(
     jsonl: &Path,
     project_id: Uuid,
+    user_id: Uuid,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) -> Result<()> {
     let session_id_str = jsonl
@@ -321,6 +323,7 @@ async fn import_session(
         .send(WriteEvent::PutChat {
             id: chat_id,
             project_id,
+            user_id,
             title: chat_title,
             created_at: chat_created_at,
         })
@@ -331,6 +334,7 @@ async fn import_session(
             .send(WriteEvent::PutMessage {
                 id: msg.uuid,
                 chat_id: chat_id.to_string(),
+                user_id,
                 sender: msg.sender,
                 content: msg.body,
                 created_at: Some(ts),
@@ -378,17 +382,13 @@ fn classify_user(entry: &serde_json::Value) -> UserContent {
     let Some(content) = entry.get("message").and_then(|m| m.get("content")) else {
         return UserContent::Empty;
     };
-    if let Some(s) = content.as_str() {
-        if is_synthetic_wrapper(s) {
-            return UserContent::Empty;
-        }
-        return UserContent::Prompt(s.to_string());
-    }
     // The CLI entrypoint writes typed prompts as a bare string, but the
     // VS Code extension (`entrypoint:"claude-vscode"`) always wraps them as
-    // `[{type:"text", text:"..."}]`. Join text blocks back into a string;
+    // `[{type:"text", text:"..."}]`. Normalize both shapes to a single string;
     // arrays without any text blocks are tool_result echoes and skipped.
-    if let Some(blocks) = content.as_array() {
+    let text = if let Some(s) = content.as_str() {
+        s.to_string()
+    } else if let Some(blocks) = content.as_array() {
         let mut parts: Vec<&str> = Vec::new();
         for b in blocks {
             if b.get("type").and_then(|t| t.as_str()) == Some("text") {
@@ -400,13 +400,14 @@ fn classify_user(entry: &serde_json::Value) -> UserContent {
         if parts.is_empty() {
             return UserContent::ToolResult;
         }
-        let joined = parts.join("\n");
-        if is_synthetic_wrapper(&joined) {
-            return UserContent::Empty;
-        }
-        return UserContent::Prompt(joined);
+        parts.join("\n")
+    } else {
+        return UserContent::Empty;
+    };
+    if is_synthetic_wrapper(&text) {
+        return UserContent::Empty;
     }
-    UserContent::Empty
+    UserContent::Prompt(text)
 }
 
 /// User-content strings that claude-code wraps in these tags are synthetic —
@@ -460,9 +461,7 @@ fn classify_assistant(entry: &serde_json::Value) -> AssistantContent {
 }
 
 fn collapse_title(text: &str) -> String {
-    let collapsed: String = text
-        .replace('\r', " ")
-        .replace('\n', " ");
+    let collapsed = text.replace(['\r', '\n'], " ");
     collapsed.chars().take(100).collect()
 }
 
