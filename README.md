@@ -42,7 +42,7 @@ Default target is your host. Released binaries are built per-target on GitHub-ho
 Honest snapshot of what the spawner does and doesn't defend against today:
 
 - **K_user transfer at install:** the install command copied from the iOS app currently carries `K_user` as an argument. This leaks momentarily through clipboard, shell history, and process arguments. **Planned:** SAS-verified ECDH pairing — the install flow displays a 9-digit verification code on both the spawner host and a device that already has `K_user`; the human compares the codes; `K_user` transfers wrapped to an ephemeral X25519 key. Server sees only ciphertext.
-- **K_user at rest:** stored as a 0600 file at `~/.zucchini-spawner/key`. Same posture as `~/.ssh/id_ed25519`, kubeconfig, `.npmrc` tokens.
+- **K_user at rest:** stored as a 0600 file at `~/.zucchini-spawner/key_<user_id>` (one per signed-in user on the machine, anticipating multi-user shared hosts). Same posture as `~/.ssh/id_ed25519`, kubeconfig, `.npmrc` tokens.
 - **K_user at runtime:** decrypted in process memory while the spawner is running. A malicious binary that the spawner trusts to install would have full access — which is why the cosign verification (planned) is the load-bearing supply-chain mitigation.
 - **Backend operator:** sees ciphertext and metadata only; cannot read message bodies. **Today**, can ship a malicious spawner update (the autoupdater currently does no signature verification on the binary it downloads). **After cosign verification ships**, can't ship code to your machine if you're on the `public` update channel. A separate `internal` channel exists for development and the project's e2e test, opt-in per user.
 
