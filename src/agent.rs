@@ -17,6 +17,8 @@ const MAX_USAGE_FRAME_BYTES: usize = 65_536;
 pub enum AgentResponse {
     Line { topic: String, content: String },
     ContextTokens { topic: String, tokens: i64 },
+    /// Manual `/compact` or auto-compact completed; carries `compactMetadata.postTokens`.
+    CompactBoundary { topic: String, post_tokens: i64 },
     Done { topic: String, has_result: bool },
 }
 
@@ -259,9 +261,22 @@ impl Supervisor {
                                     //     below only matches structural block types.
                                     let mut skip = false;
                                     if line.starts_with('{') {
-                                        if line.contains("\"type\":\"stream_event\"")
-                                            || (line.contains("\"type\":\"system\"")
-                                                && !line.contains("\"subtype\":\"status\""))
+                                        if line.contains("\"type\":\"system\"")
+                                            && !line.contains("\"subtype\":\"status\"")
+                                        {
+                                            // System frames are skipped, but compact_boundary
+                                            // carries postTokens we need — harvest it here
+                                            // instead of dropping the line silently.
+                                            if line.contains("\"subtype\":\"compact_boundary\"") {
+                                                if let Some(post_tokens) = parse_compact_post_tokens(&line) {
+                                                    let _ = tx.send(AgentResponse::CompactBoundary {
+                                                        topic: topic_clone.clone(),
+                                                        post_tokens,
+                                                    }).await;
+                                                }
+                                            }
+                                            skip = true;
+                                        } else if line.contains("\"type\":\"stream_event\"")
                                             || line.contains("\"type\":\"user\"")
                                             || line.contains("\"type\":\"rate_limit_event\"")
                                             || (line.contains("\"type\":\"assistant\"")
@@ -387,6 +402,22 @@ fn parse_assistant_usage(line: &str) -> Option<i64> {
             + f.message.usage.cache_read_input_tokens),
         Err(e) => {
             debug!("failed to parse assistant frame for usage: {}", e);
+            None
+        }
+    }
+}
+
+/// Reads `compactMetadata.postTokens` from a `compact_boundary` system frame.
+/// Narrow Deserialize struct so serde skips the rest of the frame without allocating it.
+fn parse_compact_post_tokens(line: &str) -> Option<i64> {
+    #[derive(serde::Deserialize)]
+    struct Frame { #[serde(rename = "compactMetadata")] metadata: Metadata }
+    #[derive(serde::Deserialize)]
+    struct Metadata { #[serde(rename = "postTokens")] post_tokens: i64 }
+    match serde_json::from_str::<Frame>(line) {
+        Ok(f) => Some(f.metadata.post_tokens),
+        Err(e) => {
+            debug!("failed to parse compact_boundary frame: {}", e);
             None
         }
     }

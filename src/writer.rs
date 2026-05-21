@@ -55,6 +55,9 @@ pub enum WriteEvent {
     },
     ChatRunning { chat_id: String, agent_running: bool },
     ContextTokens { chat_id: String, tokens: i64 },
+    /// `compactMetadata.postTokens` from a `compact_boundary` system frame.
+    /// Backend resolves `context_tokens = baseline_tokens + post_tokens`.
+    CompactBoundary { chat_id: String, post_tokens: i64 },
     Heartbeat { machine_id: Uuid },
     /// Sent once per process startup. Re-evaluating on each restart picks up
     /// `claude /login` after a service kick — without that, the iOS app would
@@ -194,6 +197,13 @@ fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
         }
         WriteEvent::ContextTokens { chat_id, tokens } => {
             chats_patch(chat_id, "ContextTokens", serde_json::json!({ "context_tokens": tokens }))?
+        }
+        WriteEvent::CompactBoundary { chat_id, post_tokens } => {
+            chats_patch(
+                chat_id,
+                "CompactBoundary",
+                serde_json::json!({ "compact_boundary_post_tokens": post_tokens }),
+            )?
         }
         WriteEvent::Heartbeat { machine_id } => BatchOp {
             op: "PATCH",

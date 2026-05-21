@@ -670,6 +670,11 @@ async fn main() {
                             .send(WriteEvent::ContextTokens { chat_id: topic, tokens })
                             .await;
                     }
+                    AgentResponse::CompactBoundary { topic, post_tokens } => {
+                        let _ = write_tx
+                            .send(WriteEvent::CompactBoundary { chat_id: topic, post_tokens })
+                            .await;
+                    }
                     AgentResponse::Done { topic, has_result } => {
                         info!(topic = %topic, has_result, "agent done");
                         if !has_result {
