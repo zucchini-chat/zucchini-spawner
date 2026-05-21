@@ -62,4 +62,6 @@ Bug reports and patches welcome. The spawner is small (~3k lines of Rust); no fo
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[FSL-1.1-MIT](LICENSE.md) — [Functional Source License](https://fsl.software/), MIT Future License. Source-available now; each release auto-converts to plain MIT two years after it's published.
+
+This repo's purpose is so users can verify what binary runs on their machine — not to seed a fork that swaps the backend URL and ships a competing messenger for Claude Code. FSL's `Competing Use` clause forbids exactly that, and only that, until the 2-year MIT conversion kicks in.
