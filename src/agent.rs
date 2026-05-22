@@ -407,15 +407,17 @@ fn parse_assistant_usage(line: &str) -> Option<i64> {
     }
 }
 
-/// Reads `compactMetadata.postTokens` from a `compact_boundary` system frame.
+/// Reads `compact_metadata.post_tokens` from a `compact_boundary` system frame.
+/// Stream-json uses snake_case here; the on-disk .jsonl wraps the same event
+/// in camelCase (`compactMetadata.postTokens`) — we always read stdout, not disk.
 /// Narrow Deserialize struct so serde skips the rest of the frame without allocating it.
 fn parse_compact_post_tokens(line: &str) -> Option<i64> {
     #[derive(serde::Deserialize)]
-    struct Frame { #[serde(rename = "compactMetadata")] metadata: Metadata }
+    struct Frame { compact_metadata: Metadata }
     #[derive(serde::Deserialize)]
-    struct Metadata { #[serde(rename = "postTokens")] post_tokens: i64 }
+    struct Metadata { post_tokens: i64 }
     match serde_json::from_str::<Frame>(line) {
-        Ok(f) => Some(f.metadata.post_tokens),
+        Ok(f) => Some(f.compact_metadata.post_tokens),
         Err(e) => {
             debug!("failed to parse compact_boundary frame: {}", e);
             None
