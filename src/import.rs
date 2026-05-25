@@ -283,10 +283,7 @@ async fn import_session(
         // Claude code preserves the entry uuid across `--continue`/`--resume`
         // replays of the same conversation entry — we thread it into
         // `WriteEvent::PutMessage::id` so replays dedup.
-        let entry_uuid = entry
-            .get("uuid")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Uuid::parse_str(s).ok());
+        let entry_uuid = crate::parse_uuid_field(&entry, "uuid");
 
         let imported = match entry_type {
             "user" => match classify_user(&entry) {

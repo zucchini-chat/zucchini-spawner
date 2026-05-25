@@ -2,12 +2,22 @@
 set -eu
 
 # Zucchini spawner uninstaller. Removes the launchd/systemd service, binary,
-# config, and (optionally) the user-level key. Two modes:
+# config, and (optionally) the per-user K_user keys. Two modes:
 #
-# - User-driven: ./uninstall.sh — keeps ~/.zucchini-spawner/key.
+# - User-driven: ./uninstall.sh — keeps the owner's per-user K_user files
+#   (`key_<user_id>` and the legacy `key`) so the owner doesn't have to
+#   re-paste / re-wrap on re-install. Everything else is purged: spawner
+#   identity (`x25519_secret`), enrollment metadata (`config.env`, `state.json`),
+#   sync cursor, logs. Note for SHARED machines: wiping `x25519_secret` means
+#   every previously-invited member's `machine_users.sealed_blob` (which iOS
+#   sealed against the old spawner pubkey) becomes undecryptable — they need
+#   re-invite. That's fine in practice: uninstall also wipes `config.env`, so
+#   re-install enrolls as a NEW `machine_id` with fresh server-side
+#   `machine_users` rows anyway, and the old sealed_blobs are orphaned with
+#   the old machine row regardless.
 # - Spawner self-uninstall (DELETE /api/account): REMOVE_KEY=1 SILENT=1
-#   ./uninstall.sh — wipes the key too. Both paths run as the user; user-scope
-#   systemd / per-user launchd need no sudo.
+#   ./uninstall.sh — wipes everything including the keys. Both paths run as
+#   the user; user-scope systemd / per-user launchd need no sudo.
 #
 # Usage: ./uninstall.sh
 
@@ -54,6 +64,20 @@ if [ -d "$INSTALL_DIR" ]; then
   else
     rm -rf "$INSTALL_DIR/bin"
     rm -f "$INSTALL_DIR/config.env" "$INSTALL_DIR/sync_cursor.json" "$INSTALL_DIR/spawner.log"
+    # Spawner identity (x25519_secret) is minted per-enrollment; keeping it
+    # across uninstall would just leak the long-term private key. state.json
+    # carries stale user_id / spawner_pubkey / project paths from the prior
+    # enrollment — also worthless post-uninstall.
+    rm -f "$INSTALL_DIR/x25519_secret" "$INSTALL_DIR/state.json"
+    # Sweep atomic_write_private leftovers (`<name>.tmp`) so a crash
+    # mid-write doesn't leave orphan half-files next to the live keys.
+    # Enumerated to match the surrounding `rm -f` pattern — `key_*.tmp`
+    # stays as a glob since the per-user uuid is unknown at uninstall.
+    rm -f \
+      "$INSTALL_DIR/config.env.tmp" \
+      "$INSTALL_DIR/state.json.tmp" \
+      "$INSTALL_DIR/x25519_secret.tmp"
+    rm -f "$INSTALL_DIR"/key_*.tmp 2>/dev/null || true
     if [ -z "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
       rmdir "$INSTALL_DIR"
       echo "Removed ${INSTALL_DIR}"

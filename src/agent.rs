@@ -67,6 +67,7 @@ impl Supervisor {
         project_path: Option<String>,
         worktree: bool,
         is_resume: bool,
+        is_sandboxed: bool,
     ) {
         let tx = self.response_tx.clone();
         let topic_clone = topic.clone();
@@ -75,7 +76,7 @@ impl Supervisor {
 
         let handle = tokio::spawn(async move {
             let _power_assertion = crate::power::AgentPowerAssertion::acquire();
-            info!(topic = %topic_clone, resume = is_resume, project_path = ?project_path, worktree, "spawning claude agent");
+            info!(topic = %topic_clone, resume = is_resume, project_path = ?project_path, worktree, sandbox = is_sandboxed, "spawning claude agent");
 
             // Write prompt to a temp file so it never touches the shell command string
             let unique = format!("{}-{}", std::process::id(), SystemTime::now()
@@ -120,7 +121,13 @@ impl Supervisor {
                 }
             }
             claude_cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
-            claude_cmd.push_str(" --print --verbose --output-format stream-json --dangerously-skip-permissions --disallowedTools AskUserQuestion");
+            claude_cmd.push_str(" --print --verbose --output-format stream-json --disallowedTools AskUserQuestion");
+            // Sender's `machine_users.is_sandboxed`. Non-sandboxed = bypass permission
+            // gating; sandboxed = claude's default permission mode auto-denies tools in
+            // --print, which is the actual sandboxing mechanism.
+            if !is_sandboxed {
+                claude_cmd.push_str(" --dangerously-skip-permissions");
+            }
 
             let user_shell = crate::shell::user_login_shell();
             info!(shell = %user_shell, "spawning claude via login shell");

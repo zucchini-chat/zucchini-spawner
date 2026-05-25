@@ -17,10 +17,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "native-tls", "tracing"] }
 sentry-tracing = "0.48"
 chacha20poly1305 = "0.10"
+# `seal` feature: wire-format interop with libsodium's `crypto_box_seal` on iOS.
+crypto_box = { version = "0.9", features = ["std", "seal"] }
 base64 = "0.22"
 gethostname = "0.5"
 uuid = { version = "1", features = ["v5", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Zero K_machine plaintext on drop. Pinned to match the version `crypto_box`
+# pulls in transitively (1.8.x as of crypto_box 0.9.1) so a future `cargo update`
+# can't bump us past the transitive constraint and re-trigger SemVer dual-version.
+zeroize = "1.8"
 
 # Force vendored OpenSSL on Linux so cross-builds don't need libssl-dev in the
 # Docker image. Pulled in transitively by sentry → reqwest-0.13 → native-tls.
@@ -29,3 +35,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = "0.8"
+
+# O_NOFOLLOW for atomic_write_private on shared-UID hosts.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

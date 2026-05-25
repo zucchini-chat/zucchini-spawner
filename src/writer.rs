@@ -85,6 +85,8 @@ pub enum WriteEvent {
     /// Importer-only: machines.PATCH carrying the import progress string
     /// (`requested` | `running-N` | `finished`).
     ImportStatus { machine_id: Uuid, status: String },
+    /// Machine-sharing handshake: publish our X25519 sealedbox public key.
+    SetSpawnerPubkey { machine_id: Uuid, pubkey_b64: String },
 }
 
 impl WriteEvent {
@@ -205,23 +207,17 @@ fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
                 serde_json::json!({ "compact_boundary_post_tokens": post_tokens }),
             )?
         }
-        WriteEvent::Heartbeat { machine_id } => BatchOp {
-            op: "PATCH",
-            table: "machines",
-            id: *machine_id,
+        WriteEvent::Heartbeat { machine_id } => {
             // Server stamps now() for last_heartbeat_at; the null is just a presence marker.
-            data: Some(serde_json::json!({ "last_heartbeat_at": null })),
-        },
-        WriteEvent::ReportStartupInfo { machine_id, claude_code_installed, claude_code_authenticated } => BatchOp {
-            op: "PATCH",
-            table: "machines",
-            id: *machine_id,
-            data: Some(serde_json::json!({
+            machines_patch(*machine_id, serde_json::json!({ "last_heartbeat_at": null }))
+        }
+        WriteEvent::ReportStartupInfo { machine_id, claude_code_installed, claude_code_authenticated } => {
+            machines_patch(*machine_id, serde_json::json!({
                 "spawner_version": env!("CARGO_PKG_VERSION"),
                 "claude_code_installed": claude_code_installed,
                 "claude_code_authenticated": claude_code_authenticated,
-            })),
-        },
+            }))
+        }
         WriteEvent::PutChat { id, project_id, user_id, title, created_at } => {
             let k = resolve_key_or_warn(keys, user_id, id, "chat")?;
             BatchOp {
@@ -246,13 +242,17 @@ fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
                 "path": path,
             })),
         },
-        WriteEvent::ImportStatus { machine_id, status } => BatchOp {
-            op: "PATCH",
-            table: "machines",
-            id: *machine_id,
-            data: Some(serde_json::json!({ "claude_history_import_status": status })),
-        },
+        WriteEvent::ImportStatus { machine_id, status } => {
+            machines_patch(*machine_id, serde_json::json!({ "claude_history_import_status": status }))
+        }
+        WriteEvent::SetSpawnerPubkey { machine_id, pubkey_b64 } => {
+            machines_patch(*machine_id, serde_json::json!({ "spawner_pubkey": pubkey_b64 }))
+        }
     })
+}
+
+fn machines_patch(machine_id: Uuid, data: serde_json::Value) -> BatchOp {
+    BatchOp { op: "PATCH", table: "machines", id: machine_id, data: Some(data) }
 }
 
 fn chats_patch(chat_id: &str, label: &str, data: serde_json::Value) -> Option<BatchOp> {
