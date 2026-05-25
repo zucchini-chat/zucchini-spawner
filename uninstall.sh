@@ -30,6 +30,10 @@ if [ "$SILENT" = "1" ]; then
   exec >/dev/null 2>&1
 fi
 
+# Mirror of backend-powersync/backend/static/install.sh OS case — if you add/remove a case here, update the
+# other file. Can't share via `source`: install.sh runs before any spawner
+# files exist on the user's box, and uninstall.sh must work even when the
+# spawner binary is broken or missing.
 OS="$(uname -s)"
 case "$OS" in
   Darwin) PLATFORM="darwin" ;;
