@@ -10,6 +10,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
+# `futures::future::BoxFuture` for the descriptor-registry's `fn` pointers
+# in `src/adapter.rs::AdapterDescriptor`. Pinned to 0.3 to share the
+# `futures-core` resolution with `futures-util` already on the graph.
+futures = "0.3"
 anyhow = "1"
 nix = { version = "0.29", features = ["signal"] }
 tracing = "0.1"
@@ -27,6 +31,13 @@ chrono = { version = "0.4", features = ["serde"] }
 # pulls in transitively (1.8.x as of crypto_box 0.9.1) so a future `cargo update`
 # can't bump us past the transitive constraint and re-trigger SemVer dual-version.
 zeroize = "1.8"
+smallvec = "1"
+# Read-only walk over `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
+# in `adapters/cursor.rs::import`. `bundled` ships the SQLite source so we
+# don't depend on a system libsqlite3 at the version we tested with — same
+# trade-off the rest of the Rust ecosystem makes. No `vtab` / `serde_json`
+# integration features: we only need basic prepared-statement reads.
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Force vendored OpenSSL on Linux so cross-builds don't need libssl-dev in the
 # Docker image. Pulled in transitively by sentry → reqwest-0.13 → native-tls.

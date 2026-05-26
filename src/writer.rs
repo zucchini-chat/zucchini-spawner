@@ -8,8 +8,8 @@
 
 use std::collections::VecDeque;
 use std::fmt::Display;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -20,6 +20,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::adapter::AgentKind;
 use crate::crypto::{encrypt_field_b64, KUser, KeyStore};
 
 const MAX_OPS_PER_BATCH: usize = 32;
@@ -53,19 +54,41 @@ pub enum WriteEvent {
         created_at: Option<DateTime<Utc>>,
         imported: bool,
     },
-    ChatRunning { chat_id: String, agent_running: bool },
-    ContextTokens { chat_id: String, tokens: i64 },
+    ChatRunning {
+        chat_id: String,
+        agent_running: bool,
+    },
+    ContextTokens {
+        chat_id: String,
+        tokens: i64,
+    },
     /// `compactMetadata.postTokens` from a `compact_boundary` system frame.
     /// Backend resolves `context_tokens = baseline_tokens + post_tokens`.
-    CompactBoundary { chat_id: String, post_tokens: i64 },
-    Heartbeat { machine_id: Uuid },
+    CompactBoundary {
+        chat_id: String,
+        post_tokens: i64,
+    },
+    /// Persists the session id claude generated on its own (we no longer pass
+    /// `--session-id`). Written once per chat — the harvest path in `main.rs`
+    /// stashes it locally first to avoid racing the sync round-trip.
+    AgentSessionId {
+        chat_id: String,
+        session_id: String,
+    },
+    Heartbeat {
+        machine_id: Uuid,
+    },
     /// Sent once per process startup. Re-evaluating on each restart picks up
-    /// `claude /login` after a service kick — without that, the iOS app would
-    /// never see auth flips.
+    /// `claude /login` (or `cursor-agent login`) after a service kick —
+    /// without that, the iOS app would never see auth flips. The wire shape
+    /// on `machines` is a flat pair of nullable BOOLEANs per agent kind
+    /// (`claude_installed` / `claude_authenticated` /
+    /// `cursor_installed` / `cursor_authenticated`); we carry one
+    /// `(installed, authenticated)` tuple per `AgentKind` so the encode
+    /// site can fan them out generically.
     ReportStartupInfo {
         machine_id: Uuid,
-        claude_code_installed: bool,
-        claude_code_authenticated: bool,
+        statuses: Vec<(AgentKind, (bool, bool))>,
     },
     /// Importer-only.
     PutChat {
@@ -84,9 +107,33 @@ pub enum WriteEvent {
     },
     /// Importer-only: machines.PATCH carrying the import progress string
     /// (`requested` | `running-N` | `finished`).
-    ImportStatus { machine_id: Uuid, status: String },
+    ImportStatus {
+        machine_id: Uuid,
+        status: String,
+    },
     /// Machine-sharing handshake: publish our X25519 sealedbox public key.
-    SetSpawnerPubkey { machine_id: Uuid, pubkey_b64: String },
+    SetSpawnerPubkey {
+        machine_id: Uuid,
+        pubkey_b64: String,
+    },
+    /// Seed the owner's `machine_users.agents` JSON column when it lands
+    /// NULL (migration 0035 — see `seed_default_agents_if_needed` in
+    /// main.rs). The backend routes this through `put_machine_user_envelope`
+    /// (same path iOS uses for `wrapped_key` / `sealed_blob`). For a
+    /// machine principal that handler gates writes to the `agents` field
+    /// only AND requires `expected_machine_id == jwt.machine_id`, so a
+    /// spawner can never touch its peer-machines' rosters. The owner's row
+    /// is hit naturally because a machine-token's JWT carries the owner's
+    /// user_id in `sub` (backend main.rs:691) and the UPDATE WHERE is
+    /// `user_id = $p.user_id`. `agents_json` is the literal JSON string
+    /// the backend's `validate_agents_json` will round-trip (we serialize
+    /// it once here and never re-parse). `row_id` is `machine_users.id`,
+    /// not `machine_users.user_id` — the backend looks up the row by id.
+    SetMachineUserAgents {
+        row_id: Uuid,
+        machine_id: Uuid,
+        agents_json: String,
+    },
 }
 
 impl WriteEvent {
@@ -103,7 +150,10 @@ impl WriteEvent {
     }
 
     pub fn chat_running(chat_id: String, agent_running: bool) -> Self {
-        WriteEvent::ChatRunning { chat_id, agent_running }
+        WriteEvent::ChatRunning {
+            chat_id,
+            agent_running,
+        }
     }
 }
 
@@ -146,12 +196,12 @@ pub fn start(config: WriterConfig, keys: Arc<KeyStore>) -> Writer {
 // ---------- internals ----------
 
 #[derive(Debug, Clone, Serialize)]
-struct BatchOp {
-    op: &'static str,
-    table: &'static str,
-    id: Uuid,
+pub(crate) struct BatchOp {
+    pub(crate) op: &'static str,
+    pub(crate) table: &'static str,
+    pub(crate) id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
+    pub(crate) data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,9 +224,17 @@ fn resolve_key_or_warn(
     }
 }
 
-fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
+pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
     Some(match event {
-        WriteEvent::PutMessage { id, chat_id, user_id, sender, content, created_at, imported } => {
+        WriteEvent::PutMessage {
+            id,
+            chat_id,
+            user_id,
+            sender,
+            content,
+            created_at,
+            imported,
+        } => {
             let k = resolve_key_or_warn(keys, user_id, chat_id, "message")?;
             let mut data = serde_json::json!({
                 "chat_id": chat_id,
@@ -194,32 +252,84 @@ fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
                 data: Some(data),
             }
         }
-        WriteEvent::ChatRunning { chat_id, agent_running } => {
-            chats_patch(chat_id, "ChatRunning", serde_json::json!({ "agent_running": agent_running }))?
-        }
-        WriteEvent::ContextTokens { chat_id, tokens } => {
-            chats_patch(chat_id, "ContextTokens", serde_json::json!({ "context_tokens": tokens }))?
-        }
-        WriteEvent::CompactBoundary { chat_id, post_tokens } => {
-            chats_patch(
-                chat_id,
-                "CompactBoundary",
-                serde_json::json!({ "compact_boundary_post_tokens": post_tokens }),
-            )?
-        }
+        WriteEvent::ChatRunning {
+            chat_id,
+            agent_running,
+        } => chats_patch(
+            chat_id,
+            "ChatRunning",
+            serde_json::json!({ "agent_running": agent_running }),
+        )?,
+        WriteEvent::ContextTokens { chat_id, tokens } => chats_patch(
+            chat_id,
+            "ContextTokens",
+            serde_json::json!({ "context_tokens": tokens }),
+        )?,
+        WriteEvent::CompactBoundary {
+            chat_id,
+            post_tokens,
+        } => chats_patch(
+            chat_id,
+            "CompactBoundary",
+            serde_json::json!({ "compact_boundary_post_tokens": post_tokens }),
+        )?,
+        WriteEvent::AgentSessionId {
+            chat_id,
+            session_id,
+        } => chats_patch(
+            chat_id,
+            "AgentSessionId",
+            serde_json::json!({ "agent_session_id": session_id }),
+        )?,
         WriteEvent::Heartbeat { machine_id } => {
             // Server stamps now() for last_heartbeat_at; the null is just a presence marker.
-            machines_patch(*machine_id, serde_json::json!({ "last_heartbeat_at": null }))
+            machines_patch(
+                *machine_id,
+                serde_json::json!({ "last_heartbeat_at": null }),
+            )
         }
-        WriteEvent::ReportStartupInfo { machine_id, claude_code_installed, claude_code_authenticated } => {
-            machines_patch(*machine_id, serde_json::json!({
-                "spawner_version": env!("CARGO_PKG_VERSION"),
-                "claude_code_installed": claude_code_installed,
-                "claude_code_authenticated": claude_code_authenticated,
-            }))
+        WriteEvent::ReportStartupInfo {
+            machine_id,
+            statuses,
+        } => {
+            // Per-agent install/auth is four nullable BOOLEAN columns on
+            // `machines` (`claude_code_installed` / `claude_code_authenticated`
+            // for the legacy claude columns inherited from pre-multi-agent
+            // schema, plus `cursor_installed` / `cursor_authenticated` added
+            // in migration 0033_multi_agent_support). iOS derives its
+            // `AgentInstallStatus` UI helper from these booleans locally.
+            let mut data = serde_json::Map::new();
+            data.insert(
+                "spawner_version".to_string(),
+                serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+            );
+            for (kind, (installed, authenticated)) in statuses {
+                let (installed_col, authenticated_col) = kind.install_columns();
+                data.insert(
+                    installed_col.to_string(),
+                    serde_json::Value::Bool(*installed),
+                );
+                data.insert(
+                    authenticated_col.to_string(),
+                    serde_json::Value::Bool(*authenticated),
+                );
+            }
+            machines_patch(*machine_id, serde_json::Value::Object(data))
         }
-        WriteEvent::PutChat { id, project_id, user_id, title, created_at } => {
+        WriteEvent::PutChat {
+            id,
+            project_id,
+            user_id,
+            title,
+            created_at,
+        } => {
             let k = resolve_key_or_warn(keys, user_id, id, "chat")?;
+            // Importer contract: chat id IS the claude session id (migration
+            // 0019). The pre-0032 backfill `UPDATE chats SET agent_session_id =
+            // id::text WHERE agent_session_id IS NULL` only ran once at deploy,
+            // so chats imported AFTER deploy would otherwise leave the column
+            // NULL and the next user message would spawn claude without
+            // `--resume`, losing the imported transcript context.
             BatchOp {
                 op: "PUT",
                 table: "chats",
@@ -229,10 +339,16 @@ fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
                     "title": encrypt_field_b64(&k, title),
                     "worktree": false,
                     "created_at": created_at.to_rfc3339(),
+                    "agent_session_id": id.to_string(),
                 })),
             }
         }
-        WriteEvent::PutProject { id, machine_id, name, path } => BatchOp {
+        WriteEvent::PutProject {
+            id,
+            machine_id,
+            name,
+            path,
+        } => BatchOp {
             op: "PUT",
             table: "projects",
             id: *id,
@@ -242,22 +358,59 @@ fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
                 "path": path,
             })),
         },
-        WriteEvent::ImportStatus { machine_id, status } => {
-            machines_patch(*machine_id, serde_json::json!({ "claude_history_import_status": status }))
-        }
-        WriteEvent::SetSpawnerPubkey { machine_id, pubkey_b64 } => {
-            machines_patch(*machine_id, serde_json::json!({ "spawner_pubkey": pubkey_b64 }))
+        WriteEvent::ImportStatus { machine_id, status } => machines_patch(
+            *machine_id,
+            serde_json::json!({ "claude_history_import_status": status }),
+        ),
+        WriteEvent::SetSpawnerPubkey {
+            machine_id,
+            pubkey_b64,
+        } => machines_patch(
+            *machine_id,
+            serde_json::json!({ "spawner_pubkey": pubkey_b64 }),
+        ),
+        WriteEvent::SetMachineUserAgents {
+            row_id,
+            machine_id,
+            agents_json,
+        } => {
+            // Routes through the backend's `put_machine_user_envelope`
+            // handler (table=machine_users, op=PATCH — see writes.rs
+            // dispatch table). The handler demands `machine_id` in the
+            // body for a defense-in-depth ownership check on top of the
+            // `user_id = $principal` gate. `agents` is the raw JSON
+            // string the backend's `validate_agents_json` will round-trip
+            // before commit; we never re-parse it on the spawner side.
+            BatchOp {
+                op: "PATCH",
+                table: "machine_users",
+                id: *row_id,
+                data: Some(serde_json::json!({
+                    "machine_id": machine_id.to_string(),
+                    "agents": agents_json,
+                })),
+            }
         }
     })
 }
 
 fn machines_patch(machine_id: Uuid, data: serde_json::Value) -> BatchOp {
-    BatchOp { op: "PATCH", table: "machines", id: machine_id, data: Some(data) }
+    BatchOp {
+        op: "PATCH",
+        table: "machines",
+        id: machine_id,
+        data: Some(data),
+    }
 }
 
 fn chats_patch(chat_id: &str, label: &str, data: serde_json::Value) -> Option<BatchOp> {
     match Uuid::parse_str(chat_id) {
-        Ok(id) => Some(BatchOp { op: "PATCH", table: "chats", id, data: Some(data) }),
+        Ok(id) => Some(BatchOp {
+            op: "PATCH",
+            table: "chats",
+            id,
+            data: Some(data),
+        }),
         Err(e) => {
             warn!(chat_id = %chat_id, error = %e, "{} chat_id is not a UUID, dropping", label);
             None

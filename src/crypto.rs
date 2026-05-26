@@ -58,7 +58,11 @@ pub fn encode_b64_zeroized(bytes: &[u8]) -> Zeroizing<String> {
     // If a future caller passes a non-3-multiple length, the encoded string
     // would grow past `cap` and `String::push_str` would reallocate, leaving
     // a non-zeroized copy in freed-slot heap. Fail loudly in debug builds.
-    debug_assert_eq!(s.len(), cap, "encode_b64_zeroized: encoded length exceeded preallocated capacity");
+    debug_assert_eq!(
+        s.len(),
+        cap,
+        "encode_b64_zeroized: encoded length exceeded preallocated capacity"
+    );
     s
 }
 
@@ -80,13 +84,22 @@ impl Drop for KUser {
 
 impl KUser {
     fn load_from(path: &std::path::Path) -> Result<Self> {
-        let bytes = read_b64_32(path)
-            .with_context(|| format!("read key file {}", path.display()))?;
+        let bytes =
+            read_b64_32(path).with_context(|| format!("read key file {}", path.display()))?;
         // `*bytes` deref-copies the [u8;32] out of `Zeroizing` into a fresh
         // stack slot owned by `KUser`. The `Zeroizing` wrapper scrubs its
         // own copy on drop here; the new slot is then scrubbed by `KUser::drop`
         // when the last Arc<KUser> is released.
         Ok(KUser(*bytes))
+    }
+
+    /// Test-only constructor — wraps raw 32-byte K_user material so the
+    /// `KeyStore::with_keys` seam doesn't need to round-trip through the
+    /// filesystem. Kept `pub(crate)` so external crates can't synthesise
+    /// `KUser` instances.
+    #[cfg(test)]
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        KUser(bytes)
     }
 }
 
@@ -106,7 +119,9 @@ pub struct KeyStore {
 
 impl KeyStore {
     pub fn new() -> Self {
-        Self { cache: Mutex::new(HashMap::new()) }
+        Self {
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn forget(&self, user_id: &Uuid) {
@@ -185,7 +200,11 @@ fn try_migrate_legacy_key(user_id: &Uuid, per_user: &Path) -> Result<bool> {
     }
     // Atomic rename within the same filesystem — no half-state.
     fs::rename(&legacy, per_user).with_context(|| {
-        format!("migrate legacy key {} -> {}", legacy.display(), per_user.display())
+        format!(
+            "migrate legacy key {} -> {}",
+            legacy.display(),
+            per_user.display()
+        )
     })?;
     info!(
         user_id = %user_id,
@@ -199,6 +218,23 @@ fn try_migrate_legacy_key(user_id: &Uuid, per_user: &Path) -> Result<bool> {
 impl Default for KeyStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl KeyStore {
+    /// Seed the cache directly from raw 32-byte K_user blobs so tests don't
+    /// touch the filesystem. Bypasses the legacy-key migration + per-user
+    /// path lookup in `KeyStore::get`. Used only by integration tests in
+    /// `main.rs` and adapter tests.
+    pub fn with_keys(entries: impl IntoIterator<Item = (Uuid, [u8; 32])>) -> Self {
+        let cache = entries
+            .into_iter()
+            .map(|(uid, bytes)| (uid, Some(Arc::new(KUser::from_bytes(bytes)))))
+            .collect();
+        Self {
+            cache: Mutex::new(cache),
+        }
     }
 }
 

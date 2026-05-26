@@ -1,11 +1,11 @@
+mod adapter;
+mod adapters;
 mod agent;
 mod atomic;
 mod auth;
 mod blobs;
-mod claude_code;
 mod crypto;
 mod envelope;
-mod import;
 mod power;
 mod powersync;
 mod shell;
@@ -19,21 +19,28 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent::{AgentResponse, Supervisor};
+use adapter::AgentKind;
+use agent::{AgentResponse, SpawnRequest, Supervisor};
 use auth::AuthClient;
 use blobs::BlobDownloader;
 use crypto::KeyStore;
 use crypto_box::SecretKey;
 use power::WakeSignal;
 use powersync::{SyncConfig, SyncEvent};
+use sentry_tracing::EventFilter;
 use state::Mirror;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use sentry_tracing::EventFilter;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use writer::{WriteEvent, Writer, WriterConfig};
+
+/// Shared probe-results cache shape — fan-out from `spawn_startup_info_report`
+/// into the sync-event handler so `seed_default_agents_if_needed` can decide
+/// whether claude/cursor are installed without re-shelling. `OnceLock` lets
+/// the producer set it exactly once and lets readers snapshot without locking.
+type ProbeStatusesCache = Arc<std::sync::OnceLock<Vec<(AgentKind, (bool, bool))>>>;
 
 const SENTRY_DSN: &str = "https://05d5deab2efce04e4f801af41ea39def@o4511216603234304.ingest.de.sentry.io/4511216616669264";
 const INTERRUPTED_RESULT: &str = r#"{"type":"result","subtype":"interrupted"}"#;
@@ -60,7 +67,9 @@ fn init_logging() {
 }
 
 pub(crate) fn zucchini_spawner_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".zucchini-spawner")
 }
 
@@ -101,13 +110,15 @@ struct ProdConfig {
 /// Parse the named env var as a UUID. Returns `None` if unset or unparseable
 /// (with a warn! on parse failure).
 fn env_uuid(name: &str) -> Option<Uuid> {
-    std::env::var(name).ok().and_then(|s| match Uuid::parse_str(&s) {
-        Ok(u) => Some(u),
-        Err(e) => {
-            warn!(env = name, error = %e, "env var is not a valid UUID, ignoring");
-            None
-        }
-    })
+    std::env::var(name)
+        .ok()
+        .and_then(|s| match Uuid::parse_str(&s) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                warn!(env = name, error = %e, "env var is not a valid UUID, ignoring");
+                None
+            }
+        })
 }
 
 fn load_prod_config() -> Option<ProdConfig> {
@@ -137,7 +148,10 @@ fn dev_token_fetcher() -> Box<
 /// only the dev URL differs.
 fn base_and_token(prod: Option<&ProdConfig>, dev_url: &str) -> (String, writer::TokenFetcher) {
     match prod {
-        Some(p) => (PROD_BASE_URL.to_string(), auth::token_fetcher(p.auth.clone())),
+        Some(p) => (
+            PROD_BASE_URL.to_string(),
+            auth::token_fetcher(p.auth.clone()),
+        ),
         None => (dev_url.to_string(), dev_token_fetcher()),
     }
 }
@@ -194,6 +208,19 @@ async fn handle_sync_event(
     x25519_secret: Option<&SecretKey>,
     our_pubkey_b64: Option<&str>,
     write_tx: &mpsc::Sender<WriteEvent>,
+    // Probe statuses fan-out cache (`spawn_startup_info_report` fills it
+    // once at boot). `None` here means probes haven't completed yet — the
+    // seeding pass is a no-op in that case and re-tries on the next
+    // re-emission of the row (heartbeat fan-out OR after the probe lands).
+    probe_statuses: Option<&[(AgentKind, (bool, bool))]>,
+    // Process-lifetime "already attempted seeding once" flag. Flipped to
+    // `true` after we emit the seeding PATCH; subsequent re-emissions of
+    // the same `machine_users` row (heartbeat fan-out, ~every 60s) skip
+    // re-seeding even if the DB hasn't transitioned NULL → `[]` yet. The
+    // DB transition is the durable guard; this flag prevents a transient
+    // re-seed before the round-trip lands. Restart re-checks (state.json
+    // doesn't persist it).
+    agents_seed_attempted: &mut bool,
 ) -> SyncEventOutcome {
     match event {
         SyncEvent::Put { table, id, data } => match table.as_str() {
@@ -230,15 +257,15 @@ async fn handle_sync_event(
                 // Older backends without the column simply omit the field —
                 // that's harmless, the mirror keeps `None` and the boot path
                 // will upload to a server that ignores unknown PATCH keys.
-                let pubkey_changed = mirror.set_spawner_pubkey(
-                    row.get("spawner_pubkey").and_then(|p| p.as_str()),
-                );
+                let pubkey_changed =
+                    mirror.set_spawner_pubkey(row.get("spawner_pubkey").and_then(|p| p.as_str()));
                 // If a server-side clear/rotation flips the column at runtime
                 // (e.g. ops nukes spawner_pubkey to force a re-publish), upload
                 // immediately rather than waiting for the next boot.
                 if pubkey_changed {
                     if let Some(mid) = machine_id {
-                        publish_spawner_pubkey_if_needed(mid, our_pubkey_b64, mirror, write_tx).await;
+                        publish_spawner_pubkey_if_needed(mid, our_pubkey_b64, mirror, write_tx)
+                            .await;
                     }
                 }
                 if json_pg_bool(row.get("to_uninstall")) {
@@ -247,6 +274,15 @@ async fn handle_sync_event(
                 let status = row
                     .get("claude_history_import_status")
                     .and_then(|f| f.as_str());
+                // Snapshot the user's checkbox selection alongside the status
+                // flip so the dispatcher reads the kinds the user picked at
+                // the same moment they tapped "Import" — not a later
+                // heartbeat-driven re-stream. Mid-import changes to the
+                // column don't retro-affect the in-flight run.
+                mirror.set_import_kinds(
+                    row.get("claude_history_import_kinds")
+                        .and_then(|f| f.as_str()),
+                );
                 match (mirror.set_import_status(status), status) {
                     (true, Some("requested")) => SyncEventOutcome::ImportRequested,
                     (true, Some("aborted")) => SyncEventOutcome::ImportAborted,
@@ -265,7 +301,46 @@ async fn handle_sync_event(
                 // Members are persisted across restarts so the sandbox-spawn
                 // gate doesn't fail open after the bucket cursor advances
                 // past historical machine_users rows.
-                if apply_machine_users_put(&id, user_id, &row, x25519_secret, keys, mirror) {
+                let state_changed =
+                    apply_machine_users_put(&id, user_id, &row, x25519_secret, keys, mirror);
+
+                // `agents` (migration 0035) is a TEXT column carrying a JSON
+                // array. Mirror the raw value (NULL → None; "[]" → Some) so
+                // the seeding decision below has the freshest value, AND so
+                // future per-member features (cross-user agent broadcasts,
+                // etc.) have a single source of truth. The `by_machine`
+                // bucket only ships the spawner's own row + other actives'
+                // rows; only the OWN row matters for seeding.
+                let agents_raw = row
+                    .get("agents")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                mirror.set_member_agents(&user_id, agents_raw);
+
+                // Seeding fires when ALL of:
+                //   - row is the spawner-owner's own row
+                //   - column landed NULL (not `[]` — distinct values; `[]`
+                //     means user emptied the list and we leave it alone)
+                //   - probe results are in AND at least one CLI is installed
+                //   - we haven't already attempted this process lifetime
+                // The DB NULL → `[]`-or-non-empty transition is the durable
+                // guard that prevents re-seeding on subsequent boots; the
+                // in-memory flag covers the round-trip window before that
+                // transition lands.
+                if let Some(mid) = machine_id {
+                    seed_default_agents_if_needed(
+                        &id,
+                        user_id,
+                        mid,
+                        mirror,
+                        probe_statuses,
+                        agents_seed_attempted,
+                        write_tx,
+                    )
+                    .await;
+                }
+
+                if state_changed {
                     SyncEventOutcome::StateChanged
                 } else {
                     SyncEventOutcome::Nothing
@@ -311,6 +386,53 @@ async fn handle_sync_event(
     }
 }
 
+/// Consume one `AgentResponse` (the other half of the main loop's `select!`,
+/// matching `handle_sync_event`'s role on the sync side). Maps each variant
+/// onto its `WriteEvent` and — for `Done` — synthesizes the canned
+/// `INTERRUPTED_RESULT` line when the agent died without emitting `result`,
+/// then drops the per-chat supervisor slot.
+pub(crate) async fn handle_agent_response(
+    resp: AgentResponse,
+    mirror: &mut Mirror,
+    write_tx: &mpsc::Sender<WriteEvent>,
+    supervisor: &mut Supervisor,
+) {
+    match resp {
+        AgentResponse::Line { topic, content } => {
+            send_agent_line(write_tx, mirror, &topic, content).await;
+        }
+        AgentResponse::ContextTokens { topic, tokens } => {
+            let _ = write_tx
+                .send(WriteEvent::ContextTokens { chat_id: topic, tokens })
+                .await;
+        }
+        AgentResponse::CompactBoundary { topic, post_tokens } => {
+            let _ = write_tx
+                .send(WriteEvent::CompactBoundary { chat_id: topic, post_tokens })
+                .await;
+        }
+        AgentResponse::SessionIdHarvested { topic, session_id } => {
+            // Stash locally first so a fast-followup user message
+            // in the same chat doesn't race the writer / PowerSync
+            // round-trip and spawn a second claude without --resume.
+            mirror.set_agent_session_id(&topic, session_id.clone());
+            let _ = write_tx
+                .send(WriteEvent::AgentSessionId { chat_id: topic, session_id })
+                .await;
+        }
+        AgentResponse::Done { topic, has_result } => {
+            info!(topic = %topic, has_result, "agent done");
+            if !has_result {
+                send_agent_line(write_tx, mirror, &topic, INTERRUPTED_RESULT.to_string()).await;
+            }
+            let _ = write_tx
+                .send(WriteEvent::chat_running(topic.clone(), false))
+                .await;
+            supervisor.remove(&topic);
+        }
+    }
+}
+
 async fn handle_message_put(
     data: &str,
     mirror: &mut Mirror,
@@ -327,7 +449,11 @@ async fn handle_message_put(
         }
     };
 
-    let Some(chat_id) = row.get("chat_id").and_then(|v| v.as_str()).map(str::to_string) else {
+    let Some(chat_id) = row
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
         warn!("message row missing chat_id");
         return;
     };
@@ -351,13 +477,27 @@ async fn handle_message_put(
         return;
     }
 
-    let (project_id, worktree, chat_last_seq, user_id) = match mirror.chats.get(&chat_id) {
-        Some(c) => (c.project_id.clone(), c.worktree, c.last_seq, c.user_id),
-        None => {
-            warn!(chat_id = %chat_id, "message arrived before chat row, skipping");
-            return;
-        }
-    };
+    let (project_id, worktree, chat_last_seq, user_id, agent_session_id, agent_kind, model) =
+        match mirror.chats.get(&chat_id) {
+            Some(c) => (
+                c.project_id.clone(),
+                c.worktree,
+                c.last_seq,
+                c.user_id,
+                c.agent_session_id.clone(),
+                c.agent_kind,
+                // `chats.model` (migration 0035) — filter empty strings to
+                // `None` HERE (not in the adapter) so adapter logic stays
+                // `if let Some(m) = ctx.model { ... }`. `state.rs::upsert_chat`
+                // already does the same filter on insert, but we re-apply
+                // defensively in case a future code path bypasses it.
+                c.model.as_deref().filter(|s| !s.is_empty()).map(str::to_string),
+            ),
+            None => {
+                warn!(chat_id = %chat_id, "message arrived before chat row, skipping");
+                return;
+            }
+        };
 
     // chats.last_seq is the bucket-authoritative "latest message in chat".
     // A user message with seq < last_seq is a replayed copy of an
@@ -370,7 +510,10 @@ async fn handle_message_put(
     }
 
     let Some(body_str) = row.get("body").and_then(|v| v.as_str()) else {
-        let keys: Vec<&String> = row.as_object().map(|o| o.keys().collect()).unwrap_or_default();
+        let keys: Vec<&String> = row
+            .as_object()
+            .map(|o| o.keys().collect())
+            .unwrap_or_default();
         warn!(
             chat_id = %chat_id,
             seq,
@@ -446,7 +589,11 @@ async fn handle_message_put(
         info!(chat_id = %chat_id, "aborting running agent before handling new message");
         supervisor.abort_agent(&chat_id).await;
         let _ = write_tx
-            .send(WriteEvent::agent_line(chat_id.clone(), user_id, INTERRUPTED_RESULT.to_string()))
+            .send(WriteEvent::agent_line(
+                chat_id.clone(),
+                user_id,
+                INTERRUPTED_RESULT.to_string(),
+            ))
             .await;
     }
 
@@ -479,7 +626,6 @@ async fn handle_message_put(
     };
     let prompt = blobs::build_prompt(&envelope.text, &downloaded);
 
-    let is_resume = seq > 1;
     // Only PATCH when transitioning idle→running. The abort-then-respawn path
     // (was_running==true) leaves agent_running already true from the prior
     // spawn — re-sending it would fan out a no-op write to every listening
@@ -489,14 +635,114 @@ async fn handle_message_put(
             .send(WriteEvent::chat_running(chat_id.clone(), true))
             .await;
     }
-    supervisor.spawn_agent(
-        chat_id.clone(),
+    // Resume keys off `agent_session_id`, not `seq>1`: a freshly created chat
+    // may already have a backfilled `agent_session_id` (pre-migration rows) and
+    // a brand-new chat where the first turn aborted before harvest still has
+    // `agent_session_id = None`, so we want a fresh session there too.
+    // `agent_kind` picks the adapter (claude/cursor) at spawn time.
+    supervisor.spawn_agent(SpawnRequest {
+        chat_id: chat_id.clone(),
         prompt,
-        Some(project_path),
+        project_path: Some(project_path),
         worktree,
-        is_resume,
+        agent_session_id,
+        agent_kind,
         is_sandboxed,
+        model,
+    });
+}
+
+/// Seed `machine_users.agents` defaults (migration 0035) when the owner's
+/// row lands with `agents IS NULL`. Emits exactly one
+/// `WriteEvent::SetMachineUserAgents` carrying a default list — one entry
+/// per installed CLI per `probe_statuses` — and flips the
+/// `agents_seed_attempted` in-memory guard to skip re-seeding on the next
+/// heartbeat-driven re-emission.
+///
+/// The contract with the iOS app: NULL means "spawner hasn't seeded yet"
+/// and `[]` means "user explicitly removed everything". So we only seed
+/// on NULL, never on `[]`. The DB write (NULL → non-NULL) is the durable
+/// guard against repeat-seeding across boots; the in-memory flag handles
+/// the round-trip window before the write lands and is re-streamed.
+///
+/// Defaults shape, deterministic order:
+///   1. `{id: <uuid-v7>, agent_kind: "claude", model: "", name: ""}` (if claude installed)
+///   2. `{id: <uuid-v7>, agent_kind: "cursor", model: "", name: ""}` (if cursor installed)
+///
+/// If neither is installed, no PATCH is emitted (would be `[]`, which the
+/// contract treats as user-emptied — never the spawner's call to make).
+async fn seed_default_agents_if_needed(
+    row_id: &str,
+    row_user_id: Uuid,
+    machine_id: Uuid,
+    mirror: &Mirror,
+    probe_statuses: Option<&[(AgentKind, (bool, bool))]>,
+    agents_seed_attempted: &mut bool,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    if *agents_seed_attempted {
+        return;
+    }
+    if !mirror.is_owner(row_user_id) {
+        return;
+    }
+    // NULL = "not seeded yet" → seed; Some(_) (including `"[]"`) = leave alone.
+    if mirror.member_agents(&row_user_id).is_some() {
+        return;
+    }
+    let Some(statuses) = probe_statuses else {
+        // Probes haven't completed yet — the next re-emission of this row
+        // will retry. (Heartbeat re-fans `machine_users` rows every ~60s,
+        // probe latency is typically < 1s, so this race window is short.)
+        return;
+    };
+    // Closed deterministic order: claude first, then cursor — matches the
+    // task spec so iOS sees a stable agent-picker ordering across builds.
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for kind in AgentKind::ALL {
+        let installed = statuses
+            .iter()
+            .find_map(|(k, (i, _))| (k == kind).then_some(*i))
+            .unwrap_or(false);
+        if !installed {
+            continue;
+        }
+        let id = Uuid::now_v7();
+        entries.push(serde_json::json!({
+            "id": id.to_string(),
+            "agent_kind": kind.descriptor().wire_name,
+            "model": "",
+            "name": "",
+        }));
+    }
+    if entries.is_empty() {
+        // No CLI installed → nothing to seed. Skip without setting the
+        // attempted-flag so a future re-emission (after the user runs
+        // `claude /login` / `cursor-agent login` and restarts the spawner)
+        // can still seed. NOTE: probe results don't re-fire in-process
+        // today, so this branch effectively waits for a process restart.
+        return;
+    }
+    let Some(row_uuid) = parse_uuid_str(row_id) else {
+        warn!(row_id, "machine_users.id is not a UUID; cannot seed agents");
+        return;
+    };
+    let agents_json =
+        serde_json::to_string(&entries).expect("array of small objects is always serializable");
+    info!(
+        %row_uuid,
+        n = entries.len(),
+        agents_json = %agents_json,
+        "seeding default machine_users.agents for owner row"
     );
+    *agents_seed_attempted = true;
+    let _ = write_tx
+        .send(WriteEvent::SetMachineUserAgents {
+            row_id: row_uuid,
+            machine_id,
+            agents_json,
+        })
+        .await;
 }
 
 fn apply_machine_users_put(
@@ -653,11 +899,15 @@ fn reconcile_key_files(mirror: &Mirror, keys: &KeyStore) {
         // `state.json`, `x25519_secret`, etc. (No rotated `.prev.<ts>`
         // archives exist anymore — persist_user_key refuses mismatches
         // rather than archiving.)
-        let Some(uid_str) = s.strip_prefix("key_") else { continue };
+        let Some(uid_str) = s.strip_prefix("key_") else {
+            continue;
+        };
         if uid_str.contains('.') {
             continue;
         }
-        let Some(uid) = parse_uuid_str(uid_str) else { continue };
+        let Some(uid) = parse_uuid_str(uid_str) else {
+            continue;
+        };
         if mirror.user_id == Some(uid) {
             continue;
         }
@@ -709,7 +959,8 @@ fn remove_user_key_file(user_id: &Uuid) -> std::io::Result<()> {
 }
 
 pub(crate) fn json_to_i64(v: &serde_json::Value) -> Option<i64> {
-    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 pub(crate) fn parse_uuid_str(s: &str) -> Option<Uuid> {
@@ -717,7 +968,9 @@ pub(crate) fn parse_uuid_str(s: &str) -> Option<Uuid> {
 }
 
 pub(crate) fn parse_uuid_field(row: &serde_json::Value, field: &str) -> Option<Uuid> {
-    row.get(field).and_then(|v| v.as_str()).and_then(parse_uuid_str)
+    row.get(field)
+        .and_then(|v| v.as_str())
+        .and_then(parse_uuid_str)
 }
 
 /// PowerSync serializes Postgres BOOLEAN as JSON Number 0/1, not bool — `as_bool()`
@@ -726,24 +979,148 @@ pub(crate) fn json_pg_bool(v: Option<&serde_json::Value>) -> bool {
     v.and_then(|x| x.as_i64()) == Some(1)
 }
 
-/// Off the main task — the login-shell probe in `is_installed` is hundreds of
-/// ms and we don't want to delay select-loop entry.
-fn spawn_startup_info_report(machine_id: Uuid, write_tx: mpsc::Sender<WriteEvent>) {
+/// Off the main task — the login-shell probes (one per agent) each shell out
+/// for hundreds of ms, so we run them concurrently via `join_all` and don't
+/// block select-loop entry. Iterates `AgentKind::ALL` so adding a new variant
+/// requires no edits here.
+///
+/// `cache` is the shared snapshot the sync-event handler consults on each
+/// `machine_users` PUT to decide whether to seed `agents` defaults
+/// (migration 0035). Filled once at startup; subsequent `claude /login` /
+/// `cursor-agent login` flips show up on the next spawner restart, same as
+/// the wire-side install-status report — there's no live re-probe.
+fn spawn_startup_info_report(
+    machine_id: Uuid,
+    write_tx: mpsc::Sender<WriteEvent>,
+    cache: ProbeStatusesCache,
+) {
     tokio::spawn(async move {
-        let (installed, authenticated) = tokio::join!(
-            claude_code::is_installed(),
-            tokio::task::spawn_blocking(claude_code::is_authenticated),
-        );
-        let authenticated = authenticated.unwrap_or(false);
-        info!(installed, authenticated, "reporting startup info");
+        let statuses: Vec<(AgentKind, (bool, bool))> = futures_util::future::join_all(
+            AgentKind::ALL
+                .iter()
+                .map(|kind| async move { (*kind, kind.probe().await) }),
+        )
+        .await;
+        info!(?statuses, "reporting startup info");
+        // Best-effort: if the cache is already populated (impossible under
+        // the current "spawn once at boot" call pattern, but cheap defense)
+        // we keep the first value and log nothing — the wire-side report
+        // below still runs.
+        let _ = cache.set(statuses.clone());
         let _ = write_tx
             .send(WriteEvent::ReportStartupInfo {
                 machine_id,
-                claude_code_installed: installed,
-                claude_code_authenticated: authenticated,
+                statuses,
             })
             .await;
     });
+}
+
+/// Dispatcher for the history import. Fans out across the user-selected
+/// `kinds` sequentially (kinds run one after the other so the writer's
+/// batch channel — capacity 1024 — never sees both importers piling on at
+/// once; iOS's blocking import sheet is the lock that lets us assume
+/// single-tenant access to the channel for the duration). Each kind's
+/// 0..=100 progress is rescaled into its slice of the shared 0..99 bar so
+/// iOS sees one continuous progress bar across all selected kinds.
+///
+/// `kinds` comes from `mirror.parsed_import_kinds()` which reads
+/// `claude_history_import_kinds` (CSV the iOS modal writes alongside the
+/// `requested` status flip) and falls back to `AgentKind::ALL` when the
+/// column is absent / NULL — older iOS without the checkbox UI keeps the
+/// historic both-kinds behavior.
+///
+/// Status-emission contract (owned here, not in per-kind `import` fns):
+///  - Emit `running-0` once at the very start.
+///  - Per-kind `progress(pct)` callback emits `running-{scaled}` via
+///    `write_tx.try_send` — `ImportStatus` is a tiny machines PATCH, channel
+///    backpressure that drops one of these is acceptable (the next 5%-step
+///    will reapply the correct value), so we log on a failed `try_send` but
+///    don't await.
+///  - Emit `finished` exactly once at the very end, after every kind has
+///    been attempted. EXCEPTION: if every kind errored, leave the status at
+///    its last `running-{scaled}` value — the backend FSM permits
+///    `Running(n) → Running(m)`, so the next "Import History" request from
+///    iOS would have to come via the FSM's `Running → Aborted → NotStarted →
+///    Requested` path anyway. Logging `error!` here surfaces in Sentry.
+///
+/// Per-kind errors are logged-and-continued (matches the existing
+/// per-session warn-and-skip posture inside the claude importer): one kind
+/// failing doesn't strand the user with no chats from the other kind.
+async fn run_history_import(
+    machine_id: Uuid,
+    user_id: Uuid,
+    write_tx: mpsc::Sender<WriteEvent>,
+    kinds: Vec<AgentKind>,
+) {
+    // Helper: try to push a status update; channel cap is 1024 and import
+    // status writes are sparse (≤20 per kind via the 5%-step throttle), so
+    // a full channel here means the writer is wedged on a network failure
+    // — log and move on rather than blocking the dispatcher.
+    fn emit_status(tx: &mpsc::Sender<WriteEvent>, machine_id: Uuid, status: String) {
+        if let Err(e) = tx.try_send(WriteEvent::ImportStatus {
+            machine_id,
+            status: status.clone(),
+        }) {
+            warn!(error = %e, %status, "dropped import status update (writer channel full?)");
+        }
+    }
+
+    // Caller (parsed_import_kinds) already falls back to ALL on
+    // None/empty/all-unknown — so an empty Vec here would be a programmer
+    // bug. Don't divide by zero in the rescaler; emit finished and bail.
+    if kinds.is_empty() {
+        warn!("run_history_import called with empty kinds list — nothing to do");
+        emit_status(&write_tx, machine_id, "finished".to_string());
+        return;
+    }
+
+    emit_status(&write_tx, machine_id, "running-0".to_string());
+
+    let n = kinds.len() as u32;
+    let mut ok_count = 0usize;
+    for (idx, kind) in kinds.iter().enumerate() {
+        let idx_u32 = idx as u32;
+        let tx_for_progress = write_tx.clone();
+        // Per-kind rescaler. `scaled = (idx*100 + pct) / N`, capped at 99
+        // (the dispatcher owns 100/finished). Adapter callbacks are
+        // throttled internally (5%-step), so we don't bother dedup-ing
+        // duplicate scaled values here — at most ~20 fires per kind × N
+        // kinds = ~40 PATCHes per import.
+        let progress: crate::adapter::ImportProgress = Box::new(move |pct: u8| {
+            let pct = pct.min(100) as u32;
+            let scaled = ((idx_u32 * 100 + pct) / n).min(99) as u8;
+            emit_status(&tx_for_progress, machine_id, format!("running-{scaled}"));
+        });
+
+        match kind
+            .import(machine_id, user_id, write_tx.clone(), progress)
+            .await
+        {
+            Ok(()) => {
+                info!(?kind, "history import kind completed");
+                ok_count += 1;
+            }
+            Err(e) => {
+                error!(?kind, error = %e, "history import kind failed, continuing with next kind");
+            }
+        }
+    }
+
+    if ok_count == 0 {
+        // Every kind errored. Leave the row at the last `running-X` — the
+        // backend FSM allows `Running → Running`, and there's no path back
+        // to `Requested` from `Finished`, so emitting `finished` here would
+        // permanently strand the machine with no transcripts. Surfaces in
+        // Sentry via the `error!` level.
+        error!(
+            n_kinds = kinds.len(),
+            "every kind failed during history import; leaving status at last running-X (no `finished` emitted)"
+        );
+        return;
+    }
+
+    emit_status(&write_tx, machine_id, "finished".to_string());
 }
 
 fn spawn_heartbeat(
@@ -796,7 +1173,11 @@ async fn send_agent_line(
     match mirror.chats.get(chat_id).map(|c| c.user_id) {
         Some(user_id) => {
             let _ = write_tx
-                .send(WriteEvent::agent_line(chat_id.to_string(), user_id, content))
+                .send(WriteEvent::agent_line(
+                    chat_id.to_string(),
+                    user_id,
+                    content,
+                ))
                 .await;
         }
         None => {
@@ -822,7 +1203,10 @@ async fn publish_spawner_pubkey_if_needed(
     }
     info!(%machine_id, "publishing spawner_pubkey for machine sharing");
     let _ = write_tx
-        .send(WriteEvent::SetSpawnerPubkey { machine_id, pubkey_b64: our_pubkey.to_string() })
+        .send(WriteEvent::SetSpawnerPubkey {
+            machine_id,
+            pubkey_b64: our_pubkey.to_string(),
+        })
         .await;
 }
 
@@ -939,16 +1323,27 @@ async fn main() {
     let (writer_base_url, writer_token) = base_and_token(prod.as_ref(), DEV_API_BASE_URL);
     info!(base_url = %writer_base_url, "starting write API sender");
     let writer = writer::start(
-        WriterConfig { base_url: writer_base_url, fetch_token: writer_token },
+        WriterConfig {
+            base_url: writer_base_url,
+            fetch_token: writer_token,
+        },
         keys.clone(),
     );
     let write_tx = writer.tx.clone();
+
+    // Probe results cache: populated once by `spawn_startup_info_report`,
+    // read by `seed_default_agents_if_needed` on every `machine_users` PUT.
+    // `OnceLock` (not `RwLock`) because the write happens exactly once and
+    // the read side never blocks. `None` means "probes not in yet"; the
+    // seeding pass treats that as "skip this PUT, retry on the next
+    // re-emission".
+    let probe_statuses_cache: ProbeStatusesCache = Arc::new(std::sync::OnceLock::new());
 
     let heartbeat_cancel = CancellationToken::new();
     if let Some(p) = &prod {
         info!(machine_id = %p.machine_id, "starting heartbeat task");
         spawn_heartbeat(p.machine_id, write_tx.clone(), heartbeat_cancel.clone());
-        spawn_startup_info_report(p.machine_id, write_tx.clone());
+        spawn_startup_info_report(p.machine_id, write_tx.clone(), probe_statuses_cache.clone());
 
         publish_spawner_pubkey_if_needed(
             p.machine_id,
@@ -986,6 +1381,14 @@ async fn main() {
     // `key_<uuid>` files for non-members. Process-lifetime flag.
     let mut key_files_reconciled = false;
 
+    // Process-lifetime guard for the `machine_users.agents` seeding pass
+    // (migration 0035 — see `seed_default_agents_if_needed`). Once we
+    // emit the seeding PATCH this flag flips to `true` so heartbeat-driven
+    // re-emissions of the owner's row don't re-seed before the DB
+    // transition lands. Restart re-checks via the DB NULL → non-NULL
+    // durable guard.
+    let mut agents_seed_attempted = false;
+
     info!("zucchini-spawner ready, waiting for sync + agent responses");
 
     'main_loop: loop {
@@ -1012,6 +1415,7 @@ async fn main() {
             }
             Some(event) = sync_rx.recv() => {
                 let machine_id = prod.as_ref().map(|p| p.machine_id);
+                let probe_snap = probe_statuses_cache.get().map(|v| v.as_slice());
                 let outcome = handle_sync_event(
                     event,
                     machine_id,
@@ -1022,6 +1426,8 @@ async fn main() {
                     x25519_secret.as_ref(),
                     our_pubkey_b64.as_deref(),
                     &write_tx,
+                    probe_snap,
+                    &mut agents_seed_attempted,
                 ).await;
                 match outcome {
                     SyncEventOutcome::StateChanged => save_mirror(&state_path, &mirror),
@@ -1040,16 +1446,26 @@ async fn main() {
                             reconcile_key_files(&mirror, &keys);
                         }
                     }
-                    // Claude-history import is a one-shot triggered ONLY from
-                    // iOS AddMachineView, immediately after the machine row is
-                    // created (see SyncStore::requestClaudeHistoryImport, sole
-                    // call site AddMachineView::startImport). There is no
-                    // "Import History" button anywhere else. user_id is
+                    // History import is a one-shot triggered ONLY from iOS
+                    // AddMachineView, immediately after the machine row is
+                    // created (see SyncStore::requestClaudeHistoryImport,
+                    // sole call site AddMachineView::startImport). There is
+                    // no "Import History" button anywhere else. user_id is
                     // sourced from `mirror.user_id`, harvested from the
                     // by_machine bucket's machines row — the same PUT that
                     // flipped claude_history_import_status to `requested`
                     // already populated it, so the guard below is a safety
                     // net for the impossible case where they ever diverge.
+                    //
+                    // Multi-kind fan-out: we iterate `AgentKind::ALL`
+                    // sequentially, rescaling each kind's 0..=100 progress
+                    // into its slice of the shared 0..99 bar (kind i of N
+                    // takes `i/N .. (i+1)/N`). The dispatcher owns
+                    // `running-0` and the final `finished` so iOS sees one
+                    // continuous progress bar across both kinds. iOS still
+                    // labels this "Importing claude history" today — that's
+                    // a future cleanup (rename the column or relabel the
+                    // bar; out of scope for step 1).
                     SyncEventOutcome::ImportRequested => 'arm: {
                         let Some(mid) = machine_id else {
                             warn!("import requested but spawner is in dev mode (no machine id) — ignoring");
@@ -1059,12 +1475,22 @@ async fn main() {
                             warn!("import requested but mirror.user_id not populated yet — ignoring");
                             break 'arm;
                         };
-                        info!(machine_id = %mid, user_id = %uid, "claude history import requested by user");
+                        // Snapshot the user's checkbox selection at request
+                        // time (not in the spawned task) — column changes
+                        // mid-import don't retro-affect the in-flight run.
+                        // Falls back to AgentKind::ALL when the column is
+                        // absent / NULL (older iOS / older backend) so the
+                        // historic both-kinds behavior is preserved.
+                        let selected_kinds = mirror.parsed_import_kinds();
+                        info!(
+                            machine_id = %mid,
+                            user_id = %uid,
+                            ?selected_kinds,
+                            "history import requested by user"
+                        );
                         let tx_clone = write_tx.clone();
                         let handle = tokio::spawn(async move {
-                            if let Err(e) = import::run(mid, uid, tx_clone).await {
-                                error!(error = %e, "claude history import failed");
-                            }
+                            run_history_import(mid, uid, tx_clone, selected_kinds).await;
                         });
                         // FSM only allows NotStarted→Requested once, so any
                         // pre-existing handle here is a leftover from a
@@ -1088,31 +1514,7 @@ async fn main() {
                 }
             }
             Some(resp) = response_rx.recv() => {
-                match resp {
-                    AgentResponse::Line { topic, content } => {
-                        send_agent_line(&write_tx, &mirror, &topic, content).await;
-                    }
-                    AgentResponse::ContextTokens { topic, tokens } => {
-                        let _ = write_tx
-                            .send(WriteEvent::ContextTokens { chat_id: topic, tokens })
-                            .await;
-                    }
-                    AgentResponse::CompactBoundary { topic, post_tokens } => {
-                        let _ = write_tx
-                            .send(WriteEvent::CompactBoundary { chat_id: topic, post_tokens })
-                            .await;
-                    }
-                    AgentResponse::Done { topic, has_result } => {
-                        info!(topic = %topic, has_result, "agent done");
-                        if !has_result {
-                            send_agent_line(&write_tx, &mirror, &topic, INTERRUPTED_RESULT.to_string()).await;
-                        }
-                        let _ = write_tx
-                            .send(WriteEvent::chat_running(topic.clone(), false))
-                            .await;
-                        supervisor.remove(&topic);
-                    }
-                }
+                handle_agent_response(resp, &mut mirror, &write_tx, &mut supervisor).await;
             }
         }
 
@@ -1146,4 +1548,828 @@ async fn main() {
     }
 
     info!("zucchini-spawner exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::SpawnFn;
+    use crate::powersync::SyncEvent;
+    use crate::writer::WriteEvent;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use serde_json::json;
+    use std::sync::Mutex as StdMutex;
+
+    /// Sync → spawn pipeline: a `projects` PUT + `chats` PUT + user `messages`
+    /// PUT must converge into one `Supervisor::spawn_agent` call carrying the
+    /// expected `SpawnRequest` (chat id, decrypted prompt, project path,
+    /// claude adapter kind, owner = not sandboxed).
+    #[tokio::test]
+    async fn user_message_through_handle_sync_event_spawns_one_agent() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let chat_id = Uuid::now_v7().to_string();
+        let project_id = Uuid::now_v7().to_string();
+        let project_path = "/tmp/zucchini-test-project".to_string();
+        let msg_id = Uuid::now_v7().to_string();
+
+        let mut mirror = Mirror::default();
+        // Owner classification → is_sandboxed=false branch (skips the
+        // machine_users membership gate).
+        mirror.set_user_id(user_id);
+
+        // KeyStore seeded with a deterministic key; envelope::encode signs
+        // against this so the message decodes cleanly inside handle_message_put.
+        let key_bytes = [0u8; 32];
+        let keys = KeyStore::with_keys([(user_id, key_bytes)]);
+        let key = keys.get(&user_id).expect("seeded key");
+
+        // BlobDownloader is constructed but never reached — the test message
+        // has zero attachments so `fetch_all` returns Ok(vec![]) without any
+        // network IO. Token fetcher is a panicking stub for the same reason.
+        let blobs = BlobDownloader::new(
+            "http://test.invalid",
+            Box::new(|| Box::pin(async { Err(anyhow::anyhow!("unused in test")) })),
+        );
+
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+
+        // Recorder spawn fn: captures the SpawnRequest and returns a dummy
+        // JoinHandle (no shell, no Command::spawn).
+        let recorded: Arc<StdMutex<Vec<SpawnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorder = recorded.clone();
+        let spawn_fn: SpawnFn = Arc::new(move |req, _tx, _token| {
+            recorder.lock().unwrap().push(req);
+            tokio::spawn(async {})
+        });
+        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+
+        // Seeding-guard flag the test reuses across calls (the original
+        // single-spawn flow doesn't trigger seeding because mirror.user_id
+        // is set but no `machine_users` PUT is fed; flag stays `false`).
+        let mut seed_attempted = false;
+
+        // 1. Project PUT — populates mirror.projects so handle_message_put
+        // can resolve project_path from project_id.
+        let project_row =
+            json!({ "id": project_id, "path": project_path, "name": "test-proj" }).to_string();
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "projects".into(),
+                id: project_id.clone(),
+                data: project_row,
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+
+        // 2. Chat PUT — populates mirror.chats. last_seq=0 so seq=1 passes
+        // the replay guard. agent_session_id=null → SpawnRequest carries None.
+        let chat_row = json!({
+            "id": chat_id,
+            "project_id": project_id,
+            "user_id": user_id.to_string(),
+            "last_seq": 0,
+            "agent_session_id": serde_json::Value::Null,
+            "agent_kind": "claude",
+            "worktree": false,
+        })
+        .to_string();
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_id.clone(),
+                data: chat_row,
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+
+        // 3. Encrypt the prompt the way the iOS client would: envelope JSON
+        // (text + empty attachments) → XChaCha20 AEAD with K_user → base64.
+        let plaintext = "hello world from test";
+        let envelope_json = serde_json::json!({ "text": plaintext, "attachments": [] }).to_string();
+        let body_b64 = B64.encode(crypto::encrypt(&key, envelope_json.as_bytes()));
+
+        let msg_row = json!({
+            "id": msg_id,
+            "chat_id": chat_id,
+            "sender": "user",
+            "seq": 1,
+            "body": body_b64,
+            "imported": false,
+        })
+        .to_string();
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "messages".into(),
+                id: msg_id,
+                data: msg_row,
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+
+        // Assert: exactly one spawn captured with the expected SpawnRequest.
+        let captured = recorded.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "expected one spawn, got {}",
+            captured.len()
+        );
+        let req = &captured[0];
+        assert_eq!(req.chat_id, chat_id);
+        assert_eq!(req.agent_kind, AgentKind::Claude);
+        assert!(!req.is_sandboxed, "owner spawn must not be sandboxed");
+        assert_eq!(req.project_path.as_deref(), Some(project_path.as_str()));
+        assert!(req.agent_session_id.is_none(), "fresh chat → no resume");
+        assert!(!req.worktree);
+        // No attachments → prompt is the raw envelope text (see blobs::build_prompt).
+        assert_eq!(req.prompt, plaintext);
+
+        // The idle→running transition must have emitted exactly one
+        // ChatRunning(true) PATCH on the writer channel.
+        let mut saw_running_true = false;
+        while let Ok(ev) = write_rx.try_recv() {
+            if let WriteEvent::ChatRunning {
+                chat_id: cid,
+                agent_running: true,
+            } = ev
+            {
+                if cid == chat_id {
+                    saw_running_true = true;
+                }
+            }
+        }
+        assert!(
+            saw_running_true,
+            "expected one ChatRunning(true) on the writer channel"
+        );
+    }
+
+    /// `AgentResponse → WriteEvent` half of the agent pipeline: every variant
+    /// of `handle_agent_response` must produce the right `WriteEvent`s on
+    /// `write_tx`, and the `PutMessage` body must round-trip through
+    /// `writer::encode_event` → `envelope::decode` back to its plaintext under
+    /// the seeded `K_user`.
+    #[tokio::test]
+    async fn agent_responses_produce_correct_write_events_and_encrypt_body() {
+        let user_id = Uuid::now_v7();
+        let chat_id = Uuid::now_v7().to_string();
+        let project_id = Uuid::now_v7().to_string();
+
+        // Deterministic K_user — same value used to encrypt and decrypt below.
+        let key_bytes = [7u8; 32];
+        let keys = KeyStore::with_keys([(user_id, key_bytes)]);
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        // Seed mirror.{projects,chats} so send_agent_line can resolve user_id.
+        mirror.upsert_project(
+            project_id.clone(),
+            &json!({ "id": project_id, "path": "/tmp/zucchini-test", "name": "t" }).to_string(),
+        );
+        mirror.upsert_chat(
+            chat_id.clone(),
+            &json!({
+                "id": chat_id,
+                "project_id": project_id,
+                "user_id": user_id.to_string(),
+                "last_seq": 0,
+                "agent_session_id": serde_json::Value::Null,
+                "agent_kind": "claude",
+                "worktree": false,
+            })
+            .to_string(),
+        );
+
+        // Supervisor is only needed because the `Done` arm calls
+        // `supervisor.remove(&topic)`. The spawn closure is never invoked.
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let spawn_fn: SpawnFn = Arc::new(|_req, _tx, _token| tokio::spawn(async {}));
+        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(256);
+
+        // Helper: drain everything currently queued on the writer channel.
+        fn drain(rx: &mut mpsc::Receiver<WriteEvent>) -> Vec<WriteEvent> {
+            let mut out = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                out.push(ev);
+            }
+            out
+        }
+
+        // --- 1. Line → one PutMessage with sender=agent + plaintext intact.
+        let line_plaintext = "hello from agent";
+        handle_agent_response(
+            AgentResponse::Line {
+                topic: chat_id.clone(),
+                content: line_plaintext.to_string(),
+            },
+            &mut mirror,
+            &write_tx,
+            &mut supervisor,
+        )
+        .await;
+        let events = drain(&mut write_rx);
+        assert_eq!(events.len(), 1, "Line → one WriteEvent");
+        let put = match &events[0] {
+            WriteEvent::PutMessage {
+                id,
+                chat_id: cid,
+                user_id: uid,
+                sender,
+                content,
+                created_at,
+                imported,
+            } => {
+                assert!(id.is_none(), "live agent line carries no pre-minted id");
+                assert_eq!(cid, &chat_id);
+                assert_eq!(uid, &user_id);
+                assert_eq!(*sender, "agent");
+                assert_eq!(content, line_plaintext);
+                assert!(created_at.is_none(), "live agent line: server stamps now()");
+                assert!(!*imported, "live writes are never imported=true");
+                events[0].clone()
+            }
+            other => panic!("expected PutMessage, got {:?}", other),
+        };
+
+        // --- 2. Round-trip the encryption through writer::encode_event.
+        let op = writer::encode_event(&put, &keys).expect("encode_event returns BatchOp");
+        assert_eq!(op.op, "PUT");
+        assert_eq!(op.table, "messages");
+        let data = op.data.as_ref().expect("PutMessage carries data");
+        let body_b64 = data
+            .get("body")
+            .and_then(|v| v.as_str())
+            .expect("data.body is a base64 string");
+        let key = keys.get(&user_id).expect("seeded key resolves");
+        // writer.rs::encode_event encrypts the raw `content` string (no
+        // envelope wrap on the writer side — the iOS client wraps on incoming
+        // user messages; agent-side outgoing messages are written raw).
+        let cipher_bytes = B64.decode(body_b64).expect("body is base64");
+        let plaintext_bytes =
+            crypto::decrypt_bytes(&key, &cipher_bytes).expect("body decrypts under K_user");
+        let plaintext =
+            String::from_utf8(plaintext_bytes).expect("agent line is UTF-8 plaintext");
+        assert_eq!(plaintext, line_plaintext);
+
+        // --- 3. ContextTokens → ContextTokens passthrough.
+        handle_agent_response(
+            AgentResponse::ContextTokens {
+                topic: chat_id.clone(),
+                tokens: 12345,
+            },
+            &mut mirror,
+            &write_tx,
+            &mut supervisor,
+        )
+        .await;
+        let events = drain(&mut write_rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WriteEvent::ContextTokens { chat_id: cid, tokens } => {
+                assert_eq!(cid, &chat_id);
+                assert_eq!(*tokens, 12345);
+            }
+            other => panic!("expected ContextTokens, got {:?}", other),
+        }
+
+        // --- 4. SessionIdHarvested: local stash THEN the write event.
+        handle_agent_response(
+            AgentResponse::SessionIdHarvested {
+                topic: chat_id.clone(),
+                session_id: "sess-abc".into(),
+            },
+            &mut mirror,
+            &write_tx,
+            &mut supervisor,
+        )
+        .await;
+        assert_eq!(
+            mirror
+                .chats
+                .get(&chat_id)
+                .and_then(|c| c.agent_session_id.clone())
+                .as_deref(),
+            Some("sess-abc"),
+            "session id must be stashed locally before the writer round-trip"
+        );
+        let events = drain(&mut write_rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WriteEvent::AgentSessionId { chat_id: cid, session_id } => {
+                assert_eq!(cid, &chat_id);
+                assert_eq!(session_id, "sess-abc");
+            }
+            other => panic!("expected AgentSessionId, got {:?}", other),
+        }
+
+        // --- 5. Done{has_result=false}: synthesize INTERRUPTED_RESULT line,
+        // then flip agent_running=false. Supervisor slot is gone.
+        // Pre-register a fake handle so we can observe `supervisor.remove`.
+        supervisor.spawn_agent(SpawnRequest {
+            chat_id: chat_id.clone(),
+            prompt: String::new(),
+            project_path: None,
+            worktree: false,
+            agent_session_id: None,
+            agent_kind: AgentKind::Claude,
+            is_sandboxed: false,
+            model: None,
+        });
+        assert!(
+            supervisor.is_running(&chat_id),
+            "sanity: spawn_agent inserted the topic"
+        );
+        handle_agent_response(
+            AgentResponse::Done {
+                topic: chat_id.clone(),
+                has_result: false,
+            },
+            &mut mirror,
+            &write_tx,
+            &mut supervisor,
+        )
+        .await;
+        let events = drain(&mut write_rx);
+        assert_eq!(events.len(), 2, "INTERRUPTED line + ChatRunning(false)");
+        match &events[0] {
+            WriteEvent::PutMessage { content, sender, chat_id: cid, .. } => {
+                assert_eq!(*sender, "agent");
+                assert_eq!(cid, &chat_id);
+                assert_eq!(content, INTERRUPTED_RESULT);
+            }
+            other => panic!("expected synthesized INTERRUPTED PutMessage, got {:?}", other),
+        }
+        match &events[1] {
+            WriteEvent::ChatRunning { chat_id: cid, agent_running: false } => {
+                assert_eq!(cid, &chat_id);
+            }
+            other => panic!("expected ChatRunning(false), got {:?}", other),
+        }
+        assert!(
+            !supervisor.is_running(&chat_id),
+            "Done arm must remove the topic from supervisor"
+        );
+
+        // --- 6. Done{has_result=true}: just the ChatRunning(false), no synthesized line.
+        handle_agent_response(
+            AgentResponse::Done {
+                topic: chat_id.clone(),
+                has_result: true,
+            },
+            &mut mirror,
+            &write_tx,
+            &mut supervisor,
+        )
+        .await;
+        let events = drain(&mut write_rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WriteEvent::ChatRunning { chat_id: cid, agent_running: false } => {
+                assert_eq!(cid, &chat_id);
+            }
+            other => panic!("expected ChatRunning(false), got {:?}", other),
+        }
+    }
+
+    // ===== machine_users.agents seeding (migration 0035) =====
+    //
+    // These tests exercise the seeding decision in `handle_sync_event`'s
+    // `machine_users` arm via `seed_default_agents_if_needed`. The contract:
+    //   - NULL `agents` + ≥1 CLI installed + owner row → emit one PATCH
+    //     carrying a valid JSON array with one entry per installed kind
+    //     (claude first, then cursor; ids are uuid-v7 strings).
+    //   - Non-NULL `agents` (including `"[]"`) → no PATCH (user-emptied is
+    //     distinct from spawner-not-seeded-yet).
+    //   - Re-emission of the same row within process lifetime → no PATCH
+    //     (in-memory `agents_seed_attempted` flag).
+
+    /// Helper: build the bare-bones args set `handle_sync_event` needs that
+    /// the agents-seeding tests reuse — keeps each test focused on the
+    /// scenario, not the boilerplate.
+    fn empty_blob_downloader() -> BlobDownloader {
+        BlobDownloader::new(
+            "http://test.invalid",
+            Box::new(|| Box::pin(async { Err(anyhow::anyhow!("unused in test")) })),
+        )
+    }
+
+    #[tokio::test]
+    async fn machine_users_null_agents_with_claude_installed_seeds_defaults() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let row_id = Uuid::now_v7();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id); // owner classification
+        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
+        let blobs = empty_blob_downloader();
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let spawn_fn: crate::agent::SpawnFn =
+            Arc::new(|_req, _tx, _token| tokio::spawn(async {}));
+        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+
+        // Claude installed + authenticated; cursor not installed.
+        let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
+            (AgentKind::Claude, (true, true)),
+            (AgentKind::Cursor, (false, false)),
+        ];
+        let mut seed_attempted = false;
+
+        // `machine_users` PUT with `agents = null` (the missing-key shape
+        // is treated identically; we use explicit null here to mirror the
+        // wire shape when iOS deliberately clears the column).
+        let mu_row = json!({
+            "id": row_id.to_string(),
+            "user_id": user_id.to_string(),
+            "machine_id": machine_id.to_string(),
+            "is_sandboxed": 0,
+            "sealed_blob": serde_json::Value::Null,
+            "agents": serde_json::Value::Null,
+        })
+        .to_string();
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "machine_users".into(),
+                id: row_id.to_string(),
+                data: mu_row,
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            Some(&probe_statuses),
+            &mut seed_attempted,
+        )
+        .await;
+
+        // Exactly one SetMachineUserAgents PATCH on the writer channel.
+        let mut patches: Vec<WriteEvent> = Vec::new();
+        while let Ok(ev) = write_rx.try_recv() {
+            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
+                patches.push(ev);
+            }
+        }
+        assert_eq!(patches.len(), 1, "expected one seed PATCH, got {}", patches.len());
+        let WriteEvent::SetMachineUserAgents {
+            row_id: emitted_row,
+            machine_id: emitted_machine,
+            agents_json,
+        } = &patches[0]
+        else {
+            panic!("variant mismatch")
+        };
+        assert_eq!(*emitted_row, row_id);
+        assert_eq!(*emitted_machine, machine_id);
+        // Decode + shape-check: one claude entry, model+name empty, id parses as UUID.
+        let parsed: serde_json::Value =
+            serde_json::from_str(agents_json).expect("agents_json is JSON");
+        let arr = parsed.as_array().expect("agents is array");
+        assert_eq!(arr.len(), 1, "claude installed only → one entry");
+        let entry = &arr[0];
+        assert_eq!(entry["agent_kind"], "claude");
+        assert_eq!(entry["model"], "");
+        assert_eq!(entry["name"], "");
+        let id_str = entry["id"].as_str().expect("id is string");
+        Uuid::parse_str(id_str).expect("id is uuid");
+
+        // Seeding flag flipped → second feed of the same row is a no-op.
+        assert!(seed_attempted, "seed flag must flip after one PATCH");
+    }
+
+    #[tokio::test]
+    async fn machine_users_null_agents_with_both_installed_seeds_two_entries_claude_first() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let row_id = Uuid::now_v7();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
+        let blobs = empty_blob_downloader();
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let spawn_fn: crate::agent::SpawnFn =
+            Arc::new(|_req, _tx, _token| tokio::spawn(async {}));
+        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+
+        let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
+            (AgentKind::Claude, (true, true)),
+            (AgentKind::Cursor, (true, true)),
+        ];
+        let mut seed_attempted = false;
+
+        let mu_row = json!({
+            "id": row_id.to_string(),
+            "user_id": user_id.to_string(),
+            "machine_id": machine_id.to_string(),
+            "is_sandboxed": 0,
+            "agents": serde_json::Value::Null,
+        })
+        .to_string();
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "machine_users".into(),
+                id: row_id.to_string(),
+                data: mu_row,
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            Some(&probe_statuses),
+            &mut seed_attempted,
+        )
+        .await;
+
+        let ev = write_rx
+            .try_recv()
+            .expect("expected one writer event for the seed PATCH");
+        let WriteEvent::SetMachineUserAgents { agents_json, .. } = ev else {
+            panic!("expected SetMachineUserAgents")
+        };
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&agents_json).unwrap();
+        assert_eq!(arr.len(), 2, "claude + cursor → two entries");
+        // Deterministic order: claude first, then cursor. Matches the task
+        // spec so iOS sees a stable agent-picker ordering across builds.
+        assert_eq!(arr[0]["agent_kind"], "claude");
+        assert_eq!(arr[1]["agent_kind"], "cursor");
+    }
+
+    #[tokio::test]
+    async fn machine_users_non_null_agents_does_not_seed() {
+        // `agents = "[]"` is the explicit "user emptied the list" state —
+        // the spawner MUST NOT re-seed over it. Same for any non-empty array.
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let row_id = Uuid::now_v7();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
+        let blobs = empty_blob_downloader();
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let spawn_fn: crate::agent::SpawnFn =
+            Arc::new(|_req, _tx, _token| tokio::spawn(async {}));
+        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+
+        let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
+            (AgentKind::Claude, (true, true)),
+            (AgentKind::Cursor, (true, true)),
+        ];
+        let mut seed_attempted = false;
+
+        let mu_row = json!({
+            "id": row_id.to_string(),
+            "user_id": user_id.to_string(),
+            "machine_id": machine_id.to_string(),
+            "is_sandboxed": 0,
+            "agents": "[]",
+        })
+        .to_string();
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "machine_users".into(),
+                id: row_id.to_string(),
+                data: mu_row,
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            Some(&probe_statuses),
+            &mut seed_attempted,
+        )
+        .await;
+
+        // No SetMachineUserAgents PATCH on the channel.
+        let mut saw_seed_patch = false;
+        while let Ok(ev) = write_rx.try_recv() {
+            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
+                saw_seed_patch = true;
+            }
+        }
+        assert!(
+            !saw_seed_patch,
+            "non-NULL agents (including empty array) must not trigger seeding"
+        );
+        assert!(!seed_attempted, "non-NULL path must not flip the seed flag");
+    }
+
+    /// `chats.model` flows from the row → ChatState → SpawnRequest.model.
+    /// Empty / NULL both collapse to `None`; non-empty is preserved verbatim
+    /// (the adapter is responsible for `--model <X>` shell-escaping).
+    #[tokio::test]
+    async fn chat_model_threads_into_spawn_request() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let project_id = Uuid::now_v7().to_string();
+        let project_path = "/tmp/zucchini-test-project".to_string();
+
+        // Two chats: one with `model="opus"`, one with `model=""` (empty
+        // sentinel → None). Each gets its own user message + spawn capture
+        // so we can compare the resulting SpawnRequest.model fields side by side.
+        let chat_with = Uuid::now_v7().to_string();
+        let chat_empty = Uuid::now_v7().to_string();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
+        let key = keys.get(&user_id).expect("seeded key");
+        let blobs = empty_blob_downloader();
+        let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+
+        let recorded: Arc<StdMutex<Vec<SpawnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorder = recorded.clone();
+        let spawn_fn: crate::agent::SpawnFn = Arc::new(move |req, _tx, _token| {
+            recorder.lock().unwrap().push(req);
+            tokio::spawn(async {})
+        });
+        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+
+        let mut seed_attempted = true; // skip seeding path in this test
+
+        // Project PUT.
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "projects".into(),
+                id: project_id.clone(),
+                data: json!({ "id": project_id, "path": project_path, "name": "t" }).to_string(),
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+
+        // Chat A: model="opus".
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_with.clone(),
+                data: json!({
+                    "id": chat_with,
+                    "project_id": project_id,
+                    "user_id": user_id.to_string(),
+                    "last_seq": 0,
+                    "agent_session_id": serde_json::Value::Null,
+                    "agent_kind": "claude",
+                    "worktree": false,
+                    "model": "opus",
+                })
+                .to_string(),
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+
+        // Chat B: model="" (empty sentinel → None).
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_empty.clone(),
+                data: json!({
+                    "id": chat_empty,
+                    "project_id": project_id,
+                    "user_id": user_id.to_string(),
+                    "last_seq": 0,
+                    "agent_session_id": serde_json::Value::Null,
+                    "agent_kind": "claude",
+                    "worktree": false,
+                    "model": "",
+                })
+                .to_string(),
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+
+        // Feed a user message to each chat.
+        for (cid, label) in [(chat_with.clone(), "with"), (chat_empty.clone(), "empty")] {
+            let envelope_json =
+                serde_json::json!({ "text": format!("hi {label}"), "attachments": [] })
+                    .to_string();
+            let body_b64 = B64.encode(crypto::encrypt(&key, envelope_json.as_bytes()));
+            let msg_id = Uuid::now_v7().to_string();
+            handle_sync_event(
+                SyncEvent::Put {
+                    table: "messages".into(),
+                    id: msg_id.clone(),
+                    data: json!({
+                        "id": msg_id,
+                        "chat_id": cid,
+                        "sender": "user",
+                        "seq": 1,
+                        "body": body_b64,
+                        "imported": false,
+                    })
+                    .to_string(),
+                },
+                Some(machine_id),
+                &mut mirror,
+                &mut supervisor,
+                &blobs,
+                &keys,
+                None,
+                None,
+                &write_tx,
+                None,
+                &mut seed_attempted,
+            )
+            .await;
+        }
+
+        let captured = recorded.lock().unwrap();
+        assert_eq!(captured.len(), 2, "two chats → two spawns");
+        let with_spawn = captured
+            .iter()
+            .find(|r| r.chat_id == chat_with)
+            .expect("chat A spawn captured");
+        let empty_spawn = captured
+            .iter()
+            .find(|r| r.chat_id == chat_empty)
+            .expect("chat B spawn captured");
+        assert_eq!(
+            with_spawn.model.as_deref(),
+            Some("opus"),
+            "non-empty model passes through verbatim"
+        );
+        assert!(
+            empty_spawn.model.is_none(),
+            "empty model collapses to None at the SpawnRequest construction site"
+        );
+    }
 }

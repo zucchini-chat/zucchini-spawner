@@ -82,18 +82,16 @@ impl BlobDownloader {
                 if !path.exists() {
                     self.download_one(&att.blob_key, &path, key).await?;
                 }
-                Ok::<_, anyhow::Error>(DownloadedAttachment { path, name: att.name.clone() })
+                Ok::<_, anyhow::Error>(DownloadedAttachment {
+                    path,
+                    name: att.name.clone(),
+                })
             }
         }))
         .await
     }
 
-    async fn download_one(
-        &self,
-        blob_key: &Uuid,
-        dest: &Path,
-        key: &KUser,
-    ) -> Result<()> {
+    async fn download_one(&self, blob_key: &Uuid, dest: &Path, key: &KUser) -> Result<()> {
         let token = (self.fetch_token)().await?;
         let resp = self
             .http

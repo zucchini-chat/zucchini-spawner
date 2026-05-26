@@ -56,9 +56,7 @@ mod macos {
     use std::sync::{Arc, OnceLock};
 
     use core_foundation_sys::base::CFRelease;
-    use core_foundation_sys::runloop::{
-        kCFRunLoopDefaultMode, CFRunLoopGetCurrent, CFRunLoopRun,
-    };
+    use core_foundation_sys::runloop::{kCFRunLoopDefaultMode, CFRunLoopGetCurrent, CFRunLoopRun};
     use core_foundation_sys::string::{
         kCFStringEncodingUTF8, CFStringCreateWithCString, CFStringRef,
     };
@@ -194,12 +192,14 @@ mod macos {
                     let r = unsafe { IOPMConnectionCreate(cf_name, interest, &mut conn) };
                     unsafe { CFRelease(cf_name as *const c_void) };
                     if r != KERN_SUCCESS || conn.is_null() {
-                        return Err(SetupErr { conn: None, step: "IOPMConnectionCreate", code: r });
+                        return Err(SetupErr {
+                            conn: None,
+                            step: "IOPMConnectionCreate",
+                            code: r,
+                        });
                     }
 
-                    let r = unsafe {
-                        IOPMConnectionSetNotification(conn, ctx_ptr, power_callback)
-                    };
+                    let r = unsafe { IOPMConnectionSetNotification(conn, ctx_ptr, power_callback) };
                     if r != KERN_SUCCESS {
                         return Err(SetupErr {
                             conn: Some(conn),
@@ -236,7 +236,11 @@ mod macos {
                         if let Some(c) = e.conn {
                             unsafe { IOPMConnectionRelease(c) };
                         }
-                        error!(step = e.step, code = e.code, "power watcher setup failed; disabled");
+                        error!(
+                            step = e.step,
+                            code = e.code,
+                            "power watcher setup failed; disabled"
+                        );
                     }
                 }
             });

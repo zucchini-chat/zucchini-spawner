@@ -86,9 +86,15 @@ pub fn start(config: SyncConfig) -> mpsc::Receiver<SyncEvent> {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum SyncFrame {
-    Checkpoint { checkpoint: Checkpoint },
-    CheckpointDiff { checkpoint_diff: CheckpointDiff },
-    Data { data: DataFrame },
+    Checkpoint {
+        checkpoint: Checkpoint,
+    },
+    CheckpointDiff {
+        checkpoint_diff: CheckpointDiff,
+    },
+    Data {
+        data: DataFrame,
+    },
     CheckpointComplete {
         #[serde(rename = "checkpoint_complete")]
         _checkpoint_complete: serde::de::IgnoredAny,
@@ -259,7 +265,9 @@ async fn connect_and_stream(
         anyhow::bail!("sync stream HTTP {}: {}", status, text);
     }
 
-    let byte_stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+    let byte_stream = resp
+        .bytes_stream()
+        .map(|r| r.map_err(std::io::Error::other));
     let reader = StreamReader::new(byte_stream);
     let mut lines = tokio::io::BufReader::new(reader).lines();
 
@@ -292,8 +300,12 @@ async fn connect_and_stream(
 
         match frame {
             SyncFrame::Checkpoint { checkpoint } => {
-                let keep: std::collections::HashSet<_> =
-                    checkpoint.buckets.iter().map(|b| &b.bucket).cloned().collect();
+                let keep: std::collections::HashSet<_> = checkpoint
+                    .buckets
+                    .iter()
+                    .map(|b| &b.bucket)
+                    .cloned()
+                    .collect();
                 buckets.retain(|name, _| keep.contains(name));
                 for b in checkpoint.buckets {
                     buckets.entry(b.bucket).or_insert_with(|| "0".to_string());
@@ -315,7 +327,11 @@ async fn connect_and_stream(
                                 (entry.object_type, entry.object_id, entry.data)
                             {
                                 if tx
-                                    .send(SyncEvent::Put { table, id, data: row })
+                                    .send(SyncEvent::Put {
+                                        table,
+                                        id,
+                                        data: row,
+                                    })
                                     .await
                                     .is_err()
                                 {
@@ -340,7 +356,9 @@ async fn connect_and_stream(
             }
             SyncFrame::CheckpointComplete { .. } => {
                 if tx
-                    .send(SyncEvent::CheckpointComplete { buckets: buckets.clone() })
+                    .send(SyncEvent::CheckpointComplete {
+                        buckets: buckets.clone(),
+                    })
                     .await
                     .is_err()
                 {

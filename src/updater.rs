@@ -120,8 +120,8 @@ pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
         warn!("xattr clear failed: {e}");
     }
 
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("cannot find current exe: {e}"))?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("cannot find current exe: {e}"))?;
 
     let status = tokio::process::Command::new("mv")
         .args(["-f", tmp_path, current_exe.to_str().unwrap()])

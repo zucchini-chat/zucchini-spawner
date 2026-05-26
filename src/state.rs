@@ -7,8 +7,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
+
+use crate::adapter::AgentKind;
 
 pub struct ChatState {
     pub user_id: Uuid,
@@ -18,6 +20,22 @@ pub struct ChatState {
     /// this chat. Used to skip replayed historical user messages — see
     /// `handle_message_put` in main.rs.
     pub last_seq: i64,
+    /// `chats.agent_session_id` from Postgres. `None` on the first turn of a
+    /// freshly created chat; populated on the first stdout frame from the
+    /// agent (harvested from its `system/init` frame) or backfilled from
+    /// `id::text` for pre-migration rows. When `Some(s)`, the spawner resumes
+    /// via `--resume s`; when `None`, the agent generates a fresh session id.
+    pub agent_session_id: Option<String>,
+    /// `chats.agent_kind` from Postgres. Defaults to `AgentKind::Claude`
+    /// when the column is absent (chats synced before the column was
+    /// added) — forward-compat fallback matches the Postgres DEFAULT.
+    pub agent_kind: AgentKind,
+    /// `chats.model` from Postgres (migration 0035). Verbatim `--model <X>`
+    /// pass-through; the empty-string / NULL → `None` filter lives at the
+    /// `SpawnRequest` construction site in `main.rs` (so adapter logic can
+    /// stay `if let Some(m) = ctx.model { ... }`). Column absent → `None`,
+    /// same as NULL.
+    pub model: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -37,6 +55,14 @@ pub struct Mirror {
     /// (heartbeat-driven, ~every 10s) from re-firing the importer.
     #[serde(skip)]
     pub claude_history_import_status: Option<String>,
+    /// CSV of `AgentKind` wire names the user selected via the iOS import
+    /// modal's checkboxes (e.g. "claude" / "cursor" / "claude,cursor").
+    /// `None` means the column is absent or NULL — older iOS without the
+    /// checkbox UI, or an older backend without migration 0034. The
+    /// dispatcher in main.rs falls back to `AgentKind::ALL` in that case so
+    /// the historic both-kinds behavior is preserved.
+    #[serde(skip)]
+    pub claude_history_import_kinds: Option<String>,
     #[serde(default)]
     pub spawner_pubkey: Option<String>,
     /// Persisted so `member_is_sandboxed` doesn't fail open after a restart
@@ -61,6 +87,17 @@ struct MemberInfo {
     /// tick). `None` until the first sealed_blob lands.
     #[serde(default)]
     last_sealed_blob: Option<String>,
+    /// Mirror of `machine_users.agents` (migration 0035) as the raw JSON
+    /// string the column stores. `Some(s)` for any non-NULL value (`s` may
+    /// be the literal `"[]"` if the user emptied the list — distinct from
+    /// `None`, which means the column is NULL and the spawner should seed
+    /// defaults on its own row). Only consulted for the spawner's own row;
+    /// other members' agents lists never reach the spawner via the
+    /// `by_machine` projection. Not persisted to state.json — the column is
+    /// re-streamed on every boot, and persisting it would risk drift if a
+    /// peer iOS write landed while the spawner was offline.
+    #[serde(skip)]
+    agents: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -69,7 +106,9 @@ fn default_true() -> bool {
 
 impl Mirror {
     pub fn upsert_chat(&mut self, id: String, row_json: &str) {
-        let Some(v) = parse_row_json(row_json, "chat", &id) else { return };
+        let Some(v) = parse_row_json(row_json, "chat", &id) else {
+            return;
+        };
         let Some(project_id) = v.get("project_id").and_then(|p| p.as_str()) else {
             warn!(chat_id = %id, "chat row missing project_id");
             return;
@@ -83,6 +122,75 @@ impl Mirror {
 
         let last_seq = v.get("last_seq").and_then(crate::json_to_i64).unwrap_or(0);
 
+        let incoming_agent_session_id = v
+            .get("agent_session_id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+
+        // Strict parse when the column is present. Pre-migration rows
+        // synced before the `agent_kind` column existed have no such
+        // field — fall through to `AgentKind::Claude` (matches the
+        // Postgres DEFAULT). A present-but-unrecognized value (e.g. `"codex"` from
+        // the backend whitelist before its adapter ships) escalates to an
+        // `error!` so it lands in Sentry — without an adapter the chat is
+        // dead (subsequent message handlers checking `mirror.chats.get(...)`
+        // log-and-bail on the missing chat row, leaving the iOS UI stuck
+        // showing `agent_running=true` with no reply). Visibility here is
+        // the only signal that the backend whitelist has drifted ahead of
+        // the spawner's adapter set; the real fix is either tightening the
+        // whitelist in `backend/src/writes.rs::validate_agent_kind` or
+        // shipping the missing adapter.
+        let agent_kind = match v.get("agent_kind").and_then(|x| x.as_str()) {
+            None => AgentKind::Claude,
+            Some(raw) => match AgentKind::parse(raw) {
+                Some(k) => k,
+                None => {
+                    error!(
+                        chat_id = %id,
+                        agent_kind = %raw,
+                        "unsupported agent_kind: backend whitelist accepted a value this spawner has no adapter for; chat will hang with no reply until a supported PUT lands or this spawner upgrades"
+                    );
+                    return;
+                }
+            },
+        };
+
+        // Merge-on-upsert for `agent_session_id`: when the incoming row
+        // carries `NULL` but we already harvested a session id locally,
+        // keep the local value. The race we're guarding against: the
+        // writer queues a PATCH for `agent_session_id` after harvesting
+        // it from the agent's first stdout frame, but before that PATCH
+        // lands in Postgres the writer may also flush an unrelated
+        // PATCH on the same chat row (e.g. `last_message_at`,
+        // `agent_running`, `context_tokens`). PowerSync re-streams the
+        // chat row on each PATCH; the early re-stream still has
+        // `agent_session_id=NULL`, and a naive overwrite here would wipe
+        // the harvested id — a fast-followup user message would then
+        // spawn the agent without `--resume`, dropping prior context.
+        //
+        // Safe against the row-was-actually-reset case: the importer
+        // takeover path in `backend/src/writes.rs` DELETEs the foreign
+        // chat row before re-inserting, and the DELETE op clears
+        // `mirror.chats` (see `remove_chat` callsite in main.rs), so the
+        // subsequent PUT lands with no in-memory state to merge against.
+        let merged_agent_session_id = match (
+            incoming_agent_session_id,
+            self.chats.get(&id).and_then(|c| c.agent_session_id.clone()),
+        ) {
+            (None, Some(local)) => Some(local),
+            (incoming, _) => incoming,
+        };
+
+        // `chats.model` is migration 0035. Pre-migration rows omit the column
+        // entirely; an empty string also lands as `None` so the
+        // `SpawnRequest` construction site has a single shape to handle
+        // (NULL and "" are indistinguishable on the wire for our purposes).
+        let model = v
+            .get("model")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
         self.chats.insert(
             id,
             ChatState {
@@ -90,8 +198,23 @@ impl Mirror {
                 project_id: project_id.to_string(),
                 worktree,
                 last_seq,
+                agent_session_id: merged_agent_session_id,
+                agent_kind,
+                model,
             },
         );
+    }
+
+    /// Stash the harvested session id locally so a fast-followup user message
+    /// in the same chat doesn't race the writer/PowerSync round-trip and
+    /// re-spawn the agent without `--resume`. Idempotent on subsequent harvests
+    /// (keeps the first id).
+    pub fn set_agent_session_id(&mut self, chat_id: &str, session_id: String) {
+        if let Some(c) = self.chats.get_mut(chat_id) {
+            if c.agent_session_id.is_none() {
+                c.agent_session_id = Some(session_id);
+            }
+        }
     }
 
     /// Returns true iff the stored `user_id` materially changed (None→Some, or
@@ -147,6 +270,52 @@ impl Mirror {
         true
     }
 
+    /// Stash the latest `claude_history_import_kinds` CSV streamed from the
+    /// `machines` row. No change-detection — the dispatcher reads this
+    /// directly when `ImportRequested` fires; mid-import column changes don't
+    /// retro-affect the in-flight run.
+    pub fn set_import_kinds(&mut self, kinds: Option<&str>) {
+        self.claude_history_import_kinds = kinds.map(str::to_string);
+    }
+
+    /// Parse `claude_history_import_kinds` into the closed adapter set the
+    /// dispatcher iterates. `None` (column absent / NULL — older iOS without
+    /// the checkbox UI) falls back to `AgentKind::ALL` so the historic
+    /// both-kinds behavior is preserved. Unknown / unparseable entries are
+    /// dropped with a warn so a forwards-compat backend whitelist drift
+    /// can't break the importer; if every entry is dropped we also fall
+    /// back to `ALL` so the user still gets something.
+    pub fn parsed_import_kinds(&self) -> Vec<AgentKind> {
+        let Some(csv) = self.claude_history_import_kinds.as_deref() else {
+            return AgentKind::ALL.to_vec();
+        };
+        let mut out: Vec<AgentKind> = Vec::new();
+        for part in csv.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match AgentKind::parse(part) {
+                Some(k) => {
+                    if !out.contains(&k) {
+                        out.push(k);
+                    }
+                }
+                None => {
+                    warn!(kind = %part, "unknown agent kind in claude_history_import_kinds, dropping");
+                }
+            }
+        }
+        if out.is_empty() {
+            warn!(
+                csv,
+                "claude_history_import_kinds had no known kinds; falling back to all"
+            );
+            return AgentKind::ALL.to_vec();
+        }
+        out
+    }
+
     /// Membership rows fan out on every heartbeat tick, so most calls are
     /// no-ops on an existing entry. Returns true iff the entry was inserted
     /// or its row_id/is_sandboxed materially changed.
@@ -164,9 +333,38 @@ impl Mirror {
         }
         self.members.insert(
             user_id,
-            MemberInfo { row_id, is_sandboxed, last_sealed_blob: None },
+            MemberInfo {
+                row_id,
+                is_sandboxed,
+                last_sealed_blob: None,
+                agents: None,
+            },
         );
         true
+    }
+
+    /// Stash the raw `machine_users.agents` JSON string (migration 0035) for
+    /// the given user. The spawner only reads this for its own row (owner
+    /// case) to decide whether to seed defaults — see
+    /// `seed_default_agents_if_needed` in main.rs. Pass `None` to clear
+    /// (column was streamed as NULL); pass `Some("[]")` to record the
+    /// user-emptied case (distinct from NULL — do NOT re-seed). No-op when
+    /// the member entry doesn't exist yet (the row_id must land first via
+    /// `upsert_member`).
+    pub fn set_member_agents(&mut self, user_id: &Uuid, agents_json: Option<String>) {
+        if let Some(info) = self.members.get_mut(user_id) {
+            info.agents = agents_json;
+        }
+    }
+
+    /// Read back the cached `agents` JSON string for `user_id`. `None` here
+    /// means EITHER the member entry is missing OR the column is NULL —
+    /// callers that need to distinguish should check `has_member` first.
+    /// For the seeding decision in main.rs, both cases mean "don't seed
+    /// yet" (no member → row hasn't arrived; NULL → seed pass) so the
+    /// caller can fold them together.
+    pub fn member_agents(&self, user_id: &Uuid) -> Option<&str> {
+        self.members.get(user_id).and_then(|m| m.agents.as_deref())
     }
 
     /// True if we've already unsealed this exact sealed_blob for this user.
@@ -231,7 +429,9 @@ impl Mirror {
     }
 
     pub fn upsert_project(&mut self, id: String, row_json: &str) {
-        let Some(v) = parse_row_json(row_json, "project", &id) else { return };
+        let Some(v) = parse_row_json(row_json, "project", &id) else {
+            return;
+        };
         let Some(path) = v.get("path").and_then(|f| f.as_str()) else {
             warn!(project_id = %id, "project row missing path");
             return;
@@ -270,7 +470,11 @@ impl Mirror {
     }
 }
 
-pub(crate) fn parse_row_json(row_json: &str, table: &'static str, id: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_row_json(
+    row_json: &str,
+    table: &'static str,
+    id: &str,
+) -> Option<serde_json::Value> {
     match serde_json::from_str(row_json) {
         Ok(v) => Some(v),
         Err(e) => {

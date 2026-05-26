@@ -64,7 +64,9 @@ pub fn atomic_write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
                     warn!(error = %e, parent = %parent.display(), "parent-dir fsync failed; durability not guaranteed");
                 }
             }
-            Err(e) => warn!(error = %e, parent = %parent.display(), "parent-dir open for fsync failed; durability not guaranteed"),
+            Err(e) => {
+                warn!(error = %e, parent = %parent.display(), "parent-dir open for fsync failed; durability not guaranteed")
+            }
         }
     }
 
