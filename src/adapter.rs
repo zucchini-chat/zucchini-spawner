@@ -248,6 +248,15 @@ pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Instruction telling the agent how to attach a local file to its next
+/// message via the `zucchini-spawner attach-file` CLI. Chat id + spawner
+/// binary path stay in env vars (`ZUCCHINI_CHAT_ID`, `ZUCCHINI_SPAWNER_BIN`)
+/// — never inlined — so the returned text is chat-agnostic and safe to cache
+/// across turns. Tool name is left unspecified ("run the command"): every
+/// coding agent has a shell-exec facility and picks it on its own.
+pub const ATTACH_FILE_INSTRUCTION: &str =
+    "To send a file to the user, run the command `\"$ZUCCHINI_SPAWNER_BIN\" attach-file --chat-id \"$ZUCCHINI_CHAT_ID\" <absolute-path>` before writing the message that should accompany the attachment.";
+
 #[cfg(test)]
 mod tests {
     use super::*;

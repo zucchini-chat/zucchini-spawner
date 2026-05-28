@@ -5,12 +5,21 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::adapter::AgentKind;
+
+/// Shared handle to `Mirror`. The control socket task (see `control.rs`) needs
+/// to read chat → user_id projections at the same time the main loop is
+/// mutating `Mirror` from `handle_sync_event` / `handle_agent_response`. Using
+/// `tokio::sync::RwLock` is deliberate: `handle_sync_event` `.await`s under
+/// the write guard (decryption, R2 downloads, writer-channel sends), and a
+/// `std::sync::RwLock` would deadlock + trip `clippy::await_holding_lock`.
+pub type SharedMirror = Arc<tokio::sync::RwLock<Mirror>>;
 
 pub struct ChatState {
     pub user_id: Uuid,

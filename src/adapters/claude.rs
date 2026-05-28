@@ -17,7 +17,7 @@ use tracing::debug;
 
 use crate::adapter::{
     shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, TurnContext,
-    MAX_STREAM_FRAME_BYTES,
+    ATTACH_FILE_INSTRUCTION, MAX_STREAM_FRAME_BYTES,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -110,6 +110,8 @@ impl AgentAdapter for ClaudeAdapter {
                 ));
             }
         }
+        sys.push_str("\n\n");
+        sys.push_str(ATTACH_FILE_INSTRUCTION);
         claude_cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
         claude_cmd.push_str(
             " --print --verbose --output-format stream-json --disallowedTools AskUserQuestion",

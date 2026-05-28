@@ -45,7 +45,7 @@ use tracing::{debug, warn};
 
 use crate::adapter::{
     shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, TurnContext,
-    MAX_STREAM_FRAME_BYTES,
+    ATTACH_FILE_INSTRUCTION, MAX_STREAM_FRAME_BYTES,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -135,8 +135,14 @@ impl AgentAdapter for CursorAdapter {
         if let Some(pp) = ctx.project_path {
             cmd.push_str(&format!("cd {} && ", shell_escape(pp)));
         }
+        // cursor-agent has no `--append-system-prompt` (or any other system /
+        // prompt-prefix flag — confirmed against `cursor-agent --help` 2026.05).
+        // The only injection point is the stdin prompt itself, so we prepend
+        // a short preamble before the user's prompt body.
+        let preamble = format!("{}\n\n---\n\n", ATTACH_FILE_INSTRUCTION);
         cmd.push_str(&format!(
-            "cat {} | cursor-agent",
+            "{{ printf %s {}; cat {}; }} | cursor-agent",
+            shell_escape(&preamble),
             shell_escape(&ctx.prompt_file.to_string_lossy())
         ));
         // `--approve-mcps` is the headless equivalent of "user already clicked

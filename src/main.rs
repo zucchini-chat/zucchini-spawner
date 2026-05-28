@@ -4,6 +4,7 @@ mod agent;
 mod atomic;
 mod auth;
 mod blobs;
+mod control;
 mod crypto;
 mod envelope;
 mod power;
@@ -28,7 +29,7 @@ use crypto_box::SecretKey;
 use power::WakeSignal;
 use powersync::{SyncConfig, SyncEvent};
 use sentry_tracing::EventFilter;
-use state::Mirror;
+use state::{Mirror, SharedMirror};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -178,8 +179,14 @@ fn state_path() -> PathBuf {
     zucchini_spawner_dir().join("state.json")
 }
 
-fn save_mirror(path: &Path, mirror: &Mirror) {
-    if let Err(e) = mirror.save(path) {
+/// Persist `state.json`. Locks `mirror` for read internally so callers don't
+/// have to juggle a guard alongside the IO; `Mirror::save` is `&self` so a
+/// read guard suffices. We pay the small cost of an async lock acquire to
+/// keep the call-sites in `main()` readable (compare: `let g =
+/// mirror.read().await; save_mirror(&p, &*g);` at every site).
+async fn save_mirror(path: &Path, mirror: &SharedMirror) {
+    let g = mirror.read().await;
+    if let Err(e) = g.save(path) {
         warn!(error = %e, "failed to persist state.json");
     }
 }
@@ -222,6 +229,11 @@ async fn handle_sync_event(
     // doesn't persist it).
     agents_seed_attempted: &mut bool,
 ) -> SyncEventOutcome {
+    // `&mut Mirror` here is borrowed from the same `Arc<tokio::sync::RwLock<Mirror>>`
+    // the control task reads (see `control::ControlState::mirror`); callers in
+    // `main()` acquire the write guard once per sync event before invoking this
+    // helper. Tests construct `Mirror::default()` directly and never involve
+    // the lock.
     match event {
         SyncEvent::Put { table, id, data } => match table.as_str() {
             "projects" => {
@@ -1210,6 +1222,54 @@ async fn publish_spawner_pubkey_if_needed(
         .await;
 }
 
+/// CLI entry point for `zucchini-spawner attach-file --chat-id <UUID> <abs-path>`.
+///
+/// Parses argv (hand-rolled — clap is overkill for one flag and a positional
+/// arg), connects to the daemon's `~/.zucchini-spawner/control.sock`, runs
+/// one `attach_file` RPC, and prints a human-readable result. Exits 0 on
+/// success, 1 on any failure. The CLI itself does no crypto or HTTP — the
+/// daemon owns the JWT and K_user.
+async fn run_attach_file_cli(args: &[String]) {
+    fn usage_and_exit() -> ! {
+        eprintln!("usage: zucchini-spawner attach-file --chat-id <UUID> <absolute-path>");
+        std::process::exit(2);
+    }
+
+    let mut chat_id: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--chat-id" => {
+                chat_id = it.next().cloned();
+            }
+            "-h" | "--help" => usage_and_exit(),
+            s if s.starts_with("--chat-id=") => {
+                chat_id = Some(s["--chat-id=".len()..].to_string());
+            }
+            s if path.is_none() => path = Some(s.to_string()),
+            _ => usage_and_exit(),
+        }
+    }
+    let (Some(chat_id), Some(path)) = (chat_id, path) else {
+        usage_and_exit();
+    };
+
+    match control::attach_file_via_socket(&chat_id, &path).await {
+        Ok((blob_key, name)) => {
+            // Stable, machine-parseable first line so the agent can grep for
+            // success; details follow on stderr. Keep `blob_key` in here so a
+            // future debug dump in a transcript can still cross-reference.
+            println!("attached {name} ({blob_key}) to chat {chat_id}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("attach-file failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Shared shutdown path used by both the `to_uninstall` PowerSync signal
 /// and the 410-from-/auth/token revoked signal. Caller breaks the main
 /// loop after this returns.
@@ -1229,6 +1289,20 @@ async fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+
+    // CLI subcommand dispatch — keeps the binary single-entry so the daemon
+    // and the agent-side `attach-file` client are the same on-disk
+    // executable. Hand-rolled (no clap) because we have a single subcommand
+    // and the daemon path needs no parsing. The subcommand is a thin RPC
+    // client over `~/.zucchini-spawner/control.sock`; secrets/JWT/K_user
+    // never leave the long-running daemon process.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(first) = raw_args.first() {
+        if first == "attach-file" {
+            run_attach_file_cli(&raw_args[1..]).await;
+            return;
+        }
     }
 
     let _sentry_guard = sentry::init((
@@ -1251,13 +1325,22 @@ async fn main() {
     }
 
     let state_path = state_path();
-    let mut mirror = Mirror::load(&state_path);
-    info!(
-        projects = mirror.projects.len(),
-        buckets = mirror.buckets.len(),
-        path = %state_path.display(),
-        "loaded persisted state"
-    );
+    // `Mirror` is shared with the control socket task (see
+    // `control::ControlState::mirror`). Wrapped in `Arc<tokio::sync::RwLock<…>>`
+    // so the control task can take a read guard for `chat_id → user_id`
+    // lookups while the main loop holds the write guard across `.await`s in
+    // `handle_sync_event` / `handle_agent_response`. Must be `tokio::sync` —
+    // both call sites yield under the guard.
+    let mirror: SharedMirror = Arc::new(tokio::sync::RwLock::new(Mirror::load(&state_path)));
+    {
+        let g = mirror.read().await;
+        info!(
+            projects = g.projects.len(),
+            buckets = g.buckets.len(),
+            path = %state_path.display(),
+            "loaded persisted state"
+        );
+    }
 
     // Seed `mirror.user_id` from the env var written by install.sh
     // BEFORE the sync loop starts, so the owner-check (`is_owner = ... == mirror.user_id`)
@@ -1267,11 +1350,15 @@ async fn main() {
     // PUT in that same window would be dropped because the membership gate sees no entry.
     // `set_user_id` is no-op when `user_id` is already populated (e.g. from state.json),
     // so older hosts without the env var fall back to lazy harvest unchanged.
-    if mirror.user_id.is_none() {
-        if let Some(env_uid) = env_uuid("ZUCCHINI_USER_ID") {
-            if mirror.set_user_id(env_uid) {
-                info!(user_id = %env_uid, "seeded mirror.user_id from ZUCCHINI_USER_ID");
-                save_mirror(&state_path, &mirror);
+    {
+        let mut g = mirror.write().await;
+        if g.user_id.is_none() {
+            if let Some(env_uid) = env_uuid("ZUCCHINI_USER_ID") {
+                if g.set_user_id(env_uid) {
+                    info!(user_id = %env_uid, "seeded mirror.user_id from ZUCCHINI_USER_ID");
+                    drop(g);
+                    save_mirror(&state_path, &mirror).await;
+                }
             }
         }
     }
@@ -1283,9 +1370,10 @@ async fn main() {
         .unwrap_or_default();
 
     let wake_signal = power::start_wake_watcher();
+    let initial_buckets = mirror.read().await.buckets.clone();
     let sync_config = build_sync_config(
         prod.as_ref(),
-        mirror.buckets.clone(),
+        initial_buckets,
         wake_signal,
         revoked_token.clone(),
     );
@@ -1345,10 +1433,14 @@ async fn main() {
         spawn_heartbeat(p.machine_id, write_tx.clone(), heartbeat_cancel.clone());
         spawn_startup_info_report(p.machine_id, write_tx.clone(), probe_statuses_cache.clone());
 
+        // Startup pubkey publish: read guard is fine — we only inspect
+        // `mirror.spawner_pubkey`. The call inside `handle_sync_event` runs
+        // under the write guard already; both paths use the same helper.
+        let g = mirror.read().await;
         publish_spawner_pubkey_if_needed(
             p.machine_id,
             our_pubkey_b64.as_deref(),
-            &mirror,
+            &g,
             &write_tx,
         )
         .await;
@@ -1365,6 +1457,31 @@ async fn main() {
 
     let (response_tx, mut response_rx) = mpsc::channel::<AgentResponse>(256);
     let mut supervisor = Supervisor::new(response_tx);
+
+    // Control socket for agent-side CLI subcommands (`attach-file`). Bound
+    // before we start consuming sync events so a fast `attach-file` issued
+    // right after a chat-created PUT can connect. Failure to bind is logged
+    // but non-fatal — sending files back from the agent is a feature, not a
+    // hard requirement; the rest of the spawner still works. The control
+    // task shares `mirror` (the same `Arc<tokio::sync::RwLock<Mirror>>` the
+    // main loop holds) for chat → user_id lookups — no parallel projection.
+    {
+        let (api_base_url, api_token) = base_and_token(prod.as_ref(), DEV_API_BASE_URL);
+        let control_state = control::ControlState {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .expect("control http client"),
+            api_base_url,
+            fetch_token: Arc::new(api_token),
+            keys: keys.clone(),
+            pending: supervisor.pending_attachments(),
+            mirror: mirror.clone(),
+        };
+        if let Err(e) = control::start(control_state).await {
+            warn!(error = %e, "failed to start control socket — `zucchini-spawner attach-file` will be unavailable");
+        }
+    }
     // One-shot: spawned on ImportRequested, aborted on ImportAborted. After the
     // task finishes naturally the slot stays Some(handle), but the FSM's
     // terminal `finished` blocks any further ImportRequested, so it never gets
@@ -1416,23 +1533,31 @@ async fn main() {
             Some(event) = sync_rx.recv() => {
                 let machine_id = prod.as_ref().map(|p| p.machine_id);
                 let probe_snap = probe_statuses_cache.get().map(|v| v.as_slice());
-                let outcome = handle_sync_event(
-                    event,
-                    machine_id,
-                    &mut mirror,
-                    &mut supervisor,
-                    &blob_downloader,
-                    &keys,
-                    x25519_secret.as_ref(),
-                    our_pubkey_b64.as_deref(),
-                    &write_tx,
-                    probe_snap,
-                    &mut agents_seed_attempted,
-                ).await;
+                // Take the write guard once per sync event. `handle_sync_event`
+                // is `async fn` and yields under the guard (decrypt, R2
+                // download, writer-channel sends) — that's exactly what
+                // `tokio::sync::RwLock` is for. The control task's read guards
+                // can interleave only between events, never mid-event.
+                let outcome = {
+                    let mut g = mirror.write().await;
+                    handle_sync_event(
+                        event,
+                        machine_id,
+                        &mut g,
+                        &mut supervisor,
+                        &blob_downloader,
+                        &keys,
+                        x25519_secret.as_ref(),
+                        our_pubkey_b64.as_deref(),
+                        &write_tx,
+                        probe_snap,
+                        &mut agents_seed_attempted,
+                    ).await
+                };
                 match outcome {
-                    SyncEventOutcome::StateChanged => save_mirror(&state_path, &mirror),
+                    SyncEventOutcome::StateChanged => save_mirror(&state_path, &mirror).await,
                     SyncEventOutcome::CheckpointReached => {
-                        save_mirror(&state_path, &mirror);
+                        save_mirror(&state_path, &mirror).await;
                         // Gate reconcile on `mirror.user_id.is_some()` so
                         // the FIRST CheckpointComplete from a by_user-only
                         // checkpoint (dev mode without by_machine, or first
@@ -1441,9 +1566,10 @@ async fn main() {
                         // The latch flips only once the by_machine round-trip
                         // has populated mirror.user_id, after which subsequent
                         // CheckpointComplete events reflect full membership.
-                        if !key_files_reconciled && mirror.user_id.is_some() {
+                        let g = mirror.read().await;
+                        if !key_files_reconciled && g.user_id.is_some() {
                             key_files_reconciled = true;
-                            reconcile_key_files(&mirror, &keys);
+                            reconcile_key_files(&g, &keys);
                         }
                     }
                     // History import is a one-shot triggered ONLY from iOS
@@ -1471,17 +1597,23 @@ async fn main() {
                             warn!("import requested but spawner is in dev mode (no machine id) — ignoring");
                             break 'arm;
                         };
-                        let Some(uid) = mirror.user_id else {
-                            warn!("import requested but mirror.user_id not populated yet — ignoring");
-                            break 'arm;
+                        // Snapshot user_id + parsed kinds under one read
+                        // guard, then drop it — the spawned task below
+                        // doesn't need the mirror.
+                        let (uid, selected_kinds) = {
+                            let g = mirror.read().await;
+                            let Some(uid) = g.user_id else {
+                                warn!("import requested but mirror.user_id not populated yet — ignoring");
+                                break 'arm;
+                            };
+                            // Snapshot the user's checkbox selection at request
+                            // time (not in the spawned task) — column changes
+                            // mid-import don't retro-affect the in-flight run.
+                            // Falls back to AgentKind::ALL when the column is
+                            // absent / NULL (older iOS / older backend) so the
+                            // historic both-kinds behavior is preserved.
+                            (uid, g.parsed_import_kinds())
                         };
-                        // Snapshot the user's checkbox selection at request
-                        // time (not in the spawned task) — column changes
-                        // mid-import don't retro-affect the in-flight run.
-                        // Falls back to AgentKind::ALL when the column is
-                        // absent / NULL (older iOS / older backend) so the
-                        // historic both-kinds behavior is preserved.
-                        let selected_kinds = mirror.parsed_import_kinds();
                         info!(
                             machine_id = %mid,
                             user_id = %uid,
@@ -1514,7 +1646,13 @@ async fn main() {
                 }
             }
             Some(resp) = response_rx.recv() => {
-                handle_agent_response(resp, &mut mirror, &write_tx, &mut supervisor).await;
+                // Same shape as the sync arm: write guard scoped tightly so
+                // the control task can interleave a read between agent
+                // responses but not within one. `handle_agent_response`
+                // `.await`s on writer-channel sends and the supervisor
+                // remove path, so this MUST be `tokio::sync::RwLock`.
+                let mut g = mirror.write().await;
+                handle_agent_response(resp, &mut g, &write_tx, &mut supervisor).await;
             }
         }
 
@@ -1599,7 +1737,7 @@ mod tests {
         // JoinHandle (no shell, no Command::spawn).
         let recorded: Arc<StdMutex<Vec<SpawnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
         let recorder = recorded.clone();
-        let spawn_fn: SpawnFn = Arc::new(move |req, _tx, _token| {
+        let spawn_fn: SpawnFn = Arc::new(move |req, _tx, _token, _pending| {
             recorder.lock().unwrap().push(req);
             tokio::spawn(async {})
         });
@@ -1775,7 +1913,7 @@ mod tests {
         // Supervisor is only needed because the `Done` arm calls
         // `supervisor.remove(&topic)`. The spawn closure is never invoked.
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
-        let spawn_fn: SpawnFn = Arc::new(|_req, _tx, _token| tokio::spawn(async {}));
+        let spawn_fn: SpawnFn = Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
         let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
 
         let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(256);
@@ -2000,7 +2138,7 @@ mod tests {
         let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
         let spawn_fn: crate::agent::SpawnFn =
-            Arc::new(|_req, _tx, _token| tokio::spawn(async {}));
+            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
         let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
 
         // Claude installed + authenticated; cursor not installed.
@@ -2088,7 +2226,7 @@ mod tests {
         let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
         let spawn_fn: crate::agent::SpawnFn =
-            Arc::new(|_req, _tx, _token| tokio::spawn(async {}));
+            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
         let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
 
         let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
@@ -2153,7 +2291,7 @@ mod tests {
         let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
         let spawn_fn: crate::agent::SpawnFn =
-            Arc::new(|_req, _tx, _token| tokio::spawn(async {}));
+            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
         let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
 
         let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
@@ -2229,7 +2367,7 @@ mod tests {
 
         let recorded: Arc<StdMutex<Vec<SpawnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
         let recorder = recorded.clone();
-        let spawn_fn: crate::agent::SpawnFn = Arc::new(move |req, _tx, _token| {
+        let spawn_fn: crate::agent::SpawnFn = Arc::new(move |req, _tx, _token, _pending| {
             recorder.lock().unwrap().push(req);
             tokio::spawn(async {})
         });

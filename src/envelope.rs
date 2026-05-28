@@ -3,8 +3,19 @@
 //! `messages.body` ciphertext decrypts to JSON of this shape:
 //!
 //! ```json
-//! { "text": "...", "attachments": [ { "blob_key": "...", "name": "..." } ] }
+//! { "text": "...", "attachments": [ { "blob_key": "...", "size": 123, "name": "..." } ] }
 //! ```
+//!
+//! Same wire shape is reused for agent-sent attachments (see
+//! `zucchini-spawner attach-file`) but in a SEPARATE follow-up `messages`
+//! row: the assistant text frame keeps its raw claude-SDK stream-json body
+//! unchanged, and the spawner emits an additional row whose body is a
+//! `MessageEnvelope { text: "", attachments }`. iOS renders that row as an
+//! attachment-only bubble below the assistant text. The split preserves the
+//! "one frame per row, body never grows" invariant and keeps older iOS
+//! builds — which don't decode envelopes on agent bodies and would otherwise
+//! drop the row — at the same loss surface as silently dropping (no
+//! mid-bubble corruption).
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -20,9 +31,14 @@ pub struct MessageEnvelope {
     pub attachments: Vec<EnvelopeAttachment>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// `size` matches the iOS-side `MessageEnvelope.Attachment.size` (plaintext
+/// byte length). `#[serde(default)]` for inbound decode tolerates older user
+/// messages that didn't carry the field; outbound encode always writes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvelopeAttachment {
     pub blob_key: Uuid,
+    #[serde(default)]
+    pub size: i64,
     pub name: String,
 }
 
