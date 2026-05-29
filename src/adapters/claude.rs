@@ -16,8 +16,9 @@ use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::adapter::{
-    shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, TurnContext,
-    ATTACH_FILE_INSTRUCTION, MAX_STREAM_FRAME_BYTES,
+    file_nonempty, probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter,
+    AgentEvent, AgentKind, LastTokensDedup, TurnContext, ATTACH_FILE_INSTRUCTION,
+    MAX_STREAM_FRAME_BYTES,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -39,24 +40,18 @@ fn make_boxed() -> Box<dyn AgentAdapter> {
     Box::new(ClaudeAdapter::new())
 }
 
+#[derive(Default)]
 pub struct ClaudeAdapter {
     /// Per-turn dedup so repeated usage frames (e.g. thinking frame followed
     /// by the text frame after it carries the same usage) don't fire a
-    /// redundant PATCH on each one. State lives for one turn.
-    last_emitted_tokens: Option<i64>,
+    /// redundant PATCH on each one. State lives for one turn. See
+    /// `adapter::LastTokensDedup`.
+    last_emitted_tokens: LastTokensDedup,
 }
 
 impl ClaudeAdapter {
     pub fn new() -> Self {
-        Self {
-            last_emitted_tokens: None,
-        }
-    }
-}
-
-impl Default for ClaudeAdapter {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 
@@ -143,9 +138,8 @@ impl AgentAdapter for ClaudeAdapter {
             && line.contains("\"type\":\"assistant\"")
         {
             if let Some(tokens) = parse_assistant_usage(&line) {
-                if self.last_emitted_tokens != Some(tokens) {
-                    self.last_emitted_tokens = Some(tokens);
-                    out.push(AgentEvent::ContextTokens(tokens));
+                if let Some(t) = self.last_emitted_tokens.observe(tokens) {
+                    out.push(AgentEvent::ContextTokens(t));
                 }
             }
         }
@@ -310,18 +304,13 @@ fn parse_compact_post_tokens(line: &str) -> Option<i64> {
 }
 
 /// Probe install + auth state in one go. Returns `(installed, authenticated)`
-/// — the writer flattens both pairs (claude + cursor) into a single PATCH on
-/// `machines`'s four boolean columns. `is_authenticated` is sync because it
-/// only touches the filesystem; wrapped in `spawn_blocking` so a slow
-/// filesystem read doesn't block the runtime thread.
+/// — the writer flattens one pair per registered kind into a single PATCH on
+/// `machines`. `is_authenticated` is sync because it only touches the
+/// filesystem; the shared
+/// `adapter::probe_with_blocking_auth` helper wraps it in `spawn_blocking`
+/// so a slow filesystem read doesn't block the runtime thread.
 pub async fn probe() -> (bool, bool) {
-    if !crate::shell::binary_on_path("claude").await {
-        return (false, false);
-    }
-    let authed = tokio::task::spawn_blocking(is_authenticated)
-        .await
-        .unwrap_or(false);
-    (true, authed)
+    probe_with_blocking_auth("claude", is_authenticated).await
 }
 
 /// `fn`-pointer-shaped wrapper around `probe()` for `AdapterDescriptor.probe`.
@@ -356,9 +345,7 @@ fn is_authenticated() -> bool {
     }
 
     let creds = home.join(".claude").join(".credentials.json");
-    std::fs::metadata(&creds)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false)
+    file_nonempty(&creds)
 }
 
 // ===========================================================================
@@ -399,7 +386,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::adapter::ImportProgress;
-use crate::adapters::import_shared::{basename_or, collapse_title, mint_project_id};
+use crate::adapters::import_shared::{
+    basename_or, collapse_title, is_synthetic_wrapper, mint_project_id, ProgressThrottle,
+};
 use crate::envelope::MessageEnvelope;
 use crate::writer::WriteEvent;
 
@@ -489,7 +478,7 @@ pub(crate) async fn import(
     );
 
     let mut done_sessions: usize = 0;
-    let mut last_pct: i32 = 0;
+    let mut throttle = ProgressThrottle::new();
     for (path, mut sessions) in sessions_by_path {
         sessions.sort();
         let project_id = mint_project_id(machine_id, &path);
@@ -508,17 +497,8 @@ pub(crate) async fn import(
                 warn!(file = %jsonl.display(), error = %e, "session import failed, skipping");
             }
             done_sessions += 1;
-            // Step in 5% increments. Each PATCH fans out via PowerSync to
-            // every connected client; flooding 100 of them inside one minute
-            // burns watch wakeups for negligible UX gain.
-            let pct = ((done_sessions as f64 / total_sessions as f64) * 100.0) as i32;
-            if pct >= last_pct + 5 {
-                last_pct = pct;
-                // Clamp to 0..=100 — `f64 → i32` cast above can't overflow u8
-                // for `done/total ≤ 1`, but clamp explicitly to make the
-                // contract with the dispatcher's rescaler obvious.
-                progress(pct.clamp(0, 100) as u8);
-            }
+            // 5%-step throttle shared with every importer; see `ProgressThrottle`.
+            throttle.step(done_sessions, total_sessions, &progress);
         }
     }
 
@@ -764,26 +744,6 @@ fn classify_user(entry: &serde_json::Value) -> UserContent {
     UserContent::Prompt(text)
 }
 
-/// User-content strings that claude-code wraps in these tags are synthetic —
-/// either local CLI commands handled by the TUI (`<command-name>`,
-/// `<local-command-stdout>`, `<local-command-stderr>`, `<local-command-caveat>`)
-/// or harness-injected reminders/notifications (`<system-reminder>`,
-/// `<task-notification>`). None of them are user-typed prompts, and the TUI
-/// itself strips them before rendering. `<command-message>` is the contrast
-/// case: it's how custom slash commands like `/simplify` introduce a real
-/// prompt that gets sent to the model — keep those.
-fn is_synthetic_wrapper(s: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "<local-command-caveat>",
-        "<local-command-stdout>",
-        "<local-command-stderr>",
-        "<command-name>",
-        "<system-reminder>",
-        "<task-notification>",
-    ];
-    PREFIXES.iter().any(|p| s.starts_with(p))
-}
-
 enum AssistantContent {
     /// Reshaped as the live stream-json frame so SpawnerMessageDescriber reads
     /// it the same way as live agent output.
@@ -831,19 +791,10 @@ mod tests {
     use super::*;
 
     /// Returns the SmallVec as a Vec of human-readable tags + payload for
-    /// easy assertion equality.
+    /// easy assertion equality. Delegates to the shared stringifier in
+    /// `adapter.rs` so the event→tag mapping has a single source of truth.
     fn run(adapter: &mut ClaudeAdapter, line: &str) -> Vec<String> {
-        adapter
-            .handle_line(line.to_string())
-            .into_iter()
-            .map(|e| match e {
-                AgentEvent::Frame(s) => format!("Frame({})", s),
-                AgentEvent::ContextTokens(n) => format!("ContextTokens({})", n),
-                AgentEvent::CompactBoundary(n) => format!("CompactBoundary({})", n),
-                AgentEvent::SessionIdHarvested(s) => format!("SessionIdHarvested({})", s),
-                AgentEvent::Result => "Result".to_string(),
-            })
-            .collect()
+        crate::adapter::stringify_events(adapter.handle_line(line.to_string()))
     }
 
     #[test]

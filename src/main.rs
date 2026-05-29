@@ -39,7 +39,7 @@ use writer::{WriteEvent, Writer, WriterConfig};
 
 /// Shared probe-results cache shape — fan-out from `spawn_startup_info_report`
 /// into the sync-event handler so `seed_default_agents_if_needed` can decide
-/// whether claude/cursor are installed without re-shelling. `OnceLock` lets
+/// which compatibility-seeded agents are installed without re-shelling. `OnceLock` lets
 /// the producer set it exactly once and lets readers snapshot without locking.
 type ProbeStatusesCache = Arc<std::sync::OnceLock<Vec<(AgentKind, (bool, bool))>>>;
 
@@ -415,12 +415,18 @@ pub(crate) async fn handle_agent_response(
         }
         AgentResponse::ContextTokens { topic, tokens } => {
             let _ = write_tx
-                .send(WriteEvent::ContextTokens { chat_id: topic, tokens })
+                .send(WriteEvent::ContextTokens {
+                    chat_id: topic,
+                    tokens,
+                })
                 .await;
         }
         AgentResponse::CompactBoundary { topic, post_tokens } => {
             let _ = write_tx
-                .send(WriteEvent::CompactBoundary { chat_id: topic, post_tokens })
+                .send(WriteEvent::CompactBoundary {
+                    chat_id: topic,
+                    post_tokens,
+                })
                 .await;
         }
         AgentResponse::SessionIdHarvested { topic, session_id } => {
@@ -429,7 +435,10 @@ pub(crate) async fn handle_agent_response(
             // round-trip and spawn a second claude without --resume.
             mirror.set_agent_session_id(&topic, session_id.clone());
             let _ = write_tx
-                .send(WriteEvent::AgentSessionId { chat_id: topic, session_id })
+                .send(WriteEvent::AgentSessionId {
+                    chat_id: topic,
+                    session_id,
+                })
                 .await;
         }
         AgentResponse::Done { topic, has_result } => {
@@ -503,7 +512,10 @@ async fn handle_message_put(
                 // `if let Some(m) = ctx.model { ... }`. `state.rs::upsert_chat`
                 // already does the same filter on insert, but we re-apply
                 // defensively in case a future code path bypasses it.
-                c.model.as_deref().filter(|s| !s.is_empty()).map(str::to_string),
+                c.model
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
             ),
             None => {
                 warn!(chat_id = %chat_id, "message arrived before chat row, skipping");
@@ -651,7 +663,7 @@ async fn handle_message_put(
     // may already have a backfilled `agent_session_id` (pre-migration rows) and
     // a brand-new chat where the first turn aborted before harvest still has
     // `agent_session_id = None`, so we want a fresh session there too.
-    // `agent_kind` picks the adapter (claude/cursor) at spawn time.
+    // `agent_kind` picks the adapter at spawn time.
     supervisor.spawn_agent(SpawnRequest {
         chat_id: chat_id.clone(),
         prompt,
@@ -664,10 +676,16 @@ async fn handle_message_put(
     });
 }
 
+/// Keep this list narrower than `AgentKind::ALL`: new adapter kinds are not
+/// safe to auto-insert until all older shipped clients can decode their
+/// `agent_kind` values in `machine_users.agents`. Users can still add newer
+/// kinds explicitly from clients that know how to write them.
+const DEFAULT_SEED_AGENT_KINDS: &[AgentKind] = &[AgentKind::Claude, AgentKind::Cursor];
+
 /// Seed `machine_users.agents` defaults (migration 0035) when the owner's
 /// row lands with `agents IS NULL`. Emits exactly one
 /// `WriteEvent::SetMachineUserAgents` carrying a default list — one entry
-/// per installed CLI per `probe_statuses` — and flips the
+/// per installed CLI in `DEFAULT_SEED_AGENT_KINDS` — and flips the
 /// `agents_seed_attempted` in-memory guard to skip re-seeding on the next
 /// heartbeat-driven re-emission.
 ///
@@ -681,8 +699,11 @@ async fn handle_message_put(
 ///   1. `{id: <uuid-v7>, agent_kind: "claude", model: "", name: ""}` (if claude installed)
 ///   2. `{id: <uuid-v7>, agent_kind: "cursor", model: "", name: ""}` (if cursor installed)
 ///
-/// If neither is installed, no PATCH is emitted (would be `[]`, which the
-/// contract treats as user-emptied — never the spawner's call to make).
+/// Codex is intentionally not in the default seed set yet: older iOS clients
+/// can receive the owner's roster before they know how to render codex rows.
+/// If no compatibility-seeded kind is installed, no PATCH is emitted (would
+/// be `[]`, which the contract treats as user-emptied — never the spawner's
+/// call to make).
 async fn seed_default_agents_if_needed(
     row_id: &str,
     row_user_id: Uuid,
@@ -708,10 +729,12 @@ async fn seed_default_agents_if_needed(
         // probe latency is typically < 1s, so this race window is short.)
         return;
     };
-    // Closed deterministic order: claude first, then cursor — matches the
-    // task spec so iOS sees a stable agent-picker ordering across builds.
+    // Closed deterministic order for compatibility seed defaults. Do not
+    // iterate `AgentKind::ALL` here: adding a new adapter is safe for spawn
+    // dispatch but not necessarily safe for persisted rosters consumed by
+    // older clients.
     let mut entries: Vec<serde_json::Value> = Vec::new();
-    for kind in AgentKind::ALL {
+    for kind in DEFAULT_SEED_AGENT_KINDS {
         let installed = statuses
             .iter()
             .find_map(|(k, (i, _))| (k == kind).then_some(*i))
@@ -1039,8 +1062,8 @@ fn spawn_startup_info_report(
 /// `kinds` comes from `mirror.parsed_import_kinds()` which reads
 /// `claude_history_import_kinds` (CSV the iOS modal writes alongside the
 /// `requested` status flip) and falls back to `AgentKind::ALL` when the
-/// column is absent / NULL — older iOS without the checkbox UI keeps the
-/// historic both-kinds behavior.
+/// column is absent / NULL — older iOS without the checkbox UI imports every
+/// registered kind.
 ///
 /// Status-emission contract (owned here, not in per-kind `import` fns):
 ///  - Emit `running-0` once at the very start.
@@ -1437,13 +1460,8 @@ async fn main() {
         // `mirror.spawner_pubkey`. The call inside `handle_sync_event` runs
         // under the write guard already; both paths use the same helper.
         let g = mirror.read().await;
-        publish_spawner_pubkey_if_needed(
-            p.machine_id,
-            our_pubkey_b64.as_deref(),
-            &g,
-            &write_tx,
-        )
-        .await;
+        publish_spawner_pubkey_if_needed(p.machine_id, our_pubkey_b64.as_deref(), &g, &write_tx)
+            .await;
     }
 
     let (update_tx, mut update_rx) = mpsc::channel::<String>(1);
@@ -1588,7 +1606,7 @@ async fn main() {
                     // into its slice of the shared 0..99 bar (kind i of N
                     // takes `i/N .. (i+1)/N`). The dispatcher owns
                     // `running-0` and the final `finished` so iOS sees one
-                    // continuous progress bar across both kinds. iOS still
+                    // continuous progress bar across all selected kinds. iOS still
                     // labels this "Importing claude history" today — that's
                     // a future cleanup (rename the column or relabel the
                     // bar; out of scope for step 1).
@@ -1611,7 +1629,7 @@ async fn main() {
                             // mid-import don't retro-affect the in-flight run.
                             // Falls back to AgentKind::ALL when the column is
                             // absent / NULL (older iOS / older backend) so the
-                            // historic both-kinds behavior is preserved.
+                            // historic "all supported kinds" behavior is preserved.
                             (uid, g.parsed_import_kinds())
                         };
                         info!(
@@ -1979,8 +1997,7 @@ mod tests {
         let cipher_bytes = B64.decode(body_b64).expect("body is base64");
         let plaintext_bytes =
             crypto::decrypt_bytes(&key, &cipher_bytes).expect("body decrypts under K_user");
-        let plaintext =
-            String::from_utf8(plaintext_bytes).expect("agent line is UTF-8 plaintext");
+        let plaintext = String::from_utf8(plaintext_bytes).expect("agent line is UTF-8 plaintext");
         assert_eq!(plaintext, line_plaintext);
 
         // --- 3. ContextTokens → ContextTokens passthrough.
@@ -1997,7 +2014,10 @@ mod tests {
         let events = drain(&mut write_rx);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            WriteEvent::ContextTokens { chat_id: cid, tokens } => {
+            WriteEvent::ContextTokens {
+                chat_id: cid,
+                tokens,
+            } => {
                 assert_eq!(cid, &chat_id);
                 assert_eq!(*tokens, 12345);
             }
@@ -2027,7 +2047,10 @@ mod tests {
         let events = drain(&mut write_rx);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            WriteEvent::AgentSessionId { chat_id: cid, session_id } => {
+            WriteEvent::AgentSessionId {
+                chat_id: cid,
+                session_id,
+            } => {
                 assert_eq!(cid, &chat_id);
                 assert_eq!(session_id, "sess-abc");
             }
@@ -2064,15 +2087,26 @@ mod tests {
         let events = drain(&mut write_rx);
         assert_eq!(events.len(), 2, "INTERRUPTED line + ChatRunning(false)");
         match &events[0] {
-            WriteEvent::PutMessage { content, sender, chat_id: cid, .. } => {
+            WriteEvent::PutMessage {
+                content,
+                sender,
+                chat_id: cid,
+                ..
+            } => {
                 assert_eq!(*sender, "agent");
                 assert_eq!(cid, &chat_id);
                 assert_eq!(content, INTERRUPTED_RESULT);
             }
-            other => panic!("expected synthesized INTERRUPTED PutMessage, got {:?}", other),
+            other => panic!(
+                "expected synthesized INTERRUPTED PutMessage, got {:?}",
+                other
+            ),
         }
         match &events[1] {
-            WriteEvent::ChatRunning { chat_id: cid, agent_running: false } => {
+            WriteEvent::ChatRunning {
+                chat_id: cid,
+                agent_running: false,
+            } => {
                 assert_eq!(cid, &chat_id);
             }
             other => panic!("expected ChatRunning(false), got {:?}", other),
@@ -2096,7 +2130,10 @@ mod tests {
         let events = drain(&mut write_rx);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            WriteEvent::ChatRunning { chat_id: cid, agent_running: false } => {
+            WriteEvent::ChatRunning {
+                chat_id: cid,
+                agent_running: false,
+            } => {
                 assert_eq!(cid, &chat_id);
             }
             other => panic!("expected ChatRunning(false), got {:?}", other),
@@ -2108,8 +2145,11 @@ mod tests {
     // These tests exercise the seeding decision in `handle_sync_event`'s
     // `machine_users` arm via `seed_default_agents_if_needed`. The contract:
     //   - NULL `agents` + ≥1 CLI installed + owner row → emit one PATCH
-    //     carrying a valid JSON array with one entry per installed kind
-    //     (claude first, then cursor; ids are uuid-v7 strings).
+    //     carrying a valid JSON array with one entry per installed default
+    //     seed kind (claude first, then cursor; ids are uuid-v7 strings).
+    //     Newer kinds like codex are spawnable but are not auto-seeded into
+    //     rosters because older iOS clients fail closed on unknown
+    //     `agent_kind` enum values.
     //   - Non-NULL `agents` (including `"[]"`) → no PATCH (user-emptied is
     //     distinct from spawner-not-seeded-yet).
     //   - Re-emission of the same row within process lifetime → no PATCH
@@ -2145,6 +2185,7 @@ mod tests {
         let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
             (AgentKind::Claude, (true, true)),
             (AgentKind::Cursor, (false, false)),
+            (AgentKind::Codex, (true, true)),
         ];
         let mut seed_attempted = false;
 
@@ -2186,7 +2227,12 @@ mod tests {
                 patches.push(ev);
             }
         }
-        assert_eq!(patches.len(), 1, "expected one seed PATCH, got {}", patches.len());
+        assert_eq!(
+            patches.len(),
+            1,
+            "expected one seed PATCH, got {}",
+            patches.len()
+        );
         let WriteEvent::SetMachineUserAgents {
             row_id: emitted_row,
             machine_id: emitted_machine,
@@ -2214,7 +2260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn machine_users_null_agents_with_both_installed_seeds_two_entries_claude_first() {
+    async fn machine_users_null_agents_with_default_kinds_installed_seeds_claude_then_cursor() {
         let user_id = Uuid::now_v7();
         let machine_id = Uuid::now_v7();
         let row_id = Uuid::now_v7();
@@ -2232,6 +2278,7 @@ mod tests {
         let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
             (AgentKind::Claude, (true, true)),
             (AgentKind::Cursor, (true, true)),
+            (AgentKind::Codex, (true, true)),
         ];
         let mut seed_attempted = false;
 
@@ -2269,11 +2316,81 @@ mod tests {
             panic!("expected SetMachineUserAgents")
         };
         let arr: Vec<serde_json::Value> = serde_json::from_str(&agents_json).unwrap();
-        assert_eq!(arr.len(), 2, "claude + cursor → two entries");
+        assert_eq!(
+            arr.len(),
+            2,
+            "claude + cursor seed; codex installed must not be auto-seeded"
+        );
         // Deterministic order: claude first, then cursor. Matches the task
         // spec so iOS sees a stable agent-picker ordering across builds.
         assert_eq!(arr[0]["agent_kind"], "claude");
         assert_eq!(arr[1]["agent_kind"], "cursor");
+    }
+
+    #[tokio::test]
+    async fn machine_users_null_agents_with_only_codex_installed_does_not_seed() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let row_id = Uuid::now_v7();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
+        let blobs = empty_blob_downloader();
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let spawn_fn: crate::agent::SpawnFn =
+            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
+        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+
+        let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
+            (AgentKind::Claude, (false, false)),
+            (AgentKind::Cursor, (false, false)),
+            (AgentKind::Codex, (true, true)),
+        ];
+        let mut seed_attempted = false;
+
+        let mu_row = json!({
+            "id": row_id.to_string(),
+            "user_id": user_id.to_string(),
+            "machine_id": machine_id.to_string(),
+            "is_sandboxed": 0,
+            "agents": serde_json::Value::Null,
+        })
+        .to_string();
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "machine_users".into(),
+                id: row_id.to_string(),
+                data: mu_row,
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            Some(&probe_statuses),
+            &mut seed_attempted,
+        )
+        .await;
+
+        let mut saw_seed_patch = false;
+        while let Ok(ev) = write_rx.try_recv() {
+            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
+                saw_seed_patch = true;
+            }
+        }
+        assert!(
+            !saw_seed_patch,
+            "codex-only install must not seed a roster older clients cannot decode"
+        );
+        assert!(
+            !seed_attempted,
+            "no default seed entries means a later restart may still seed compatibility defaults"
+        );
     }
 
     #[tokio::test]
@@ -2458,8 +2575,7 @@ mod tests {
         // Feed a user message to each chat.
         for (cid, label) in [(chat_with.clone(), "with"), (chat_empty.clone(), "empty")] {
             let envelope_json =
-                serde_json::json!({ "text": format!("hi {label}"), "attachments": [] })
-                    .to_string();
+                serde_json::json!({ "text": format!("hi {label}"), "attachments": [] }).to_string();
             let body_b64 = B64.encode(crypto::encrypt(&key, envelope_json.as_bytes()));
             let msg_id = Uuid::now_v7().to_string();
             handle_sync_event(

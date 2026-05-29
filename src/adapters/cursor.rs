@@ -44,8 +44,9 @@ use tokio::process::Command;
 use tracing::{debug, warn};
 
 use crate::adapter::{
-    shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, TurnContext,
-    ATTACH_FILE_INSTRUCTION, MAX_STREAM_FRAME_BYTES,
+    claude_assistant_envelope, claude_tool_use_envelope, parse_json_obj, shell_escape,
+    AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, TurnContext, ATTACH_FILE_INSTRUCTION,
+    MAX_STREAM_FRAME_BYTES,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -261,9 +262,11 @@ impl AgentAdapter for CursorAdapter {
             return out;
         }
 
-        let Some(obj) = parse_obj(&line) else {
+        let Some(obj) = parse_json_obj(&line) else {
             // Non-JSON line (shouldn't happen on a healthy cursor-agent
-            // stdout, but the line loop doesn't filter). Log and drop.
+            // stdout, but the line loop doesn't filter). The shared parser
+            // logs the parse failure at debug; we additionally log + drop
+            // here because cursor's wire protocol is strict-JSON-only.
             debug!("cursor-agent non-JSON stdout line, dropping: {}", line);
             return out;
         };
@@ -398,20 +401,6 @@ impl AgentAdapter for CursorAdapter {
     }
 }
 
-fn parse_obj(line: &str) -> Option<Value> {
-    let s = line.trim();
-    if !s.starts_with('{') {
-        return None;
-    }
-    match serde_json::from_str::<Value>(s) {
-        Ok(v) => v.is_object().then_some(v),
-        Err(e) => {
-            debug!("cursor-agent JSON parse failed: {}", e);
-            None
-        }
-    }
-}
-
 /// Converts a cursor `assistant` frame to claude-shape. cursor's content
 /// blocks already use `{"type":"text","text":"..."}` (identical to claude),
 /// so we forward them verbatim and wrap the envelope to claude's shape.
@@ -433,23 +422,12 @@ fn normalize_assistant_frame(obj: &Value) -> Option<String> {
     if !renderable {
         return None;
     }
-    let envelope = json!({
-        "type": "assistant",
-        "message": {
-            "content": blocks,
-            // Usage is only known on `result.success` for cursor — zero here.
-            // iOS treats per-frame usage as cumulative on claude too, so
-            // emitting zeros mid-turn matches "no progress yet" (the real
-            // ContextTokens event lands at end-of-turn via the result frame).
-            "usage": {
-                "input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 0,
-            },
-        },
-    });
-    Some(envelope.to_string())
+    // Usage is only known on `result.success` for cursor — the shared
+    // envelope helper stamps zeros here. iOS treats per-frame usage as
+    // cumulative on claude too, so emitting zeros mid-turn matches "no
+    // progress yet" (the real ContextTokens event lands at end-of-turn
+    // via the result frame).
+    Some(claude_assistant_envelope(Value::Array(blocks)))
 }
 
 /// Converts a cursor `tool_call.completed` frame to a claude-shape assistant
@@ -481,24 +459,7 @@ fn normalize_tool_call_completed(obj: &Value) -> Option<String> {
         })?;
     let raw_args = verb_payload.get("args").cloned().unwrap_or(Value::Null);
     let (name, input) = map_cursor_tool(verb_key, &raw_args);
-    let envelope = json!({
-        "type": "assistant",
-        "message": {
-            "content": [{
-                "type": "tool_use",
-                "id": call_id,
-                "name": name,
-                "input": input,
-            }],
-            "usage": {
-                "input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 0,
-            },
-        },
-    });
-    Some(envelope.to_string())
+    Some(claude_tool_use_envelope(call_id, &name, input))
 }
 
 /// Substring-based synthesis of a minimal claude-shape tool_use envelope for
@@ -513,24 +474,7 @@ fn synthesize_oversize_tool_call_completed(line: &str) -> Option<String> {
     let call_id = sniff_string_field(line, "\"call_id\":\"")?;
     let verb_key = sniff_tool_call_verb(line)?;
     let (name, _input) = map_cursor_tool(&verb_key, &Value::Null);
-    let envelope = json!({
-        "type": "assistant",
-        "message": {
-            "content": [{
-                "type": "tool_use",
-                "id": call_id,
-                "name": name,
-                "input": {},
-            }],
-            "usage": {
-                "input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 0,
-            },
-        },
-    });
-    Some(envelope.to_string())
+    Some(claude_tool_use_envelope(&call_id, &name, json!({})))
 }
 
 /// Extracts a JSON string field's value by literal substring after `needle`,
@@ -583,12 +527,28 @@ fn sniff_tool_call_verb(line: &str) -> Option<String> {
 ///   writeToolCall  → Write  (args.path → input.file_path)
 ///   grepToolCall   → Grep   (args.pattern unchanged — assumed)
 ///   globToolCall   → Glob   (args.pattern unchanged — assumed)
+///   updateTodosToolCall → TodoWrite (args.todos unchanged)
 ///   anything else  → strip `"ToolCall"` suffix, args passthrough.
 ///
 /// For Read/Edit/Write the `path → file_path` rename is in-place on a clone
 /// of the args object; sibling keys (offset, streamContent, etc.) are
 /// preserved untouched — iOS ignores them but keeping the wire faithful
 /// makes the persisted body useful for future tooling.
+///
+/// SIBLING MAP — keep in sync with [`map_cursor_persisted_tool`]. That fn
+/// maps the SAME cursor→claude tool set from the importer's vocabulary
+/// (persisted tool *names* like `run_terminal_cmd`, `read_file`) instead of
+/// these live verb *keys*. They are deliberately NOT merged: the input
+/// vocabularies differ AND the source arg keys differ (live `path` vs
+/// persisted `target_file`/`relativeWorkspacePath`), so a unified dispatch
+/// would be a leaky abstraction. When you add or change a tool here, check
+/// whether the persisted side needs the matching change too.
+///
+/// TODO PARITY: the persisted side maps `todo_write` → `TodoWrite`; the live
+/// equivalent is `updateTodosToolCall` (verb key confirmed against live
+/// `cursor-agent --print --output-format stream-json` output — args carry a
+/// `todos` array plus a `merge` flag). Both forward args verbatim so iOS's
+/// `SpawnerMessageDescriber` sees a claude-shape `TodoWrite` with `input.todos`.
 fn map_cursor_tool(verb_key: &str, args: &Value) -> (String, Value) {
     match verb_key {
         "shellToolCall" => ("Bash".to_string(), args.clone()),
@@ -597,6 +557,7 @@ fn map_cursor_tool(verb_key: &str, args: &Value) -> (String, Value) {
         "writeToolCall" => ("Write".to_string(), rename_path_to_file_path(args)),
         "grepToolCall" => ("Grep".to_string(), args.clone()),
         "globToolCall" => ("Glob".to_string(), args.clone()),
+        "updateTodosToolCall" => ("TodoWrite".to_string(), args.clone()),
         other => {
             let name = other.strip_suffix("ToolCall").unwrap_or(other).to_string();
             (name, args.clone())
@@ -609,14 +570,7 @@ fn map_cursor_tool(verb_key: &str, args: &Value) -> (String, Value) {
 /// are preserved. Non-object args pass through unchanged (defensive — this
 /// shouldn't happen on the cursor wire).
 fn rename_path_to_file_path(args: &Value) -> Value {
-    let Some(map) = args.as_object() else {
-        return args.clone();
-    };
-    let mut out = map.clone();
-    if let Some(path_val) = out.remove("path") {
-        out.insert("file_path".to_string(), path_val);
-    }
-    Value::Object(out)
+    rename_either_key(args, &["path"], "file_path")
 }
 
 /// Converts a cursor `result` frame to claude-shape. Preserves `subtype`,
@@ -660,8 +614,8 @@ fn normalize_result_frame(obj: &Value) -> String {
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Probe install + auth in one shot. Returns `(installed, authenticated)`
-/// — the writer flattens both pairs (claude + cursor) into a single PATCH on
-/// `machines`'s four boolean columns.
+/// — the writer flattens one pair per registered kind into a single PATCH on
+/// `machines`.
 ///
 /// Auth detection: `cursor-agent status --format json` returns a JSON object
 /// with `isAuthenticated: true|false`. Stable contract (the JSON output mode
@@ -806,7 +760,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::adapter::ImportProgress;
-use crate::adapters::import_shared::{basename_or, collapse_title, mint_project_id};
+use crate::adapters::import_shared::{
+    basename_or, collapse_title, is_synthetic_wrapper, mint_project_id, ProgressThrottle,
+};
 use crate::envelope::MessageEnvelope;
 use crate::writer::WriteEvent;
 
@@ -896,7 +852,7 @@ pub(crate) async fn import(
     );
 
     let mut done_composers: usize = 0;
-    let mut last_pct: i32 = 0;
+    let mut throttle = ProgressThrottle::new();
     for (project_path, mut composers) in by_project {
         composers.sort_by_key(|h| h.created_at_ms);
         let project_id = mint_project_id(machine_id, &project_path);
@@ -928,14 +884,8 @@ pub(crate) async fn import(
                 tracing::warn!(composer_id = %header.id, error = %e, "cursor composer import failed, skipping");
             }
             done_composers += 1;
-            // Same 5%-step throttle as the claude importer — each progress
-            // call fans out via PowerSync to every connected client, so
-            // throttling avoids burning watch wakeups for negligible UX gain.
-            let pct = ((done_composers as f64 / total_composers as f64) * 100.0) as i32;
-            if pct >= last_pct + 5 {
-                last_pct = pct;
-                progress(pct.clamp(0, 100) as u8);
-            }
+            // 5%-step throttle shared with every importer; see `ProgressThrottle`.
+            throttle.step(done_composers, total_composers, &progress);
         }
     }
 
@@ -1338,7 +1288,7 @@ fn classify_user_bubble(bubble: &serde_json::Value) -> BubbleOut {
     // cursor bubbles (Cursor isn't claude code, so the TUI's synthetic
     // wrapper rows don't appear), but the check is cheap and prevents a
     // future drift from sneaking harness messages into the chat.
-    if super_is_synthetic_wrapper(text) {
+    if is_synthetic_wrapper(text) {
         return BubbleOut::Skip;
     }
     BubbleOut::User {
@@ -1370,22 +1320,11 @@ fn classify_assistant_bubble(bubble: &serde_json::Value) -> BubbleOut {
 }
 
 fn assistant_text_frame(text: &str) -> String {
-    let envelope = serde_json::json!({
-        "type": "assistant",
-        "message": {
-            "content": [{"type": "text", "text": text}],
-            // Zeros: the persisted bubble has no per-message usage, and iOS
-            // reads `chats.context_tokens` for the live counter anyway.
-            // Matches the live cursor adapter's `normalize_assistant_frame`.
-            "usage": {
-                "input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 0,
-            },
-        },
-    });
-    envelope.to_string()
+    // The persisted bubble has no per-message usage, and iOS reads
+    // `chats.context_tokens` for the live counter anyway — the shared
+    // envelope helper stamps the claude-shape zero usage. Matches the
+    // live cursor adapter's `normalize_assistant_frame`.
+    crate::adapter::claude_assistant_text_envelope(text)
 }
 
 /// Build a claude-shape `tool_use` frame from a persisted `toolFormerData`
@@ -1424,24 +1363,7 @@ fn assistant_tool_use_frame_from_persisted(
         .unwrap_or(serde_json::Value::Object(Default::default()));
 
     let (claude_name, input) = map_cursor_persisted_tool(name, &raw_args);
-    let envelope = serde_json::json!({
-        "type": "assistant",
-        "message": {
-            "content": [{
-                "type": "tool_use",
-                "id": call_id,
-                "name": claude_name,
-                "input": input,
-            }],
-            "usage": {
-                "input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 0,
-            },
-        },
-    });
-    Some(envelope.to_string())
+    Some(claude_tool_use_envelope(&call_id, &claude_name, input))
 }
 
 /// Map a persisted `toolFormerData.name` string to a claude tool name + a
@@ -1453,6 +1375,17 @@ fn assistant_tool_use_frame_from_persisted(
 /// stripped for dispatch but the original key names in `rawArgs` (where
 /// present) are still passed through unchanged for sibling fields — iOS
 /// doesn't read them but keeping the wire faithful helps future tooling.
+///
+/// SIBLING MAP — keep in sync with [`map_cursor_tool`] (the live-wire path).
+/// Both encode the same cursor→claude tool set; they are deliberately NOT
+/// merged because the input vocabularies and the source arg keys differ
+/// (persisted `target_file`/`relativeWorkspacePath` vs live `path`). When you
+/// add or change a tool here, check whether the live side needs it too.
+///
+/// KNOWN ASYMMETRY: `todo_write` → `TodoWrite` exists here but has no
+/// counterpart in [`map_cursor_tool`]. That is intentional, not an oversight:
+/// `todo_write` is an observed persisted tool name, but the live wire's todo
+/// verb key (if any) is unconfirmed, so we don't guess a spelling there.
 fn map_cursor_persisted_tool(
     name: &str,
     raw_args: &serde_json::Value,
@@ -1502,14 +1435,7 @@ fn map_cursor_persisted_tool(
 /// Clone `args` (if it's an object) and rename `from` → `to` in place.
 /// Non-object args pass through unchanged.
 fn rename_key(args: &serde_json::Value, from: &str, to: &str) -> serde_json::Value {
-    let Some(map) = args.as_object() else {
-        return args.clone();
-    };
-    let mut out = map.clone();
-    if let Some(v) = out.remove(from) {
-        out.insert(to.to_string(), v);
-    }
-    serde_json::Value::Object(out)
+    rename_either_key(args, &[from], to)
 }
 
 /// Like `rename_key` but tries each `from_candidates` in order — the first
@@ -1532,24 +1458,6 @@ fn rename_either_key(
         }
     }
     serde_json::Value::Object(out)
-}
-
-/// User-content strings that the harness would treat as synthetic. No
-/// observed cases in cursor bubbles (Cursor isn't claude code), but the
-/// check is cheap and matches the claude importer's posture; rename-only
-/// wrapper around the claude prefix list so a future centralization is one
-/// edit. The `super_` prefix is just because `is_synthetic_wrapper` is a
-/// private fn in `adapters/claude.rs` and this module doesn't see it.
-fn super_is_synthetic_wrapper(s: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "<local-command-caveat>",
-        "<local-command-stdout>",
-        "<local-command-stderr>",
-        "<command-name>",
-        "<system-reminder>",
-        "<task-notification>",
-    ];
-    PREFIXES.iter().any(|p| s.starts_with(p))
 }
 
 /// Cursor stores `createdAt` as ms since unix epoch. Saturating cast: the
@@ -1578,17 +1486,17 @@ fn import_boxed(
 mod tests {
     use super::*;
 
+    /// Delegates to the shared stringifier in `adapter.rs` so the event→tag
+    /// mapping has a single source of truth.
     fn run(a: &mut CursorAdapter, line: &str) -> Vec<String> {
-        a.handle_line(line.to_string())
-            .into_iter()
-            .map(|e| match e {
-                AgentEvent::Frame(s) => format!("Frame({})", s),
-                AgentEvent::ContextTokens(n) => format!("ContextTokens({})", n),
-                AgentEvent::CompactBoundary(n) => format!("CompactBoundary({})", n),
-                AgentEvent::SessionIdHarvested(s) => format!("SessionIdHarvested({})", s),
-                AgentEvent::Result => "Result".to_string(),
-            })
-            .collect()
+        crate::adapter::stringify_events(a.handle_line(line.to_string()))
+    }
+
+    /// Local alias for the shared Frame-payload parser, so the many cursor
+    /// normalization tests below can `frame_value(&events[0])` instead of
+    /// open-coding `strip_prefix("Frame(").unwrap().strip_suffix(')')…`.
+    fn frame_value(event: &str) -> Value {
+        crate::adapter::frame_value(event)
     }
 
     #[test]
@@ -1611,11 +1519,7 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi"}]},"session_id":"abc-1"}"#;
         let events = run(&mut a, line);
         assert_eq!(events.len(), 1);
-        let Some(rest) = events[0].strip_prefix("Frame(") else {
-            panic!("not Frame")
-        };
-        let body = rest.strip_suffix(')').unwrap();
-        let v: Value = serde_json::from_str(body).unwrap();
+        let v = frame_value(&events[0]);
         assert_eq!(v["type"], "assistant");
         assert_eq!(v["message"]["content"][0]["type"], "text");
         assert_eq!(v["message"]["content"][0]["text"], "Hi");
@@ -1628,12 +1532,7 @@ mod tests {
         let line = r#"{"type":"tool_call","subtype":"completed","call_id":"tool_xx","tool_call":{"shellToolCall":{"args":{"command":"ls"},"result":{"success":{"stdout":"a"}}}},"session_id":"abc-1"}"#;
         let events = run(&mut a, line);
         assert_eq!(events.len(), 1);
-        let body = events[0]
-            .strip_prefix("Frame(")
-            .unwrap()
-            .strip_suffix(')')
-            .unwrap();
-        let v: Value = serde_json::from_str(body).unwrap();
+        let v = frame_value(&events[0]);
         assert_eq!(v["type"], "assistant");
         let block = &v["message"]["content"][0];
         assert_eq!(block["type"], "tool_use");
@@ -1648,12 +1547,7 @@ mod tests {
         let line = r#"{"type":"tool_call","subtype":"completed","call_id":"r1","tool_call":{"readToolCall":{"args":{"path":"/etc/hosts","offset":0},"result":{}}}}"#;
         let events = run(&mut a, line);
         assert_eq!(events.len(), 1);
-        let body = events[0]
-            .strip_prefix("Frame(")
-            .unwrap()
-            .strip_suffix(')')
-            .unwrap();
-        let v: Value = serde_json::from_str(body).unwrap();
+        let v = frame_value(&events[0]);
         let block = &v["message"]["content"][0];
         assert_eq!(block["name"], "Read");
         assert_eq!(block["input"]["file_path"], "/etc/hosts");
@@ -1667,12 +1561,7 @@ mod tests {
         let line = r#"{"type":"tool_call","subtype":"completed","call_id":"e1","tool_call":{"editToolCall":{"args":{"path":"/tmp/x","streamContent":"hello"},"result":{}}}}"#;
         let events = run(&mut a, line);
         assert_eq!(events.len(), 1);
-        let body = events[0]
-            .strip_prefix("Frame(")
-            .unwrap()
-            .strip_suffix(')')
-            .unwrap();
-        let v: Value = serde_json::from_str(body).unwrap();
+        let v = frame_value(&events[0]);
         let block = &v["message"]["content"][0];
         assert_eq!(block["name"], "Edit");
         assert_eq!(block["input"]["file_path"], "/tmp/x");
@@ -1686,12 +1575,7 @@ mod tests {
         let line = r#"{"type":"tool_call","subtype":"completed","call_id":"w1","tool_call":{"writeToolCall":{"args":{"path":"/tmp/y"},"result":{}}}}"#;
         let events = run(&mut a, line);
         assert_eq!(events.len(), 1);
-        let body = events[0]
-            .strip_prefix("Frame(")
-            .unwrap()
-            .strip_suffix(')')
-            .unwrap();
-        let v: Value = serde_json::from_str(body).unwrap();
+        let v = frame_value(&events[0]);
         let block = &v["message"]["content"][0];
         assert_eq!(block["name"], "Write");
         assert_eq!(block["input"]["file_path"], "/tmp/y");
@@ -1704,15 +1588,28 @@ mod tests {
         let line = r#"{"type":"tool_call","subtype":"completed","call_id":"u1","tool_call":{"fooBarToolCall":{"args":{"x":1},"result":{}}}}"#;
         let events = run(&mut a, line);
         assert_eq!(events.len(), 1);
-        let body = events[0]
-            .strip_prefix("Frame(")
-            .unwrap()
-            .strip_suffix(')')
-            .unwrap();
-        let v: Value = serde_json::from_str(body).unwrap();
+        let v = frame_value(&events[0]);
         let block = &v["message"]["content"][0];
         assert_eq!(block["name"], "fooBar");
         assert_eq!(block["input"]["x"], 1);
+    }
+
+    #[test]
+    fn cursor_update_todos_maps_to_claude_todowrite() {
+        // Live verb key `updateTodosToolCall` (confirmed against live
+        // cursor-agent stream-json) → claude `TodoWrite` with the `todos`
+        // array forwarded verbatim, mirroring the importer's `todo_write`
+        // → TodoWrite mapping so both surfaces render the same iOS summary.
+        let mut a = CursorAdapter::new();
+        let line = r#"{"type":"tool_call","subtype":"completed","call_id":"td1","tool_call":{"updateTodosToolCall":{"args":{"todos":[{"id":"1","content":"step one","status":"TODO_STATUS_PENDING"}],"merge":false},"result":{}}}}"#;
+        let events = run(&mut a, line);
+        assert_eq!(events.len(), 1);
+        let v = frame_value(&events[0]);
+        let block = &v["message"]["content"][0];
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["name"], "TodoWrite");
+        assert_eq!(block["id"], "td1");
+        assert_eq!(block["input"]["todos"][0]["content"], "step one");
     }
 
     #[test]
@@ -1725,12 +1622,7 @@ mod tests {
         let line = r#"{"type":"tool_call","subtype":"completed","call_id":"tool_yy","tool_call":{"_meta":{"t":0},"shellToolCall":{"args":{"command":"ls"},"result":{}}}}"#;
         let events = run(&mut a, line);
         assert_eq!(events.len(), 1);
-        let body = events[0]
-            .strip_prefix("Frame(")
-            .unwrap()
-            .strip_suffix(')')
-            .unwrap();
-        let v: Value = serde_json::from_str(body).unwrap();
+        let v = frame_value(&events[0]);
         let block = &v["message"]["content"][0];
         assert_eq!(block["name"], "Bash");
         assert_eq!(block["input"]["command"], "ls");
@@ -1751,12 +1643,7 @@ mod tests {
         assert!(line.len() > MAX_STREAM_FRAME_BYTES);
         let events = run(&mut a, &line);
         assert_eq!(events.len(), 1);
-        let body = events[0]
-            .strip_prefix("Frame(")
-            .unwrap()
-            .strip_suffix(')')
-            .unwrap();
-        let v: Value = serde_json::from_str(body).unwrap();
+        let v = frame_value(&events[0]);
         let block = &v["message"]["content"][0];
         assert_eq!(block["type"], "tool_use");
         assert_eq!(block["id"], "big_1");
@@ -2567,11 +2454,7 @@ mod tests {
             model: Some("Composer 2.5 Fast"),
         };
         let cmd = a.prepare_command(&ctx).unwrap();
-        assert!(
-            cmd.contains("--model 'Composer 2.5 Fast'"),
-            "got: {}",
-            cmd
-        );
+        assert!(cmd.contains("--model 'Composer 2.5 Fast'"), "got: {}", cmd);
     }
 
     #[test]

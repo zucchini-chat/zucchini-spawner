@@ -4,8 +4,8 @@
 //! the CLI command, normalizing stdout frames into claude-shape envelopes,
 //! harvesting session ids/usage/compact boundaries — live behind the
 //! `AgentAdapter` trait in `adapter.rs` and the concrete adapters in
-//! `adapters/`. Supervisor stays agent-agnostic; future adapters (codex,
-//! hermes, gemini) plug in without touching this file.
+//! `adapters/`. Supervisor stays agent-agnostic; future adapters plug in
+//! through the registry without touching this file.
 //!
 //! Each `spawn_agent` call constructs a fresh adapter, hands it to the spawned
 //! task, and discards it when the turn ends.
@@ -369,13 +369,13 @@ fn default_spawn_fn(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .process_group(0); // new process group so we can kill shell + agent together
-        // Adapter system prompts reference both vars by name (see
-        // `adapters/claude.rs` / `adapters/cursor.rs` prompt strings) to tell
-        // the agent how to invoke `zucchini-spawner attach-file`. We export
-        // them on the spawn rather than relying on the user's shell rc so a
-        // stale PATH can't pick up the wrong binary — `current_exe()` is
-        // whatever launchd/systemd is actually running, which is what the
-        // RPC handler also listens on.
+                               // Adapter system prompts reference both vars by name (see
+                               // `adapters/claude.rs` / `adapters/cursor.rs` prompt strings) to tell
+                               // the agent how to invoke `zucchini-spawner attach-file`. We export
+                               // them on the spawn rather than relying on the user's shell rc so a
+                               // stale PATH can't pick up the wrong binary — `current_exe()` is
+                               // whatever launchd/systemd is actually running, which is what the
+                               // RPC handler also listens on.
         cmd.env("ZUCCHINI_CHAT_ID", &topic_clone);
         if let Ok(exe) = std::env::current_exe() {
             cmd.env("ZUCCHINI_SPAWNER_BIN", exe);

@@ -65,11 +65,12 @@ pub struct Mirror {
     #[serde(skip)]
     pub claude_history_import_status: Option<String>,
     /// CSV of `AgentKind` wire names the user selected via the iOS import
-    /// modal's checkboxes (e.g. "claude" / "cursor" / "claude,cursor").
+    /// modal's checkboxes (e.g. "claude" / "cursor" / "codex" /
+    /// "claude,cursor,codex").
     /// `None` means the column is absent or NULL — older iOS without the
     /// checkbox UI, or an older backend without migration 0034. The
     /// dispatcher in main.rs falls back to `AgentKind::ALL` in that case so
-    /// the historic both-kinds behavior is preserved.
+    /// the historic "all supported kinds" behavior is preserved.
     #[serde(skip)]
     pub claude_history_import_kinds: Option<String>,
     #[serde(default)]
@@ -290,8 +291,8 @@ impl Mirror {
     /// Parse `claude_history_import_kinds` into the closed adapter set the
     /// dispatcher iterates. `None` (column absent / NULL — older iOS without
     /// the checkbox UI) falls back to `AgentKind::ALL` so the historic
-    /// both-kinds behavior is preserved. Unknown / unparseable entries are
-    /// dropped with a warn so a forwards-compat backend whitelist drift
+    /// "all supported kinds" behavior is preserved. Unknown / unparseable
+    /// entries are dropped with a warn so a forwards-compat backend whitelist drift
     /// can't break the importer; if every entry is dropped we also fall
     /// back to `ALL` so the user still gets something.
     pub fn parsed_import_kinds(&self) -> Vec<AgentKind> {

@@ -40,6 +40,7 @@ pub type ImportProgress = Box<dyn Fn(u8) + Send + Sync>;
 pub enum AgentKind {
     Claude,
     Cursor,
+    Codex,
 }
 
 /// Per-kind metadata + behavior table. Each `adapters/<kind>.rs` exports a
@@ -69,17 +70,18 @@ pub struct AdapterDescriptor {
 pub const ADAPTERS: &[&AdapterDescriptor] = &[
     &crate::adapters::claude::DESCRIPTOR,
     &crate::adapters::cursor::DESCRIPTOR,
+    &crate::adapters::codex::DESCRIPTOR,
 ];
 
 impl AgentKind {
     /// Strict parse: only the closed set of supported adapter kinds (those
     /// with a `DESCRIPTOR` in `ADAPTERS`) maps to `Some(_)`. Unknown values
-    /// (e.g. `"codex"`, `"hermes"`, `"gemini"` — permitted by the backend
-    /// whitelist but not yet implemented as adapters) return `None`, and the
-    /// caller refuses to mirror the chat rather than silently coercing to
-    /// claude. Pre-migration rows where the column is absent are handled at
-    /// the caller (defaulting to `AgentKind::Claude`) — strictness only
-    /// kicks in when a value is present but unrecognized.
+    /// (e.g. `"hermes"`, `"gemini"` — permitted by the backend whitelist but
+    /// not yet implemented as adapters) return `None`, and the caller refuses
+    /// to mirror the chat rather than silently coercing to claude.
+    /// Pre-migration rows where the column is absent are handled at the
+    /// caller (defaulting to `AgentKind::Claude`) — strictness only kicks in
+    /// when a value is present but unrecognized.
     pub fn parse(s: &str) -> Option<Self> {
         ADAPTERS.iter().find(|a| a.wire_name == s).map(|a| a.kind)
     }
@@ -89,7 +91,7 @@ impl AgentKind {
     /// at compile time — `const fn` can't iterate slices yet stably enough
     /// for this) so it stays `const`-evaluable; the
     /// `adapter_registry_consistent` test couples it to `ADAPTERS`.
-    pub const ALL: &'static [AgentKind] = &[AgentKind::Claude, AgentKind::Cursor];
+    pub const ALL: &'static [AgentKind] = &[AgentKind::Claude, AgentKind::Cursor, AgentKind::Codex];
 
     /// Look up this variant's descriptor in `ADAPTERS`. Panics if the
     /// variant is missing from the registry — but the
@@ -113,7 +115,7 @@ impl AgentKind {
 
     /// Per-kind (`installed_col`, `authenticated_col`) on the `machines` row
     /// — the writer's startup PATCH builder fans out a single boolean pair per
-    /// `AgentKind` into the four nullable boolean columns. Keeping this on
+    /// `AgentKind` into the nullable boolean columns. Keeping this on
     /// `AgentKind` (instead of inline in `writer.rs`) means a future variant
     /// only touches the descriptor in its `adapters/<kind>.rs`.
     pub fn install_columns(self) -> (&'static str, &'static str) {
@@ -122,9 +124,9 @@ impl AgentKind {
     }
 
     /// Probes install + auth state for this kind. Returns
-    /// `(installed, authenticated)` — the writer flattens both pairs into a
-    /// single PATCH on `machines`'s four boolean columns. `async` because
-    /// probes shell out for both kinds.
+    /// `(installed, authenticated)` — the writer flattens one pair per
+    /// registered kind into a single PATCH on `machines`. `async` because
+    /// probes may shell out or hit the filesystem.
     pub async fn probe(self) -> (bool, bool) {
         (self.descriptor().probe)().await
     }
@@ -234,16 +236,16 @@ pub trait AgentAdapter: Send + Sync {
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]>;
 }
 
-/// Per-line frame-size cap used by both adapters to skip a full
+/// Per-line frame-size cap used by every adapter to skip a full
 /// `serde_json::Value` parse (or even a full-line substring scan) on multi-MB
 /// frames — tool_result/edit/read frames can legitimately blow past hundreds
-/// of KB. Lives here so the two adapters can't drift on the threshold.
+/// of KB. Lives here so adapters can't drift on the threshold.
 pub(crate) const MAX_STREAM_FRAME_BYTES: usize = 65_536;
 
-/// Shared shell-escape helper. Both adapters use single-quote escaping for
-/// command strings handed to the user's login shell. Kept here so both
-/// `adapters/claude.rs` and `adapters/cursor.rs` can share it without
-/// reaching back into `agent.rs`.
+/// Shared shell-escape helper. Every adapter uses single-quote escaping for
+/// command strings handed to the user's login shell. Kept here so all
+/// `adapters/*.rs` modules can share it without reaching back into
+/// `agent.rs`.
 pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -256,6 +258,170 @@ pub fn shell_escape(s: &str) -> String {
 /// coding agent has a shell-exec facility and picks it on its own.
 pub const ATTACH_FILE_INSTRUCTION: &str =
     "To send a file to the user, run the command `\"$ZUCCHINI_SPAWNER_BIN\" attach-file --chat-id \"$ZUCCHINI_CHAT_ID\" <absolute-path>` before writing the message that should accompany the attachment.";
+
+/// Trim + `starts_with('{')` gate + `serde_json::from_str::<Value>` for
+/// adapters that need to dispatch on a frame's `type` field. Returns `None`
+/// when the line isn't an object — caller decides whether to forward as a
+/// raw `Frame` (codex's permissive path) or drop with a debug log (cursor's
+/// stricter path). Logs parse failures at debug so a wire-format drift leaves
+/// a breadcrumb in the spawner log without spamming on every healthy line.
+pub(crate) fn parse_json_obj(line: &str) -> Option<serde_json::Value> {
+    let s = line.trim();
+    if !s.starts_with('{') {
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(v) => v.is_object().then_some(v),
+        Err(e) => {
+            tracing::debug!("JSON parse failed: {}", e);
+            None
+        }
+    }
+}
+
+/// Four-zero `usage` block in claude's snake_case shape — the same constant
+/// every non-claude adapter stamps into mid-turn assistant envelopes when
+/// per-frame usage isn't available. iOS reads `chats.context_tokens` for the
+/// live counter (driven by `AgentEvent::ContextTokens`) so the zeros are
+/// cosmetic — the persisted body still has to carry *something* here because
+/// `SpawnerMessageDescriber` and other downstream consumers may parse it.
+pub(crate) fn claude_zero_usage() -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 0,
+    })
+}
+
+/// Wraps an already-built array of claude content blocks (`[{"type":"text",...}]`,
+/// mixed text + tool_use, etc.) in the claude-shape assistant envelope with
+/// zero usage. Output is the serialized stream-json line ready to ship as
+/// `AgentEvent::Frame(_)`. Used by cursor's live `normalize_assistant_frame`
+/// (where the blocks come straight off the cursor wire) — codex and the
+/// cursor importer use the more specialized text / tool_use builders below
+/// because they build single-block envelopes from primitives.
+pub(crate) fn claude_assistant_envelope(content: serde_json::Value) -> String {
+    serde_json::json!({
+        "type": "assistant",
+        "message": {
+            "content": content,
+            "usage": claude_zero_usage(),
+        },
+    })
+    .to_string()
+}
+
+/// Convenience: assistant envelope carrying a single `text` block. Codex's
+/// `agent_message` item and the cursor importer's text-only bubble both emit
+/// this shape; calling this from both sites keeps the wire identical (same
+/// key order, same zero usage) so iOS sees one envelope shape per text-only
+/// frame across all adapters.
+pub(crate) fn claude_assistant_text_envelope(text: &str) -> String {
+    claude_assistant_envelope(serde_json::json!([
+        { "type": "text", "text": text },
+    ]))
+}
+
+/// Convenience: assistant envelope carrying a single `tool_use` block.
+/// `input` is forwarded verbatim — caller picks the shape (the full cursor
+/// args object, the full codex item, claude-renamed keys for cursor's tool
+/// re-mapping, ...). Same call sites as `claude_assistant_text_envelope`:
+/// codex's file_change / command_execution / web_search items, cursor's live
+/// tool_call.completed normalizer + oversize-frame synthesizer, and the
+/// cursor importer's persisted tool_use builder.
+pub(crate) fn claude_tool_use_envelope(id: &str, name: &str, input: serde_json::Value) -> String {
+    claude_assistant_envelope(serde_json::json!([
+        {
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": input,
+        },
+    ]))
+}
+
+/// Per-turn dedup helper for adapters whose underlying CLI reports a
+/// cumulative context-token count and may legitimately emit the same value
+/// twice in a turn (claude: usage repeats across thinking-then-text frames
+/// in the same turn; codex: hypothetical streamed-usage variant or a
+/// re-emitted final frame). Returns `Some(tokens)` on a fresh value (and
+/// stores it as the new high-water mark), `None` when the value matches the
+/// last emission. Cursor doesn't use this — its tokens come from a single
+/// `result.usage` so dedup is structurally impossible.
+#[derive(Default)]
+pub(crate) struct LastTokensDedup {
+    last: Option<i64>,
+}
+
+impl LastTokensDedup {
+    pub(crate) fn observe(&mut self, tokens: i64) -> Option<i64> {
+        if self.last == Some(tokens) {
+            return None;
+        }
+        self.last = Some(tokens);
+        Some(tokens)
+    }
+}
+
+/// Shared `probe()` shape for adapters whose auth check is a sync
+/// filesystem-only function — runs the binary-on-PATH check first, then
+/// `spawn_blocking`s the sync auth fn so a slow disk doesn't stall the
+/// runtime thread. Returns `(installed, authenticated)`; an `auth_fn` panic
+/// surfaces as `(true, false)` via the `.unwrap_or(false)` on join.
+///
+/// Cursor's probe is NOT layered on top of this because its auth check is
+/// async (it shells out to `cursor-agent status`) — see `cursor::probe()`
+/// for the bespoke path.
+pub(crate) async fn probe_with_blocking_auth(bin: &str, auth_fn: fn() -> bool) -> (bool, bool) {
+    if !crate::shell::binary_on_path(bin).await {
+        return (false, false);
+    }
+    let authed = tokio::task::spawn_blocking(auth_fn).await.unwrap_or(false);
+    (true, authed)
+}
+
+/// File-presence test shared by adapters' filesystem-only auth probes: `true`
+/// only if `path` exists, is `stat`-able, and is non-empty. A missing file,
+/// any metadata error, or a zero-length file all map to `false`. Centralizing
+/// this keeps the "presence + non-empty" auth contract identical across
+/// adapters so a future hardening (symlink handling, zero-byte sentinels, …)
+/// can't be applied to one probe and forgotten in another.
+pub(crate) fn file_nonempty(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Test-only stringifier shared by every adapter's `run()` helper. Maps a
+/// turn's emitted events to human-readable tags for assertion equality. Lives
+/// here (next to the enum) so a new `AgentEvent` variant forces exactly ONE
+/// update instead of three drifting per-adapter copies.
+#[cfg(test)]
+pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String> {
+    events
+        .into_iter()
+        .map(|e| match e {
+            AgentEvent::Frame(s) => format!("Frame({})", s),
+            AgentEvent::ContextTokens(n) => format!("ContextTokens({})", n),
+            AgentEvent::CompactBoundary(n) => format!("CompactBoundary({})", n),
+            AgentEvent::SessionIdHarvested(s) => format!("SessionIdHarvested({})", s),
+            AgentEvent::Result => "Result".to_string(),
+        })
+        .collect()
+}
+
+/// Test-only: unwrap a `Frame(<json>)` tag produced by [`stringify_events`]
+/// back into parsed JSON. Panics if the tag isn't a Frame or the payload isn't
+/// valid JSON — adapters assert on normalized claude-shape frames a lot.
+#[cfg(test)]
+pub(crate) fn frame_value(event: &str) -> serde_json::Value {
+    let inner = event
+        .strip_prefix("Frame(")
+        .and_then(|s| s.strip_suffix(')'))
+        .expect("event was not a Frame");
+    serde_json::from_str(inner).expect("frame payload was not valid JSON")
+}
 
 #[cfg(test)]
 mod tests {

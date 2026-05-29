@@ -79,13 +79,13 @@ pub enum WriteEvent {
         machine_id: Uuid,
     },
     /// Sent once per process startup. Re-evaluating on each restart picks up
-    /// `claude /login` (or `cursor-agent login`) after a service kick —
-    /// without that, the iOS app would never see auth flips. The wire shape
-    /// on `machines` is a flat pair of nullable BOOLEANs per agent kind
-    /// (`claude_installed` / `claude_authenticated` /
-    /// `cursor_installed` / `cursor_authenticated`); we carry one
-    /// `(installed, authenticated)` tuple per `AgentKind` so the encode
-    /// site can fan them out generically.
+    /// `claude /login`, `cursor-agent login`, or `codex login` after a service
+    /// kick — without that, the iOS app would never see auth flips. The wire
+    /// shape on `machines` is a flat pair of nullable BOOLEANs per agent kind
+    /// (`claude_code_installed` / `claude_code_authenticated`,
+    /// `cursor_installed` / `cursor_authenticated`, `codex_installed` /
+    /// `codex_authenticated`); we carry one `(installed, authenticated)` tuple
+    /// per `AgentKind` so the encode site can fan them out generically.
     ReportStartupInfo {
         machine_id: Uuid,
         statuses: Vec<(AgentKind, (bool, bool))>,
@@ -292,11 +292,12 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
             machine_id,
             statuses,
         } => {
-            // Per-agent install/auth is four nullable BOOLEAN columns on
+            // Per-agent install/auth is a pair of nullable BOOLEAN columns per kind on
             // `machines` (`claude_code_installed` / `claude_code_authenticated`
             // for the legacy claude columns inherited from pre-multi-agent
-            // schema, plus `cursor_installed` / `cursor_authenticated` added
-            // in migration 0033_multi_agent_support). iOS derives its
+            // schema, `cursor_installed` / `cursor_authenticated` added in
+            // migration 0033_multi_agent_support, and `codex_installed` /
+            // `codex_authenticated` added in migration 0037). iOS derives its
             // `AgentInstallStatus` UI helper from these booleans locally.
             let mut data = serde_json::Map::new();
             data.insert(

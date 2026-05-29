@@ -184,13 +184,15 @@ async fn handle_conn(stream: UnixStream, state: ControlState) -> Result<()> {
 
 async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse {
     match req {
-        ControlRequest::AttachFile { chat_id, path } => match attach_file(&chat_id, &path, state).await {
-            Ok((blob_key, name)) => ControlResponse::ok(blob_key.to_string(), name),
-            Err(e) => {
-                warn!(chat_id = %chat_id, path = %path, error = %e, "attach_file failed");
-                ControlResponse::err(format!("{e:#}"))
+        ControlRequest::AttachFile { chat_id, path } => {
+            match attach_file(&chat_id, &path, state).await {
+                Ok((blob_key, name)) => ControlResponse::ok(blob_key.to_string(), name),
+                Err(e) => {
+                    warn!(chat_id = %chat_id, path = %path, error = %e, "attach_file failed");
+                    ControlResponse::err(format!("{e:#}"))
+                }
             }
-        },
+        }
     }
 }
 
@@ -225,9 +227,9 @@ async fn attach_file(
     // the guard.
     let attach_tx = {
         let g = state.pending.lock().expect("PendingAttachments mutex");
-        g.get(chat_id).cloned().ok_or_else(|| {
-            anyhow!("no running agent for chat {chat_id} (start a turn first)")
-        })?
+        g.get(chat_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no running agent for chat {chat_id} (start a turn first)"))?
     };
 
     let path_buf = Path::new(path).to_path_buf();
@@ -320,10 +322,9 @@ async fn attach_file(
         };
 
         // CPU-bound; offload so we don't stall a tokio worker.
-        let cipher_res = tokio::task::spawn_blocking(move || {
-            crate::crypto::encrypt(&*key_for_task, &plaintext)
-        })
-        .await;
+        let cipher_res =
+            tokio::task::spawn_blocking(move || crate::crypto::encrypt(&*key_for_task, &plaintext))
+                .await;
         let ciphertext = match cipher_res {
             Ok(c) => c,
             Err(e) => {
@@ -398,9 +399,12 @@ async fn attach_file(
 /// (no-such-chat, upload failure) verbatim.
 pub async fn attach_file_via_socket(chat_id: &str, path: &str) -> Result<(String, String)> {
     let sock = control_socket_path();
-    let stream = UnixStream::connect(&sock)
-        .await
-        .with_context(|| format!("connect to {} — is zucchini-spawner running?", sock.display()))?;
+    let stream = UnixStream::connect(&sock).await.with_context(|| {
+        format!(
+            "connect to {} — is zucchini-spawner running?",
+            sock.display()
+        )
+    })?;
     let (read_half, mut write_half) = stream.into_split();
     let req = ControlRequest::AttachFile {
         chat_id: chat_id.to_string(),
@@ -420,8 +424,8 @@ pub async fn attach_file_via_socket(chat_id: &str, path: &str) -> Result<(String
         .read_line(&mut line)
         .await
         .context("read control response")?;
-    let resp: ControlResponse = serde_json::from_str(line.trim_end_matches('\n'))
-        .context("parse control response JSON")?;
+    let resp: ControlResponse =
+        serde_json::from_str(line.trim_end_matches('\n')).context("parse control response JSON")?;
     if !resp.ok {
         return Err(anyhow!(
             "{}",
