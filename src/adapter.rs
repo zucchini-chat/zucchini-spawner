@@ -42,6 +42,7 @@ pub enum AgentKind {
     Cursor,
     Codex,
     Hermes,
+    Gemini,
 }
 
 /// Per-kind metadata + behavior table. Each `adapters/<kind>.rs` exports a
@@ -73,6 +74,7 @@ pub const ADAPTERS: &[&AdapterDescriptor] = &[
     &crate::adapters::cursor::DESCRIPTOR,
     &crate::adapters::codex::DESCRIPTOR,
     &crate::adapters::hermes::DESCRIPTOR,
+    &crate::adapters::gemini::DESCRIPTOR,
 ];
 
 impl AgentKind {
@@ -98,6 +100,7 @@ impl AgentKind {
         AgentKind::Cursor,
         AgentKind::Codex,
         AgentKind::Hermes,
+        AgentKind::Gemini,
     ];
 
     /// Look up this variant's descriptor in `ADAPTERS`. Panics if the

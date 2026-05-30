@@ -513,7 +513,11 @@ async fn run(
 /// Filter here = no poison message gets queued in the first place.
 fn backend_has_install_columns(kind: AgentKind) -> bool {
     match kind {
-        AgentKind::Claude | AgentKind::Cursor | AgentKind::Codex | AgentKind::Hermes => true,
+        AgentKind::Claude
+        | AgentKind::Cursor
+        | AgentKind::Codex
+        | AgentKind::Hermes
+        | AgentKind::Gemini => true,
     }
 }
 
