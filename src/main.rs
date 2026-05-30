@@ -7,6 +7,7 @@ mod blobs;
 mod control;
 mod crypto;
 mod envelope;
+mod hermes_support;
 mod power;
 mod powersync;
 mod shell;
@@ -1326,6 +1327,25 @@ async fn main() {
             run_attach_file_cli(&raw_args[1..]).await;
             return;
         }
+        if first == "hermes-turn" {
+            // Per-turn trampoline child for the hermes adapter. Connects to
+            // the spawner's hermes socket, sends one `turn` frame, shuttles
+            // envelopes back to stdout as claude-shape NDJSON. See
+            // `adapters/hermes/trampoline.rs` for the wire-format contract.
+            let parsed = match hermes_support::trampoline::HermesTurnArgs::parse(&raw_args[1..]) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("hermes-turn: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            // `run_hermes_turn` returns the trampoline's process exit code
+            // (0 on clean result, 1 on any error). The supervisor
+            // synthesises INTERRUPTED_RESULT on non-zero exits so the
+            // chat lands a terminator either way.
+            let code = hermes_support::trampoline::run_hermes_turn(parsed).await;
+            std::process::exit(code);
+        }
     }
 
     let _sentry_guard = sentry::init((
@@ -1449,6 +1469,36 @@ async fn main() {
     // seeding pass treats that as "skip this PUT, retry on the next
     // re-emission".
     let probe_statuses_cache: ProbeStatusesCache = Arc::new(std::sync::OnceLock::new());
+
+    // Hermes plugin self-heal: write the embedded plugin payload to
+    // `~/.hermes/plugins/zucchini/` if missing or byte-different from the
+    // embedded copy. Runs unconditionally — cheap (3 file-stats + 0-3
+    // writes per boot) and removes a class of "is the plugin installed?"
+    // failure modes. Logged-and-skipped on filesystem error so a
+    // permission glitch doesn't gate the rest of the spawner.
+    if let Err(e) = hermes_support::plugin_install::ensure_hermes_plugin_installed() {
+        warn!(error = %e, "hermes plugin install/self-heal failed; hermes chats may fail until resolved");
+    }
+
+    // Hermes socket server: binds the single-socket multiplexer at
+    // `~/.zucchini-spawner/hermes.sock` (configurable via
+    // ZUCCHINI_SPAWNER_SOCK env var for dev/tests). Spawns the
+    // `hermes gateway run` child process under the user's login shell so
+    // the plugin can dial back in. The trampoline children read the same
+    // env var to find the socket. Export the path so the env var is
+    // inherited by every subprocess (`agent.rs::default_spawn_fn` doesn't
+    // override it).
+    let hermes_socket = match hermes_support::socket_server::start(write_tx.clone(), mirror.clone())
+    {
+        Ok(handle) => {
+            std::env::set_var("ZUCCHINI_SPAWNER_SOCK", &handle.socket_path);
+            Some(handle)
+        }
+        Err(e) => {
+            warn!(error = %e, "hermes socket server failed to start; hermes chats will fail");
+            None
+        }
+    };
 
     let heartbeat_cancel = CancellationToken::new();
     if let Some(p) = &prod {
@@ -1703,6 +1753,9 @@ async fn main() {
         }
     }
 
+    if let Some(h) = hermes_socket.as_ref() {
+        h.cancel.cancel();
+    }
     info!("zucchini-spawner exiting");
 }
 

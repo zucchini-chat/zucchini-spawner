@@ -1,0 +1,55 @@
+name: zucchini-platform
+label: Zucchini
+kind: platform
+version: 0.3.0
+description: >
+  Zucchini gateway adapter for Hermes Agent.
+
+  Bridges hermes' agent loop to the zucchini-spawner Rust process over a
+  local Unix-domain socket. ONE gateway process for the whole spawner
+  (Telegram-shape, not per-chat) — all chats are multiplexed over a single
+  socket and isolated via hermes' native ``task_id`` mechanism (chat_id ==
+  task_id). Concurrent turns spawn as ``asyncio.create_task`` per turn; no
+  inter-chat locking.
+
+  Per-chat cwd is registered via ``tools.terminal_tool.register_task_env_overrides``
+  before each turn so ``_resolve_container_task_id`` returns the chat_id
+  unchanged (instead of collapsing it to ``"default"``). ``TERMINAL_CWD`` is
+  deliberately NOT used — it's process-global and would race across
+  concurrent turns; the per-task override is the right hook.
+
+  Auth on the socket is filesystem perms (chmod 0600 + parent dir owned by
+  the spawner user); no HMAC, no tokens, no cosign signing. The user already
+  trusts the spawner to run ``claude --dangerously-skip-permissions`` on
+  their machine, so the socket auth model is the same as ssh-agent's:
+  whoever can read the socket file can drive the gateway.
+
+  Cron / proactive deliveries are wired via ``BasePlatformAdapter.send()``,
+  which both the in-process cron path (cron/scheduler.py:618-723) and the
+  out-of-process ``standalone_sender_fn`` route to. Our ``send()`` override
+  emits a ``proactive: true`` envelope on the same socket.
+
+  Stdlib only — asyncio + json.
+author: Zucchini
+# ``requires_env`` entries are surfaced in ``hermes config`` UI via the
+# platform-plugin env var injector in ``hermes_cli/config.py``.
+requires_env:
+  - ZUCCHINI_SPAWNER_SOCK
+optional_env:
+  - name: ZUCCHINI_SPAWNER_SOCK
+    description: >
+      Path to the Unix-domain socket the plugin connects out to. REQUIRED.
+      The zucchini-spawner picks a single path (e.g.
+      ``~/.zucchini-spawner/hermes.sock``) and bakes it into the gateway
+      child's env on launch. The plugin refuses to start if this is unset.
+    prompt: "Spawner socket path"
+    password: false
+  - name: ZUCCHINI_CRON_DELIVER
+    description: >
+      Default chat id cron jobs use when ``--deliver zucchini`` is set
+      without an explicit ``--chat-id``. First value wins if comma-separated.
+      Most cron jobs use ``deliver=origin`` (the chat the job was created
+      from) so this is mostly an escape hatch for jobs created outside the
+      agent loop.
+    prompt: "Default cron chat id"
+    password: false

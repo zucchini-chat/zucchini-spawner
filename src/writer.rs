@@ -296,15 +296,27 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
             // `machines` (`claude_code_installed` / `claude_code_authenticated`
             // for the legacy claude columns inherited from pre-multi-agent
             // schema, `cursor_installed` / `cursor_authenticated` added in
-            // migration 0033_multi_agent_support, and `codex_installed` /
-            // `codex_authenticated` added in migration 0037). iOS derives its
-            // `AgentInstallStatus` UI helper from these booleans locally.
+            // migration 0033_multi_agent_support, `codex_installed` /
+            // `codex_authenticated` added in migration 0037, and
+            // `hermes_installed` / `hermes_authenticated` added in migration
+            // 0038). iOS derives its `AgentInstallStatus` UI helper from these
+            // booleans locally.
+            //
+            // `backend_has_install_columns` stays as a per-kind guard so a
+            // future kind whose backend migration is still in flight can be
+            // filtered out here: shipping a PATCH with a column the backend's
+            // `reject_unknown_fields(obj, allowed)` doesn't know would 4xx the
+            // whole batch and head-of-line block the writer (items stay queued
+            // on 4xx, retry forever with backoff).
             let mut data = serde_json::Map::new();
             data.insert(
                 "spawner_version".to_string(),
                 serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
             );
             for (kind, (installed, authenticated)) in statuses {
+                if !backend_has_install_columns(*kind) {
+                    continue;
+                }
                 let (installed_col, authenticated_col) = kind.install_columns();
                 data.insert(
                     installed_col.to_string(),
@@ -484,6 +496,24 @@ async fn run(
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
+    }
+}
+
+/// Whether the deployed backend's `machines` allowlist already carries the
+/// install/authenticated columns for `kind`. Per-kind override that exists
+/// only while a kind's backend migration is in flight — once the columns are
+/// live (and `process_machine_patch`'s `machine_fields` allowlist + COALESCE
+/// block know about them), drop the kind from this filter.
+///
+/// Why this exists: `ReportStartupInfo` ships a PATCH carrying one
+/// `<kind>_installed` / `<kind>_authenticated` pair per `AgentKind::ALL`. The
+/// backend's `reject_unknown_fields` 4xx's the whole batch on any unknown
+/// field, items stay queued on 4xx (writer retries forever with backoff),
+/// and every subsequent flush is blocked behind the same poison message.
+/// Filter here = no poison message gets queued in the first place.
+fn backend_has_install_columns(kind: AgentKind) -> bool {
+    match kind {
+        AgentKind::Claude | AgentKind::Cursor | AgentKind::Codex | AgentKind::Hermes => true,
     }
 }
 

@@ -41,6 +41,7 @@ pub enum AgentKind {
     Claude,
     Cursor,
     Codex,
+    Hermes,
 }
 
 /// Per-kind metadata + behavior table. Each `adapters/<kind>.rs` exports a
@@ -71,6 +72,7 @@ pub const ADAPTERS: &[&AdapterDescriptor] = &[
     &crate::adapters::claude::DESCRIPTOR,
     &crate::adapters::cursor::DESCRIPTOR,
     &crate::adapters::codex::DESCRIPTOR,
+    &crate::adapters::hermes::DESCRIPTOR,
 ];
 
 impl AgentKind {
@@ -91,7 +93,12 @@ impl AgentKind {
     /// at compile time — `const fn` can't iterate slices yet stably enough
     /// for this) so it stays `const`-evaluable; the
     /// `adapter_registry_consistent` test couples it to `ADAPTERS`.
-    pub const ALL: &'static [AgentKind] = &[AgentKind::Claude, AgentKind::Cursor, AgentKind::Codex];
+    pub const ALL: &'static [AgentKind] = &[
+        AgentKind::Claude,
+        AgentKind::Cursor,
+        AgentKind::Codex,
+        AgentKind::Hermes,
+    ];
 
     /// Look up this variant's descriptor in `ADAPTERS`. Panics if the
     /// variant is missing from the registry — but the
