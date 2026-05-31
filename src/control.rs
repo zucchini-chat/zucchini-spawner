@@ -323,7 +323,7 @@ async fn attach_file(
 
         // CPU-bound; offload so we don't stall a tokio worker.
         let cipher_res =
-            tokio::task::spawn_blocking(move || crate::crypto::encrypt(&*key_for_task, &plaintext))
+            tokio::task::spawn_blocking(move || crate::crypto::encrypt(&key_for_task, &plaintext))
                 .await;
         let ciphertext = match cipher_res {
             Ok(c) => c,

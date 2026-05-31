@@ -883,7 +883,9 @@ pub(crate) async fn import(
             }
             done_composers += 1;
             // Per-percent throttle shared with every importer; see `ProgressThrottle`.
-            throttle.step(done_composers, total_composers, &progress).await;
+            throttle
+                .step(done_composers, total_composers, &progress)
+                .await;
         }
     }
 
@@ -1175,7 +1177,10 @@ async fn import_composer(
             BubbleOut::Assistant {
                 text_frame,
                 tool_frame,
-            } => ("agent", [text_frame, tool_frame].into_iter().flatten().collect()),
+            } => (
+                "agent",
+                [text_frame, tool_frame].into_iter().flatten().collect(),
+            ),
             BubbleOut::Skip => continue,
         };
         for body in frames {

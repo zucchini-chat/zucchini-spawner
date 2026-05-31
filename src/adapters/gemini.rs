@@ -91,8 +91,8 @@ use crate::adapter::{
     ImportProgress, LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES,
 };
 use crate::adapters::import_shared::{
-    basename_or, collapse_title, emit_chat, is_synthetic_wrapper, mint_project_id, parse_rfc3339_utc,
-    user_message_body, ImportedChat, ImportedMessage, ProgressThrottle,
+    basename_or, collapse_title, emit_chat, is_synthetic_wrapper, mint_project_id,
+    parse_rfc3339_utc, user_message_body, ImportedChat, ImportedMessage, ProgressThrottle,
 };
 use crate::writer::WriteEvent;
 
@@ -766,7 +766,9 @@ pub(crate) async fn import(
             }
             done_sessions += 1;
             // Per-percent throttle shared with every importer; see `ProgressThrottle`.
-            throttle.step(done_sessions, total_sessions, &progress).await;
+            throttle
+                .step(done_sessions, total_sessions, &progress)
+                .await;
         }
     }
 
@@ -1001,10 +1003,7 @@ fn user_prompt_text(entry: &Value) -> Option<String> {
     let parts = entry.get("content").and_then(|c| c.as_array())?;
     // A part carrying `functionResponse` is a tool-result echo — drop the whole
     // record (it never carries user text alongside).
-    if parts
-        .iter()
-        .any(|p| p.get("functionResponse").is_some())
-    {
+    if parts.iter().any(|p| p.get("functionResponse").is_some()) {
         return None;
     }
     let mut texts: Vec<&str> = Vec::new();
@@ -1585,7 +1584,8 @@ mod tests {
 
     #[test]
     fn user_prompt_text_drops_function_response_echo() {
-        let entry = json!({"type":"user","content":[{"functionResponse":{"name":"x","response":{}}}]});
+        let entry =
+            json!({"type":"user","content":[{"functionResponse":{"name":"x","response":{}}}]});
         assert_eq!(user_prompt_text(&entry), None);
     }
 
@@ -1593,8 +1593,7 @@ mod tests {
     fn user_prompt_text_drops_session_context_synthetic() {
         // `<session_context>` priming message is injected by gemini-cli on
         // resume; `is_synthetic_wrapper` (extended for this) screens it.
-        let entry =
-            json!({"type":"user","content":[{"text":"<session_context>prior turns…"}]});
+        let entry = json!({"type":"user","content":[{"text":"<session_context>prior turns…"}]});
         assert_eq!(user_prompt_text(&entry), None);
     }
 

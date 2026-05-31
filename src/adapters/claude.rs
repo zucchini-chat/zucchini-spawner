@@ -498,7 +498,9 @@ pub(crate) async fn import(
             }
             done_sessions += 1;
             // Per-percent throttle shared with every importer; see `ProgressThrottle`.
-            throttle.step(done_sessions, total_sessions, &progress).await;
+            throttle
+                .step(done_sessions, total_sessions, &progress)
+                .await;
         }
     }
 

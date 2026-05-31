@@ -10,26 +10,26 @@
 //!  - `thread.started`           → `SessionIdHarvested` only (no Frame; matches claude's init-skip)
 //!  - `turn.started`             → drop (no claude analog)
 //!  - `item.started`             → drop for v1 (we forward completions only;
-//!                                 a future pass may surface in-flight tool
-//!                                 status the way cursor's tool_call.started
-//!                                 is currently dropped)
+//!    a future pass may surface in-flight tool
+//!    status the way cursor's tool_call.started
+//!    is currently dropped)
 //!  - `item.completed` agent_message       → Frame: claude-shape assistant text envelope
 //!  - `item.completed` command_execution   → Frame: claude `Bash` tool_use `{command}`
 //!  - `item.completed` file_change         → one Frame per change:
-//!                                            kind=add    → claude `Write` tool_use `{file_path}`
-//!                                            kind=update → claude `Edit`  tool_use `{file_path}`
-//!                                            kind=delete → claude `Bash`  tool_use `{command: "rm <path>"}`
-//!                                            (no dedicated claude delete tool; `rm` is what claude
-//!                                            code itself emits for the same intent)
+//!    kind=add    → claude `Write` tool_use `{file_path}`
+//!    kind=update → claude `Edit`  tool_use `{file_path}`
+//!    kind=delete → claude `Bash`  tool_use `{command: "rm <path>"}`
+//!    (no dedicated claude delete tool; `rm` is what claude
+//!    code itself emits for the same intent)
 //!  - `item.completed` web_search          → Frame: claude `WebSearch` tool_use `{query}`
 //!  - `turn.completed`           → ContextTokens(input_tokens)
-//!                                 + Frame (claude-shape result envelope)
-//!                                 + Result
+//!    + Frame (claude-shape result envelope)
+//!    + Result
 //!  - `turn.failed`              → Frame (claude-shape error result envelope)
-//!                                 + Result
+//!    + Result
 //!  - anything else              → forwarded as-is (defensive against codex
-//!                                 format drift; iOS will likely drop, but
-//!                                 we avoid silently losing the line)
+//!    format drift; iOS will likely drop, but
+//!    we avoid silently losing the line)
 //!
 //! Codex's actual wire format observed via `codex exec --json` on
 //! codex-cli 0.133.0: each turn starts with `thread.started` carrying a
@@ -848,8 +848,7 @@ async fn parse_session(path: &Path) -> anyhow::Result<Option<ParsedSession>> {
                             .filter(|s| !s.is_empty())
                         {
                             had_event_text = true;
-                            messages
-                                .push(imported_agent(claude_assistant_text_envelope(msg), ts));
+                            messages.push(imported_agent(claude_assistant_text_envelope(msg), ts));
                         }
                     }
                     // token_count / task_started / task_complete /
@@ -1559,7 +1558,10 @@ mod tests {
         let env = json!({"role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/x</cwd>"}]});
         assert!(response_item_message_text(&env).is_none());
         let real = json!({"role":"user","content":[{"type":"input_text","text":"real prompt"}]});
-        assert_eq!(response_item_message_text(&real).as_deref(), Some("real prompt"));
+        assert_eq!(
+            response_item_message_text(&real).as_deref(),
+            Some("real prompt")
+        );
     }
 
     #[tokio::test]
@@ -1574,7 +1576,10 @@ mod tests {
         )
         .unwrap();
         let parsed = parse_session(&path).await.unwrap();
-        assert!(parsed.is_none(), "legacy bare-head (no cwd) must be skipped");
+        assert!(
+            parsed.is_none(),
+            "legacy bare-head (no cwd) must be skipped"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1587,13 +1592,20 @@ mod tests {
         // prompt + a function_call + an agent_message + the mirrored
         // response_item assistant text (which must NOT double-emit).
         let content = concat!(
-            r#"{"timestamp":"2025-10-03T00:16:55.629Z","type":"session_meta","payload":{"id":"0199a76d-cf26-7761-a338-3d456edb725f","timestamp":"2025-10-03T00:16:55.590Z","cwd":"/Users/me/projects/demo"}}"#, "\n",
-            r#"{"timestamp":"2025-10-03T00:16:56.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\nblah"}]}}"#, "\n",
-            r#"{"timestamp":"2025-10-03T00:16:56.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/x</cwd>"}]}}"#, "\n",
-            r#"{"timestamp":"2025-10-03T00:16:57.000Z","type":"event_msg","payload":{"type":"user_message","message":"list files please"}}"#, "\n",
-            r#"{"timestamp":"2025-10-03T00:16:58.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call_1","arguments":"{\"command\":[\"ls\",\"-la\"]}"}}"#, "\n",
-            r#"{"timestamp":"2025-10-03T00:16:59.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Here are the files."}}"#, "\n",
-            r#"{"timestamp":"2025-10-03T00:16:59.500Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here are the files."}]}}"#, "\n"
+            r#"{"timestamp":"2025-10-03T00:16:55.629Z","type":"session_meta","payload":{"id":"0199a76d-cf26-7761-a338-3d456edb725f","timestamp":"2025-10-03T00:16:55.590Z","cwd":"/Users/me/projects/demo"}}"#,
+            "\n",
+            r#"{"timestamp":"2025-10-03T00:16:56.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\nblah"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2025-10-03T00:16:56.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/x</cwd>"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2025-10-03T00:16:57.000Z","type":"event_msg","payload":{"type":"user_message","message":"list files please"}}"#,
+            "\n",
+            r#"{"timestamp":"2025-10-03T00:16:58.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call_1","arguments":"{\"command\":[\"ls\",\"-la\"]}"}}"#,
+            "\n",
+            r#"{"timestamp":"2025-10-03T00:16:59.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Here are the files."}}"#,
+            "\n",
+            r#"{"timestamp":"2025-10-03T00:16:59.500Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here are the files."}]}}"#,
+            "\n"
         );
         std::fs::write(&path, content).unwrap();
 
@@ -1608,8 +1620,7 @@ mod tests {
         // and the mirrored response_item assistant text are NOT emitted.
         assert_eq!(session.messages.len(), 3, "expected 3 messages");
         assert_eq!(session.messages[0].sender, "user");
-        let user_env: MessageEnvelope =
-            serde_json::from_str(&session.messages[0].body).unwrap();
+        let user_env: MessageEnvelope = serde_json::from_str(&session.messages[0].body).unwrap();
         assert_eq!(user_env.text, "list files please");
         // shell tool_use
         assert_eq!(session.messages[1].sender, "agent");
@@ -1632,10 +1643,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rollout-2025-10-03T07-16-55-0199a770.jsonl");
         let content = concat!(
-            r#"{"timestamp":"2025-10-03T00:16:55.629Z","type":"session_meta","payload":{"id":"0199a770-b04e-76c3-b7b9-e556f59ddeab","timestamp":"2025-10-03T00:16:55.590Z","cwd":"/Users/me/projects/demo2"}}"#, "\n",
-            r#"{"timestamp":"2025-10-03T00:16:56.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\nblah"}]}}"#, "\n",
-            r#"{"timestamp":"2025-10-03T00:16:57.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"what is 1+1"}]}}"#, "\n",
-            r#"{"timestamp":"2025-10-03T00:16:58.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"2"}]}}"#, "\n"
+            r#"{"timestamp":"2025-10-03T00:16:55.629Z","type":"session_meta","payload":{"id":"0199a770-b04e-76c3-b7b9-e556f59ddeab","timestamp":"2025-10-03T00:16:55.590Z","cwd":"/Users/me/projects/demo2"}}"#,
+            "\n",
+            r#"{"timestamp":"2025-10-03T00:16:56.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\nblah"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2025-10-03T00:16:57.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"what is 1+1"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2025-10-03T00:16:58.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"2"}]}}"#,
+            "\n"
         );
         std::fs::write(&path, content).unwrap();
 

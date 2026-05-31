@@ -286,7 +286,11 @@ mod tests {
         // `done/total*100`, so assert the shape, not an exact 1..=100.
         assert!(fired.windows(2).all(|w| w[0] < w[1]), "strictly increasing");
         assert_eq!(fired.last(), Some(&100));
-        assert!(fired.len() >= 98, "fires ~once per percent, got {}", fired.len());
+        assert!(
+            fired.len() >= 98,
+            "fires ~once per percent, got {}",
+            fired.len()
+        );
     }
 
     #[tokio::test]
