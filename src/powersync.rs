@@ -29,6 +29,29 @@ const TOKEN_REFRESH_THRESHOLD_SECS: i64 = 60;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Max silence on the stream — no frame of any kind — before we treat the connection
+/// as dead and force a reconnect from the saved cursor.
+///
+/// Sizing is empirical (see the 2026-05-31 stall investigation). PowerSync sends a
+/// keepalive frame every ~18-22s whenever the stream is otherwise idle (data frames
+/// reset that timer, so keepalives only show up during quiet periods). So on a healthy
+/// link SOME frame — data, checkpoint, or keepalive — always lands within ~25s: across
+/// an overnight idle window the inter-frame distribution was tightly bunched under 25s
+/// with a clean empty band at 45-60s. Above that band sit only genuine read-stalls:
+/// the long-lived `POST /sync/stream` half-opens after a network blip (Wi-Fi/VPN/NAT)
+/// and goes totally silent — observed at 60s, 103s, and the original 231s — while
+/// short-lived `/api/writes` POSTs keep succeeding on separate sockets. 60s sits in the
+/// empty band: above all healthy traffic (~3 missed keepalives), below every stall, so
+/// it caps recovery at 60s without false-positive reconnects. Without this watchdog
+/// `lines.next_line()` blocks until the OS finally tears the socket down — surfacing as
+/// "sent but not delivered" until the network path heals on its own.
+const FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// OS-level TCP keepalive on the sync socket — defense in depth under the
+/// application-level `FRAME_IDLE_TIMEOUT`. Probes a quiet connection so a truly
+/// dead path surfaces as a read error/EOF (→ reconnect) instead of hanging.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
 // ---------- public API ----------
 
 #[derive(Debug, Clone)]
@@ -71,6 +94,9 @@ enum ConnectExit {
     Eof,
     TokenRefresh,
     Wake,
+    /// No frame (not even a keepalive) arrived within `FRAME_IDLE_TIMEOUT` —
+    /// the read half is stalled. Reconnect immediately from the saved cursor.
+    IdleTimeout,
 }
 
 pub fn start(config: SyncConfig) -> mpsc::Receiver<SyncEvent> {
@@ -172,6 +198,7 @@ struct BucketRequest {
 async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
     let http = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(60))
+        .tcp_keepalive(TCP_KEEPALIVE)
         .build()
         .expect("reqwest client");
 
@@ -193,6 +220,13 @@ async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
                 match reason {
                     ConnectExit::Wake => {
                         info!("sync stream aborted by wake signal, reconnecting immediately");
+                        continue;
+                    }
+                    ConnectExit::IdleTimeout => {
+                        warn!(
+                            timeout = ?FRAME_IDLE_TIMEOUT,
+                            "no sync frame within idle timeout (stalled read half), reconnecting immediately"
+                        );
                         continue;
                     }
                     ConnectExit::TokenRefresh => info!("sync stream ended for token refresh"),
@@ -280,7 +314,15 @@ async fn connect_and_stream(
         let line = tokio::select! {
             biased;
             _ = &mut wake => return Ok(ConnectExit::Wake),
-            line = lines.next_line() => line?,
+            // Bound the wait for the next frame. On a healthy link a keepalive
+            // (or our 60s heartbeat's round-trip checkpoint) always lands inside
+            // FRAME_IDLE_TIMEOUT; exceeding it means the read half has stalled,
+            // so bail to the outer loop for an immediate reconnect from the
+            // saved cursor rather than blocking indefinitely on a zombie socket.
+            res = tokio::time::timeout(FRAME_IDLE_TIMEOUT, lines.next_line()) => match res {
+                Ok(line) => line?,
+                Err(_elapsed) => return Ok(ConnectExit::IdleTimeout),
+            },
         };
         let line = match line {
             Some(l) => l,
@@ -367,6 +409,7 @@ async fn connect_and_stream(
                 debug!("checkpoint complete, emitted snapshot");
             }
             SyncFrame::Keepalive(k) => {
+                debug!(token_expires_in = k.token_expires_in, "keepalive frame");
                 if k.token_expires_in < TOKEN_REFRESH_THRESHOLD_SECS {
                     info!(
                         expires_in = k.token_expires_in,
