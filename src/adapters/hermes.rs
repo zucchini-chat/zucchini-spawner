@@ -295,7 +295,7 @@ pub(crate) async fn import(
     progress: ImportProgress,
 ) -> Result<()> {
     info!("hermes history import not yet implemented, skipping");
-    progress(100);
+    progress(100).await;
     Ok(())
 }
 

@@ -387,9 +387,9 @@ use uuid::Uuid;
 
 use crate::adapter::ImportProgress;
 use crate::adapters::import_shared::{
-    basename_or, collapse_title, is_synthetic_wrapper, mint_project_id, ProgressThrottle,
+    basename_or, collapse_title, emit_chat, is_synthetic_wrapper, mint_project_id,
+    parse_rfc3339_utc, user_message_body, ImportedChat, ImportedMessage, ProgressThrottle,
 };
-use crate::envelope::MessageEnvelope;
 use crate::writer::WriteEvent;
 
 /// One-shot. Triggered exactly once, immediately after a machine is added —
@@ -413,7 +413,7 @@ pub(crate) async fn import(
         Ok(d) => d,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             info!(path = %projects_dir.display(), "no ~/.claude/projects, nothing to import");
-            progress(100);
+            progress(100).await;
             return Ok(());
         }
         Err(e) => return Err(e).with_context(|| format!("read_dir {}", projects_dir.display())),
@@ -468,7 +468,7 @@ pub(crate) async fn import(
 
     if total_sessions == 0 {
         info!("no .jsonl transcripts found");
-        progress(100);
+        progress(100).await;
         return Ok(());
     }
     info!(
@@ -497,8 +497,8 @@ pub(crate) async fn import(
                 warn!(file = %jsonl.display(), error = %e, "session import failed, skipping");
             }
             done_sessions += 1;
-            // 5%-step throttle shared with every importer; see `ProgressThrottle`.
-            throttle.step(done_sessions, total_sessions, &progress);
+            // Per-percent throttle shared with every importer; see `ProgressThrottle`.
+            throttle.step(done_sessions, total_sessions, &progress).await;
         }
     }
 
@@ -607,8 +607,7 @@ async fn import_session(
         let ts = entry
             .get("timestamp")
             .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
+            .and_then(parse_rfc3339_utc);
 
         // Claude code preserves the entry uuid across `--continue`/`--resume`
         // replays of the same conversation entry — we thread it into
@@ -646,29 +645,32 @@ async fn import_session(
 
     let chat_created_at = first_ts.unwrap_or_else(Utc::now);
     let chat_title = title.unwrap_or_else(|| "Imported chat".to_string());
-    let _ = write_tx
-        .send(WriteEvent::PutChat {
+
+    // Each keeper carries its sort timestamp + entry uuid (threaded into the
+    // message id so `--continue`/`--resume` replays dedup in place). The PutChat
+    // + per-row PutMessage emit is shared via `emit_chat`.
+    let messages: Vec<ImportedMessage> = keepers
+        .into_iter()
+        .map(|(ts, msg)| ImportedMessage {
+            id: msg.uuid,
+            sender: msg.sender,
+            body: msg.body,
+            created_at: ts,
+        })
+        .collect();
+
+    emit_chat(
+        write_tx,
+        user_id,
+        ImportedChat {
             id: chat_id,
             project_id,
-            user_id,
             title: chat_title,
             created_at: chat_created_at,
-        })
-        .await;
-
-    for (ts, msg) in keepers {
-        let _ = write_tx
-            .send(WriteEvent::PutMessage {
-                id: msg.uuid,
-                chat_id: chat_id.to_string(),
-                user_id,
-                sender: msg.sender,
-                content: msg.body,
-                created_at: Some(ts),
-                imported: true,
-            })
-            .await;
-    }
+            messages,
+        },
+    )
+    .await;
 
     Ok(())
 }
@@ -681,13 +683,9 @@ struct ImportedMsg {
 
 impl ImportedMsg {
     fn user(text: String, uuid: Option<Uuid>) -> Self {
-        let env = MessageEnvelope {
-            text,
-            attachments: Vec::new(),
-        };
         Self {
             sender: "user",
-            body: serde_json::to_string(&env).expect("envelope serializable"),
+            body: user_message_body(&text),
             uuid,
         }
     }

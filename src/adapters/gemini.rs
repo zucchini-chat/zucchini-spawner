@@ -64,22 +64,35 @@
 //! writes its token blob there) OR check `GEMINI_API_KEY` — same pragmatic
 //! presence + non-empty check codex uses for `~/.codex/auth.json`.
 //!
-//! `import()` is a stub for v1, like codex/hermes.
+//! `import()` walks `~/.gemini/tmp/<short>/chats/*.jsonl` (one file per
+//! session), resolves each `<short>` back to its project path via
+//! `~/.gemini/projects.json`, and emits PutProject/PutChat/PutMessage events
+//! shaped like the claude/cursor importers — sharing `mint_project_id`,
+//! `collapse_title`, `ProgressThrottle`, the claude-shape envelope helpers, and
+//! the `normalize_tool_use` mapping table (now primitive-keyed so the live
+//! adapter and the importer feed one map). See the section above `import()`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use smallvec::SmallVec;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::adapter::{
     claude_assistant_text_envelope, claude_tool_use_envelope, file_nonempty, parse_json_obj,
     probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind,
     ImportProgress, LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES,
+};
+use crate::adapters::import_shared::{
+    basename_or, collapse_title, emit_chat, is_synthetic_wrapper, mint_project_id, parse_rfc3339_utc,
+    user_message_body, ImportedChat, ImportedMessage, ProgressThrottle,
 };
 use crate::writer::WriteEvent;
 
@@ -281,7 +294,15 @@ impl AgentAdapter for GeminiAdapter {
                 }
             }
             "tool_use" => {
-                if let Some(frame) = normalize_tool_use(&obj) {
+                // Live wire uses `tool_name` / `tool_id` / `parameters`; the
+                // importer reads `name` / `id` / `args` from the transcript.
+                // Both feed the SAME `normalize_tool_use` mapping table via
+                // primitives so the gemini→claude tool map has one source of
+                // truth (CLAUDE.md "never duplicate").
+                let name = obj.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+                let id = obj.get("tool_id").and_then(|v| v.as_str()).unwrap_or("");
+                let args = obj.get("parameters");
+                if let Some(frame) = normalize_tool_use(name, id, args) {
                     // Real tool → flush the text run that preceded it FIRST so
                     // text and tool become separate, correctly-ordered bubbles.
                     if let Some(ev) = self.flush_pending_text() {
@@ -340,10 +361,17 @@ impl AgentAdapter for GeminiAdapter {
     }
 }
 
-/// Maps a gemini `tool_use` frame to a claude-shape tool_use envelope. Returns
+/// Maps a gemini tool call to a claude-shape tool_use envelope. Returns
 /// `None` for the gemini meta-tools `update_topic` / `exit_plan_mode` (dropped
-/// entirely — they have no claude analog and would render as noise). `tool_id`
+/// entirely — they have no claude analog and would render as noise). `id`
 /// is used as the claude `tool_use.id` so iOS can key its row diffing off it.
+///
+/// Takes the call as `(name, id, args)` PRIMITIVES rather than a `Value` frame
+/// so the SAME mapping table serves two callers with different field names:
+/// the live adapter reads `tool_name` / `tool_id` / `parameters` off the wire
+/// frame, while the importer reads `name` / `id` / `args` off a persisted
+/// transcript `toolCalls[]` entry. Both normalize to these primitives before
+/// calling here, so the gemini→claude tool map exists exactly once.
 ///
 /// iOS's `SpawnerMessage.toolSummary` only renders a one-line detail for a
 /// fixed set of claude tool names keyed on specific input fields:
@@ -373,15 +401,12 @@ impl AgentAdapter for GeminiAdapter {
 ///   web_fetch         → `WebSearch` `{query: <prompt>}`   (iOS has no WebFetch)
 ///   update_topic / exit_plan_mode → filtered (None)
 ///   <unknown>         → forwarded under its native name (defensive)
-fn normalize_tool_use(obj: &Value) -> Option<String> {
-    let tool_name = obj.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+fn normalize_tool_use(tool_name: &str, id: &str, params: Option<&Value>) -> Option<String> {
     // Gemini-injected meta-tools — filter out entirely.
     if matches!(tool_name, "update_topic" | "exit_plan_mode") {
         debug!("gemini meta-tool {:?} filtered out", tool_name);
         return None;
     }
-    let id = obj.get("tool_id").and_then(|v| v.as_str()).unwrap_or("");
-    let params = obj.get("parameters");
     let param_str = |key: &str| -> String {
         params
             .and_then(|p| p.get(key))
@@ -582,19 +607,420 @@ fn is_authenticated() -> bool {
     file_nonempty(&creds)
 }
 
-/// One-shot per-kind history importer. Gemini stores session transcripts under
-/// `~/.gemini/` but the on-disk format isn't yet wired up to PutChat/PutMessage
-/// — stub for v1, like codex/hermes: log + report 100% so the dispatcher's
-/// per-kind progress slice closes cleanly.
+// ===========================================================================
+// One-shot gemini-history importer. Walks `~/.gemini/tmp/<short>/chats/*.jsonl`
+// (one file per session), resolves each `<short>` dir back to its absolute
+// project path via `~/.gemini/projects.json` (verified against the session
+// header's `projectHash = sha256(absolute_path)`), and emits
+// PutProject/PutChat/PutMessage events shaped identically to claude's importer
+// output. Status emission lives in the dispatcher in `main.rs` (which rescales
+// per-kind progress into a single 0..99 bar and emits `finished` once), so this
+// function only reports raw 0..=100 via the `progress` callback.
+//
+// Idempotent: project ids are UUIDv5(machine_id || path) — SAME namespace as
+// claude/cursor, so a project with transcripts from several CLIs collapses to a
+// single `projects` row. Chat id = the header `sessionId` (the exact UUID
+// gemini mints + accepts on `--resume`, so import stays consistent with the
+// live resume path, mirroring claude migration 0019).
+//
+// Per-file body lines are one of:
+//   - `{"$set":{...}}`              mutation delta → IGNORE.
+//   - `type:"info"`                 CLI/auth chatter → DROP.
+//   - `type:"user"`, content=[{text}]            → real prompt (MessageEnvelope).
+//   - `type:"user"`, content=[{functionResponse}] → tool-result echo → DROP.
+//   - `type:"gemini"`, content=STRING            → assistant text + optional
+//        `toolCalls:[{id,name,args}]`. Records GROW IN PLACE by `id` (the same
+//        id is re-emitted, first text-only then again with toolCalls), so we
+//        DEDUP last-write-wins per id and map the FINAL form: one assistant
+//        text frame, then one tool_use frame per toolCalls entry (text first,
+//        like the cursor importer).
+//
+// User strings also get the shared synthetic-wrapper screen (a `<session_context>`
+// priming message the CLI injects on resume is not a user prompt).
+
+/// One-shot. Triggered once, immediately after a machine is added; the iOS app
+/// blocks on the import-progress sheet so no live agent contends for the
+/// writer channel (same contract as the claude importer).
 pub(crate) async fn import(
-    _machine_id: Uuid,
-    _user_id: Uuid,
-    _write_tx: mpsc::Sender<WriteEvent>,
+    machine_id: Uuid,
+    user_id: Uuid,
+    write_tx: mpsc::Sender<WriteEvent>,
     progress: ImportProgress,
 ) -> Result<()> {
-    info!("gemini history import not yet implemented, skipping");
-    progress(100);
+    let Some(tmp_dir) = gemini_tmp_dir() else {
+        info!("HOME not set, skipping gemini history import");
+        progress(100).await;
+        return Ok(());
+    };
+    if !tmp_dir.exists() {
+        // No gemini-cli sessions on this machine (never run, or fresh install).
+        // Early-out at 100% so the dispatcher's per-kind slice closes cleanly.
+        info!(path = %tmp_dir.display(), "no ~/.gemini/tmp, nothing to import");
+        progress(100).await;
+        return Ok(());
+    }
+    info!(path = %tmp_dir.display(), "scanning gemini-cli transcripts");
+
+    // shortName → absolute project path, reversed from ~/.gemini/projects.json.
+    let short_to_path = load_projects_map();
+
+    // Group session files by resolved project path. A `BTreeMap` keeps the
+    // order stable for logs and deterministic across re-runs.
+    let mut sessions_by_path: BTreeMap<String, Vec<std::path::PathBuf>> = BTreeMap::new();
+    let mut total_sessions: usize = 0;
+    let mut skipped_no_path = 0usize;
+    let dir = match std::fs::read_dir(&tmp_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(path = %tmp_dir.display(), "no ~/.gemini/tmp, nothing to import");
+            progress(100).await;
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("read_dir {}", tmp_dir.display())),
+    };
+    for entry in dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "skipping unreadable entry under ~/.gemini/tmp");
+                continue;
+            }
+        };
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let short = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Resolve the short name to a real project path. Without a path the
+        // chat can't be opened or resumed (the agent spawns in the project's
+        // cwd), so drop it — same posture as the cursor importer.
+        let Some(path) = short_to_path.get(&short).cloned() else {
+            skipped_no_path += 1;
+            warn!(short = %short, "gemini: no projects.json entry for tmp dir, skipping");
+            continue;
+        };
+        // Worktree sessions live under a transient checkout the user usually
+        // cleans up; they'd land under a project the user never created. Skip
+        // them, exactly like the claude importer skips `/.claude/worktrees/`.
+        if path.contains("/.gemini/worktrees/") {
+            info!(short = %short, "gemini: skipping worktree session transcripts");
+            continue;
+        }
+        let chats_dir = entry.path().join("chats");
+        let inner = match std::fs::read_dir(&chats_dir) {
+            Ok(it) => it,
+            // No `chats/` subdir yet (dir created but no session saved).
+            Err(_) => continue,
+        };
+        let bucket = sessions_by_path.entry(path).or_default();
+        for f in inner {
+            let f = match f {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            let p = f.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                bucket.push(p);
+                total_sessions += 1;
+            }
+        }
+    }
+    if skipped_no_path > 0 {
+        info!(
+            count = skipped_no_path,
+            "gemini: skipped tmp dirs with no resolvable project path"
+        );
+    }
+
+    if total_sessions == 0 {
+        info!("gemini: no .jsonl transcripts found");
+        progress(100).await;
+        return Ok(());
+    }
+    info!(
+        projects = sessions_by_path.len(),
+        sessions = total_sessions,
+        "starting gemini import"
+    );
+
+    let mut done_sessions: usize = 0;
+    let mut throttle = ProgressThrottle::new();
+    for (path, mut sessions) in sessions_by_path {
+        sessions.sort();
+        let project_id = mint_project_id(machine_id, &path);
+        let project_name = basename_or(&path, "project");
+        let _ = write_tx
+            .send(WriteEvent::PutProject {
+                id: project_id,
+                machine_id,
+                name: project_name,
+                path: path.clone(),
+            })
+            .await;
+
+        for jsonl in sessions {
+            if let Err(e) = import_session(&jsonl, project_id, user_id, &write_tx).await {
+                warn!(file = %jsonl.display(), error = %e, "gemini session import failed, skipping");
+            }
+            done_sessions += 1;
+            // Per-percent throttle shared with every importer; see `ProgressThrottle`.
+            throttle.step(done_sessions, total_sessions, &progress).await;
+        }
+    }
+
+    info!(sessions = done_sessions, "gemini history import complete");
     Ok(())
+}
+
+fn gemini_tmp_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".gemini").join("tmp"))
+}
+
+/// Reads `~/.gemini/projects.json` (`{ "projects": { "<absPath>": "<short>" } }`)
+/// and reverses it into `short → absPath`. Returns an empty map if the file is
+/// absent or unparseable — sessions whose `<short>` dir then has no entry are
+/// skipped (logged) rather than failing the whole import.
+fn load_projects_map() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return map;
+    };
+    let path = home.join(".gemini").join("projects.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "gemini: projects.json unreadable");
+            return map;
+        }
+    };
+    #[derive(Deserialize)]
+    struct ProjectsFile {
+        #[serde(default)]
+        projects: std::collections::HashMap<String, String>,
+    }
+    match serde_json::from_slice::<ProjectsFile>(&bytes) {
+        Ok(f) => {
+            for (abs_path, short) in f.projects {
+                // Reverse: short → absPath. On the rare duplicate short name,
+                // last-write-wins is fine — the projectHash check at session
+                // time would catch a true mismatch, but in practice shorts are
+                // unique per gemini-cli.
+                map.insert(short, abs_path);
+            }
+        }
+        Err(e) => warn!(error = %e, "gemini: projects.json not parseable"),
+    }
+    map
+}
+
+/// Parses one gemini session `.jsonl`: header (line 0) → chat id + created_at,
+/// body lines → deduped messages, then emits PutChat + one PutMessage per
+/// kept frame (imported:true). Skips files whose `sessionId` isn't UUID-shaped
+/// and sessions that yield no keepers.
+async fn import_session(
+    jsonl: &std::path::Path,
+    project_id: Uuid,
+    user_id: Uuid,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) -> Result<()> {
+    let file = tokio::fs::File::open(jsonl)
+        .await
+        .with_context(|| format!("open {}", jsonl.display()))?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+
+    // Line 0 = header carrying the sessionId (a UUID) + startTime.
+    let header_line = match lines.next_line().await? {
+        Some(l) => l,
+        None => return Ok(()), // empty file
+    };
+    let header: Value = serde_json::from_str(&header_line)
+        .with_context(|| format!("session header not JSON: {}", jsonl.display()))?;
+    let Some(session_id) = header.get("sessionId").and_then(|v| v.as_str()) else {
+        return Ok(()); // not a session file (no header) — skip silently
+    };
+    let chat_id = Uuid::parse_str(session_id)
+        .with_context(|| format!("sessionId is not a UUID: {session_id}"))?;
+    let chat_created_at = header
+        .get("startTime")
+        .and_then(|v| v.as_str())
+        .and_then(parse_rfc3339_utc);
+
+    // Dedup gemini records last-write-wins per `id` (records grow in place:
+    // text-only first, then re-emitted with toolCalls). The map stores the
+    // latest record + its timestamp for each id; emit order is carried by the
+    // `sequence` vec below (each id is recorded there exactly once, on first
+    // sight, so a re-emit updates the record in place without reordering).
+    let mut gemini_by_id: std::collections::HashMap<String, (DateTime<Utc>, Value)> =
+        std::collections::HashMap::new();
+    // User prompts don't grow; collect them inline as (ts, frame).
+    enum Kept {
+        UserText { ts: DateTime<Utc>, text: String },
+        GeminiId(String),
+    }
+    let mut sequence: Vec<Kept> = Vec::new();
+    let mut first_user_text: Option<String> = None;
+
+    while let Some(line) = lines.next_line().await? {
+        if line.is_empty() {
+            continue;
+        }
+        let entry: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "gemini: skipping malformed jsonl line");
+                continue;
+            }
+        };
+        // `{"$set":{...}}` mutation deltas carry no message — ignore.
+        if entry.get("$set").is_some() {
+            continue;
+        }
+        let ts = entry
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339_utc);
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match entry_type {
+            "user" => {
+                let Some(text) = user_prompt_text(&entry) else {
+                    continue; // functionResponse echo, synthetic, or empty
+                };
+                if first_user_text.is_none() {
+                    first_user_text = Some(text.clone());
+                }
+                let ts = ts.unwrap_or_else(Utc::now);
+                sequence.push(Kept::UserText { ts, text });
+            }
+            "gemini" => {
+                let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let ts = ts.unwrap_or_else(Utc::now);
+                // Last-write-wins: the re-emitted (toolCalls-bearing) record
+                // replaces the earlier text-only one under the same id, but the
+                // emit slot is recorded only on first sight (no reordering).
+                if !gemini_by_id.contains_key(id) {
+                    sequence.push(Kept::GeminiId(id.to_string()));
+                }
+                gemini_by_id.insert(id.to_string(), (ts, entry));
+            }
+            // `info` (auth/CLI chatter) and any other type → drop.
+            _ => {}
+        }
+    }
+
+    // Build the emit list in observed order. Each gemini record fans out into
+    // an assistant text frame (if non-empty) followed by one tool_use frame
+    // per toolCalls entry — text first, like the cursor importer.
+    let mut emitted: Vec<(DateTime<Utc>, &'static str, String)> = Vec::new();
+    for kept in &sequence {
+        match kept {
+            Kept::UserText { ts, text } => {
+                emitted.push((*ts, "user", user_message_body(text)));
+            }
+            Kept::GeminiId(id) => {
+                let Some((ts, record)) = gemini_by_id.get(id) else {
+                    continue;
+                };
+                if let Some(text) = record.get("content").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        emitted.push((*ts, "agent", claude_assistant_text_envelope(text)));
+                    }
+                }
+                if let Some(calls) = record.get("toolCalls").and_then(|v| v.as_array()) {
+                    for call in calls {
+                        let name = call.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let tid = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let args = call.get("args");
+                        // Shares the live adapter's mapping table.
+                        if let Some(frame) = normalize_tool_use(name, tid, args) {
+                            emitted.push((*ts, "agent", frame));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if emitted.is_empty() {
+        return Ok(());
+    }
+
+    let chat_created_at = chat_created_at
+        .or_else(|| emitted.first().map(|(ts, _, _)| *ts))
+        .unwrap_or_else(Utc::now);
+    let chat_title = first_user_text
+        .as_deref()
+        .map(collapse_title)
+        .unwrap_or_else(|| "Imported chat".to_string());
+
+    // A gemini text+tool record shares one `timestamp`, so bump per-row by the
+    // emit index to keep `created_at` monotonic within the chat (mirrors the
+    // cursor importer, which has the same multi-row-per-bubble shape). Message
+    // ids are `None` (gemini ids aren't UUIDs and a record fans out into
+    // multiple rows), so the writer mints them; re-imports converge through the
+    // backend's INSERT ... ON CONFLICT only at the (chat_id) level, which is
+    // fine: the chat row is stable, message rows are insert-once. The PutChat +
+    // per-row PutMessage emit itself is shared via `emit_chat`.
+    let messages: Vec<ImportedMessage> = emitted
+        .into_iter()
+        .enumerate()
+        .map(|(seq, (ts, sender, body))| ImportedMessage {
+            id: None,
+            sender,
+            body,
+            created_at: ts + ChronoDuration::milliseconds(seq as i64),
+        })
+        .collect();
+
+    emit_chat(
+        write_tx,
+        user_id,
+        ImportedChat {
+            id: chat_id,
+            project_id,
+            title: chat_title,
+            created_at: chat_created_at,
+            messages,
+        },
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Extracts a real user prompt string from a gemini `user` record, or `None`
+/// when the record is a tool-result echo (`functionResponse`), a synthetic
+/// `<session_context>` priming message, or otherwise empty. Gemini's user
+/// `content` is an array of parts; a real prompt carries `{text}` parts.
+fn user_prompt_text(entry: &Value) -> Option<String> {
+    let parts = entry.get("content").and_then(|c| c.as_array())?;
+    // A part carrying `functionResponse` is a tool-result echo — drop the whole
+    // record (it never carries user text alongside).
+    if parts
+        .iter()
+        .any(|p| p.get("functionResponse").is_some())
+    {
+        return None;
+    }
+    let mut texts: Vec<&str> = Vec::new();
+    for p in parts {
+        if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+            texts.push(t);
+        }
+    }
+    if texts.is_empty() {
+        return None;
+    }
+    let joined = texts.join("\n");
+    if joined.trim().is_empty() || is_synthetic_wrapper(&joined) {
+        return None;
+    }
+    Some(joined)
 }
 
 /// `fn`-pointer-shaped wrapper around `import()` for `AdapterDescriptor.import`.
@@ -1147,5 +1573,197 @@ mod tests {
         let c = ctx(&prompt_file, None, false, None);
         let cmd = a.prepare_command(&c).unwrap();
         assert!(!cmd.contains(" -m "), "got: {}", cmd);
+    }
+
+    // ----- importer unit tests --------------------------------------------
+
+    #[test]
+    fn user_prompt_text_keeps_real_text() {
+        let entry = json!({"type":"user","content":[{"text":"hello there"}]});
+        assert_eq!(user_prompt_text(&entry), Some("hello there".to_string()));
+    }
+
+    #[test]
+    fn user_prompt_text_drops_function_response_echo() {
+        let entry = json!({"type":"user","content":[{"functionResponse":{"name":"x","response":{}}}]});
+        assert_eq!(user_prompt_text(&entry), None);
+    }
+
+    #[test]
+    fn user_prompt_text_drops_session_context_synthetic() {
+        // `<session_context>` priming message is injected by gemini-cli on
+        // resume; `is_synthetic_wrapper` (extended for this) screens it.
+        let entry =
+            json!({"type":"user","content":[{"text":"<session_context>prior turns…"}]});
+        assert_eq!(user_prompt_text(&entry), None);
+    }
+
+    #[test]
+    fn user_prompt_text_drops_empty_and_whitespace() {
+        assert_eq!(user_prompt_text(&json!({"type":"user","content":[]})), None);
+        assert_eq!(
+            user_prompt_text(&json!({"type":"user","content":[{"text":"   "}]})),
+            None
+        );
+    }
+
+    #[test]
+    fn importer_tool_map_shares_live_mapping_table() {
+        // The importer feeds `name`/`id`/`args` primitives into the SAME
+        // `normalize_tool_use` the live adapter uses — so a run_shell_command
+        // toolCalls entry maps to claude Bash{command}, and meta-tools filter.
+        let args = json!({"command":"echo hi","description":"say hi"});
+        let frame = normalize_tool_use("run_shell_command", "call-1", Some(&args)).unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["message"]["content"][0]["name"], "Bash");
+        assert_eq!(v["message"]["content"][0]["id"], "call-1");
+        assert_eq!(v["message"]["content"][0]["input"]["command"], "echo hi");
+        assert!(normalize_tool_use("update_topic", "x", Some(&json!({}))).is_none());
+    }
+
+    /// Writes `lines` (joined by "\n") to a session .jsonl under `chats_dir`.
+    fn write_session(chats_dir: &std::path::Path, name: &str, lines: &[Value]) {
+        std::fs::create_dir_all(chats_dir).unwrap();
+        let body = lines
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(chats_dir.join(name), body).unwrap();
+    }
+
+    fn temp_home() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "zucchini_gemini_import_home_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn end_to_end_import_over_fixture_tree() {
+        let home = temp_home();
+        let gemini = home.join(".gemini");
+        // projects.json: one real project + one worktree project (must be
+        // skipped) + one short name with no transcripts.
+        let projects = json!({
+            "projects": {
+                "/tmp/proj-real": "proj-real",
+                "/tmp/wt/.gemini/worktrees/feat-x": "feat-x",
+            }
+        });
+        std::fs::create_dir_all(&gemini).unwrap();
+        std::fs::write(
+            gemini.join("projects.json"),
+            serde_json::to_vec(&projects).unwrap(),
+        )
+        .unwrap();
+
+        // Real project session: header, $set delta (ignored), info (dropped),
+        // user prompt, gemini text-only (id g1), gemini g1 RE-EMITTED with a
+        // toolCalls run_shell_command (last-write-wins → final form), a user
+        // functionResponse echo (dropped), and a final gemini text (id g2).
+        let sid = "019e7758-63ce-7443-9524-4af3cea5b638";
+        let real_chats = gemini.join("tmp").join("proj-real").join("chats");
+        write_session(
+            &real_chats,
+            "session-2026-05-30T05-25-019e7758.jsonl",
+            &[
+                json!({"sessionId": sid, "projectHash":"x", "startTime":"2026-05-30T05:25:00.000Z", "kind":"main"}),
+                json!({"$set": {"messages": [], "lastUpdated": "2026-05-30T05:25:00.000Z"}}),
+                json!({"id":"i1","type":"info","timestamp":"2026-05-30T05:25:01.000Z","content":"Authentication succeeded"}),
+                json!({"id":"u1","type":"user","timestamp":"2026-05-30T05:25:02.000Z","content":[{"text":"list files then say done"}]}),
+                json!({"id":"g1","type":"gemini","timestamp":"2026-05-30T05:25:03.000Z","content":"Let me check.","thoughts":[{"x":1}],"tokens":{}}),
+                json!({"id":"g1","type":"gemini","timestamp":"2026-05-30T05:25:04.000Z","content":"Let me check.","toolCalls":[{"id":"tc1","name":"run_shell_command","args":{"command":"ls"},"status":"success"}]}),
+                json!({"id":"u2","type":"user","timestamp":"2026-05-30T05:25:05.000Z","content":[{"functionResponse":{"name":"run_shell_command","response":{}}}]}),
+                json!({"id":"g2","type":"gemini","timestamp":"2026-05-30T05:25:06.000Z","content":"done"}),
+            ],
+        );
+
+        // Worktree session — must be skipped entirely (path under /.gemini/worktrees/).
+        let wt_chats = gemini.join("tmp").join("feat-x").join("chats");
+        write_session(
+            &wt_chats,
+            "session-2026-05-21T13-44-77a1b80a.jsonl",
+            &[
+                json!({"sessionId":"77a1b80a-b8db-499a-87b3-170313b5e398","startTime":"2026-05-21T13:44:58.525Z","kind":"main"}),
+                json!({"id":"wu","type":"user","timestamp":"2026-05-21T13:44:59.000Z","content":[{"text":"echo hi"}]}),
+            ],
+        );
+
+        // A tmp dir with no projects.json entry — skipped (no resolvable path).
+        let orphan_chats = gemini.join("tmp").join("ghost").join("chats");
+        write_session(
+            &orphan_chats,
+            "session-2026-05-30T00-00-00000000.jsonl",
+            &[
+                json!({"sessionId":"00000000-0000-4000-8000-000000000000","startTime":"2026-05-30T00:00:00.000Z","kind":"main"}),
+                json!({"id":"ou","type":"user","timestamp":"2026-05-30T00:00:01.000Z","content":[{"text":"orphan"}]}),
+            ],
+        );
+
+        let (tx, mut rx) = mpsc::channel::<WriteEvent>(64);
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: env mutation is single-threaded per test process.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let result = import(
+            Uuid::nil(),
+            Uuid::nil(),
+            tx,
+            Box::new(|_| Box::pin(async {}) as futures::future::BoxFuture<'static, ()>)
+                as ImportProgress,
+        )
+        .await;
+        // SAFETY: restore before assertions.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        result.expect("import ok");
+
+        let mut projects_seen = Vec::new();
+        let mut chats_seen = Vec::new();
+        let mut messages: Vec<(String, String)> = Vec::new(); // (sender, body)
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                WriteEvent::PutProject { path, .. } => projects_seen.push(path),
+                WriteEvent::PutChat { id, title, .. } => chats_seen.push((id, title)),
+                WriteEvent::PutMessage {
+                    sender, content, ..
+                } => messages.push((sender.to_string(), content)),
+                _ => {}
+            }
+        }
+        let _ = home; // tempdir leaked deliberately (cheap; test teardown only)
+
+        // Only the real project survives — worktree + orphan dropped.
+        assert_eq!(projects_seen, vec!["/tmp/proj-real".to_string()]);
+        assert_eq!(chats_seen.len(), 1);
+        assert_eq!(chats_seen[0].0, Uuid::parse_str(sid).unwrap());
+        assert_eq!(chats_seen[0].1, "list files then say done");
+
+        // Messages: user prompt, g1 text, g1 tool (Bash), g2 text = 4 rows.
+        // info / $set / functionResponse echo all dropped; g1 deduped LWW.
+        assert_eq!(messages.len(), 4, "got: {:?}", messages);
+        assert_eq!(messages[0].0, "user");
+        assert!(messages[0].1.contains("list files then say done"));
+        assert_eq!(messages[1].0, "agent");
+        assert!(messages[1].1.contains("Let me check."));
+        assert_eq!(messages[2].0, "agent");
+        let tool: Value = serde_json::from_str(&messages[2].1).unwrap();
+        assert_eq!(tool["message"]["content"][0]["name"], "Bash");
+        assert_eq!(tool["message"]["content"][0]["input"]["command"], "ls");
+        assert_eq!(messages[3].0, "agent");
+        assert!(messages[3].1.contains("done"));
     }
 }

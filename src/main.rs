@@ -18,6 +18,7 @@ mod writer;
 mod x25519;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1070,9 +1071,14 @@ fn spawn_startup_info_report(
 ///  - Emit `running-0` once at the very start.
 ///  - Per-kind `progress(pct)` callback emits `running-{scaled}` via
 ///    `write_tx.try_send` — `ImportStatus` is a tiny machines PATCH, channel
-///    backpressure that drops one of these is acceptable (the next 5%-step
-///    will reapply the correct value), so we log on a failed `try_send` but
-///    don't await.
+///    backpressure that drops one of these is acceptable (the next percent
+///    step will reapply the correct value), so we log on a failed `try_send`
+///    but don't await. The callback fires roughly once per imported chat
+///    (per-percent throttle inside the adapter); a shared `last_scaled` gate
+///    here suppresses the duplicate `running-{scaled}` values that several
+///    per-kind percents collapse to once they're rescaled into this kind's
+///    slice of the shared 0..99 bar, so the wire still only moves on a real
+///    bar advance.
 ///  - Emit `finished` exactly once at the very end, after every kind has
 ///    been attempted. EXCEPTION: if every kind errored, leave the status at
 ///    its last `running-{scaled}` value — the backend FSM permits
@@ -1089,16 +1095,28 @@ async fn run_history_import(
     write_tx: mpsc::Sender<WriteEvent>,
     kinds: Vec<AgentKind>,
 ) {
-    // Helper: try to push a status update; channel cap is 1024 and import
-    // status writes are sparse (≤20 per kind via the 5%-step throttle), so
-    // a full channel here means the writer is wedged on a network failure
-    // — log and move on rather than blocking the dispatcher.
-    fn emit_status(tx: &mpsc::Sender<WriteEvent>, machine_id: Uuid, status: String) {
-        if let Err(e) = tx.try_send(WriteEvent::ImportStatus {
-            machine_id,
-            status: status.clone(),
-        }) {
-            warn!(error = %e, %status, "dropped import status update (writer channel full?)");
+    // Helper: deliver a status update with a blocking send so it can't be
+    // dropped. The 1024-cap writer channel is SHARED with this import's bulk
+    // PutChat/PutMessage row writes, so on a large import (hundreds of
+    // sessions) it legitimately fills with row writes faster than the writer
+    // drains; a non-blocking `try_send` here would silently drop updates —
+    // including the terminal `finished`, which is the only signal that
+    // dismisses the client's progress modal (observed: a 331-session import
+    // dropped `finished` → modal hung forever at the last delivered percent).
+    // Blocking instead applies backpressure (the import loop waits for the
+    // writer to drain a slot) and `finished` is guaranteed to land. Safe to
+    // block here: this runs in its own spawned task (see the `tokio::spawn`
+    // caller), so it never stalls the dispatcher, and the writer's
+    // retry-with-backoff keeps draining the channel.
+    async fn emit_status(tx: &mpsc::Sender<WriteEvent>, machine_id: Uuid, status: String) {
+        if let Err(e) = tx
+            .send(WriteEvent::ImportStatus {
+                machine_id,
+                status: status.clone(),
+            })
+            .await
+        {
+            warn!(error = %e, %status, "failed to enqueue import status (writer channel closed)");
         }
     }
 
@@ -1107,26 +1125,38 @@ async fn run_history_import(
     // bug. Don't divide by zero in the rescaler; emit finished and bail.
     if kinds.is_empty() {
         warn!("run_history_import called with empty kinds list — nothing to do");
-        emit_status(&write_tx, machine_id, "finished".to_string());
+        emit_status(&write_tx, machine_id, "finished".to_string()).await;
         return;
     }
 
-    emit_status(&write_tx, machine_id, "running-0".to_string());
+    emit_status(&write_tx, machine_id, "running-0".to_string()).await;
 
     let n = kinds.len() as u32;
+    // Last `running-{scaled}` value we put on the wire, shared across every
+    // kind's callback. The bar is monotonic non-decreasing (idx grows, and
+    // each kind's percent grows), so deduping consecutive identical values
+    // collapses the per-chat callbacks down to one PATCH per integer-percent
+    // advance — `running-0` is already on the wire, so seed it to 0.
+    let last_scaled = Arc::new(AtomicU8::new(0));
     let mut ok_count = 0usize;
     for (idx, kind) in kinds.iter().enumerate() {
         let idx_u32 = idx as u32;
         let tx_for_progress = write_tx.clone();
+        let last_scaled = Arc::clone(&last_scaled);
         // Per-kind rescaler. `scaled = (idx*100 + pct) / N`, capped at 99
-        // (the dispatcher owns 100/finished). Adapter callbacks are
-        // throttled internally (5%-step), so we don't bother dedup-ing
-        // duplicate scaled values here — at most ~20 fires per kind × N
-        // kinds = ~40 PATCHes per import.
+        // (the dispatcher owns 100/finished). The adapter calls this ~once per
+        // imported chat; we emit only when the rescaled bar value actually
+        // moves, so multi-kind imports don't re-send the same percent N times.
         let progress: crate::adapter::ImportProgress = Box::new(move |pct: u8| {
-            let pct = pct.min(100) as u32;
-            let scaled = ((idx_u32 * 100 + pct) / n).min(99) as u8;
-            emit_status(&tx_for_progress, machine_id, format!("running-{scaled}"));
+            let tx = tx_for_progress.clone();
+            let last_scaled = Arc::clone(&last_scaled);
+            Box::pin(async move {
+                let pct = pct.min(100) as u32;
+                let scaled = ((idx_u32 * 100 + pct) / n).min(99) as u8;
+                if last_scaled.swap(scaled, Ordering::Relaxed) != scaled {
+                    emit_status(&tx, machine_id, format!("running-{scaled}")).await;
+                }
+            })
         });
 
         match kind
@@ -1156,7 +1186,7 @@ async fn run_history_import(
         return;
     }
 
-    emit_status(&write_tx, machine_id, "finished".to_string());
+    emit_status(&write_tx, machine_id, "finished".to_string()).await;
 }
 
 fn spawn_heartbeat(

@@ -761,26 +761,18 @@ use uuid::Uuid;
 
 use crate::adapter::ImportProgress;
 use crate::adapters::import_shared::{
-    basename_or, collapse_title, is_synthetic_wrapper, mint_project_id, ProgressThrottle,
+    basename_or, collapse_title, emit_chat, is_synthetic_wrapper, mint_project_id,
+    user_message_body, ImportedChat, ImportedMessage, ProgressThrottle,
 };
-use crate::envelope::MessageEnvelope;
 use crate::writer::WriteEvent;
-
-/// Sentinel `projects.path` for cursor composers whose `workspaceIdentifier`
-/// carries only an opaque id (no `uri.path`). Real project paths are
-/// absolute (always start with `/`), so this string can't collide. Kept
-/// short + human-readable because it surfaces in the iOS project list and
-/// (via `basename_or`) in the project name fallback.
-const CURSOR_NO_PROJECT_PATH: &str = "<no project>";
-const CURSOR_NO_PROJECT_NAME: &str = "Cursor (no project)";
 
 /// Parsed `composer.composerHeaders.allComposers[i]` entry. Only the fields
 /// we actually use — serde drops the rest via the catch-all (no #[serde(deny_unknown_fields)]).
 struct ComposerHeader {
     id: String,
     /// Resolved workspace path, or `None` when only `workspaceIdentifier.id`
-    /// is present (no `uri.path`). Caller buckets `None` under
-    /// `CURSOR_NO_PROJECT_PATH`.
+    /// is present (no `uri.path`). Caller DROPS `None` composers — a chat with
+    /// no project folder can't be opened or resumed in Zucchini.
     project_path: Option<String>,
     created_at_ms: i64,
     /// `composerData.name` is preferred for the title; the header name is
@@ -830,16 +822,26 @@ pub(crate) async fn import(
         return Ok(());
     }
 
-    // Group composers by project path (sentinel for unresolved). Sort each
-    // group's composers by created_at so progress is deterministic across
-    // re-runs and the iOS UI walks oldest→newest.
+    // Group composers by project path. Composers whose `workspaceIdentifier`
+    // carries only an opaque id (no resolvable `uri.path`) are DROPPED: a chat
+    // with no project folder can't be opened or resumed in Zucchini (the agent
+    // is spawned in the project's cwd), so a "<no project>" bucket would only
+    // create dead chats. Sort each group's composers by created_at so progress
+    // is deterministic across re-runs and the iOS UI walks oldest→newest.
     let mut by_project: BTreeMap<String, Vec<ComposerHeader>> = BTreeMap::new();
+    let mut skipped_no_project = 0usize;
     for h in headers {
-        let key = h
-            .project_path
-            .clone()
-            .unwrap_or_else(|| CURSOR_NO_PROJECT_PATH.to_string());
+        let Some(key) = h.project_path.clone() else {
+            skipped_no_project += 1;
+            continue;
+        };
         by_project.entry(key).or_default().push(h);
+    }
+    if skipped_no_project > 0 {
+        info!(
+            count = skipped_no_project,
+            "cursor: skipped composers with no resolvable project path"
+        );
     }
     let total_composers: usize = by_project.values().map(|v| v.len()).sum();
     if total_composers == 0 {
@@ -856,11 +858,7 @@ pub(crate) async fn import(
     for (project_path, mut composers) in by_project {
         composers.sort_by_key(|h| h.created_at_ms);
         let project_id = mint_project_id(machine_id, &project_path);
-        let project_name = if project_path == CURSOR_NO_PROJECT_PATH {
-            CURSOR_NO_PROJECT_NAME.to_string()
-        } else {
-            basename_or(&project_path, "project")
-        };
+        let project_name = basename_or(&project_path, "project");
         let _ = write_tx
             .send(WriteEvent::PutProject {
                 id: project_id,
@@ -884,8 +882,8 @@ pub(crate) async fn import(
                 tracing::warn!(composer_id = %header.id, error = %e, "cursor composer import failed, skipping");
             }
             done_composers += 1;
-            // 5%-step throttle shared with every importer; see `ProgressThrottle`.
-            throttle.step(done_composers, total_composers, &progress);
+            // Per-percent throttle shared with every importer; see `ProgressThrottle`.
+            throttle.step(done_composers, total_composers, &progress).await;
         }
     }
 
@@ -1150,7 +1148,14 @@ async fn import_composer(
         return Ok(());
     };
 
-    let mut emitted: Vec<PendingMsg> = Vec::new();
+    // Per-message `created_at`: bubbles have no clock. Use
+    // `chat_created_at + idx ms` (idx = emit slot, == `messages.len()` at push
+    // time) so the writer's `created_at` is monotonic per row — text+tool_use
+    // from the same bubble get distinct timestamps because they occupy
+    // consecutive slots. The bubbleId is a UUID, threaded as the message id so
+    // re-imports converge in place. The PutChat-then-PutMessage emit is shared
+    // via `emit_chat`.
+    let mut messages: Vec<ImportedMessage> = Vec::new();
     let mut first_user_text: Option<String> = None;
     for h in headers {
         let Some(bubble_id) = h.get("bubbleId").and_then(|v| v.as_str()) else {
@@ -1159,47 +1164,32 @@ async fn import_composer(
         let Some(bubble) = bubble_rows.get(&(header.id.clone(), bubble_id.to_string())) else {
             continue;
         };
-        match classify_bubble(bubble) {
+        let id = Uuid::parse_str(bubble_id).ok();
+        let (sender, frames) = match classify_bubble(bubble) {
             BubbleOut::User { text } => {
                 if first_user_text.is_none() {
                     first_user_text = Some(text.clone());
                 }
-                let env = MessageEnvelope {
-                    text,
-                    attachments: Vec::new(),
-                };
-                let body =
-                    serde_json::to_string(&env).expect("MessageEnvelope is always serializable");
-                emitted.push(PendingMsg {
-                    bubble_id: bubble_id.to_string(),
-                    sender: "user",
-                    body,
-                });
+                ("user", vec![user_message_body(&text)])
             }
             BubbleOut::Assistant {
                 text_frame,
                 tool_frame,
-            } => {
-                if let Some(frame) = text_frame {
-                    emitted.push(PendingMsg {
-                        bubble_id: bubble_id.to_string(),
-                        sender: "agent",
-                        body: frame,
-                    });
-                }
-                if let Some(frame) = tool_frame {
-                    emitted.push(PendingMsg {
-                        bubble_id: bubble_id.to_string(),
-                        sender: "agent",
-                        body: frame,
-                    });
-                }
-            }
-            BubbleOut::Skip => {}
+            } => ("agent", [text_frame, tool_frame].into_iter().flatten().collect()),
+            BubbleOut::Skip => continue,
+        };
+        for body in frames {
+            let ts = chat_created_at + ChronoDuration::milliseconds(messages.len() as i64);
+            messages.push(ImportedMessage {
+                id,
+                sender,
+                body,
+                created_at: ts,
+            });
         }
     }
 
-    if emitted.is_empty() {
+    if messages.is_empty() {
         return Ok(());
     }
 
@@ -1214,45 +1204,20 @@ async fn import_composer(
         .or_else(|| first_user_text.as_deref().map(collapse_title))
         .unwrap_or_else(|| "Imported chat".to_string());
 
-    // PutChat MUST land before its messages — matches the claude importer
-    // ordering, and the backend's FK on `messages.chat_id` rejects orphans.
-    let _ = write_tx
-        .send(WriteEvent::PutChat {
+    emit_chat(
+        write_tx,
+        user_id,
+        ImportedChat {
             id: chat_id,
             project_id,
-            user_id,
             title,
             created_at: chat_created_at,
-        })
-        .await;
-
-    // Per-message `created_at`: bubbles have no clock. Use
-    // `chat_created_at + idx ms` so the writer's `created_at` is monotonic
-    // per row (text+tool_use from the same bubble get distinct timestamps
-    // because they occupy consecutive emit slots).
-    for (seq, msg) in emitted.into_iter().enumerate() {
-        let bubble_uuid = Uuid::parse_str(&msg.bubble_id).ok();
-        let ts = chat_created_at + ChronoDuration::milliseconds(seq as i64);
-        let _ = write_tx
-            .send(WriteEvent::PutMessage {
-                id: bubble_uuid,
-                chat_id: chat_id.to_string(),
-                user_id,
-                sender: msg.sender,
-                content: msg.body,
-                created_at: Some(ts),
-                imported: true,
-            })
-            .await;
-    }
+            messages,
+        },
+    )
+    .await;
 
     Ok(())
-}
-
-struct PendingMsg {
-    bubble_id: String,
-    sender: &'static str,
-    body: String,
 }
 
 enum BubbleOut {
@@ -2277,7 +2242,14 @@ mod tests {
             std::env::remove_var("XDG_CONFIG_HOME");
         }
 
-        let result = import(machine_id, user_id, tx, Box::new(|_| {}) as ImportProgress).await;
+        let result = import(
+            machine_id,
+            user_id,
+            tx,
+            Box::new(|_| Box::pin(async {}) as futures::future::BoxFuture<'static, ()>)
+                as ImportProgress,
+        )
+        .await;
 
         // Restore HOME / XDG_CONFIG_HOME before any assertions panic.
         // SAFETY: same as above — single-threaded test process.
@@ -2314,14 +2286,13 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, WriteEvent::PutMessage { .. }))
             .collect();
-        assert_eq!(projects.len(), 2, "/tmp/proj-a + <no project>");
-        assert_eq!(chats.len(), 2, "one per accepted composer");
-        // composer1: user + assistant_text + assistant_tool = 3; composer2: 1
-        assert_eq!(messages.len(), 4);
+        // composer2 has no resolvable project path → dropped entirely (no
+        // "<no project>" bucket), so only `/tmp/proj-a` survives.
+        assert_eq!(projects.len(), 1, "only /tmp/proj-a (no-project dropped)");
+        assert_eq!(chats.len(), 1, "one per accepted composer");
+        // composer1: user + assistant_text + assistant_tool = 3.
+        assert_eq!(messages.len(), 3);
 
-        // Project ordering: BTreeMap iterates by path, so `/tmp/proj-a`
-        // (starts with '/') comes before `<no project>` (starts with '<')
-        // — '/' (0x2F) < '<' (0x3C).
         let WriteEvent::PutProject {
             path: first_path, ..
         } = &events[0]

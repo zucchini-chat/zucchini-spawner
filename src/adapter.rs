@@ -23,15 +23,22 @@ use uuid::Uuid;
 use crate::writer::WriteEvent;
 
 /// Progress callback handed to each adapter's `import()`. Adapter calls
-/// `progress(pct)` with monotonic 0..=100 values (throttled internally — the
-/// 5%-step gate lives inside each adapter, so the dispatcher's closure can
-/// fire on every call without flooding). The dispatcher in `main.rs` wraps
-/// this with a per-kind rescaler (kind i of N takes the slice
-/// `i/N .. (i+1)/N`) and writes the rescaled value to `machines.
-/// claude_history_import_status` via the writer channel. Per-kind 100% is
-/// reserved for the dispatcher (it emits `"finished"` exactly once at the
-/// very end, after every kind has run).
-pub type ImportProgress = Box<dyn Fn(u8) + Send + Sync>;
+/// `progress(pct).await` with monotonic 0..=100 values (throttled internally —
+/// the per-percent gate lives inside each adapter, firing ~once per imported
+/// chat, and the dispatcher's closure dedups identical rescaled values before
+/// they hit the wire). The dispatcher in `main.rs` wraps this with a per-kind
+/// rescaler (kind i of N takes the slice `i/N .. (i+1)/N`) and writes the
+/// rescaled value to `machines.claude_history_import_status` via the writer
+/// channel. Per-kind 100% is reserved for the dispatcher (it emits
+/// `"finished"` exactly once at the very end, after every kind has run).
+///
+/// The callback is **async** so the dispatcher can deliver each status with a
+/// blocking channel send rather than a droppable `try_send`: the status
+/// channel is shared with the import's bulk row writes, and a dropped terminal
+/// `finished` strands the client's progress modal forever. Awaiting also
+/// applies natural backpressure — the import loop slows to the writer's drain
+/// rate instead of overrunning the channel.
+pub type ImportProgress = Box<dyn Fn(u8) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Picks the adapter at spawn time. Mirrors the `chats.agent_kind` enum
 /// stored in Postgres.

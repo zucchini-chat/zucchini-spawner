@@ -119,6 +119,15 @@ const PLUGIN_PING_INTERVAL: Duration = Duration::from_secs(30);
 const GATEWAY_RESTART_MIN: Duration = Duration::from_secs(1);
 const GATEWAY_RESTART_MAX: Duration = Duration::from_secs(30);
 
+/// Idle interval used when hermes isn't installed at all. Without this the
+/// supervisor crash-loops `hermes gateway run` (which exits 127 instantly)
+/// at the 30s backoff cap forever, flooding the journal with start/exit
+/// pairs — ~190 lines/hour on a box that never had hermes. Instead we probe
+/// PATH first and, while absent, re-probe at this slow cadence so the gateway
+/// still auto-starts if the user installs hermes later, just without the
+/// spam.
+const HERMES_ABSENT_POLL_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Default path for the spawner-owned hermes socket, lives under the
 /// spawner's 0700 dir. Overridable via the `ZUCCHINI_SPAWNER_SOCK` env var
 /// for dev / tests; main.rs sets the env var on the gateway child + every
@@ -692,9 +701,34 @@ async fn send_proactive_agent_line(
 /// will reconnect on its own once `hermes gateway run` is back up.
 async fn spawn_gateway_supervisor(socket_path: PathBuf, cancel: CancellationToken) {
     let mut backoff = GATEWAY_RESTART_MIN;
+    let mut logged_absent = false;
     loop {
         if cancel.is_cancelled() {
             return;
+        }
+        // Don't crash-loop the gateway when hermes isn't installed. Probe
+        // PATH the same way the spawn resolves it (`-lic` login shell) and,
+        // while absent, idle at a slow cadence — logging the transition just
+        // once so the journal isn't flooded. Re-probing each tick means the
+        // gateway starts automatically once hermes appears on PATH.
+        if !crate::shell::binary_on_path("hermes").await {
+            if !logged_absent {
+                info!(
+                    poll_secs = HERMES_ABSENT_POLL_INTERVAL.as_secs(),
+                    "hermes not on PATH; gateway supervisor idle (re-probing)"
+                );
+                logged_absent = true;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(HERMES_ABSENT_POLL_INTERVAL) => {}
+            }
+            continue;
+        }
+        if logged_absent {
+            info!("hermes now on PATH; starting gateway supervisor");
+            logged_absent = false;
+            backoff = GATEWAY_RESTART_MIN;
         }
         let started = std::time::Instant::now();
         match start_gateway_child(&socket_path).await {

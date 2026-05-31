@@ -4,6 +4,8 @@ Rust. PowerSync sync-stream client (read-only NDJSON) + writeback. Spawns claude
 
 Installed via `install.sh`, which enrolls a Machine and runs a heartbeat. Runtime dir: `~/.zucchini-spawner/` (config, sync cursor, `key`). Dev JWT via `ZUCCHINI_DEV_JWT`.
 
+In prod the installer registers a **per-user service** (`SERVICE_NAME=chat.zucchini.spawner`) — `systemctl --user` on Linux (loginctl linger enabled so it survives logout), launchd LaunchAgent on macOS. Read logs with `journalctl --user -u chat.zucchini.spawner -f` (Linux); on the e2e box (`beprod`) that's the source of truth for what the spawner actually did. The install/build/ship mechanics are simpler to read in `install.sh`, `build-releases.sh`, and `uninstall.sh` than to mirror here.
+
 ## Message-frame invariant
 
 Consumes claude's `--output-format stream-json` and writes one `messages` row per JSON frame (whole frames, not token deltas — bodies are final at insert, never grow; attachments are encoded inside the body envelope so they're frozen alongside it). Combined with append-only ordering by `seq`, `(count, last.id)` is a stable identity for a chat's message array — guards like `ChatMessagesList.ApplyFingerprint` depend on this; widen them before adding edits, deletes, or out-of-envelope attachment hydration.

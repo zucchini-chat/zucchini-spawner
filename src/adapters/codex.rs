@@ -50,10 +50,11 @@
 //! `codex` has no `status`-style sub-command stable enough to lean on
 //! across versions (TODO: revisit once codex ships one).
 //!
-//! `import()` is a stub for v1. Codex's on-disk rollouts live at
-//! `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`; a follow-up
-//! pass will walk them and emit PutProject/PutChat/PutMessage like the
-//! claude / cursor importers do.
+//! `import()` walks Codex's on-disk rollouts at
+//! `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO8601>-<uuid>.jsonl` (one file per
+//! session) and emits PutProject/PutChat/PutMessage like the claude / cursor
+//! importers. See the importer section at the bottom of this file for the
+//! line→frame mapping and the persisted-tool-name map.
 
 use std::path::PathBuf;
 
@@ -71,6 +72,20 @@ use crate::adapter::{
     ImportProgress, LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES,
 };
 use crate::writer::WriteEvent;
+
+use crate::adapters::import_shared::{
+    basename_or, collapse_title, emit_chat, mint_project_id, parse_rfc3339_utc, user_message_body,
+    ImportedChat, ImportedMessage, ProgressThrottle,
+};
+#[cfg(test)]
+use crate::envelope::MessageEnvelope;
+use anyhow::Context;
+use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
+use std::io::ErrorKind;
+use std::path::Path;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing::warn;
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
 /// shape; the `probe` / `import` slots are filled by `_boxed` wrappers below
@@ -508,22 +523,569 @@ fn is_authenticated() -> bool {
     file_nonempty(&auth)
 }
 
-/// One-shot per-kind history importer. Codex stores rollouts at
-/// `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` (one file per
-/// turn-or-session, format roughly analogous to claude's `~/.claude/projects`
-/// jsonl transcripts). A follow-up pass will walk them and emit
-/// PutProject/PutChat/PutMessage events shaped identically to the claude /
-/// cursor importer output. For v1 we stub: log + report 100% so the
-/// dispatcher's per-kind progress slice closes cleanly.
+// ===========================================================================
+// One-shot codex-history importer. Walks `~/.codex/sessions/**/rollout-*.jsonl`
+// recursively (one file per session), groups by the session's `cwd` so each
+// project emits one PutProject before its chats, and emits
+// PutProject/PutChat/PutMessage events shaped identically to the claude /
+// cursor importer output. Status emission lives in the dispatcher in
+// `main.rs`; this fn only reports raw 0..=100 progress via `progress`.
+//
+// Idempotent: project ids are UUIDv5(machine_id || cwd) via the SAME
+// `mint_project_id` namespace as claude/cursor (so a project with transcripts
+// from multiple CLIs collapses to one row); chat ids are the session UUID
+// (`session_meta.payload.id`, also in the filename), so re-runs reconverge.
+//
+// Line→frame mapping (current format; see file-level doc for the live wire):
+//   session_meta            → harvest `payload.id` (chat id) + `payload.cwd`
+//                             (project) + `payload.timestamp` (chat created_at)
+//   event_msg/user_message  → real typed prompt → MessageEnvelope (sender "user")
+//   event_msg/agent_message → final assistant text → claude_assistant_text_envelope
+//   response_item/function_call → claude_tool_use_envelope (persisted-tool map)
+//   everything else (response_item message/reasoning, function_call_output,
+//   token_count, task_started/complete, turn_context, developer msgs) → drop.
+//
+// Double-emit avoidance: codex carries the same assistant text BOTH in
+// `event_msg/agent_message` AND `response_item`/role:assistant output_text,
+// and the same user prompt in `event_msg/user_message` AND
+// `response_item`/role:user input_text (alongside the injected
+// `<user_instructions>`/`<environment_context>` developer dumps). We source
+// BOTH user and assistant TEXT exclusively from `event_msg`, which also
+// naturally filters the injected response_item user messages — only tool calls
+// come from `response_item`. If a future codex build stops emitting event_msg
+// text (a non-tool-using turn that only has response_item rows), we fall back
+// to response_item message text (still filtering the injected dumps).
+//
+// SKIP-NO-CWD: legacy 2025 bare-head files (line 1 = `{id,timestamp,instructions}`
+// with no `type`/`cwd`) and any session_meta lacking `cwd` are skipped entirely
+// — a chat with no project folder can't be opened or resumed in Zucchini.
+
 pub(crate) async fn import(
-    _machine_id: Uuid,
-    _user_id: Uuid,
-    _write_tx: mpsc::Sender<WriteEvent>,
+    machine_id: Uuid,
+    user_id: Uuid,
+    write_tx: mpsc::Sender<WriteEvent>,
     progress: ImportProgress,
 ) -> Result<()> {
-    info!("codex history import not yet implemented, skipping");
-    progress(100);
+    let Some(sessions_dir) = codex_sessions_dir() else {
+        info!("HOME not set, skipping codex history import");
+        progress(100).await;
+        return Ok(());
+    };
+    info!(path = %sessions_dir.display(), "scanning codex rollouts");
+
+    // Recursively collect every `rollout-*.jsonl` under the sessions dir. The
+    // year/month/day nesting is just for the operator's benefit; we flatten it
+    // and read each file's `session_meta.cwd` to group by project.
+    let mut files: Vec<PathBuf> = Vec::new();
+    match collect_rollouts(&sessions_dir, &mut files) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            info!(path = %sessions_dir.display(), "no ~/.codex/sessions, nothing to import");
+            progress(100).await;
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("walk {}", sessions_dir.display()));
+        }
+    }
+
+    if files.is_empty() {
+        info!("no codex rollout files found");
+        progress(100).await;
+        return Ok(());
+    }
+    files.sort();
+    let total_files = files.len();
+    info!(files = total_files, "starting codex import");
+
+    // Group the parsed sessions by cwd so each project emits one PutProject
+    // before its chats. We parse every file once up-front (cheap: each rollout
+    // is a few hundred small JSON lines), bucket by cwd, then emit per-project.
+    // A session with no cwd is skipped (see SKIP-NO-CWD above).
+    let mut by_project: BTreeMap<String, Vec<ParsedSession>> = BTreeMap::new();
+    let mut skipped_no_cwd = 0usize;
+    let mut done_files = 0usize;
+    let mut throttle = ProgressThrottle::new();
+    for path in &files {
+        match parse_session(path).await {
+            Ok(Some(session)) => {
+                by_project
+                    .entry(session.cwd.clone())
+                    .or_default()
+                    .push(session);
+            }
+            Ok(None) => {
+                skipped_no_cwd += 1;
+            }
+            Err(e) => {
+                warn!(file = %path.display(), error = %e, "codex session parse failed, skipping");
+            }
+        }
+        done_files += 1;
+        // Per-percent throttle shared with every importer; see `ProgressThrottle`.
+        throttle.step(done_files, total_files, &progress).await;
+    }
+
+    if skipped_no_cwd > 0 {
+        info!(
+            count = skipped_no_cwd,
+            "codex: skipped sessions with no cwd (legacy bare-head files or session_meta without cwd)"
+        );
+    }
+
+    info!(
+        projects = by_project.len(),
+        "codex: emitting parsed sessions"
+    );
+
+    for (cwd, mut sessions) in by_project {
+        // Deterministic order across re-runs and oldest→newest in the UI.
+        sessions.sort_by_key(|s| s.created_at);
+        let project_id = mint_project_id(machine_id, &cwd);
+        let project_name = basename_or(&cwd, "project");
+        let _ = write_tx
+            .send(WriteEvent::PutProject {
+                id: project_id,
+                machine_id,
+                name: project_name,
+                path: cwd.clone(),
+            })
+            .await;
+
+        for session in sessions {
+            emit_chat(
+                &write_tx,
+                user_id,
+                ImportedChat {
+                    id: session.chat_id,
+                    project_id,
+                    title: session.title,
+                    created_at: session.created_at,
+                    messages: session.messages,
+                },
+            )
+            .await;
+        }
+    }
+
+    info!("codex history import complete");
     Ok(())
+}
+
+/// `~/.codex/sessions`, or `None` when HOME is unset.
+fn codex_sessions_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".codex").join("sessions"))
+}
+
+/// Recursively collect `rollout-*.jsonl` files under `dir` into `out`. Codex
+/// nests sessions under `YYYY/MM/DD/`, but an older flat layout
+/// (`~/.codex/sessions/rollout-*.json[l]`) may coexist, so we walk the whole
+/// subtree rather than assuming the date nesting. Returns the first
+/// `NotFound` so the caller can early-out exactly like claude's missing-dir
+/// branch; other IO errors on nested dirs are logged and skipped.
+fn collect_rollouts(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let entries = std::fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, dir = %dir.display(), "skipping unreadable codex sessions entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            // Nested IO errors (permissions on a stray dir) shouldn't abort the
+            // whole walk — log + continue.
+            if let Err(e) = collect_rollouts(&path, out) {
+                warn!(error = %e, dir = %path.display(), "skipping unreadable codex sessions subdir");
+            }
+        } else if file_type.is_file() {
+            let is_rollout = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+                .unwrap_or(false);
+            if is_rollout {
+                out.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A fully-parsed codex session ready to emit. `cwd` is guaranteed non-empty
+/// (sessions without one are dropped at parse time). `messages` is in file
+/// order; the writer assigns `seq` on insert.
+struct ParsedSession {
+    chat_id: Uuid,
+    cwd: String,
+    title: String,
+    created_at: DateTime<Utc>,
+    messages: Vec<ImportedMessage>,
+}
+
+/// Codex `call_id`s are `call_<base62>`, not UUIDs, so every imported message
+/// leaves `id` as `None` and the writer mints `Uuid::now_v7()`. These two
+/// constructors keep the per-sender shaping (user → `MessageEnvelope` body,
+/// agent → already-shaped claude frame) at the call sites that build the
+/// session message list.
+fn imported_user(text: String, created_at: DateTime<Utc>) -> ImportedMessage {
+    ImportedMessage {
+        id: None,
+        sender: "user",
+        body: user_message_body(&text),
+        created_at,
+    }
+}
+
+fn imported_agent(body: String, created_at: DateTime<Utc>) -> ImportedMessage {
+    ImportedMessage {
+        id: None,
+        sender: "agent",
+        body,
+        created_at,
+    }
+}
+
+/// Parse a single rollout file. Returns `Ok(None)` when the session has no
+/// `cwd` (legacy bare-head file, or a `session_meta` lacking `cwd`) so the
+/// caller skips it. Errors only on unreadable files.
+async fn parse_session(path: &Path) -> anyhow::Result<Option<ParsedSession>> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+
+    let mut chat_id: Option<Uuid> = None;
+    let mut cwd: Option<String> = None;
+    let mut created_at: Option<DateTime<Utc>> = None;
+    let mut title: Option<String> = None;
+    let mut messages: Vec<ImportedMessage> = Vec::new();
+    // Fallback assistant/user text harvested from response_item rows, used only
+    // when a session emitted NO event_msg text rows at all (defensive against a
+    // future codex build that stops mirroring text into event_msg).
+    let mut had_event_text = false;
+    let mut response_text_fallback: Vec<ImportedMessage> = Vec::new();
+    // First user prompt harvested from the fallback path, kept as plain text so
+    // the title can use it without re-deserializing a `MessageEnvelope` body.
+    let mut first_fallback_user_text: Option<String> = None;
+
+    while let Some(line) = lines.next_line().await? {
+        if line.is_empty() {
+            continue;
+        }
+        let entry: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "skipping malformed codex jsonl line");
+                continue;
+            }
+        };
+
+        let line_ts = entry
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339_utc);
+
+        let Some(ty) = entry.get("type").and_then(|v| v.as_str()) else {
+            // LEGACY 2025 bare-head line (`{id,timestamp,instructions}`) has no
+            // `type`. It carries no cwd, so the whole session is unimportable —
+            // bail out as no-cwd.
+            return Ok(None);
+        };
+
+        match ty {
+            "session_meta" => {
+                let payload = entry.get("payload");
+                chat_id = payload
+                    .and_then(|p| p.get("id"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
+                cwd = payload
+                    .and_then(|p| p.get("cwd"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                created_at = payload
+                    .and_then(|p| p.get("timestamp"))
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_rfc3339_utc)
+                    .or(line_ts);
+                // No cwd → unimportable session, skip the whole file.
+                if cwd.is_none() {
+                    return Ok(None);
+                }
+            }
+            "event_msg" => {
+                let payload = entry.get("payload");
+                let pty = payload.and_then(|p| p.get("type")).and_then(|v| v.as_str());
+                let ts = line_ts.unwrap_or_else(Utc::now);
+                match pty {
+                    Some("user_message") => {
+                        if let Some(msg) = payload
+                            .and_then(|p| p.get("message"))
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            had_event_text = true;
+                            if title.is_none() {
+                                title = Some(collapse_title(msg));
+                            }
+                            messages.push(imported_user(msg.to_string(), ts));
+                        }
+                    }
+                    Some("agent_message") => {
+                        if let Some(msg) = payload
+                            .and_then(|p| p.get("message"))
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            had_event_text = true;
+                            messages
+                                .push(imported_agent(claude_assistant_text_envelope(msg), ts));
+                        }
+                    }
+                    // token_count / task_started / task_complete /
+                    // agent_reasoning → drop.
+                    _ => {}
+                }
+            }
+            "response_item" => {
+                let payload = entry.get("payload");
+                let pty = payload.and_then(|p| p.get("type")).and_then(|v| v.as_str());
+                let ts = line_ts.unwrap_or_else(Utc::now);
+                match pty {
+                    Some("function_call") => {
+                        if let Some(frame) = normalize_persisted_function_call(payload.unwrap()) {
+                            messages.push(imported_agent(frame, ts));
+                        }
+                    }
+                    Some("message") => {
+                        // Text is normally sourced from event_msg; collect a
+                        // fallback here in case event_msg text is absent. The
+                        // injected `<user_instructions>` / `<environment_context>`
+                        // / developer dumps are filtered by
+                        // `response_item_message_text`.
+                        let role = payload
+                            .and_then(|p| p.get("role"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if let Some(text) = response_item_message_text(payload.unwrap()) {
+                            match role {
+                                "user" => {
+                                    if first_fallback_user_text.is_none() {
+                                        first_fallback_user_text = Some(text.clone());
+                                    }
+                                    response_text_fallback.push(imported_user(text, ts));
+                                }
+                                "assistant" => {
+                                    response_text_fallback.push(imported_agent(
+                                        claude_assistant_text_envelope(&text),
+                                        ts,
+                                    ));
+                                }
+                                // developer / system → drop.
+                                _ => {}
+                            }
+                        }
+                    }
+                    // reasoning / function_call_output → drop.
+                    _ => {}
+                }
+            }
+            // turn_context → ignore. Unknown future types → drop.
+            _ => {}
+        }
+    }
+
+    let Some(cwd) = cwd else {
+        // No session_meta with cwd was ever seen.
+        return Ok(None);
+    };
+    let Some(chat_id) = chat_id else {
+        // session_meta had a cwd but no parseable id — we can't mint a stable
+        // chat id, so skip (defensive; not observed in practice).
+        warn!(file = %path.display(), "codex session_meta has cwd but no UUID id, skipping");
+        return Ok(None);
+    };
+
+    // Merge the response_item fallback only if the session emitted no event_msg
+    // text at all (tool-only / function_call rows still landed in `messages`).
+    if !had_event_text && !response_text_fallback.is_empty() {
+        if title.is_none() {
+            title = first_fallback_user_text.as_deref().map(collapse_title);
+        }
+        messages.extend(response_text_fallback);
+        // Keep file order stable after the merge.
+        messages.sort_by_key(|m| m.created_at);
+    }
+
+    if messages.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ParsedSession {
+        chat_id,
+        cwd,
+        title: title.unwrap_or_else(|| "Imported chat".to_string()),
+        created_at: created_at.unwrap_or_else(Utc::now),
+        messages,
+    }))
+}
+
+/// Extract the joined text of a `response_item`/`message` payload, filtering
+/// codex's injected developer dumps (`<user_instructions>` /
+/// `<environment_context>`). Concatenates `content[].text` for
+/// `input_text`/`output_text` blocks. Returns `None` when nothing renderable
+/// remains.
+fn response_item_message_text(payload: &Value) -> Option<String> {
+    let blocks = payload.get("content").and_then(|c| c.as_array())?;
+    let mut parts: Vec<&str> = Vec::new();
+    for b in blocks {
+        let bt = b.get("type").and_then(|t| t.as_str());
+        if matches!(bt, Some("input_text") | Some("output_text")) {
+            if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                parts.push(t);
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join("\n");
+    // Filter the injected AGENTS.md / permissions / environment dumps that
+    // codex prepends as the first response_item user messages — they are not
+    // user-typed prompts. The real prompt has no such wrapper.
+    if joined.starts_with("<user_instructions>") || joined.starts_with("<environment_context>") {
+        return None;
+    }
+    Some(joined)
+}
+
+/// Convert a codex `response_item`/`function_call` payload to a claude-shape
+/// `tool_use` frame. `arguments` is a JSON-encoded STRING (e.g.
+/// `"{\"cmd\":\"ls\"}"`) — we `from_str` it before re-keying, exactly like the
+/// cursor importer's `rawArgs` handling. Returns `None` when there's no name.
+fn normalize_persisted_function_call(payload: &Value) -> Option<String> {
+    let name = payload.get("name").and_then(|v| v.as_str())?;
+    if name.is_empty() {
+        return None;
+    }
+    // `call_id` is `call_<base62>`, not a UUID — used verbatim as the
+    // claude-shape `tool_use.id` (iOS keys row diffing off it; uniqueness
+    // within a chat is enough).
+    let call_id = payload
+        .get("call_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("codex_persisted_unknown");
+    // `arguments` is a JSON-encoded string; parse it. Missing/unparseable →
+    // empty object so the bubble still renders (iOS falls back to tool-name-only).
+    let args: Value = payload
+        .get("arguments")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    let (claude_name, input) = map_codex_persisted_tool(name, &args);
+    Some(claude_tool_use_envelope(call_id, &claude_name, input))
+}
+
+/// Map a codex persisted `function_call.name` to a claude tool name + a
+/// claude-shape input object. iOS's `SpawnerMessageDescriber` dispatches on
+/// claude names and reads claude-named arg keys (`command`, `file_path`,
+/// `pattern`, `query`, `todos`), so we rename here on the spawner side.
+///
+/// SEPARATE from the live adapter's `normalize_item_completed` map: the
+/// persisted names are the raw OpenAI tool names (`shell`, `exec_command`,
+/// `apply_patch`, `update_plan`, ...), NOT the live `item.completed` item
+/// types (`command_execution`, `file_change`, `web_search`). Confirmed against
+/// real rollouts on disk: `shell`, `exec_command`, `update_plan`,
+/// `write_stdin`, `spawn_agent`, `wait_agent`, `close_agent`.
+///
+/// Known codex → claude:
+///   shell           → Bash   (`command` is an ARRAY ["bash","-lc","..."] →
+///                              join to a single `{command}` string)
+///   exec_command    → Bash   (`cmd` string → `{command}`)
+///   apply_patch     → Edit   (`{file_path}` from `path`/`file_path` if present,
+///                              else the raw patch under `{command}` so the
+///                              bubble still shows something)
+///   update_plan     → TodoWrite (`{todos}` from the `plan` array)
+///   web_search      → WebSearch (`{query}`)
+///   anything else (write_stdin, spawn_agent, wait_agent, close_agent, mcp_*,
+///                   future tools) → pass-through name + args verbatim; iOS
+///                   falls back to the tool-name-only branch, which renders fine.
+fn map_codex_persisted_tool(name: &str, args: &Value) -> (String, Value) {
+    match name {
+        "shell" => {
+            // `args.command` is typically an array of argv tokens; join to a
+            // single shell-ish string for the claude `Bash` summary. Fall back
+            // to a string command if codex ever sends one.
+            let command = match args.get("command") {
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Some(Value::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            ("Bash".to_string(), json!({ "command": command }))
+        }
+        "exec_command" => {
+            let command = args
+                .get("cmd")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("command").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            ("Bash".to_string(), json!({ "command": command }))
+        }
+        "apply_patch" => {
+            // codex's apply_patch carries the edit as a unified-patch blob; the
+            // target path isn't always a discrete field. Prefer an explicit
+            // path key; otherwise surface the raw patch body as a Bash-ish
+            // command so the bubble isn't empty.
+            if let Some(path) = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("file_path").and_then(|v| v.as_str()))
+            {
+                ("Edit".to_string(), json!({ "file_path": path }))
+            } else if let Some(patch) = args
+                .get("input")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("patch").and_then(|v| v.as_str()))
+            {
+                ("Bash".to_string(), json!({ "command": patch }))
+            } else {
+                ("Edit".to_string(), args.clone())
+            }
+        }
+        "update_plan" => {
+            // `plan` array → claude `TodoWrite`'s `todos`. iOS reads
+            // `input.todos`; we forward the array verbatim under that key.
+            let todos = args.get("plan").cloned().unwrap_or_else(|| json!([]));
+            ("TodoWrite".to_string(), json!({ "todos": todos }))
+        }
+        "web_search" | "web_search_call" => {
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            ("WebSearch".to_string(), json!({ "query": query }))
+        }
+        // Pass-through: write_stdin, spawn_agent, wait_agent, close_agent,
+        // mcp_*, and anything we haven't seen. iOS renders the tool-name-only
+        // branch.
+        other => (other.to_string(), args.clone()),
+    }
 }
 
 /// `fn`-pointer-shaped wrapper around `import()` for `AdapterDescriptor.import`.
@@ -924,5 +1486,165 @@ mod tests {
             "expected -c approval_policy=never on sandboxed resume, got: {}",
             cmd
         );
+    }
+
+    // ===================== importer tests =====================
+
+    #[test]
+    fn persisted_shell_joins_argv_to_bash_command() {
+        // `shell.command` is an argv ARRAY; the persisted-tool map joins it to
+        // a single claude `Bash` `{command}` string.
+        let args = json!({"command":["bash","-lc","ls .."],"workdir":"/tmp"});
+        let (name, input) = map_codex_persisted_tool("shell", &args);
+        assert_eq!(name, "Bash");
+        assert_eq!(input["command"], "bash -lc ls ..");
+    }
+
+    #[test]
+    fn persisted_exec_command_maps_cmd_to_bash() {
+        let args = json!({"cmd":"tail -20 log.txt","workdir":"/tmp","yield_time_ms":1000});
+        let (name, input) = map_codex_persisted_tool("exec_command", &args);
+        assert_eq!(name, "Bash");
+        assert_eq!(input["command"], "tail -20 log.txt");
+        // codex metadata dropped — only `command` survives.
+        assert!(input.get("workdir").is_none());
+    }
+
+    #[test]
+    fn persisted_update_plan_maps_to_todowrite() {
+        let args = json!({"plan":[{"step":"do X","status":"completed"}]});
+        let (name, input) = map_codex_persisted_tool("update_plan", &args);
+        assert_eq!(name, "TodoWrite");
+        assert_eq!(input["todos"][0]["step"], "do X");
+    }
+
+    #[test]
+    fn persisted_apply_patch_with_path_maps_to_edit() {
+        let args = json!({"path":"src/foo.rs"});
+        let (name, input) = map_codex_persisted_tool("apply_patch", &args);
+        assert_eq!(name, "Edit");
+        assert_eq!(input["file_path"], "src/foo.rs");
+    }
+
+    #[test]
+    fn persisted_unknown_tool_passes_through() {
+        let args = json!({"agent_type":"worker"});
+        let (name, input) = map_codex_persisted_tool("spawn_agent", &args);
+        assert_eq!(name, "spawn_agent");
+        assert_eq!(input["agent_type"], "worker");
+    }
+
+    #[test]
+    fn function_call_arguments_string_is_parsed() {
+        // `arguments` arrives as a JSON-encoded STRING (like cursor's rawArgs).
+        let payload = json!({
+            "type":"function_call",
+            "name":"exec_command",
+            "call_id":"call_abc",
+            "arguments":"{\"cmd\":\"echo hi\"}"
+        });
+        let frame = normalize_persisted_function_call(&payload).expect("frame");
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        let block = &v["message"]["content"][0];
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["name"], "Bash");
+        assert_eq!(block["id"], "call_abc");
+        assert_eq!(block["input"]["command"], "echo hi");
+    }
+
+    #[test]
+    fn response_item_message_filters_injected_dumps() {
+        let inj = json!({"role":"user","content":[{"type":"input_text","text":"<user_instructions>\nfoo"}]});
+        assert!(response_item_message_text(&inj).is_none());
+        let env = json!({"role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/x</cwd>"}]});
+        assert!(response_item_message_text(&env).is_none());
+        let real = json!({"role":"user","content":[{"type":"input_text","text":"real prompt"}]});
+        assert_eq!(response_item_message_text(&real).as_deref(), Some("real prompt"));
+    }
+
+    #[tokio::test]
+    async fn parse_session_skips_legacy_bare_head() {
+        // Legacy 2025 file: line 1 has `id` but NO `type` and NO `cwd`.
+        let dir = std::env::temp_dir().join(format!("codex_test_{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2025-07-02T14-36-01-19855ba8.jsonl");
+        std::fs::write(
+            &path,
+            "{\"id\":\"19855ba8-f15f-4d81-a2fe-502e28d2e08a\",\"timestamp\":\"2025-07-02T14:36:01.490Z\",\"instructions\":\"x\"}\n{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}\n",
+        )
+        .unwrap();
+        let parsed = parse_session(&path).await.unwrap();
+        assert!(parsed.is_none(), "legacy bare-head (no cwd) must be skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn parse_session_current_format_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("codex_test_{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2025-10-03T07-16-55-0199a76d.jsonl");
+        // session_meta + injected response_item user dumps + real event_msg
+        // prompt + a function_call + an agent_message + the mirrored
+        // response_item assistant text (which must NOT double-emit).
+        let content = concat!(
+            r#"{"timestamp":"2025-10-03T00:16:55.629Z","type":"session_meta","payload":{"id":"0199a76d-cf26-7761-a338-3d456edb725f","timestamp":"2025-10-03T00:16:55.590Z","cwd":"/Users/me/projects/demo"}}"#, "\n",
+            r#"{"timestamp":"2025-10-03T00:16:56.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\nblah"}]}}"#, "\n",
+            r#"{"timestamp":"2025-10-03T00:16:56.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n<cwd>/x</cwd>"}]}}"#, "\n",
+            r#"{"timestamp":"2025-10-03T00:16:57.000Z","type":"event_msg","payload":{"type":"user_message","message":"list files please"}}"#, "\n",
+            r#"{"timestamp":"2025-10-03T00:16:58.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call_1","arguments":"{\"command\":[\"ls\",\"-la\"]}"}}"#, "\n",
+            r#"{"timestamp":"2025-10-03T00:16:59.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Here are the files."}}"#, "\n",
+            r#"{"timestamp":"2025-10-03T00:16:59.500Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here are the files."}]}}"#, "\n"
+        );
+        std::fs::write(&path, content).unwrap();
+
+        let session = parse_session(&path).await.unwrap().expect("session");
+        assert_eq!(session.cwd, "/Users/me/projects/demo");
+        assert_eq!(
+            session.chat_id.to_string(),
+            "0199a76d-cf26-7761-a338-3d456edb725f"
+        );
+        assert_eq!(session.title, "list files please");
+        // user prompt + shell tool_use + agent text = 3. The injected dumps
+        // and the mirrored response_item assistant text are NOT emitted.
+        assert_eq!(session.messages.len(), 3, "expected 3 messages");
+        assert_eq!(session.messages[0].sender, "user");
+        let user_env: MessageEnvelope =
+            serde_json::from_str(&session.messages[0].body).unwrap();
+        assert_eq!(user_env.text, "list files please");
+        // shell tool_use
+        assert_eq!(session.messages[1].sender, "agent");
+        let tool: Value = serde_json::from_str(&session.messages[1].body).unwrap();
+        assert_eq!(tool["message"]["content"][0]["name"], "Bash");
+        assert_eq!(tool["message"]["content"][0]["input"]["command"], "ls -la");
+        // agent text (from event_msg, not the mirrored response_item)
+        assert_eq!(session.messages[2].sender, "agent");
+        let txt: Value = serde_json::from_str(&session.messages[2].body).unwrap();
+        assert_eq!(txt["message"]["content"][0]["text"], "Here are the files.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn parse_session_falls_back_to_response_item_text_when_no_event_msg() {
+        // A session with NO event_msg text rows still imports its real prompt
+        // and assistant text from response_item (injected dumps filtered).
+        let dir = std::env::temp_dir().join(format!("codex_test_{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2025-10-03T07-16-55-0199a770.jsonl");
+        let content = concat!(
+            r#"{"timestamp":"2025-10-03T00:16:55.629Z","type":"session_meta","payload":{"id":"0199a770-b04e-76c3-b7b9-e556f59ddeab","timestamp":"2025-10-03T00:16:55.590Z","cwd":"/Users/me/projects/demo2"}}"#, "\n",
+            r#"{"timestamp":"2025-10-03T00:16:56.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>\nblah"}]}}"#, "\n",
+            r#"{"timestamp":"2025-10-03T00:16:57.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"what is 1+1"}]}}"#, "\n",
+            r#"{"timestamp":"2025-10-03T00:16:58.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"2"}]}}"#, "\n"
+        );
+        std::fs::write(&path, content).unwrap();
+
+        let session = parse_session(&path).await.unwrap().expect("session");
+        assert_eq!(session.title, "what is 1+1");
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].sender, "user");
+        assert_eq!(session.messages[1].sender, "agent");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
