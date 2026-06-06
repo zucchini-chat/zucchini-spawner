@@ -60,6 +60,9 @@ pub const DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     make: make_boxed,
     probe: probe_boxed,
     import: import_boxed,
+    // Long-lived in-process gateway with a lossy resume and no per-turn local
+    // transcript the spawner can edit — prune-context is infeasible.
+    prune: None,
 };
 
 fn make_boxed() -> Box<dyn AgentAdapter> {

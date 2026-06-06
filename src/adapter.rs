@@ -16,7 +16,7 @@
 use anyhow::Result;
 use futures::future::BoxFuture;
 use smallvec::SmallVec;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -69,6 +69,10 @@ pub struct AdapterDescriptor {
     pub probe: fn() -> BoxFuture<'static, (bool, bool)>,
     pub import:
         fn(Uuid, Uuid, mpsc::Sender<WriteEvent>, ImportProgress) -> BoxFuture<'static, Result<()>>,
+    /// Selective-forgetting ("prune-context") hooks, or `None` for cursor/hermes;
+    /// see `crate::prune::PruneOps`. Set by each adapter's `PRUNE_OPS` const;
+    /// dispatch goes through `AgentKind::prune_ops()`.
+    pub prune: Option<crate::prune::PruneOps>,
 }
 
 /// The registry. Order is preserved for callers that iterate (probe fan-out,
@@ -146,6 +150,50 @@ impl AgentKind {
     /// probes may shell out or hit the filesystem.
     pub async fn probe(self) -> (bool, bool) {
         (self.descriptor().probe)().await
+    }
+
+    /// Selective-forgetting hooks for this kind, or `None` for cursor/hermes;
+    /// see `crate::prune::PruneOps`. The `prune-context` flow (`control.rs`
+    /// pre-scan, `main.rs` rewrite) dispatches through here rather than matching
+    /// the variant, so prune support is a per-kind `AdapterDescriptor::prune` flip.
+    pub fn prune_ops(self) -> Option<&'static crate::prune::PruneOps> {
+        self.descriptor().prune.as_ref()
+    }
+
+    /// Base dir the kind's CLI stores per-session transcripts under — searched by
+    /// the prune resolvers (`PruneOps::find_session`). Honors each CLI's
+    /// relocation env var (semantics differ, hence the per-kind match), else
+    /// `$HOME/.<cli>`. `None` for cursor/hermes (no `PruneOps`).
+    ///
+    /// gemini: `GEMINI_CLI_HOME` REPLACES `$HOME`, then gemini-cli appends
+    /// `.gemini`, so we join `.gemini` onto it. Verified against the bundled
+    /// gemini-cli `Storage.getGlobalGeminiDir` (`homedir()` = `GEMINI_CLI_HOME ||
+    /// os.homedir()`, then `join(".gemini")`).
+    ///
+    /// An empty env value is treated as unset (the CLIs `||` past it) so a stray
+    /// `CODEX_HOME=` doesn't resolve to `/`.
+    pub fn cli_home(self) -> Option<PathBuf> {
+        // `$HOME/.<subdir>` fallback shared by all three.
+        fn home_subdir(subdir: &str) -> Option<PathBuf> {
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(subdir))
+        }
+        // The CLI's relocation env var when set non-empty.
+        fn env_dir(var: &str) -> Option<PathBuf> {
+            std::env::var_os(var)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        }
+        match self {
+            AgentKind::Claude => env_dir("CLAUDE_CONFIG_DIR").or_else(|| home_subdir(".claude")),
+            AgentKind::Codex => env_dir("CODEX_HOME").or_else(|| home_subdir(".codex")),
+            // GEMINI_CLI_HOME replaces $HOME; gemini-cli appends `.gemini` to it.
+            AgentKind::Gemini => env_dir("GEMINI_CLI_HOME")
+                .map(|h| h.join(".gemini"))
+                .or_else(|| home_subdir(".gemini")),
+            AgentKind::Cursor | AgentKind::Hermes => None,
+        }
     }
 
     /// One-shot per-kind history importer. Each adapter walks its own
@@ -229,6 +277,23 @@ pub enum AgentEvent {
     /// Marks a final/result frame seen — Supervisor uses this to set
     /// `Done.has_result`.
     Result,
+    /// The agent's own `prune-context` call has PERSISTED its result. Content-free
+    /// CUE the main loop uses to drive the prune restart: when the chat has a queued
+    /// `PruneRequest`, the loop aborts → rewrites → respawns NOW (strictly after the
+    /// result landed, so the resumed agent sees its own prune + summary).
+    ///
+    /// CALL-KEYED, not chat-keyed: each adapter emits this ONLY for the
+    /// `prune-context` call's own result, never a sibling tool's. The adapter is
+    /// the only layer that sees both the tool_use (command = prune-context) and the
+    /// matching result id, so it does the correlation and the cue stays content-free.
+    /// Without this, a sibling tool's result in the same parallel batch (common on
+    /// gemini — its `update_topic` meta-tool's result usually lands first) would fire
+    /// the restart before the prune's own result persists, losing the prune.
+    /// Per-adapter "prune call persisted" boundary: claude/gemini match their
+    /// `tool_result` frame's id against the recorded `prune-context` `tool_use` id;
+    /// codex matches the completed `command_execution`'s `command` (it has no
+    /// standalone tool_result frame). See `crate::prune` flow.
+    ToolResult,
 }
 
 pub trait AgentAdapter: Send + Sync {
@@ -251,6 +316,47 @@ pub trait AgentAdapter: Send + Sync {
     /// lines via `BufReader::lines()` which already hands out owned `String`s,
     /// so passing by value avoids a per-frame heap allocation on the hot path.
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]>;
+
+    /// Static text appended (never prepended — see below) to the **first user
+    /// message of the chat** when the adapter has no `--append-system-prompt`
+    /// equivalent. The Supervisor calls this only on the FIRST turn
+    /// (`agent_session_id.is_none()`); on resume the suffix is already baked into
+    /// the reconstructed history, so re-appending would pollute every turn.
+    ///
+    /// Default `None`. Claude injects via `--append-system-prompt` instead;
+    /// cursor/hermes don't support prune-context. Gemini and codex override to
+    /// their tool-name-corrected variants (`Some(PRUNE_CONTEXT_INSTRUCTION_GEMINI)`
+    /// / `Some(PRUNE_CONTEXT_INSTRUCTION_CODEX)`) — their only hook for persisting
+    /// the prune nudge into the conversation.
+    ///
+    /// MUST be appended after the user's text, not prepended: codex derives the
+    /// chat title from the first user message (`first_fallback_user_text` →
+    /// `collapse_title` in `adapters/codex.rs`), so prepending would corrupt
+    /// imported titles. The text is invisible to the user — it reaches only the
+    /// CLI's stdin (`prompt_file`), never the stored `messages` row / bubble, and
+    /// both adapters drop their user-echo frames.
+    fn first_turn_prompt_suffix(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Called once after the agent process for a turn has fully exited (so any
+    /// on-disk transcript is closed and flushed), just before the Supervisor
+    /// emits `Done`. Lets an adapter publish a corrected context-token reading
+    /// sourced from disk state the live stream can't expose; the returned value
+    /// (if any) is emitted as this turn's `AgentEvent::ContextTokens`.
+    ///
+    /// Default `None`. Codex overrides it: the live `--json` stream only carries
+    /// the cumulative `total_token_usage` (grows unbounded across turns), while
+    /// the real context occupancy (`last_token_usage.input_tokens`) lives only
+    /// in the rollout's `token_count` records — see `adapters/codex.rs`. The
+    /// other adapters report occupancy inline from the stream and return `None`.
+    ///
+    /// `agent_session_id` is the resume id passed into the turn (`None` on a
+    /// brand-new chat, where the adapter may instead use a session id it
+    /// harvested from the stream this turn).
+    fn post_turn_context_tokens(&self, _agent_session_id: Option<&str>) -> Option<i64> {
+        None
+    }
 }
 
 /// Per-line frame-size cap used by every adapter to skip a full
@@ -267,14 +373,67 @@ pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Instruction telling the agent how to attach a local file to its next
-/// message via the `zucchini-spawner attach-file` CLI. Chat id + spawner
-/// binary path stay in env vars (`ZUCCHINI_CHAT_ID`, `ZUCCHINI_SPAWNER_BIN`)
-/// — never inlined — so the returned text is chat-agnostic and safe to cache
-/// across turns. Tool name is left unspecified ("run the command"): every
-/// coding agent has a shell-exec facility and picks it on its own.
+/// Instruction telling the agent how to attach a local file to its next message
+/// via the `zucchini-spawner attach-file` CLI. Chat id and binary path stay in
+/// env vars (`ZUCCHINI_CHAT_ID`, `ZUCCHINI_SPAWNER_BIN`) exported on every spawn
+/// — `--chat-id` defaults to `ZUCCHINI_CHAT_ID`, so it's dropped from the command
+/// line and the text is chat-agnostic and cacheable. Tool name is left
+/// unspecified ("run the command"): every coding agent has a shell-exec facility.
 pub const ATTACH_FILE_INSTRUCTION: &str =
-    "To send a file to the user, run the command `\"$ZUCCHINI_SPAWNER_BIN\" attach-file --chat-id \"$ZUCCHINI_CHAT_ID\" <absolute-path>` before writing the message that should accompany the attachment.";
+    "To send a file to the user, run the command `\"$ZUCCHINI_SPAWNER_BIN\" attach-file <absolute-path>` before writing the message that should accompany the attachment.";
+
+/// Body of the prune-context nudge with a per-adapter `$example` clause spliced
+/// in. The shared text lives here EXACTLY ONCE; only the worked example varies
+/// (claude/gemini name tools the same way the matcher's claude-shape aliases do;
+/// codex needs a different example — see `PRUNE_CONTEXT_INSTRUCTION_CODEX`).
+macro_rules! prune_context_instruction {
+    ($toolname_frag:literal, $example:literal) => {
+        concat!(
+            "Reclaim context as you go: once you've extracted what you need from a tool output, prune it — noisy grep, an already-answered file, junk: prune with `\"$ZUCCHINI_SPAWNER_BIN\" prune-context ",
+            $toolname_frag,
+            "--args \"<value glob>\" --summary \"<1-line digest of what you're keeping — the key takeaway from this tool result>\"`. --args is a glob (supports *) over the call's argument VALUES, not key names, and selects which calls match — each prune blanks only the MOST RECENT matching call, so repeat the command to prune older ones. Pass --args \"\" for a call you made with no arguments. To forget several outputs at once, repeat the flags in ONE call (one --summary per output, which closes that target; --tool-name is per-target, so repeat it on each — an omitted one falls back to matching any tool) — they apply as a single batch. E.g. ",
+            $example,
+            ". Run prune-context alone, never alongside other tool calls."
+        )
+    };
+}
+
+/// Instruction telling the agent to proactively reclaim context by permanently
+/// forgetting tool outputs it no longer needs. Delivered via
+/// `--append-system-prompt` (claude) or appended to the first user message
+/// (gemini, which lacks that hook — see `first_turn_prompt_suffix`). Codex uses
+/// `PRUNE_CONTEXT_INSTRUCTION_CODEX` instead (its tool names differ). Same
+/// env-var convention as `ATTACH_FILE_INSTRUCTION`, so it's chat-agnostic and
+/// cacheable. The spawner aborts + respawns the agent with a "continue" prompt
+/// after a prune, so the instruction doesn't tell the agent to stop.
+pub const PRUNE_CONTEXT_INSTRUCTION: &str = prune_context_instruction!(
+    "--tool-name <ToolName> ",
+    "`--tool-name \"Read\" --args \"src/main.ts\" --summary \"main.ts: initApp() wires routes then listens on PORT — entry point confirmed\" --tool-name Read --args \"build.log\" --summary \"build: passed, nothing relevant\"`"
+);
+
+/// Codex variant. Codex has no `Read`/`Grep`/`Edit` tools — file reads, greps,
+/// and edits ALL run through two generic shell tools (`shell`/`exec_command`), so
+/// no single native tool name targets a given file op (and naming one shell tool
+/// misses the other). Rather than force a claude-shape `Bash` alias the agent
+/// never actually emitted, the codex example OMITS `--tool-name` entirely — the
+/// empty selector prunes on the `--args` path alone, which already disambiguates.
+/// (Gemini keeps native names because its reads/greps/edits land on distinct,
+/// self-describing tools; codex has no such per-op name.)
+pub const PRUNE_CONTEXT_INSTRUCTION_CODEX: &str = prune_context_instruction!(
+    "",
+    "`--args \"src/main.ts\" --summary \"main.ts: initApp() wires routes then listens on PORT — entry point confirmed\" --args \"build.log\" --summary \"build: passed, nothing relevant\"` (omit --tool-name on codex)"
+);
+
+/// Gemini variant. The matcher DOES alias claude-shape `Read`→`read_file`, so the
+/// shared `Read` example technically works — but a gemini agent sees its own tool
+/// calls named `read_file`/`list_directory`/`replace`/`grep_search` in its
+/// transcript, and the `Read` example invites it to guess wrong variants
+/// (`ReadFile`, `List`, …) that literal-compare to nothing and fail. The example
+/// here uses gemini's native names so `--tool-name` matches what the agent sees.
+pub const PRUNE_CONTEXT_INSTRUCTION_GEMINI: &str = prune_context_instruction!(
+    "--tool-name <ToolName> ",
+    "`--tool-name \"read_file\" --args \"src/main.ts\" --summary \"main.ts: initApp() wires routes then listens on PORT — entry point confirmed\" --tool-name read_file --args \"build.log\" --summary \"build: passed, nothing relevant\"` (use your own tool names — `read_file`, `list_directory`, `replace`, `grep_search`, … — not claude's `Read`/`Edit`/`Grep`)"
+);
 
 /// Trim + `starts_with('{')` gate + `serde_json::from_str::<Value>` for
 /// adapters that need to dispatch on a frame's `type` field. Returns `None`
@@ -424,6 +583,7 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             AgentEvent::CompactBoundary(n) => format!("CompactBoundary({})", n),
             AgentEvent::SessionIdHarvested(s) => format!("SessionIdHarvested({})", s),
             AgentEvent::Result => "Result".to_string(),
+            AgentEvent::ToolResult => "ToolResult".to_string(),
         })
         .collect()
 }
@@ -508,6 +668,34 @@ mod tests {
                 d.wire_name,
                 d.kind,
             );
+        }
+    }
+
+    /// Only gemini/codex (no `--append-system-prompt` hook) carry the prune nudge
+    /// on the first user message. The rest must return `None`: a non-`None` would
+    /// double-inject (claude) or inject a no-op nudge (cursor/hermes). Gemini and
+    /// codex each use a tool-name-corrected variant (native names / Bash, not Read).
+    #[test]
+    fn first_turn_prompt_suffix_only_for_gemini_and_codex() {
+        for v in AgentKind::ALL {
+            let suffix = v.make_adapter().first_turn_prompt_suffix();
+            match v {
+                AgentKind::Gemini => assert_eq!(
+                    suffix,
+                    Some(PRUNE_CONTEXT_INSTRUCTION_GEMINI),
+                    "Gemini must append the gemini-specific prune nudge (read_file example) \
+                     on the first turn (it has no --append-system-prompt hook)",
+                ),
+                AgentKind::Codex => assert_eq!(
+                    suffix,
+                    Some(PRUNE_CONTEXT_INSTRUCTION_CODEX),
+                    "Codex must append the codex-specific prune nudge (Bash example)",
+                ),
+                _ => assert_eq!(
+                    suffix, None,
+                    "AgentKind::{v:?} must NOT set a first-turn prompt suffix",
+                ),
+            }
         }
     }
 }

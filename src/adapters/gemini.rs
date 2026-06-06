@@ -9,9 +9,17 @@
 //! Frame mapping (gemini → claude-shape), observed empirically on gemini-cli
 //! 0.44.1 (`-o stream-json`, JSONL, one object per line):
 //!
-//! - `init` → `SessionIdHarvested` only (no Frame; matches claude's init-skip).
-//!   `session_id` echoes the exact UUID we minted and passed via `--session-id`;
-//!   harvest it regardless so the resume path on the next turn is exact.
+//! - `init` → `SessionIdHarvested` only (no Frame; matches claude's init-skip),
+//!   but ONLY on the FIRST turn. On the first turn `session_id` echoes the exact
+//!   UUID we minted and passed via `--session-id`; harvest it so the resume path on
+//!   the next turn is exact. On a RESUME turn we IGNORE it: gemini forks a fresh
+//!   transcript whose line-0 header is a brand-new ephemeral UUID (it embeds the
+//!   parent header deeper in the file, so `--resume` still resolves the file to the
+//!   PARENT id). Harvesting that ephemeral id would overwrite
+//!   `chats.agent_session_id`, and the next `--resume <ephemeral>` fails with
+//!   "Invalid session identifier" — gemini de-dupes its session list by the
+//!   reconstructed/parent id, so the ephemeral id is never resumable. See
+//!   `self.resumed` / `find_gemini_session_jsonl`.
 //! - `message` role=user → drop (echo of our own prompt).
 //! - `message` role=assistant → buffered, NOT emitted immediately. Assistant
 //!   text arrives as MULTIPLE incremental `delta:true` chunks per turn (verified
@@ -72,7 +80,7 @@
 //! the `normalize_tool_use` mapping table (now primitive-keyed so the live
 //! adapter and the importer feed one map). See the section above `import()`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -89,6 +97,7 @@ use crate::adapter::{
     claude_assistant_text_envelope, claude_tool_use_envelope, file_nonempty, parse_json_obj,
     probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind,
     ImportProgress, LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES,
+    PRUNE_CONTEXT_INSTRUCTION_GEMINI,
 };
 use crate::adapters::import_shared::{
     basename_or, collapse_title, emit_chat, is_synthetic_wrapper, mint_project_id,
@@ -112,6 +121,7 @@ pub const DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     make: make_boxed,
     probe: probe_boxed,
     import: import_boxed,
+    prune: Some(PRUNE_OPS),
 };
 
 fn make_boxed() -> Box<dyn AgentAdapter> {
@@ -141,6 +151,21 @@ pub struct GeminiAdapter {
     session_id: Uuid,
     last_emitted_tokens: LastTokensDedup,
     pending_assistant_text: String,
+    /// True once `prepare_command` resolved this turn as a RESUME (we passed
+    /// `--resume <agent_session_id>` rather than minting). Gates the `init`
+    /// session-id harvest: on resume gemini reports an EPHEMERAL per-fork header
+    /// id that `--resume` later rejects, so we must keep the canonical id we
+    /// resumed with. See the module header / the `init` branch in `handle_line`.
+    resumed: bool,
+    /// `tool_id`s of in-flight `prune-context` calls seen on `tool_use` frames
+    /// this turn. The `tool_result` cue that drives a queued prune's apply fires
+    /// ONLY when the result's own `tool_id` is in this set — call-keyed, not
+    /// chat-keyed. Load-bearing for gemini: it batches tool calls in parallel
+    /// and injects an `update_topic` meta-tool almost every turn whose
+    /// `tool_result` usually lands FIRST, so a chat-keyed cue would near-always
+    /// fire abort→respawn before the `prune-context` call's own result persists,
+    /// losing the prune + summary and re-running it. See `AgentEvent::ToolResult`.
+    pending_prune_tool_ids: HashSet<String>,
 }
 
 impl Default for GeminiAdapter {
@@ -149,6 +174,8 @@ impl Default for GeminiAdapter {
             session_id: Uuid::now_v7(),
             last_emitted_tokens: LastTokensDedup::default(),
             pending_assistant_text: String::new(),
+            resumed: false,
+            pending_prune_tool_ids: HashSet::new(),
         }
     }
 }
@@ -201,6 +228,10 @@ impl AgentAdapter for GeminiAdapter {
         // RESUME: `--resume <sid>` with the harvested id genuinely continues
         // context — verified. The two flags are mutually exclusive.
         if let Some(sid) = ctx.agent_session_id {
+            // Mark this turn a resume so the `init` handler skips harvesting
+            // gemini's ephemeral per-fork session id (it would overwrite the
+            // canonical `sid` and break the next `--resume`). See `handle_line`.
+            self.resumed = true;
             cmd.push_str(&format!(" --resume {}", shell_escape(sid)));
         } else {
             cmd.push_str(&format!(
@@ -209,6 +240,9 @@ impl AgentAdapter for GeminiAdapter {
             ));
         }
 
+        // prune-context nudge can't ride a system prompt here (gemini's only
+        // hook, `GEMINI_SYSTEM_MD`, is a FULL replacement) — see
+        // `first_turn_prompt_suffix` below.
         cmd.push_str(" -o stream-json");
 
         // Sender's `machine_users.is_sandboxed`. Non-sandboxed = bypass all
@@ -236,6 +270,13 @@ impl AgentAdapter for GeminiAdapter {
         let _ = ctx.worktree;
 
         Ok(cmd)
+    }
+
+    /// No `--append-system-prompt` on gemini-cli, so the prune nudge rides in on
+    /// the first user message instead. Uses the gemini-specific variant (native
+    /// tool names in the example). See `AgentAdapter::first_turn_prompt_suffix`.
+    fn first_turn_prompt_suffix(&self) -> Option<&'static str> {
+        Some(PRUNE_CONTEXT_INSTRUCTION_GEMINI)
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
@@ -267,9 +308,22 @@ impl AgentAdapter for GeminiAdapter {
                     out.push(ev);
                 }
                 // Harvest session_id → `chats.agent_session_id`; drop the frame
-                // (matches claude's init-skip). It echoes our minted uuid;
-                // harvest regardless so resume is exact.
-                if let Some(sid) = obj.get("session_id").and_then(|v| v.as_str()) {
+                // (matches claude's init-skip). FIRST turn only: gemini echoes the
+                // uuid we minted, so harvesting persists the canonical resumable id.
+                // On a RESUME turn the echoed id is an EPHEMERAL per-fork header
+                // (gemini writes a fresh transcript with a new line-0 uuid but
+                // resolves `--resume` to the embedded PARENT id). Harvesting it
+                // would clobber the canonical id and make the next `--resume` fail
+                // with "Invalid session identifier" — so on resume we keep the id
+                // we resumed with and ignore the frame's session_id.
+                if self.resumed {
+                    if let Some(sid) = obj.get("session_id").and_then(|v| v.as_str()) {
+                        debug!(
+                            ephemeral = %sid,
+                            "gemini resume init: ignoring ephemeral session_id, keeping canonical"
+                        );
+                    }
+                } else if let Some(sid) = obj.get("session_id").and_then(|v| v.as_str()) {
                     out.push(AgentEvent::SessionIdHarvested(sid.to_string()));
                 } else {
                     debug!("gemini init frame without session_id");
@@ -302,6 +356,12 @@ impl AgentAdapter for GeminiAdapter {
                 let name = obj.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
                 let id = obj.get("tool_id").and_then(|v| v.as_str()).unwrap_or("");
                 let args = obj.get("parameters");
+                // Record the `prune-context` call's own `tool_id` so only its
+                // matching `tool_result` can later drive the queued prune's
+                // apply (the shell command is in `parameters.command`).
+                if !id.is_empty() && args.is_some_and(crate::prune::value_is_prune_context_call) {
+                    self.pending_prune_tool_ids.insert(id.to_string());
+                }
                 if let Some(frame) = normalize_tool_use(name, id, args) {
                     // Real tool → flush the text run that preceded it FIRST so
                     // text and tool become separate, correctly-ordered bubbles.
@@ -316,9 +376,28 @@ impl AgentAdapter for GeminiAdapter {
                 // split the surrounding text into two bubbles.
             }
             "tool_result" => {
-                // Claude UI shows tool_use only and infers the result — match
-                // codex and drop.
-                debug!("gemini tool_result dropped (claude infers results)");
+                // Claude UI shows tool_use only and infers the result, so the
+                // frame is still dropped from the chat — but it IS the signal that
+                // gemini has persisted a finished tool call's output.
+                //
+                // Call-keyed: emit the content-free `ToolResult` cue ONLY when
+                // THIS result's own `tool_id` matches a recorded `prune-context`
+                // call. Gemini batches tools in parallel and fires an
+                // `update_topic` meta-tool almost every turn whose result usually
+                // lands first — a chat-keyed cue would fire abort→respawn on that
+                // sibling before the prune's own result persists, losing the
+                // prune. The set is empty for every ordinary turn, so this is a
+                // cheap lookup that fires nothing.
+                let matched = obj
+                    .get("tool_id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|tid| self.pending_prune_tool_ids.remove(tid));
+                if matched {
+                    out.push(AgentEvent::ToolResult);
+                    debug!("gemini prune-context tool_result landed — emitted prune cue");
+                } else {
+                    debug!("gemini tool_result dropped from chat (no prune cue)");
+                }
             }
             "result" => {
                 // Flush the trailing text run before the turn terminator so the
@@ -426,55 +505,37 @@ fn normalize_tool_use(tool_name: &str, id: &str, params: Option<&Value>) -> Opti
             .to_string()
     };
 
-    Some(match tool_name {
-        "read_file" => {
-            claude_tool_use_envelope(id, "Read", json!({ "file_path": param_str("file_path") }))
+    // The claude tool NAME comes from the single-source `GEMINI_TOOL_NAME_MAP`
+    // (so the prune inverse `claude_to_gemini_tool_names` can never drift out of
+    // lockstep); the per-tool ARG reshaping below is direction-specific and stays
+    // here. An unmapped gemini tool is forwarded under its native name with its
+    // params verbatim (defensive against gemini adding tools).
+    let input = match tool_name {
+        "read_file" => json!({ "file_path": param_str("file_path") }),
+        "write_file" => {
+            json!({ "file_path": param_str("file_path"), "content": param_str("content") })
         }
-        "write_file" => claude_tool_use_envelope(
-            id,
-            "Write",
-            json!({ "file_path": param_str("file_path"), "content": param_str("content") }),
-        ),
         // In-place edit. Gemini carries file_path/old_string/new_string; iOS's
         // Edit summary only reads file_path.
-        "replace" => {
-            claude_tool_use_envelope(id, "Edit", json!({ "file_path": param_str("file_path") }))
-        }
+        "replace" => json!({ "file_path": param_str("file_path") }),
         // Shell command — THE reported bug. Gemini's `command` param maps onto
         // claude Bash's `command` so iOS renders the actual command line.
-        "run_shell_command" => {
-            claude_tool_use_envelope(id, "Bash", json!({ "command": param_str("command") }))
-        }
-        "list_directory" => claude_tool_use_envelope(
-            id,
-            "Bash",
-            json!({ "command": format!("ls {}", param_str("dir_path")) }),
-        ),
+        "run_shell_command" => json!({ "command": param_str("command") }),
+        "list_directory" => json!({ "command": format!("ls {}", param_str("dir_path")) }),
         // Codebase text search. Gemini's tool_name is `grep_search` (not the
         // older `search_file_content`); `pattern` matches claude Grep's key.
-        "grep_search" => {
-            claude_tool_use_envelope(id, "Grep", json!({ "pattern": param_str("pattern") }))
-        }
-        "glob" => claude_tool_use_envelope(id, "Glob", json!({ "pattern": param_str("pattern") })),
+        "grep_search" => json!({ "pattern": param_str("pattern") }),
+        "glob" => json!({ "pattern": param_str("pattern") }),
         // Bulk read by glob/path list. Show the first include entry as the
         // file_path so iOS's Read summary renders something meaningful.
-        "read_many_files" => {
-            claude_tool_use_envelope(id, "Read", json!({ "file_path": param_first("include") }))
-        }
-        "google_web_search" => {
-            claude_tool_use_envelope(id, "WebSearch", json!({ "query": param_str("query") }))
-        }
+        "read_many_files" => json!({ "file_path": param_first("include") }),
+        "google_web_search" => json!({ "query": param_str("query") }),
         // No WebFetch case in iOS — fold into WebSearch using the prompt text.
-        "web_fetch" => {
-            claude_tool_use_envelope(id, "WebSearch", json!({ "query": param_str("prompt") }))
-        }
-        // Unknown gemini tool — forward under its native name with whatever
-        // parameters it carried (defensive against gemini adding tools).
-        _ => {
-            let input = params.cloned().unwrap_or_else(|| json!({}));
-            claude_tool_use_envelope(id, tool_name, input)
-        }
-    })
+        "web_fetch" => json!({ "query": param_str("prompt") }),
+        _ => params.cloned().unwrap_or_else(|| json!({})),
+    };
+    let claude_name = gemini_to_claude_tool_name(tool_name).unwrap_or(tool_name);
+    Some(claude_tool_use_envelope(id, claude_name, input))
 }
 
 /// Estimates the context-window occupancy from a `result` frame's `stats`.
@@ -1032,6 +1093,527 @@ fn import_boxed(
     Box::pin(import(machine_id, user_id, write_tx, progress))
 }
 
+// ===========================================================================
+// Selective forgetting ("prune-context") — gemini dialect. Shared contract: see
+// `crate::prune`. Wired via `PRUNE_OPS` (→ `AdapterDescriptor::prune`).
+//
+// Gemini delta: a session is an append-only MUTATION LOG
+// (`~/.gemini/tmp/<project_hash>/chats/session-<ts>-<id>.jsonl`) that stores the
+// SAME tool output in MANY places, so a prune must blank EVERY copy of the
+// chosen id or `--resume` reloads a stale full one (fails open). Verified
+// locally: one `read_file` of a 13 KB file had its output duplicated 4×. Copies
+// live in `type:"gemini"` records
+// (`toolCalls[].result[].functionResponse.response.output` + a sibling
+// `toolCalls[].resultDisplay`, string OR object), `type:"user"` echoes
+// (`content[].functionResponse.response.output`, keyed by `functionResponse.id`
+// == the toolCall `id`), AND every periodic `{"$set":{"messages":[...]}}`
+// full-history snapshot. `{"$set":{"lastUpdated":...}}` is a no-op pass-through.
+//
+// Because a copy can sit "batched under a sibling toolCall" / under unfamiliar
+// keys, both passes walk EVERY object node at any depth
+// (`walk_objects`/`walk_objects_mut`), NOT named containers, plus a fail-closed
+// post-scan (`count_leaked_gemini_outputs`, logs leaks at `error!` → Sentry
+// without failing the prune).
+
+/// `crate::prune::PruneOps` for gemini.
+pub(crate) const PRUNE_OPS: crate::prune::PruneOps = crate::prune::PruneOps {
+    find_session: find_gemini_session_jsonl,
+    count_matches: count_gemini_matches,
+    prune_batch: prune_batch_gemini_jsonl,
+};
+
+/// Locate the gemini transcript for `session_id`. The UUID is neither in the
+/// filename (`session-<ts>-<shortid>.jsonl`) nor reliably line 0's `sessionId`,
+/// so we scan `<base>/tmp/*/chats/*.jsonl` (`base` from `AgentKind::cli_home`)
+/// and match each file by its RECONSTRUCTED session id — see
+/// `gemini_reconstructed_session_id`.
+///
+/// One `sessionId` can span MULTIPLE files (resume/re-snapshot forks a fresh
+/// chats file; ~6 of 40 observed across 2–3 files). The file the live session
+/// re-reads on `--resume` is the newest by mtime (not
+/// `read_dir`/filename/`startTime` order), so we return that; a stale pick fails
+/// open. Unreadable mtime sorts oldest.
+fn find_gemini_session_jsonl(
+    base: &std::path::Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    let tmp = base.join("tmp");
+    let outer = std::fs::read_dir(&tmp).ok()?;
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for project in outer.flatten() {
+        if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let chats = project.path().join("chats");
+        let Ok(inner) = std::fs::read_dir(&chats) else {
+            continue;
+        };
+        for f in inner.flatten() {
+            let path = f.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if gemini_reconstructed_session_id(&path).as_deref() != Some(session_id) {
+                continue;
+            }
+            // Unreadable mtime → UNIX_EPOCH (oldest).
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if best
+                .as_ref()
+                .is_none_or(|(best_mtime, _)| mtime >= *best_mtime)
+            {
+                best = Some((mtime, path));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// The session id gemini-cli's `--resume` resolves this file to — which is NOT
+/// always line 0's `sessionId`. gemini reconstructs a session by replaying the
+/// mutation log: any record carrying `sessionId`+`projectHash` (the line-0 header
+/// AND any later embedded/re-snapshot header) or a `$set.sessionId` overwrites the
+/// running metadata, last-write-wins (mirrors gemini's own
+/// `loadConversationRecord` metadata pass). When gemini forks a session on resume
+/// (observed when we kill it mid-turn for a prune, gemini-cli 0.45.0) it writes a
+/// fresh line-0 header with a NEW ephemeral id but embeds the PARENT header deeper
+/// in the file, so the reconstructed id collapses back to the parent — and that
+/// parent id is the only one `--resume` accepts (gemini de-dupes its session list
+/// by the reconstructed id). Reads the whole file (gemini does too); `None` if
+/// unreadable or no record ever set a `sessionId`.
+fn gemini_reconstructed_session_id(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut session_id: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(obj) = v.as_object() else {
+            continue;
+        };
+        // A header / partial-metadata record sets the id only when it carries BOTH
+        // `sessionId` and `projectHash` (gemini's `isPartialMetadataRecord`); a
+        // bare `sessionId` elsewhere must not hijack the identity.
+        if obj.get("projectHash").and_then(|p| p.as_str()).is_some() {
+            if let Some(sid) = obj.get("sessionId").and_then(|s| s.as_str()) {
+                session_id = Some(sid.to_string());
+                continue;
+            }
+        }
+        // A `$set` metadata delta may also carry `sessionId` (defensive: the live
+        // identity overrides come through headers, but `$set` spreads are part of
+        // gemini's accumulation too).
+        if let Some(sid) = obj
+            .get("$set")
+            .and_then(|s| s.as_object())
+            .and_then(|s| s.get("sessionId"))
+            .and_then(|s| s.as_str())
+        {
+            session_id = Some(sid.to_string());
+        }
+    }
+    session_id
+}
+
+/// Single source of truth for the gemini-tool-name ↔ claude-tool-name mapping,
+/// as `(gemini name, claude name)` pairs. BOTH directions derive from this table:
+/// `normalize_tool_use` (live + import) resolves the claude name via
+/// `gemini_to_claude_tool_name`, and the prune inverse `claude_to_gemini_tool_names`
+/// filters it — so the two can never drift (the old failure mode: a renamed gemini
+/// tool that silently stopped matching, leaking that tool's output past a prune).
+/// The per-tool ARG reshaping is direction-specific and lives in `normalize_tool_use`.
+/// Order matters — it's preserved by the inverse's fan-out (e.g. `Read` →
+/// `read_file`, `read_many_files`).
+const GEMINI_TOOL_NAME_MAP: &[(&str, &str)] = &[
+    ("read_file", "Read"),
+    ("read_many_files", "Read"),
+    ("write_file", "Write"),
+    ("replace", "Edit"),
+    ("run_shell_command", "Bash"),
+    ("list_directory", "Bash"),
+    ("grep_search", "Grep"),
+    ("glob", "Glob"),
+    ("google_web_search", "WebSearch"),
+    ("web_fetch", "WebSearch"),
+];
+
+/// Forward lookup: the claude tool name a gemini `name` renders as, or `None` for
+/// an unmapped tool (then forwarded under its native name by `normalize_tool_use`).
+fn gemini_to_claude_tool_name(gemini_name: &str) -> Option<&'static str> {
+    GEMINI_TOOL_NAME_MAP
+        .iter()
+        .find(|(g, _)| *g == gemini_name)
+        .map(|(_, c)| *c)
+}
+
+/// Invert the map: a CLAUDE-shape `--tool-name` → every gemini `name` that renders
+/// as it (one claude name can fan out, e.g. `Read` → `read_file`, `read_many_files`).
+/// Empty result = unmapped name → caller matches it literally.
+fn claude_to_gemini_tool_names(claude_name: &str) -> Vec<&'static str> {
+    GEMINI_TOOL_NAME_MAP
+        .iter()
+        .filter(|(_, c)| *c == claude_name)
+        .map(|(g, _)| *g)
+        .collect()
+}
+
+/// Does a gemini toolCall (`name`, `args`) match (`tool_name`, `needle`)? Gated
+/// on the name (`tool_name_matches`); a non-empty `needle` is a glob over `args`
+/// VALUE leaves (`prune::value_glob_match` — never keys), and `needle == ""` is
+/// the empty-args selector (`prune::args_value_is_empty`).
+fn gemini_tool_call_matches(
+    name: &str,
+    args: Option<&serde_json::Value>,
+    tool_name: &str,
+    needle: &str,
+) -> bool {
+    if !crate::prune::tool_name_matches(name, tool_name, claude_to_gemini_tool_names) {
+        return false;
+    }
+    // Skip the agent's own in-flight prune-context call — see
+    // `crate::prune::value_is_prune_context_call`.
+    if args.is_some_and(crate::prune::value_is_prune_context_call) {
+        return false;
+    }
+    if needle.is_empty() {
+        return crate::prune::args_value_is_empty(args);
+    }
+    match args {
+        Some(a) => crate::prune::value_glob_match(a, needle),
+        None => false,
+    }
+}
+
+/// Read-only depth-first walk calling `visit` once per JSON object node in
+/// `value` (recursing objects + arrays). The shape-agnostic basis for the
+/// pruner — see the module header for why we walk every node, not named
+/// containers.
+fn walk_objects<F: FnMut(&serde_json::Map<String, serde_json::Value>)>(
+    value: &serde_json::Value,
+    visit: &mut F,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            visit(map);
+            for v in map.values() {
+                walk_objects(v, visit);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                walk_objects(v, visit);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mutable twin of `walk_objects`: visits each object by `&mut`, then descends
+/// into the (possibly-mutated) node's children.
+fn walk_objects_mut<F: FnMut(&mut serde_json::Map<String, serde_json::Value>)>(
+    value: &mut serde_json::Value,
+    visit: &mut F,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            visit(map);
+            for v in map.values_mut() {
+                walk_objects_mut(v, visit);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                walk_objects_mut(v, visit);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Does this object node look like a gemini toolCall? A toolCall has a string
+/// `id`, a string `name`, and an `args` value. (A `functionResponse` has `id` +
+/// `name` but NO `args`, so the two predicates are disjoint — a functionResponse
+/// is never collected as a tool call.)
+fn gemini_object_is_tool_call(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("id").and_then(|v| v.as_str()).is_some()
+        && obj.get("name").and_then(|v| v.as_str()).is_some()
+        && obj.contains_key("args")
+}
+
+/// Matching toolCall `id`s in DOCUMENT ORDER, EXCLUDING any whose paired
+/// `functionResponse.response.output` is already the `[pruned]` placeholder (so
+/// repeated prunes walk newest→oldest instead of re-hitting an already-blanked
+/// call). A toolCall with no output yet (in-flight) stays eligible. The "ordered
+/// matched minus already-pruned" combinator (shared with claude/codex) lives in
+/// [`crate::prune::select_eligible_ids`]; here we supply the gemini-shape
+/// collectors ([`gemini_collect_matched`] / [`gemini_collect_pruned`]) — the SAME
+/// two `prune_gemini_jsonl` feeds the single-read apply driver, so the count and
+/// apply paths can't drift. `select_eligible_ids` preserves insertion order and
+/// never reorders, so a later snapshot copy can't move the "most recent distinct
+/// call" decision.
+fn eligible_matches(
+    path: &std::path::Path,
+    tool_name: &str,
+    needle: &str,
+) -> std::io::Result<Vec<String>> {
+    crate::prune::select_eligible_ids(
+        path,
+        |entry, matched| gemini_collect_matched(entry, tool_name, needle, matched),
+        gemini_collect_pruned,
+    )
+}
+
+/// Pass-1 matched collector shared by `eligible_matches` (the control-side count
+/// path, via [`crate::prune::select_eligible_ids`]) and `prune_gemini_jsonl` (the
+/// apply path, via [`crate::prune::rewrite_jsonl_last_only`]). Pushes matching
+/// toolCall `id`s in DOCUMENT ORDER onto `matched`.
+///
+/// `collect_matched` recurses via `walk_objects` over EVERY node, but
+/// `$set.messages` snapshots re-render the SAME toolCall id at multiple
+/// depths/lines — so we de-dup to FIRST-seen document order (skip ids already
+/// pushed). That makes "last" mean the last DISTINCT call, matching the
+/// `HashSet`-dedup semantics the old count had.
+fn gemini_collect_matched(
+    entry: &serde_json::Value,
+    tool_name: &str,
+    needle: &str,
+    matched: &mut Vec<String>,
+) {
+    walk_objects(entry, &mut |obj| {
+        if !gemini_object_is_tool_call(obj) {
+            return;
+        }
+        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let args = obj.get("args");
+        if !gemini_tool_call_matches(name, args, tool_name, needle) {
+            return;
+        }
+        if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+            // First-seen wins: skip duplicates so document order tracks
+            // DISTINCT calls, not snapshot re-renders of the same id.
+            if !matched.iter().any(|m| m == id) {
+                matched.push(id.to_string());
+            }
+        }
+    });
+}
+
+/// Pass-1 already-pruned collector shared by `eligible_matches` and
+/// `prune_gemini_jsonl` (same call sites as [`gemini_collect_matched`]). Marks a
+/// call ineligible from ANY of its (possibly many) functionResponse copies whose
+/// `response.output` is already the `[pruned]` placeholder.
+fn gemini_collect_pruned(
+    entry: &serde_json::Value,
+    already_pruned: &mut std::collections::HashSet<String>,
+) {
+    walk_objects(entry, &mut |obj| {
+        let Some(id) = obj.get("id").and_then(|v| v.as_str()) else {
+            return;
+        };
+        // The load-bearing pruned-output copy: a functionResponse whose
+        // `response.output == "[pruned]"`.
+        let pruned = obj
+            .get("response")
+            .and_then(|r| r.as_object())
+            .and_then(|r| r.get("output"))
+            .and_then(|o| o.as_str())
+            == Some(crate::prune::PRUNED_PLACEHOLDER);
+        if pruned {
+            already_pruned.insert(id.to_string());
+        }
+    });
+}
+
+/// Read-only pre-scan: how many ELIGIBLE matches (drives the zero-check and the
+/// "N remain" CLI message). Zero → the control task errors back to the live agent
+/// instead of killing + respawning.
+fn count_gemini_matches(
+    path: &std::path::Path,
+    tool_name: &str,
+    needle: &str,
+) -> std::io::Result<usize> {
+    Ok(eligible_matches(path, tool_name, needle)?.len())
+}
+
+/// Blank every output copy of a pruned `id` reachable from `entry`, at ANY
+/// depth. For each object node with `id ∈ pruned_ids`:
+///
+///   (a) functionResponse (has `response`) — blank `response.output`. The
+///       load-bearing copy; appears under `toolCalls[].result[]`, `user`
+///       `content[]`, and (defensively) anywhere else.
+///   (b) toolCall (has `args`) — blank its own `resultDisplay`.
+///
+/// The predicates are DISJOINT (functionResponse has `response` not `args`;
+/// toolCall the reverse), so no node is double-counted. Returns bytes freed.
+///
+/// `outputs_blanked` collects each `id` whose output was ACTUALLY newly blanked
+/// (`blank_string_field` returned `Some`, incl. `Some(0)`); the `HashSet` dedups
+/// across the many copies. A re-prune (output already `[pruned]`) records
+/// nothing, so `results_blanked` reflects work done, not ids matched (mirrors
+/// codex).
+fn blank_gemini_outputs(
+    entry: &mut serde_json::Value,
+    pruned_ids: &std::collections::HashSet<String>,
+    outputs_blanked: &mut std::collections::HashSet<String>,
+) -> usize {
+    let mut freed = 0usize;
+    walk_objects_mut(entry, &mut |obj| {
+        let Some(id) = obj.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
+            return;
+        };
+        if !pruned_ids.contains(&id) {
+            return;
+        }
+        // (a) functionResponse copy.
+        if obj.contains_key("response") {
+            if let Some(resp) = obj.get_mut("response").and_then(|r| r.as_object_mut()) {
+                if let Some(f) = crate::prune::blank_string_field(
+                    resp,
+                    "output",
+                    crate::prune::PRUNED_PLACEHOLDER,
+                ) {
+                    freed += f;
+                    outputs_blanked.insert(id.clone());
+                }
+            }
+        }
+        // (b) toolCall copy (disjoint from (a): has `args`, no `response`).
+        if obj.contains_key("args") {
+            if let Some(f) = crate::prune::blank_string_field(
+                obj,
+                "resultDisplay",
+                crate::prune::PRUNED_PLACEHOLDER,
+            ) {
+                freed += f;
+                outputs_blanked.insert(id);
+            }
+        }
+    });
+    freed
+}
+
+/// Read-only fail-closed re-scan: count functionResponse copies that SHOULD have
+/// been pruned (`id ∈ pruned_ids`, has a `response`) whose `response.output` is
+/// still present and is NOT the `[pruned]` placeholder — i.e. a leaked un-pruned
+/// copy. Used after blanking to assert the prune was total; a non-zero count
+/// means a copy at some unexpected shape survived (a silent context leak).
+fn count_leaked_gemini_outputs(
+    entry: &serde_json::Value,
+    pruned_ids: &std::collections::HashSet<String>,
+) -> usize {
+    let mut leaked = 0usize;
+    walk_objects(entry, &mut |obj| {
+        let id_pruned = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| pruned_ids.contains(id))
+            .unwrap_or(false);
+        if !id_pruned {
+            return;
+        }
+        let Some(resp) = obj.get("response").and_then(|r| r.as_object()) else {
+            return;
+        };
+        match resp.get("output") {
+            None => {}
+            Some(serde_json::Value::String(s)) if s == crate::prune::PRUNED_PLACEHOLDER => {}
+            Some(_) => leaked += 1,
+        }
+    });
+    leaked
+}
+
+/// Single-target gemini rewrite, LAST-ONLY: blank EVERY output copy of just the
+/// MOST RECENT eligible match. The one-round case of [`prune_batch_gemini_jsonl`]
+/// (which carries the shared blank + fail-closed leak re-scan); kept TEST-ONLY as
+/// the equivalence oracle the batch path is pinned against. Production goes through
+/// the batch fn. `PruneStats::results_blanked` is 0 or 1; `freed_bytes` sums across
+/// all copies of the one id.
+#[cfg(test)]
+fn prune_gemini_jsonl(
+    path: &std::path::Path,
+    tool_name: &str,
+    needle: &str,
+) -> std::io::Result<crate::prune::PruneStats> {
+    prune_batch_gemini_jsonl(
+        path,
+        std::slice::from_ref(&(tool_name.into(), needle.into())),
+    )
+}
+
+/// Batch entry point behind `PRUNE_OPS::prune_batch`: blank the last-only target of
+/// every `(tool_name, needle)` in `targets` in ONE read/write via the shared batch
+/// driver ([`crate::prune::rewrite_jsonl_batch_last_only`]), reproducing exactly
+/// what running [`prune_gemini_jsonl`] once per target produced. Preserves gemini's
+/// fail-closed post-scan: the blank closure captures EVERY id it actually blanked
+/// across the batch into `blanked_ids`, then — only when ≥1 was blanked — a single
+/// `count_leaked_gemini_outputs` re-scan over the driver's FINAL entries (keyed by
+/// that full set) logs any surviving un-pruned copy at `error!` (→ Sentry). The
+/// per-copy blank logic + the leak detector are unchanged.
+fn prune_batch_gemini_jsonl(
+    path: &std::path::Path,
+    targets: &[crate::prune::PruneTarget],
+) -> std::io::Result<crate::prune::PruneStats> {
+    // The ids actually blanked this batch (≤ targets.len(), the last-only targets
+    // the driver picked) — captured from the blank closure so the fail-closed
+    // re-scan can key on the EXACT set the driver acted on, with no separate read.
+    let mut blanked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let (stats, final_entries) = crate::prune::rewrite_jsonl_batch_last_only(
+        path,
+        targets.len(),
+        |idx, entry, matched| {
+            let (tool_name, needle) = &targets[idx];
+            gemini_collect_matched(entry, tool_name, needle, matched)
+        },
+        gemini_collect_pruned,
+        |entry, pruned_ids, outputs_blanked| {
+            // Map freed bytes to the driver's `Option`: net-zero (incl. a tiny
+            // output blanked to `Some(0)`) → None → keep the line verbatim.
+            let before = outputs_blanked.len();
+            let freed = blank_gemini_outputs(entry, pruned_ids, outputs_blanked);
+            if outputs_blanked.len() > before {
+                blanked_ids.extend(outputs_blanked.iter().cloned());
+            }
+            if freed == 0 {
+                None
+            } else {
+                Some(freed)
+            }
+        },
+    )?;
+
+    // Empty-target no-op: nothing was blanked, so skip the leak re-scan entirely —
+    // same semantics as the old early-return (which returned before the post-scan).
+    if blanked_ids.is_empty() {
+        return Ok(stats);
+    }
+
+    // Fail-closed re-scan over the FINAL blanked entries the driver hands back
+    // (no re-read drift): any copy of a blanked id whose output isn't `[pruned]`
+    // is a leak.
+    let leaked: usize = final_entries
+        .iter()
+        .flatten()
+        .map(|entry| count_leaked_gemini_outputs(entry, &blanked_ids))
+        .sum();
+    if leaked > 0 {
+        tracing::error!(
+            leaked_copies = leaked,
+            session_file = %path.display(),
+            targets = targets.len(),
+            "gemini prune left un-pruned functionResponse output copies — context leak",
+        );
+    }
+
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,6 +1656,38 @@ mod tests {
             events,
             vec!["SessionIdHarvested(11111111-2222-3333-4444-555555555555)"]
         );
+    }
+
+    #[test]
+    fn resume_init_does_not_harvest_ephemeral_session_id() {
+        // On resume, init carries an ephemeral per-fork session_id; harvesting it
+        // would clobber the canonical id (see the module header), so the init
+        // handler must NOT emit SessionIdHarvested — contrast the first-turn path.
+        let mut a = GeminiAdapter::new();
+        let prompt = std::env::temp_dir().join(format!(
+            "zucchini_gemini_resume_prompt_{}_{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&prompt, "hi").unwrap();
+        let _ = a
+            .prepare_command(&ctx(
+                &prompt,
+                Some("019e91c1-8e30-7220-93e9-5c18e88a2595"),
+                true,
+                None,
+            ))
+            .unwrap();
+        // gemini reports a DIFFERENT (ephemeral) id in init on the resumed fork.
+        let line = r#"{"type":"init","session_id":"019e91c1-f570-7ad2-8043-599259035758"}"#;
+        assert!(
+            run(&mut a, line).is_empty(),
+            "resume init must not harvest the ephemeral fork session id"
+        );
+        let _ = std::fs::remove_file(&prompt);
     }
 
     #[test]
@@ -1340,10 +1954,38 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_dropped() {
+    fn tool_result_without_pending_prune_emits_no_cue() {
         let mut a = GeminiAdapter::new();
+        // No `prune-context` call recorded this turn ⇒ an ordinary tool_result
+        // is dropped silently (the cue is call-keyed, not chat-keyed).
         let line = r#"{"type":"tool_result","tool_id":"t1","output":"some output"}"#;
         assert!(run(&mut a, line).is_empty());
+    }
+
+    #[test]
+    fn prune_context_result_emits_cue_only_for_its_own_id() {
+        let mut a = GeminiAdapter::new();
+        // The injected meta-tool fires first (its tool_use is filtered out), then
+        // a parallel batch: prune-context (t_prune) + a sibling read (t_read).
+        let topic = r#"{"type":"tool_use","tool_name":"update_topic","tool_id":"t_topic","parameters":{"topic":"x"}}"#;
+        let prune_use = r#"{"type":"tool_use","tool_name":"run_shell_command","tool_id":"t_prune","parameters":{"command":"\"$ZUCCHINI_SPAWNER_BIN\" prune-context --tool-name read_file --args \"*x*\" --reason y"}}"#;
+        let read_use = r#"{"type":"tool_use","tool_name":"read_file","tool_id":"t_read","parameters":{"absolute_path":"/x"}}"#;
+        let _ = run(&mut a, topic);
+        let _ = run(&mut a, prune_use);
+        let _ = run(&mut a, read_use);
+        // update_topic's result lands FIRST — must NOT fire the cue.
+        let topic_res =
+            r#"{"type":"tool_result","tool_id":"t_topic","status":"success","output":"Topic set"}"#;
+        assert!(run(&mut a, topic_res).is_empty());
+        // The sibling read's result next — also must NOT fire.
+        let read_res =
+            r#"{"type":"tool_result","tool_id":"t_read","status":"success","output":"big body"}"#;
+        assert!(run(&mut a, read_res).is_empty());
+        // The prune-context call's OWN result — fires the cue exactly once.
+        let prune_res = r#"{"type":"tool_result","tool_id":"t_prune","status":"success","output":"pruned 2 outputs"}"#;
+        assert_eq!(run(&mut a, prune_res), vec!["ToolResult"]);
+        // Consumed: a late/duplicate result for the same id does not re-fire.
+        assert!(run(&mut a, prune_res).is_empty());
     }
 
     #[test]
@@ -1764,5 +2406,997 @@ mod tests {
         assert_eq!(tool["message"]["content"][0]["input"]["command"], "ls");
         assert_eq!(messages[3].0, "agent");
         assert!(messages[3].1.contains("done"));
+    }
+
+    // ===== prune-context (gemini dialect) =================================
+    mod prune {
+        use super::super::{
+            claude_to_gemini_tool_names, count_gemini_matches, count_leaked_gemini_outputs,
+            find_gemini_session_jsonl, gemini_reconstructed_session_id, normalize_tool_use,
+            prune_gemini_jsonl, GEMINI_TOOL_NAME_MAP,
+        };
+        use crate::prune::test_util::{read_lines, write_jsonl};
+        use crate::prune::PRUNED_PLACEHOLDER;
+        use std::collections::HashSet;
+
+        /// gemini incremental `type:"gemini"` record carrying a toolCall with a
+        /// bulky `result[].functionResponse.response.output` + `resultDisplay`.
+        fn gemini_record(id: &str, name: &str, args: &str, output: &str) -> String {
+            serde_json::json!({
+                "id": format!("msg-{id}"),
+                "type": "gemini",
+                "content": "",
+                "toolCalls": [{
+                    "id": id,
+                    "name": name,
+                    "args": serde_json::from_str::<serde_json::Value>(args).unwrap(),
+                    "result": [{
+                        "functionResponse": {
+                            "id": id,
+                            "name": name,
+                            "response": { "output": output }
+                        }
+                    }],
+                    "resultDisplay": output,
+                    "status": "success",
+                }]
+            })
+            .to_string()
+        }
+
+        /// gemini incremental `type:"user"` tool-result echo keyed by `id`.
+        fn gemini_user_echo(id: &str, name: &str, output: &str) -> String {
+            serde_json::json!({
+                "id": format!("u-{id}"),
+                "type": "user",
+                "content": [{
+                    "functionResponse": {
+                        "id": id,
+                        "name": name,
+                        "response": { "output": output }
+                    }
+                }]
+            })
+            .to_string()
+        }
+
+        #[test]
+        fn gemini_tool_name_map_round_trips() {
+            // Lockstep guard: every mapped gemini tool must round-trip —
+            // `normalize_tool_use` emits it under the table's claude name, and
+            // `claude_to_gemini_tool_names` maps that claude name back to the
+            // gemini name. Driving GEMINI_TOOL_NAME_MAP as the single source means
+            // a rename can't silently break prune matching for that tool.
+            for &(gemini, claude) in GEMINI_TOOL_NAME_MAP {
+                let frame = normalize_tool_use(gemini, "id", Some(&serde_json::json!({}))).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                assert_eq!(
+                    v["message"]["content"][0]["name"], claude,
+                    "normalize_tool_use({gemini}) must emit claude name {claude}",
+                );
+                assert!(
+                    claude_to_gemini_tool_names(claude).contains(&gemini),
+                    "claude_to_gemini_tool_names({claude}) must contain {gemini}",
+                );
+            }
+            // Fan-out order is preserved; an unmapped name yields empty (the caller
+            // then matches it literally).
+            assert_eq!(
+                claude_to_gemini_tool_names("Read"),
+                vec!["read_file", "read_many_files"]
+            );
+            assert!(claude_to_gemini_tool_names("read_file").is_empty());
+        }
+
+        #[test]
+        fn gemini_count_matches_maps_claude_name_to_gemini_tools() {
+            let f = write_jsonl(&[
+                &gemini_record("t1", "read_file", r#"{"file_path":"junk.rs"}"#, "big"),
+                &gemini_user_echo("t1", "read_file", "big"),
+                &gemini_record("t2", "read_file", r#"{"file_path":"keep.rs"}"#, "y"),
+                &gemini_record(
+                    "t3",
+                    "run_shell_command",
+                    r#"{"command":"cat junk.rs"}"#,
+                    "z",
+                ),
+            ]);
+            // claude "Read" + needle "junk.rs" → only t1 (read_file with junk.rs).
+            assert_eq!(
+                count_gemini_matches(f.path(), "Read", "junk.rs").unwrap(),
+                1
+            );
+            // claude "Bash" maps to run_shell_command → t3 only.
+            assert_eq!(
+                count_gemini_matches(f.path(), "Bash", "junk.rs").unwrap(),
+                1
+            );
+            assert_eq!(count_gemini_matches(f.path(), "Read", "nope").unwrap(), 0);
+        }
+
+        #[test]
+        fn gemini_empty_args_selector_matches_only_no_arg_calls() {
+            // A no-arg call records `args` as `{}`. `--args ""` must hit only it,
+            // sparing the same tool's with-args call (which a substring can't target).
+            let f = write_jsonl(&[
+                &gemini_record("e1", "list_directory", "{}", "BULKY"),
+                &gemini_user_echo("e1", "list_directory", "BULKY"),
+                &gemini_record("e2", "list_directory", r#"{"path":"/x"}"#, "OTHER"),
+            ]);
+            // Empty args + claude "Bash" (→ run_shell_command/list_directory) → e1.
+            assert_eq!(count_gemini_matches(f.path(), "Bash", "").unwrap(), 1);
+            // Prune blanks e1's output, counts exactly one.
+            let stats = prune_gemini_jsonl(f.path(), "Bash", "").unwrap();
+            assert_eq!(stats.results_blanked, 1);
+        }
+
+        #[test]
+        fn gemini_prune_blanks_incremental_record_and_user_echo() {
+            let f = write_jsonl(&[
+                r#"{"sessionId":"s1","startTime":"2026-05-30T00:00:00.000Z"}"#,
+                &gemini_record(
+                    "t1",
+                    "read_file",
+                    r#"{"file_path":"junk.rs"}"#,
+                    "BULKY FILE BODY",
+                ),
+                &gemini_user_echo("t1", "read_file", "BULKY FILE BODY"),
+                &gemini_record("t2", "read_file", r#"{"file_path":"keep.rs"}"#, "KEEP BODY"),
+                &gemini_user_echo("t2", "read_file", "KEEP BODY"),
+            ]);
+            let stats = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            // One distinct matched toolCall id (t1).
+            assert_eq!(stats.results_blanked, 1);
+            let lines = read_lines(f.path());
+            // Nothing deleted: header + 4 body lines.
+            assert_eq!(lines.len(), 5);
+            // t1's incremental record: output + resultDisplay blanked.
+            let tc = &lines[1]["toolCalls"][0];
+            assert_eq!(
+                tc["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            assert_eq!(tc["resultDisplay"], "[pruned]");
+            // t1's user echo blanked.
+            assert_eq!(
+                lines[2]["content"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            // t2 (keep.rs) untouched — both record and echo keep their body.
+            assert_eq!(
+                lines[3]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "KEEP BODY"
+            );
+            assert_eq!(
+                lines[4]["content"][0]["functionResponse"]["response"]["output"],
+                "KEEP BODY"
+            );
+        }
+
+        #[test]
+        fn gemini_prune_blanks_all_copies_in_set_messages_snapshot() {
+            // Same output in the incremental log AND a `$set.messages` snapshot:
+            // blank every copy, count the toolCall once, sum freed bytes.
+            let bulky = "VERY LARGE READ OUTPUT";
+            let snapshot = serde_json::json!({
+                "$set": {
+                    "lastUpdated": "2026-05-30T00:00:10.000Z",
+                    "messages": [
+                        { "id": "u1", "type": "user", "content": [{ "text": "read junk.rs" }] },
+                        {
+                            "id": "msg-t1", "type": "gemini", "content": "",
+                            "toolCalls": [{
+                                "id": "t1", "name": "read_file",
+                                "args": { "file_path": "junk.rs" },
+                                "result": [{ "functionResponse": {
+                                    "id": "t1", "name": "read_file",
+                                    "response": { "output": bulky }
+                                }}],
+                                "resultDisplay": bulky
+                            }]
+                        },
+                        {
+                            "id": "u-t1", "type": "user",
+                            "content": [{ "functionResponse": {
+                                "id": "t1", "name": "read_file",
+                                "response": { "output": bulky }
+                            }}]
+                        },
+                        // A second user copy (gemini emits the echo twice in snapshots).
+                        {
+                            "id": "u-t1b", "type": "user",
+                            "content": [{ "functionResponse": {
+                                "id": "t1", "name": "read_file",
+                                "response": { "output": bulky }
+                            }}]
+                        }
+                    ]
+                }
+            })
+            .to_string();
+
+            let f = write_jsonl(&[
+                r#"{"sessionId":"s1","startTime":"2026-05-30T00:00:00.000Z"}"#,
+                &gemini_record("t1", "read_file", r#"{"file_path":"junk.rs"}"#, bulky),
+                &gemini_user_echo("t1", "read_file", bulky),
+                &snapshot,
+            ]);
+
+            let stats = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            // One distinct matched toolCall id (t1), counted once despite appearing
+            // in both the incremental log and the snapshot.
+            assert_eq!(stats.results_blanked, 1);
+            // Freed bytes sum across ALL blanked copies: incremental output +
+            // resultDisplay + user echo, plus the snapshot's toolCall output +
+            // resultDisplay + 2 user echoes = 6 copies of the ~22-byte body.
+            assert!(
+                stats.freed_bytes >= 6 * (bulky.len() - PRUNED_PLACEHOLDER.len() - 2),
+                "freed_bytes = {}",
+                stats.freed_bytes
+            );
+
+            // No `[pruned]`-free copy of the bulky body may survive ANYWHERE.
+            let raw = std::fs::read_to_string(f.path()).unwrap();
+            assert!(
+                !raw.contains(bulky),
+                "stale bulky copy survived a prune: {raw}"
+            );
+
+            let lines = read_lines(f.path());
+            assert_eq!(lines.len(), 4);
+            // Snapshot copies all blanked: gemini toolCall output + resultDisplay,
+            // and BOTH user functionResponse echoes.
+            let snap = &lines[3]["$set"]["messages"];
+            assert_eq!(
+                snap[1]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            assert_eq!(snap[1]["toolCalls"][0]["resultDisplay"], "[pruned]");
+            assert_eq!(
+                snap[2]["content"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            assert_eq!(
+                snap[3]["content"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            // `lastUpdated` no-op preserved.
+            assert_eq!(lines[3]["$set"]["lastUpdated"], "2026-05-30T00:00:10.000Z");
+        }
+
+        #[test]
+        fn gemini_prune_no_match_leaves_file_untouched() {
+            let f = write_jsonl(&[
+                r#"{"sessionId":"s1","startTime":"2026-05-30T00:00:00.000Z"}"#,
+                &gemini_record("t1", "read_file", r#"{"file_path":"keep.rs"}"#, "BODY"),
+                &gemini_user_echo("t1", "read_file", "BODY"),
+            ]);
+            let stats = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(stats.results_blanked, 0);
+            assert_eq!(stats.freed_bytes, 0);
+            let lines = read_lines(f.path());
+            assert_eq!(
+                lines[1]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "BODY"
+            );
+            assert_eq!(
+                lines[2]["content"][0]["functionResponse"]["response"]["output"],
+                "BODY"
+            );
+        }
+
+        #[test]
+        fn gemini_resultdisplay_object_is_blanked_to_placeholder_string() {
+            // `resultDisplay` can be an OBJECT (e.g. grep_search's structured match
+            // table) — it must still collapse to the `[pruned]` string.
+            let record = serde_json::json!({
+                "id": "msg-g1", "type": "gemini", "content": "",
+                "toolCalls": [{
+                    "id": "g1", "name": "grep_search",
+                    "args": { "pattern": "AgentKind", "dir_path": "native-android/" },
+                    "result": [{ "functionResponse": {
+                        "id": "g1", "name": "grep_search",
+                        "response": { "output": "Found 60 matches ..." }
+                    }}],
+                    "resultDisplay": { "summary": "Found 60 matches", "matches": [{"x": 1}] }
+                }]
+            })
+            .to_string();
+            let f = write_jsonl(&[
+                r#"{"sessionId":"s1","startTime":"2026-05-30T00:00:00.000Z"}"#,
+                &record,
+            ]);
+            let stats = prune_gemini_jsonl(f.path(), "Grep", "AgentKind").unwrap();
+            assert_eq!(stats.results_blanked, 1);
+            let lines = read_lines(f.path());
+            assert_eq!(lines[1]["toolCalls"][0]["resultDisplay"], "[pruned]");
+            assert_eq!(
+                lines[1]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+        }
+
+        #[test]
+        fn gemini_prune_blanks_output_batched_under_sibling_tool_call() {
+            // REGRESSION (real gemini-cli 0.44.1): a toolCall's `result[]` can batch
+            // the `functionResponse` of a DIFFERENT tool call (observed an
+            // `update_topic` whose `result[1]` carried the matched `read_file`'s id +
+            // body). Blank by the INNER `functionResponse.id`, not the parent id.
+            let bulky = "VERY LARGE READ_FILE BODY THAT MUST BE PRUNED EVERYWHERE";
+            // A real read_file toolCall (matched by args needle) — establishes the id.
+            let read_record = gemini_record(
+                "read_file__1",
+                "read_file",
+                r#"{"file_path":"junk.rs"}"#,
+                bulky,
+            );
+            // A SIBLING toolCall (update_topic, never matched on its own) whose
+            // result array carries BOTH its own short output AND the read_file body.
+            let sibling = serde_json::json!({
+                "id": "msg-meta", "type": "gemini", "content": "",
+                "toolCalls": [{
+                    "id": "update_topic__1", "name": "update_topic",
+                    "args": { "summary": "x" },
+                    "result": [
+                        { "functionResponse": {
+                            "id": "update_topic__1", "name": "update_topic",
+                            "response": { "output": "topic set" }
+                        }},
+                        { "functionResponse": {
+                            "id": "read_file__1", "name": "read_file",
+                            "response": { "output": bulky }
+                        }}
+                    ],
+                    "resultDisplay": "topic updated"
+                }]
+            })
+            .to_string();
+            let f = write_jsonl(&[
+                r#"{"sessionId":"s1","startTime":"2026-05-30T00:00:00.000Z"}"#,
+                &read_record,
+                &sibling,
+            ]);
+
+            let stats = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(stats.results_blanked, 1, "one distinct matched tool call");
+
+            // No surviving copy of the bulky body ANYWHERE.
+            let raw = std::fs::read_to_string(f.path()).unwrap();
+            assert!(
+                !raw.contains(bulky),
+                "stale bulky copy survived inside a sibling toolCall's result array: {raw}"
+            );
+
+            let lines = read_lines(f.path());
+            // The read_file record's own output blanked.
+            assert_eq!(
+                lines[1]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            // The sibling update_topic's OWN result/resultDisplay are untouched...
+            assert_eq!(
+                lines[2]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "topic set"
+            );
+            assert_eq!(lines[2]["toolCalls"][0]["resultDisplay"], "topic updated");
+            // ...but the batched read_file copy (result[1]) IS blanked.
+            assert_eq!(
+                lines[2]["toolCalls"][0]["result"][1]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+        }
+
+        #[test]
+        fn gemini_prune_blanks_function_response_at_unexpected_depth() {
+            // REGRESSION: a matched functionResponse copy nested under unfamiliar
+            // keys (`pendingHistory[].wrapper`) the old container-enumerator missed.
+            let bulky = "DEEPLY NESTED READ BODY THAT MUST STILL BE PRUNED";
+            let read_record = gemini_record("t1", "read_file", r#"{"file_path":"junk.rs"}"#, bulky);
+            // Same id's functionResponse stashed two levels deeper, under unfamiliar keys.
+            let deep = serde_json::json!({
+                "id": "msg-deep", "type": "gemini", "content": "",
+                "pendingHistory": [{
+                    "wrapper": {
+                        "functionResponse": {
+                            "id": "t1", "name": "read_file",
+                            "response": { "output": bulky }
+                        }
+                    }
+                }]
+            })
+            .to_string();
+            let f = write_jsonl(&[
+                r#"{"sessionId":"s1","startTime":"2026-05-30T00:00:00.000Z"}"#,
+                &read_record,
+                &deep,
+            ]);
+
+            let stats = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(stats.results_blanked, 1, "one distinct matched tool call");
+
+            // No surviving copy anywhere, including the deeply-nested one.
+            let raw = std::fs::read_to_string(f.path()).unwrap();
+            assert!(
+                !raw.contains(bulky),
+                "stale bulky copy survived at an unexpected nesting depth: {raw}"
+            );
+
+            let lines = read_lines(f.path());
+            // The normal record's output blanked.
+            assert_eq!(
+                lines[1]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            // The deeply-nested copy blanked too.
+            assert_eq!(
+                lines[2]["pendingHistory"][0]["wrapper"]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+        }
+
+        #[test]
+        fn gemini_fail_closed_rescan_finds_no_leak_after_normal_prune() {
+            // After a normal prune the fail-closed re-scan
+            // (`count_leaked_gemini_outputs`) reports 0 leaks; controls below cover
+            // the never-pruned and still-live cases.
+            let bulky = "BODY ACROSS MANY COPIES";
+            let snapshot = serde_json::json!({
+                "$set": { "messages": [
+                    {
+                        "id": "msg-t1", "type": "gemini", "content": "",
+                        "toolCalls": [{
+                            "id": "t1", "name": "read_file",
+                            "args": { "file_path": "junk.rs" },
+                            "result": [{ "functionResponse": {
+                                "id": "t1", "name": "read_file",
+                                "response": { "output": bulky }
+                            }}],
+                            "resultDisplay": bulky
+                        }]
+                    },
+                    {
+                        "id": "u-t1", "type": "user",
+                        "content": [{ "functionResponse": {
+                            "id": "t1", "name": "read_file",
+                            "response": { "output": bulky }
+                        }}]
+                    }
+                ]}
+            })
+            .to_string();
+            let f = write_jsonl(&[
+                r#"{"sessionId":"s1","startTime":"2026-05-30T00:00:00.000Z"}"#,
+                &gemini_record("t1", "read_file", r#"{"file_path":"junk.rs"}"#, bulky),
+                &gemini_user_echo("t1", "read_file", bulky),
+                &snapshot,
+            ]);
+
+            let stats = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(stats.results_blanked, 1);
+
+            // Re-scan the FINAL blanked file with the same pruned-id set: zero leaks.
+            let pruned: HashSet<String> = ["t1".to_string()].into_iter().collect();
+            let leaked: usize = read_lines(f.path())
+                .iter()
+                .map(|entry| count_leaked_gemini_outputs(entry, &pruned))
+                .sum();
+            assert_eq!(leaked, 0, "no un-pruned functionResponse copy may survive");
+
+            // Negative control: a never-pruned id's live output is not a leak.
+            let kept = serde_json::json!({
+                "functionResponse": { "id": "untouched", "response": { "output": "live body" } }
+            });
+            assert_eq!(count_leaked_gemini_outputs(&kept, &pruned), 0);
+
+            // Positive control: a pruned id with still-live output IS a leak.
+            let leak = serde_json::json!({
+                "functionResponse": { "id": "t1", "response": { "output": "STILL HERE" } }
+            });
+            assert_eq!(count_leaked_gemini_outputs(&leak, &pruned), 1);
+        }
+
+        #[test]
+        fn gemini_re_prune_of_already_pruned_session_reports_zero() {
+            // G1 regression: gemini blanks output, never `args`, so a re-prune still
+            // matches by `args` though every output is already `[pruned]`. First
+            // prune reports 1, second 0 (newly-blanked, not matched); byte-stable.
+            let bulky = "BULKY FILE BODY ACROSS COPIES";
+            let snapshot = serde_json::json!({
+                "$set": { "messages": [
+                    {
+                        "id": "msg-t1", "type": "gemini", "content": "",
+                        "toolCalls": [{
+                            "id": "t1", "name": "read_file",
+                            "args": { "file_path": "junk.rs" },
+                            "result": [{ "functionResponse": {
+                                "id": "t1", "name": "read_file",
+                                "response": { "output": bulky }
+                            }}],
+                            "resultDisplay": bulky
+                        }]
+                    },
+                    {
+                        "id": "u-t1", "type": "user",
+                        "content": [{ "functionResponse": {
+                            "id": "t1", "name": "read_file",
+                            "response": { "output": bulky }
+                        }}]
+                    }
+                ]}
+            })
+            .to_string();
+            let f = write_jsonl(&[
+                r#"{"sessionId":"s1","startTime":"2026-05-30T00:00:00.000Z"}"#,
+                &gemini_record("t1", "read_file", r#"{"file_path":"junk.rs"}"#, bulky),
+                &gemini_user_echo("t1", "read_file", bulky),
+                &snapshot,
+            ]);
+
+            // First prune: real work — one tool call, bytes freed across every copy.
+            let first = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(first.results_blanked, 1, "first prune blanks one tool call");
+            assert!(first.freed_bytes > 0, "first prune frees bytes");
+            let after_first = std::fs::read_to_string(f.path()).unwrap();
+            assert!(
+                !after_first.contains(bulky),
+                "no live copy may survive the first prune"
+            );
+
+            // Second prune of the SAME needle: still matches by `args`, but every
+            // output is already `[pruned]`, so nothing is newly blanked.
+            let second = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(
+                second.results_blanked, 0,
+                "re-prune must report nothing blanked (no misleading timeline frame)"
+            );
+            assert_eq!(second.freed_bytes, 0, "re-prune frees no bytes");
+            let after_second = std::fs::read_to_string(f.path()).unwrap();
+            assert_eq!(after_first, after_second, "re-prune must be byte-stable");
+        }
+
+        #[test]
+        fn find_gemini_session_jsonl_matches_header_session_id() {
+            // Single-header (no fork) file: the reconstructed id == line 0's
+            // `sessionId`, which is NOT the filename short id.
+            //
+            // `base` is gemini's home dir (what `AgentKind::cli_home` resolves);
+            // `find_gemini_session_jsonl` scans `<base>/tmp/*/chats/*.jsonl`. We
+            // pass a temp dir straight in — no `HOME` mutation, no env races.
+            let base = std::env::temp_dir().join(format!(
+                "zucchini_gemini_find_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let chats = base.join("tmp").join("proj").join("chats");
+            std::fs::create_dir_all(&chats).unwrap();
+            let sid = "019e77bf-9f30-75e3-b86e-eaa48d924e5d";
+            // Filename short id deliberately differs from the header sessionId.
+            let file = chats.join("session-2026-05-30T07-18-DEADBEEF.jsonl");
+            std::fs::write(
+                &file,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"sessionId": sid, "projectHash": "abc", "startTime": "2026-05-30T07:18:00.000Z"}),
+                    serde_json::json!({"id":"u1","type":"user","content":[{"text":"hi"}]})
+                ),
+            )
+            .unwrap();
+
+            let found = find_gemini_session_jsonl(&base, sid);
+            let miss = find_gemini_session_jsonl(&base, "00000000-0000-0000-0000-000000000000");
+            assert_eq!(found.as_deref(), Some(file.as_path()));
+            assert!(miss.is_none());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn find_gemini_session_jsonl_picks_newest_mtime_on_duplicate_session_id() {
+            // Resume/re-snapshot writes a new chats file reusing the header
+            // sessionId, so one sessionId spans multiple files; the live one is the
+            // newest by mtime (not read_dir order). This proves newest-mtime wins.
+            let base = std::env::temp_dir().join(format!(
+                "zucchini_gemini_find_dup_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let chats = base.join("tmp").join("proj").join("chats");
+            std::fs::create_dir_all(&chats).unwrap();
+            let sid = "019e77bf-9f30-75e3-b86e-eaa48d924e5d";
+            let header = serde_json::json!({"sessionId": sid, "projectHash": "abc", "startTime": "2026-05-30T07:18:00.000Z"});
+            let body = serde_json::json!({"id":"u1","type":"user","content":[{"text":"hi"}]});
+            // Two files with the SAME header sessionId.
+            let stale = chats.join("session-2026-05-30T07-18-STALE000.jsonl");
+            let live = chats.join("session-2026-05-30T07-18-LIVE0000.jsonl");
+            std::fs::write(&stale, format!("{header}\n{body}\n")).unwrap();
+            std::fs::write(&live, format!("{header}\n{body}\n")).unwrap();
+            // Explicit mtimes 60s apart — no flaky sleep, order-independent.
+            let now = std::time::SystemTime::now();
+            let old = now - std::time::Duration::from_secs(60);
+            std::fs::File::options()
+                .write(true)
+                .open(&stale)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&live)
+                .unwrap()
+                .set_modified(now)
+                .unwrap();
+
+            let found = find_gemini_session_jsonl(&base, sid);
+            // Newest mtime wins — the live copy, not the stale one.
+            assert_eq!(found.as_deref(), Some(live.as_path()));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn gemini_reconstructed_session_id_follows_embedded_parent_header() {
+            // Forked transcript: ephemeral line-0 id, parent embedded deeper. Last
+            // header with sessionId+projectHash wins → reconstructed == parent.
+            let parent = "019e91c1-8e30-7220-93e9-5c18e88a2595";
+            let child = "019e91c1-f570-7ad2-8043-599259035758";
+            let l0 = serde_json::json!({"sessionId": child, "projectHash":"d6d3", "startTime":"t", "kind":"main"}).to_string();
+            let l1 =
+                serde_json::json!({"id":"u1","type":"user","content":[{"text":"hi"}]}).to_string();
+            let l2 =
+                serde_json::json!({"sessionId": parent, "projectHash":"d6d3", "startTime":"t"})
+                    .to_string();
+            let l3 = serde_json::json!({"$set":{"lastUpdated":"t2"}}).to_string();
+            let f = write_jsonl(&[&l0, &l1, &l2, &l3]);
+            assert_eq!(
+                gemini_reconstructed_session_id(f.path()).as_deref(),
+                Some(parent)
+            );
+        }
+
+        #[test]
+        fn gemini_reconstructed_session_id_single_header_is_that_header() {
+            // The common case (no fork): line-0 header is the only id-setter, so
+            // reconstructed == header. A bare `sessionId` WITHOUT `projectHash`
+            // must not override it.
+            let sid = "019e77bf-9f30-75e3-b86e-eaa48d924e5d";
+            let l0 = serde_json::json!({"sessionId": sid, "projectHash":"abc", "startTime":"t"})
+                .to_string();
+            let l1 =
+                serde_json::json!({"id":"m1","type":"gemini","content":"hi","sessionId":"bogus"})
+                    .to_string();
+            let f = write_jsonl(&[&l0, &l1]);
+            assert_eq!(
+                gemini_reconstructed_session_id(f.path()).as_deref(),
+                Some(sid)
+            );
+        }
+
+        #[test]
+        fn find_gemini_session_jsonl_matches_reconstructed_id_after_fork() {
+            // Forked file (ephemeral line-0 id, reconstructs to parent): find must
+            // locate it by the parent id; the ephemeral id must NOT resolve to it.
+            // Regression for the "Invalid session identifier" prune-respawn failure.
+            let base = std::env::temp_dir().join(format!(
+                "zucchini_gemini_find_fork_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let chats = base.join("tmp").join("proj").join("chats");
+            std::fs::create_dir_all(&chats).unwrap();
+            let parent = "019e91c1-8e30-7220-93e9-5c18e88a2595";
+            let child = "019e91c1-f570-7ad2-8043-599259035758";
+            let file = chats.join("session-2026-06-04T08-31-019e91c1.jsonl");
+            std::fs::write(
+                &file,
+                format!(
+                    "{}\n{}\n{}\n",
+                    serde_json::json!({"sessionId": child, "projectHash":"d6d3", "startTime":"t", "kind":"main"}),
+                    serde_json::json!({"id":"u1","type":"user","content":[{"text":"hi"}]}),
+                    serde_json::json!({"sessionId": parent, "projectHash":"d6d3", "startTime":"t"}),
+                ),
+            )
+            .unwrap();
+
+            // Parent (canonical) id resolves to the forked file …
+            assert_eq!(
+                find_gemini_session_jsonl(&base, parent).as_deref(),
+                Some(file.as_path())
+            );
+            // … the ephemeral line-0 header id does NOT (it reconstructs to parent).
+            assert!(find_gemini_session_jsonl(&base, child).is_none());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        // ----- Change A: value-scoped glob matching -----------------------
+
+        #[test]
+        fn gemini_needle_equal_to_key_name_does_not_match() {
+            // A needle equal to an arg KEY (`file_path`) must NOT match — the glob
+            // tests VALUE leaves only (matching a key was the over-match bug).
+            let f = write_jsonl(&[&gemini_record(
+                "t1",
+                "read_file",
+                r#"{"file_path":"src/main.rs"}"#,
+                "BODY",
+            )]);
+            assert_eq!(
+                count_gemini_matches(f.path(), "Read", "file_path").unwrap(),
+                0
+            );
+            let stats = prune_gemini_jsonl(f.path(), "Read", "file_path").unwrap();
+            assert_eq!(stats.results_blanked, 0);
+        }
+
+        #[test]
+        fn gemini_glob_wildcard_matches_value_leaf() {
+            // `*`-separated segments match in order within ONE value leaf.
+            let f = write_jsonl(&[&gemini_record(
+                "t1",
+                "run_shell_command",
+                r#"{"command":"grep -r foo src/ && echo bar"}"#,
+                "SHELL OUTPUT BIG ENOUGH TO FREE BYTES",
+            )]);
+            assert_eq!(
+                count_gemini_matches(f.path(), "Bash", "grep*echo bar").unwrap(),
+                1
+            );
+            let stats = prune_gemini_jsonl(f.path(), "Bash", "grep*echo bar").unwrap();
+            assert_eq!(stats.results_blanked, 1);
+        }
+
+        // ----- Change B: last-only (most-recent-eligible per prune) --------
+
+        #[test]
+        fn gemini_read_fanout_prunes_most_recent_then_older_then_zero() {
+            // Spec repro 3: `--tool-name Read` fans out to read_file AND
+            // read_many_files. Two eligible matches → a single prune blanks ONLY
+            // the most recent; a second prune blanks the older; a third reports 0.
+            let old = "OLD READ BODY BIG ENOUGH TO FREE";
+            let new = "NEW READ BODY BIG ENOUGH TO FREE";
+            let f = write_jsonl(&[
+                &gemini_record("r1", "read_file", r#"{"file_path":"junk.rs"}"#, old),
+                &gemini_user_echo("r1", "read_file", old),
+                &gemini_record(
+                    "r2",
+                    "read_many_files",
+                    r#"{"paths":["a.rs"],"note":"junk.rs"}"#,
+                    new,
+                ),
+                &gemini_user_echo("r2", "read_many_files", new),
+            ]);
+            // Both are eligible matches (read_file + read_many_files via Read).
+            assert_eq!(
+                count_gemini_matches(f.path(), "Read", "junk.rs").unwrap(),
+                2
+            );
+
+            // First prune: only the most recent (r2 / read_many_files).
+            let first = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(first.results_blanked, 1);
+            let lines = read_lines(f.path());
+            assert_eq!(
+                lines[2]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            // r1 (older) still has its body.
+            assert_eq!(
+                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                old
+            );
+            assert_eq!(
+                count_gemini_matches(f.path(), "Read", "junk.rs").unwrap(),
+                1
+            );
+
+            // Second prune: the older one (r1).
+            let second = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(second.results_blanked, 1);
+            let lines = read_lines(f.path());
+            assert_eq!(
+                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+
+            // Third prune: nothing eligible.
+            assert_eq!(
+                count_gemini_matches(f.path(), "Read", "junk.rs").unwrap(),
+                0
+            );
+            let third = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(third.results_blanked, 0);
+        }
+
+        #[test]
+        fn gemini_prune_context_shell_call_excluded_so_real_read_is_pruned() {
+            // Shell read (`cat junk.rs`) then a run_shell_command prune-context call
+            // naming the same path. Pruning by `Bash`/`junk.rs` must skip the
+            // agent's own prune call (even with an output present) and blank the
+            // real read instead.
+            let body = "BULKY junk.rs BODY BIG ENOUGH TO FREE";
+            let prune_cmd = r#"{"command":"zucchini-spawner prune-context --tool-name Bash --args junk.rs --reason x"}"#;
+            let f = write_jsonl(&[
+                &gemini_record(
+                    "r1",
+                    "run_shell_command",
+                    r#"{"command":"cat junk.rs"}"#,
+                    body,
+                ),
+                &gemini_user_echo("r1", "run_shell_command", body),
+                &gemini_record("p1", "run_shell_command", prune_cmd, "IGNORED OUTPUT"),
+                &gemini_user_echo("p1", "run_shell_command", "IGNORED OUTPUT"),
+            ]);
+            // Only the real read is eligible; the prune-context call is excluded.
+            assert_eq!(
+                count_gemini_matches(f.path(), "Bash", "junk.rs").unwrap(),
+                1
+            );
+            let stats = prune_gemini_jsonl(f.path(), "Bash", "junk.rs").unwrap();
+            assert_eq!(stats.results_blanked, 1);
+            let lines = read_lines(f.path());
+            assert_eq!(
+                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            // The prune-context call's args + output are left fully intact.
+            assert_eq!(
+                lines[2]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "IGNORED OUTPUT"
+            );
+        }
+
+        #[test]
+        fn gemini_two_same_tool_matches_walk_newest_to_oldest() {
+            // Two same-tool calls whose args both match → most-recent-only per
+            // prune, walking newest→oldest across repeated calls.
+            // Bodies must exceed the placeholder so a blank frees bytes (gemini's
+            // mapper keeps a line verbatim on net-zero freed).
+            let first = "FIRST READ BODY BIG ENOUGH";
+            let second = "SECOND READ BODY BIG ENOUGH";
+            let f = write_jsonl(&[
+                &gemini_record("a1", "read_file", r#"{"file_path":"junk.rs"}"#, first),
+                &gemini_user_echo("a1", "read_file", first),
+                &gemini_record("a2", "read_file", r#"{"file_path":"junk.rs"}"#, second),
+                &gemini_user_echo("a2", "read_file", second),
+            ]);
+            assert_eq!(
+                count_gemini_matches(f.path(), "Read", "junk.rs").unwrap(),
+                2
+            );
+
+            prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            let lines = read_lines(f.path());
+            // Newest (a2) blanked; oldest (a1) preserved.
+            assert_eq!(
+                lines[2]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            assert_eq!(
+                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                first
+            );
+
+            prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            let lines = read_lines(f.path());
+            assert_eq!(
+                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            assert_eq!(
+                count_gemini_matches(f.path(), "Read", "junk.rs").unwrap(),
+                0
+            );
+        }
+
+        #[test]
+        fn gemini_empty_args_selector_walks_newest_to_oldest() {
+            // `--args ""` over multiple no-arg calls of one tool walks
+            // newest→oldest across repeated prunes (relies on the output-pruned
+            // eligibility guard — the args never change, so without it the second
+            // prune would re-hit the same call).
+            let old = "OLD DIR LISTING BIG ENOUGH TO FREE";
+            let new = "NEW DIR LISTING BIG ENOUGH TO FREE";
+            let f = write_jsonl(&[
+                &gemini_record("n1", "list_directory", "{}", old),
+                &gemini_user_echo("n1", "list_directory", old),
+                &gemini_record("n2", "list_directory", "{}", new),
+                &gemini_user_echo("n2", "list_directory", new),
+            ]);
+            assert_eq!(count_gemini_matches(f.path(), "Bash", "").unwrap(), 2);
+
+            prune_gemini_jsonl(f.path(), "Bash", "").unwrap();
+            let lines = read_lines(f.path());
+            // Newest no-arg call (n2) blanked first.
+            assert_eq!(
+                lines[2]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            assert_eq!(
+                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                old
+            );
+
+            prune_gemini_jsonl(f.path(), "Bash", "").unwrap();
+            let lines = read_lines(f.path());
+            assert_eq!(
+                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                "[pruned]"
+            );
+            assert_eq!(count_gemini_matches(f.path(), "Bash", "").unwrap(), 0);
+        }
+
+        #[test]
+        fn gemini_snapshot_duplicate_id_counts_distinct_and_blanks_last_distinct() {
+            // Snapshot re-renders the SAME id at multiple lines: eligibility de-dups
+            // to first-seen order (older call can't masquerade as "most recent"),
+            // and a prune blanks ALL copies of the chosen id (incremental+snapshot).
+            let old_body = "OLD READ BODY";
+            let new_body = "NEW READ BODY";
+            // Snapshot (appears BEFORE the newest incremental record) re-rendering
+            // the older call s1 — its duplicate must not shift the "last" pick.
+            let snapshot = serde_json::json!({
+                "$set": { "messages": [
+                    {
+                        "id": "msg-s1", "type": "gemini", "content": "",
+                        "toolCalls": [{
+                            "id": "s1", "name": "read_file",
+                            "args": { "file_path": "junk.rs" },
+                            "result": [{ "functionResponse": {
+                                "id": "s1", "name": "read_file",
+                                "response": { "output": old_body }
+                            }}],
+                            "resultDisplay": old_body
+                        }]
+                    }
+                ]}
+            })
+            .to_string();
+            let f = write_jsonl(&[
+                r#"{"sessionId":"s1","startTime":"2026-05-30T00:00:00.000Z"}"#,
+                &gemini_record("s1", "read_file", r#"{"file_path":"junk.rs"}"#, old_body),
+                &gemini_user_echo("s1", "read_file", old_body),
+                &snapshot,
+                &gemini_record("s2", "read_file", r#"{"file_path":"junk.rs"}"#, new_body),
+                &gemini_user_echo("s2", "read_file", new_body),
+            ]);
+
+            // Two DISTINCT eligible calls despite s1's snapshot duplicate.
+            assert_eq!(
+                count_gemini_matches(f.path(), "Read", "junk.rs").unwrap(),
+                2
+            );
+
+            // First prune blanks the LAST distinct call (s2), not the snapshot's s1.
+            let first = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(first.results_blanked, 1);
+            let raw = std::fs::read_to_string(f.path()).unwrap();
+            assert!(
+                !raw.contains(new_body),
+                "s2 body must be fully pruned: {raw}"
+            );
+            assert!(
+                raw.contains(old_body),
+                "s1 (older) must be untouched on the first prune: {raw}"
+            );
+
+            // Second prune blanks s1 — and ALL its copies (incremental + snapshot).
+            let second = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
+            assert_eq!(second.results_blanked, 1);
+            let raw = std::fs::read_to_string(f.path()).unwrap();
+            assert!(
+                !raw.contains(old_body),
+                "every copy of s1 (incl. the snapshot) must be pruned: {raw}"
+            );
+            assert_eq!(
+                count_gemini_matches(f.path(), "Read", "junk.rs").unwrap(),
+                0
+            );
+        }
     }
 }

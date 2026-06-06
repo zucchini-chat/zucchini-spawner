@@ -28,6 +28,7 @@ use crate::agent::PendingAttachments;
 use crate::blobs;
 use crate::crypto::KeyStore;
 use crate::envelope::EnvelopeAttachment;
+use crate::prune::{PendingPrunes, PruneRequest};
 use crate::state::SharedMirror;
 use crate::writer::TokenFetcher;
 
@@ -49,6 +50,37 @@ pub enum ControlRequest {
     /// rule. Validation is restricted to "is there a running agent for this
     /// chat".
     AttachFile { chat_id: String, path: String },
+    /// Selective context forgetting (claude/gemini/codex). Carries one or more
+    /// [`PruneItem`]s — the agent batches every output it wants to forget into a
+    /// SINGLE CLI call so the burst is one process → one RPC → one restart.
+    /// (Separate parallel `prune-context` processes used to reap each other: the
+    /// first one's restart SIGTERMs the agent's whole process group, killing
+    /// still-running sibling prune CLIs before their RPC lands — see
+    /// `tmp/agent_log.txt`.) Each item with ≥1 eligible match is queued as its
+    /// own `PruneRequest`; the actual abort/rewrite/respawn is NOT triggered by
+    /// this call. The `prune-context` CLI just prints its summary and exits 0; the
+    /// main loop applies the queued prune when claude emits that call's
+    /// `tool_result` frame (so the rewrite lands strictly after claude persists the
+    /// result). If NO item matches anything, nothing is queued and the call errors
+    /// so the live agent can retry.
+    PruneContext {
+        chat_id: String,
+        items: Vec<PruneItem>,
+    },
+}
+
+/// One prune target inside a (possibly batched) `prune-context` call. `tool_name`
+/// is the CLAUDE-shape tool to prune, or `""` for the "any tool" selector (match
+/// on `needle` alone — codex omits `--tool-name`); `needle` is the `--args` glob,
+/// `""` selecting no-args calls; `reason` is the agent's `--summary` (the
+/// task-relevant takeaway it keeps after the raw output is blanked). A single CLI
+/// invocation carries one or more of these (one per `--summary`-terminated triple
+/// on the command line); the daemon queues a `PruneRequest` per matching item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PruneItem {
+    pub tool_name: String,
+    pub needle: String,
+    pub reason: String,
 }
 
 /// Wire response. `ok=true` always carries `blob_key`+`name`; `ok=false`
@@ -65,6 +97,14 @@ pub struct ControlResponse {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Per-item eligible-match counts, parallel to the request's `items` — set
+    /// only on the `prune_context` success path. A `0` entry means that item
+    /// matched nothing (queued nothing); the CLI reports it as a per-item miss
+    /// without failing the whole batch (the batch succeeds as long as ≥1 item
+    /// matched). Each non-zero `n` is the count BEFORE this prune, so `n-1`
+    /// matches remain for a repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruned_counts: Option<Vec<usize>>,
 }
 
 impl ControlResponse {
@@ -74,6 +114,16 @@ impl ControlResponse {
             blob_key: Some(blob_key),
             name: Some(name),
             error: None,
+            pruned_counts: None,
+        }
+    }
+    fn pruned_ok(counts: Vec<usize>) -> Self {
+        Self {
+            ok: true,
+            blob_key: None,
+            name: None,
+            error: None,
+            pruned_counts: Some(counts),
         }
     }
     fn err(msg: impl Into<String>) -> Self {
@@ -82,6 +132,7 @@ impl ControlResponse {
             blob_key: None,
             name: None,
             error: Some(msg.into()),
+            pruned_counts: None,
         }
     }
 }
@@ -99,6 +150,13 @@ pub struct ControlState {
     pub keys: Arc<KeyStore>,
     pub pending: PendingAttachments,
     pub mirror: SharedMirror,
+    /// Shared park-table of `PruneRequest`s, keyed by `chat_id`. We push under the
+    /// lock here, inside the `prune-context` RPC; the main `select!` loop (sole
+    /// owner of the `Supervisor`) drains the chat's entry and applies the
+    /// abort + jsonl rewrite + respawn when claude emits the `prune-context`
+    /// call's `tool_result` frame. The push completing before this RPC returns is
+    /// what guarantees the request is visible before that cue can fire.
+    pub pending_prunes: PendingPrunes,
 }
 
 /// Bind the listener and spawn the accept loop. Unlinks a stale socket from
@@ -193,7 +251,126 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                 }
             }
         }
+        ControlRequest::PruneContext { chat_id, items } => {
+            info!(chat_id = %chat_id, n_items = items.len(), "prune-context called");
+            match prune_context(&chat_id, &items, state).await {
+                Ok(counts) => ControlResponse::pruned_ok(counts),
+                Err(e) => {
+                    warn!(chat_id = %chat_id, n_items = items.len(), error = %e, "prune_context failed");
+                    ControlResponse::err(format!("{e:#}"))
+                }
+            }
+        }
     }
+}
+
+/// Human label for a prune target, naming the empty-args/any-tool selectors
+/// distinctly so both the daemon's retry/miss error and the CLI's per-target
+/// output read unambiguously. Shared (`pub`) so `main.rs`'s `prune-context` CLI
+/// uses the SAME phrasing — no second copy to drift.
+pub fn describe_prune_target(tool_name: &str, needle: &str) -> String {
+    match (tool_name.is_empty(), needle.is_empty()) {
+        (true, true) => "no-argument call".to_string(),
+        (true, false) => format!("call with args matching \"{needle}\""),
+        (false, true) => format!("no-argument \"{tool_name}\" call"),
+        (false, false) => format!("\"{tool_name}\" call with args matching \"{needle}\""),
+    }
+}
+
+/// Control-side `prune-context`: validate + locate the session transcript ONCE
+/// (shared across the batch), then pre-scan each item for ELIGIBLE matches. Every
+/// item with ≥1 match is queued as its own `PruneRequest` for the main loop; the
+/// returned `Vec<usize>` is the per-item eligible count (parallel to `items`, `0`
+/// = miss) the CLI turns into per-item "N remain" / "no … found" messages. If NO
+/// item matched anything, nothing is queued and we error (agent still alive, can
+/// retry) — this keeps the single-item behavior intact. The prunes are applied
+/// when claude emits the `prune-context` call's `tool_result` frame, folded into
+/// ONE abort→respawn.
+async fn prune_context(
+    chat_id: &str,
+    items: &[PruneItem],
+    state: &ControlState,
+) -> Result<Vec<usize>> {
+    if items.is_empty() {
+        return Err(anyhow!("prune-context called with no items"));
+    }
+    // Tight read-guard scope: no `.await` held under it.
+    let (agent_kind, agent_session_id) = {
+        let g = state.mirror.read().await;
+        g.chats
+            .get(chat_id)
+            .map(|c| (c.agent_kind, c.agent_session_id.clone()))
+            .ok_or_else(|| anyhow!("no chat with id {chat_id} (unknown or not yet synced)"))?
+    };
+    // Selective-forgetting hooks (claude/gemini/codex only).
+    let ops = agent_kind
+        .prune_ops()
+        .ok_or_else(|| anyhow!("prune-context supports claude, gemini and codex only"))?;
+
+    // Locate by the agent SESSION id, which for spawner-created chats is NOT the
+    // chat id. Fall back to chat_id for backfilled/imported rows (or before one's
+    // been harvested), where the two coincide.
+    let session_id = agent_session_id.as_deref().unwrap_or(chat_id);
+
+    // CLI transcript base dir (honors CLAUDE_CONFIG_DIR / CODEX_HOME /
+    // GEMINI_CLI_HOME, else $HOME/.<cli>).
+    let base = agent_kind
+        .cli_home()
+        .ok_or_else(|| anyhow!("cannot resolve home dir for {agent_kind:?}"))?;
+
+    // Locate the transcript ONCE; every item in the batch prunes the same file.
+    let jsonl_path = (ops.find_session)(&base, session_id)
+        .ok_or_else(|| anyhow!("no transcript for chat {chat_id} (session {session_id})"))?;
+
+    // Pre-scan each item against the (as-yet-unmodified) transcript and queue a
+    // `PruneRequest` for every item with ≥1 eligible match. `count_matches`
+    // reads the on-disk jsonl, which isn't rewritten until `apply_prune_group`
+    // runs at restart — so two items naming the same needle each see the full
+    // count here and both queue (the group then blanks the most-recent-remaining
+    // per request, exactly as repeated separate calls did before batching).
+    let mut counts = Vec::with_capacity(items.len());
+    let mut misses = Vec::new();
+    let mut queued = 0usize;
+    for item in items {
+        let n = (ops.count_matches)(&jsonl_path, &item.tool_name, &item.needle)
+            .with_context(|| format!("scan transcript {}", jsonl_path.display()))?;
+        counts.push(n);
+        if n == 0 {
+            // Don't queue a no-op; record the miss for the batch error message
+            // (only surfaced if EVERY item missed).
+            misses.push(describe_prune_target(&item.tool_name, &item.needle));
+            continue;
+        }
+        // Push under the lock — a tight, non-`await` critical section. This
+        // completes before the RPC returns to the CLI, so the request is parked
+        // before claude's `prune-context` `tool_result` (and thus the apply cue)
+        // can land. No `Sender` to fail, so no shutdown-race branch here; an
+        // entry parked moments before SIGTERM is simply dropped with the table
+        // (the agent is being torn down anyway).
+        state
+            .pending_prunes
+            .lock()
+            .await
+            .entry(chat_id.to_string())
+            .or_default()
+            .push(PruneRequest {
+                jsonl_path: jsonl_path.clone(),
+                agent_kind,
+                tool_name: item.tool_name.clone(),
+                needle: item.needle.clone(),
+                reason: item.reason.clone(),
+            });
+        queued += 1;
+    }
+
+    if queued == 0 {
+        // Nothing matched anywhere — no PruneRequest queued, so no restart fires
+        // and the agent stays alive to retry. Mirror the single-item error so the
+        // existing "no … found" handling (and tests) hold for a 1-item batch.
+        return Err(anyhow!("no {} found in transcript", misses.join("; no ")));
+    }
+
+    Ok(counts)
 }
 
 async fn attach_file(
@@ -437,4 +614,49 @@ pub async fn attach_file_via_socket(chat_id: &str, path: &str) -> Result<(String
         .ok_or_else(|| anyhow!("response missing blob_key"))?;
     let name = resp.name.ok_or_else(|| anyhow!("response missing name"))?;
     Ok((blob_key, name))
+}
+
+/// Connect to the daemon's control socket and run one (possibly batched)
+/// `prune-context` RPC, returning the per-item eligible counts (parallel to
+/// `items`, `0` = that item matched nothing). This RPC only pre-scans + queues a
+/// `PruneRequest` per matching item, then returns cleanly so the CLI can exit 0.
+/// The actual abort/rewrite/respawn is driven by the main loop when claude emits
+/// the `prune-context` call's `tool_result` frame, folding the batch into ONE
+/// restart that lands strictly after claude persists the call's result.
+pub async fn prune_context_via_socket(chat_id: &str, items: Vec<PruneItem>) -> Result<Vec<usize>> {
+    let sock = control_socket_path();
+    let stream = UnixStream::connect(&sock).await.with_context(|| {
+        format!(
+            "connect to {} — is zucchini-spawner running?",
+            sock.display()
+        )
+    })?;
+    let (read_half, mut write_half) = stream.into_split();
+    let req = ControlRequest::PruneContext {
+        chat_id: chat_id.to_string(),
+        items,
+    };
+    let mut payload = serde_json::to_string(&req).expect("serialize control request");
+    payload.push('\n');
+    write_half
+        .write_all(payload.as_bytes())
+        .await
+        .context("write control request")?;
+    write_half.shutdown().await.ok();
+
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .context("read control response")?;
+    let resp: ControlResponse =
+        serde_json::from_str(line.trim_end_matches('\n')).context("parse control response JSON")?;
+    if !resp.ok {
+        return Err(anyhow!(
+            "{}",
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+    Ok(resp.pruned_counts.unwrap_or_default())
 }

@@ -60,6 +60,9 @@ pub const DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     make: make_boxed,
     probe: probe_boxed,
     import: import_boxed,
+    // No editable local plaintext transcript (history is an opaque VS Code
+    // SQLite blob + server-bound chat id) — prune-context is infeasible.
+    prune: None,
 };
 
 fn make_boxed() -> Box<dyn AgentAdapter> {

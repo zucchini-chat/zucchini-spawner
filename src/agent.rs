@@ -69,6 +69,14 @@ pub enum AgentResponse {
         topic: String,
         has_result: bool,
     },
+    /// The `prune-context` call's own result has persisted for `topic` — the main
+    /// loop's cue to apply a queued prune (abort → rewrite → respawn). Call-keyed:
+    /// the adapter only emits it for the prune call's own result, never a sibling's.
+    /// Carries no body (the frame itself is skipped); a no-op unless a
+    /// `PruneRequest` is pending for the chat. See `AgentEvent::ToolResult`.
+    ToolResult {
+        topic: String,
+    },
 }
 
 impl AgentEvent {
@@ -99,6 +107,9 @@ impl AgentEvent {
                 *has_result = true;
                 return None;
             }
+            AgentEvent::ToolResult => AgentResponse::ToolResult {
+                topic: topic.to_string(),
+            },
         })
     }
 }
@@ -320,6 +331,17 @@ fn default_spawn_fn(
             sandbox = is_sandboxed,
             "spawning agent"
         );
+
+        // First turn only (`agent_session_id.is_none()`): append the adapter's
+        // prompt suffix after the user's text. See `first_turn_prompt_suffix`.
+        let prompt = if agent_session_id.is_none() {
+            match adapter.first_turn_prompt_suffix() {
+                Some(suffix) => format!("{prompt}\n\n---\n{suffix}"),
+                None => prompt,
+            }
+        } else {
+            prompt
+        };
 
         // Write prompt to a temp file so it never touches the shell command string
         let unique = format!(
@@ -561,6 +583,19 @@ fn default_spawn_fn(
         }
 
         let _ = tokio::fs::remove_file(&prompt_file).await;
+
+        // Post-turn context-token correction for adapters (codex) that read
+        // occupancy from the on-disk transcript, now flushed after exit.
+        // `None` (stream-sourced adapters, or a read miss) ⇒ gauge keeps its
+        // last value, not zeroed.
+        if let Some(tokens) = adapter.post_turn_context_tokens(agent_session_id.as_deref()) {
+            let _ = tx
+                .send(AgentResponse::ContextTokens {
+                    topic: topic_clone.clone(),
+                    tokens,
+                })
+                .await;
+        }
 
         let _ = tx
             .send(AgentResponse::Done {

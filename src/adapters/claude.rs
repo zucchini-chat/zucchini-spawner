@@ -8,6 +8,7 @@
 //! the `AgentAdapter` trait — `dyn AgentAdapter` can't dispatch statics).
 //! `main.rs::probe_install` calls into it from the startup-info report.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -18,7 +19,7 @@ use tracing::debug;
 use crate::adapter::{
     file_nonempty, probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter,
     AgentEvent, AgentKind, LastTokensDedup, TurnContext, ATTACH_FILE_INSTRUCTION,
-    MAX_STREAM_FRAME_BYTES,
+    MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -34,6 +35,7 @@ pub const DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     make: make_boxed,
     probe: probe_boxed,
     import: import_boxed,
+    prune: Some(PRUNE_OPS),
 };
 
 fn make_boxed() -> Box<dyn AgentAdapter> {
@@ -47,12 +49,64 @@ pub struct ClaudeAdapter {
     /// redundant PATCH on each one. State lives for one turn. See
     /// `adapter::LastTokensDedup`.
     last_emitted_tokens: LastTokensDedup,
+    /// `tool_use` ids of in-flight `prune-context` calls seen on assistant
+    /// frames this turn. The `tool_result` cue that drives a queued prune's
+    /// apply fires ONLY when the result's own `tool_use_id` is in this set —
+    /// call-keyed, not chat-keyed. Without this, a sibling tool's result in
+    /// the same parallel batch would fire abort→respawn before the
+    /// `prune-context` call's own result persists, so the resumed agent never
+    /// sees its prune + summary and re-runs it. See `AgentEvent::ToolResult`.
+    pending_prune_tool_use_ids: HashSet<String>,
 }
 
 impl ClaudeAdapter {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Scan an assistant frame for `prune-context` `tool_use` blocks and record
+    /// their ids so the matching `tool_result` (and only it) can later drive the
+    /// queued prune's apply. Caller gates on `line.contains("prune-context")`,
+    /// so the parse only runs on frames that actually mention the subcommand.
+    fn record_prune_tool_use_ids(&mut self, line: &str) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        let Some(blocks) = entry
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            return;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let Some(input) = block.get("input") else {
+                continue;
+            };
+            if crate::prune::value_is_prune_context_call(input) {
+                if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
+                    self.pending_prune_tool_use_ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Extract a `tool_result` frame's `tool_use_id` WITHOUT a full parse of the
+/// (possibly multi-MB) result body — the id is a short token near the head of
+/// the content block. The structural field is unescaped (`"tool_use_id":"`);
+/// any occurrence inside the result's own text is JSON-escaped (`\"…\"`), so
+/// this substring only matches the real field — same reasoning the frame-skip
+/// filters above rely on.
+fn extract_tool_result_id(line: &str) -> Option<&str> {
+    const KEY: &str = "\"tool_use_id\":\"";
+    let start = line.find(KEY)? + KEY.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
 }
 
 impl AgentAdapter for ClaudeAdapter {
@@ -107,6 +161,8 @@ impl AgentAdapter for ClaudeAdapter {
         }
         sys.push_str("\n\n");
         sys.push_str(ATTACH_FILE_INSTRUCTION);
+        sys.push_str("\n\n");
+        sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
         claude_cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
         claude_cmd.push_str(
             " --print --verbose --output-format stream-json --disallowedTools AskUserQuestion",
@@ -126,13 +182,45 @@ impl AgentAdapter for ClaudeAdapter {
         if let Some(model) = ctx.model {
             claude_cmd.push_str(&format!(" --model {}", shell_escape(model)));
         }
+        // Register a `PostToolUse` hook that nudges the agent to prune large tool
+        // outputs once they're no longer needed (selective forgetting). The hook
+        // command re-invokes THIS binary (`prune-reminder-hook`), so there's no
+        // bash+jq script and no external dep — the spawner parses the hook JSON
+        // and applies the size gate in Rust. `$ZUCCHINI_SPAWNER_BIN` is exported
+        // on the spawn (agent.rs); shell_escape wraps the settings JSON in single
+        // quotes, so the var is passed through LITERALLY and claude's hook runner
+        // expands it at hook time against the inherited env (NOT the outer login
+        // shell). Added unconditionally (harmless when nothing's large), same as
+        // the prune-context system-prompt nudge. `--settings` MERGES with (never
+        // replaces) the user's settings.json / project hooks, so user-configured
+        // hooks survive the spawn (verified empirically). See `zucchini-spawner/CLAUDE.md`.
+        let settings = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [{
+                    // Match-all. claude treats the matcher as a REGEX, so the
+                    // documented match-all is the empty string (`""`), NOT `"*"`
+                    // (a bare `*` is not a valid standalone quantifier).
+                    "matcher": "",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "\"$ZUCCHINI_SPAWNER_BIN\" prune-reminder-hook"
+                    }]
+                }]
+            }
+        });
+        claude_cmd.push_str(&format!(
+            " --settings {}",
+            shell_escape(&settings.to_string())
+        ));
         Ok(claude_cmd)
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
         let mut out: SmallVec<[AgentEvent; 2]> = SmallVec::new();
 
-        // Pre-skip-filter: thinking-only frames also carry usage.
+        // Pre-skip-filter: thinking-only frames also carry usage. The
+        // token-usage parse stays under MAX_STREAM_FRAME_BYTES — it runs on
+        // EVERY assistant frame, so it must skip pathologically large bodies.
         if line.len() < MAX_STREAM_FRAME_BYTES
             && line.starts_with('{')
             && line.contains("\"type\":\"assistant\"")
@@ -142,6 +230,30 @@ impl AgentAdapter for ClaudeAdapter {
                     out.push(AgentEvent::ContextTokens(t));
                 }
             }
+        }
+
+        // Record the `tool_use` id of any `prune-context` call so its own
+        // `tool_result` (and only its own) can later drive the queued prune's
+        // apply. The `prune-context` substring is the cheap pre-filter that
+        // keeps ordinary assistant frames from paying the parse.
+        //
+        // Deliberately NOT under the MAX_STREAM_FRAME_BYTES gate (unlike the
+        // usage parse above): record and the matching `tool_result` EMIT below
+        // share one policy. A batched multi-target prune call (many
+        // --tool-name/--args/--summary triples with large needles/summaries)
+        // can push the assistant frame past 64KiB; if we skipped the record
+        // there, the cue would silently never fire and the queued prune would
+        // be a no-op (leaking in `pending_prunes` until the turn's Done clears
+        // it). The substring + starts_with('{') + assistant-type check keep
+        // this scoped to assistant-shaped prune-bearing frames (a user/
+        // tool_result frame can also echo "prune-context" in its result text,
+        // but record_prune_tool_use_ids only inspects `tool_use` blocks, so
+        // restricting to assistant frames just avoids a needless parse).
+        if line.starts_with('{')
+            && line.contains("\"type\":\"assistant\"")
+            && line.contains("prune-context")
+        {
+            self.record_prune_tool_use_ids(&line);
         }
 
         // Pre-skip harvest: `system/init` frames carry claude's
@@ -186,8 +298,34 @@ impl AgentAdapter for ClaudeAdapter {
                     }
                 }
                 skip = true;
+            } else if line.contains("\"type\":\"user\"") {
+                // User frames are never rendered — but a `tool_result` user frame
+                // is claude's signal that it has PERSISTED a finished tool call's
+                // result. Emit a content-free `ToolResult` cue (still skipping the
+                // frame) so the main loop can apply a queued prune the instant the
+                // `prune-context` call's own result lands on disk — strictly after
+                // it persists, so the resumed agent sees its prune + summary.
+                // Substring match (not a parse): a real `tool_result` block type
+                // has unescaped quotes; any occurrence inside the result's own
+                // text is escaped (`\"`), so this only matches the structural block.
+                //
+                // Call-keyed: fire ONLY when this result's own `tool_use_id`
+                // matches a recorded `prune-context` call. A sibling tool's
+                // result in the same parallel batch must NOT preempt the apply
+                // (it would abort→respawn before the prune's own result
+                // persists). The set is empty for every ordinary turn, so the
+                // id extraction is skipped entirely unless a prune is in flight.
+                if line.contains("\"type\":\"tool_result\"")
+                    && !self.pending_prune_tool_use_ids.is_empty()
+                {
+                    if let Some(id) = extract_tool_result_id(&line) {
+                        if self.pending_prune_tool_use_ids.remove(id) {
+                            out.push(AgentEvent::ToolResult);
+                        }
+                    }
+                }
+                skip = true;
             } else if line.contains("\"type\":\"stream_event\"")
-                || line.contains("\"type\":\"user\"")
                 || line.contains("\"type\":\"rate_limit_event\"")
                 || (line.contains("\"type\":\"assistant\"")
                     && !line.contains("\"type\":\"text\"")
@@ -786,6 +924,283 @@ fn import_boxed(
     Box::pin(import(machine_id, user_id, write_tx, progress))
 }
 
+// ===========================================================================
+// Selective forgetting ("prune-context") — claude dialect. Shared contract:
+// `crate::prune`. Claude shape: a tool result lives in a `user` entry paired to
+// the assistant's `tool_use` by `tool_use_id`; a prune blanks the `tool_use`
+// `input` to `{}` and the paired `tool_result` `content` to `PRUNED_PLACEHOLDER`
+// — preserving every line + id/threading field byte-for-byte so `--resume` keeps
+// its prompt-cache prefix up to the edit. Wired in via `PRUNE_OPS` (→
+// `AdapterDescriptor::prune`). Single-pass (assistant input + paired user
+// content blank in one read pass), distinct from the shared two-pass driver
+// gemini/codex use.
+
+/// `crate::prune::PruneOps` for claude. Points the descriptor at this module's
+/// dialect pruners.
+pub(crate) const PRUNE_OPS: crate::prune::PruneOps = crate::prune::PruneOps {
+    find_session: find_session_jsonl,
+    count_matches,
+    prune_batch: prune_batch_jsonl,
+};
+
+/// Locate `~/.claude/projects/*/<session_id>.jsonl` under `base` (the CLI home
+/// resolved by `AgentKind::cli_home`). claude shards transcripts into one
+/// per-cwd subdir, so we scan the immediate children of `projects/` for the
+/// `<session_id>.jsonl` leaf. `None` when no transcript for that id exists yet.
+fn find_session_jsonl(base: &Path, session_id: &str) -> Option<PathBuf> {
+    let projects = base.join("projects");
+    let file_name = format!("{session_id}.jsonl");
+    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let candidate = entry.path().join(&file_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Does this `tool_use` block match the (`tool_name`, `needle`) selector? Block
+/// must be a `tool_use`; an empty `--tool-name` matches any tool (prune on the
+/// args needle alone), else the claude-shape `name` must match exactly. The
+/// agent's own in-flight `prune-context` call is never a target (see
+/// [`crate::prune::value_is_prune_context_call`]). Empty `needle` is the no-args
+/// selector ([`crate::prune::args_value_is_empty`]); otherwise glob the input
+/// VALUES ([`crate::prune::value_glob_match`]).
+fn tool_use_matches(block: &serde_json::Value, tool_name: &str, needle: &str) -> bool {
+    if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+        return false;
+    }
+    if !tool_name.is_empty() && block.get("name").and_then(|n| n.as_str()) != Some(tool_name) {
+        return false;
+    }
+    // Skip the agent's own in-flight prune-context call (its command line carries
+    // the same needle, and last-only would otherwise pick it over the real target).
+    if block
+        .get("input")
+        .is_some_and(crate::prune::value_is_prune_context_call)
+    {
+        return false;
+    }
+    if needle.is_empty() {
+        return crate::prune::args_value_is_empty(block.get("input"));
+    }
+    block
+        .get("input")
+        .is_some_and(|i| crate::prune::value_glob_match(i, needle))
+}
+
+/// Eligible (matched, not already `[pruned]`) `tool_use` ids in document order.
+/// The ordered-minus-pruned combinator is the shared
+/// [`crate::prune::select_eligible_ids`]; here we supply the claude-shape
+/// collectors ([`claude_collect_matched`] / [`claude_collect_pruned`]) — the SAME
+/// two `prune_jsonl` feeds the single-read apply driver, so the count and apply
+/// paths can't drift.
+fn eligible_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::Result<Vec<String>> {
+    crate::prune::select_eligible_ids(
+        path,
+        |entry, matched| claude_collect_matched(entry, tool_name, needle, matched),
+        claude_collect_pruned,
+    )
+}
+
+/// Pass-1 matched collector shared by `eligible_matches` (the control-side count
+/// path, via [`crate::prune::select_eligible_ids`]) and `prune_jsonl` (the apply
+/// path, via [`crate::prune::rewrite_jsonl_last_only`]). Walks assistant `tool_use`
+/// blocks via [`tool_use_matches`], pushing matching ids in DOCUMENT ORDER.
+fn claude_collect_matched(
+    entry: &serde_json::Value,
+    tool_name: &str,
+    needle: &str,
+    matched: &mut Vec<String>,
+) {
+    if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return;
+    }
+    let Some(blocks) = entry
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return;
+    };
+    for block in blocks {
+        if tool_use_matches(block, tool_name, needle) {
+            if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
+                matched.push(id.to_string());
+            }
+        }
+    }
+}
+
+/// Pass-1 already-pruned collector shared by `eligible_matches` and `prune_jsonl`
+/// (same call sites as [`claude_collect_matched`]). Walks user `tool_result`
+/// blocks whose `content` is already the `[pruned]` placeholder, marking their
+/// `tool_use_id` ineligible.
+fn claude_collect_pruned(
+    entry: &serde_json::Value,
+    already_pruned: &mut std::collections::HashSet<String>,
+) {
+    use crate::prune::PRUNED_PLACEHOLDER;
+    if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return;
+    }
+    let Some(blocks) = entry
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return;
+    };
+    for block in blocks {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            continue;
+        }
+        // A `[pruned]` tool_result marks its tool_use ineligible.
+        if block.get("content").and_then(|c| c.as_str()) == Some(PRUNED_PLACEHOLDER) {
+            if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
+                already_pruned.insert(id.to_string());
+            }
+        }
+    }
+}
+
+/// Read-only pre-scan: count eligible matches (control-side, before aborting).
+fn count_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::Result<usize> {
+    Ok(eligible_matches(path, tool_name, needle)?.len())
+}
+
+/// Pass-2 helper: blank one parsed claude transcript entry in place for any
+/// `tool_use`/`tool_result` whose id ∈ `pruned_ids` (the singleton target seeded
+/// by [`prune_jsonl`]):
+///   - assistant: each `tool_use` whose `id` ∈ set → `input` blanked to `{}` (the
+///     path/command lives in the agent's summary; the args carry nothing it still
+///     needs). Does NOT count toward `results_blanked`/`freed_bytes` — only the
+///     paired output does.
+///   - user: each `tool_result` whose `tool_use_id` ∈ set → `content` blanked to
+///     the placeholder and the id recorded in `outputs_blanked` (drives the
+///     user-facing `results_blanked` count + `freed_bytes`).
+///
+/// Cross-line by design: the tool_use lives on the assistant line and its
+/// tool_result on a later user line; the driver runs this per-entry, so each is
+/// blanked when its own line comes through. Returns `None` when the entry was
+/// left untouched, or `Some(freed_bytes)` when a field was blanked (`freed` may be
+/// `0` for an input-only blank or a tiny output — the driver still re-serializes).
+/// Idempotent: already-blank fields no-op so a re-prune stays byte-stable.
+fn blank_claude_entry(
+    entry: &mut serde_json::Value,
+    pruned_ids: &std::collections::HashSet<String>,
+    outputs_blanked: &mut std::collections::HashSet<String>,
+) -> Option<usize> {
+    use crate::prune::PRUNED_PLACEHOLDER;
+
+    let entry_type = entry.get("type").and_then(|t| t.as_str());
+    let is_assistant = entry_type == Some("assistant");
+    let is_user = entry_type == Some("user");
+    if !is_assistant && !is_user {
+        return None;
+    }
+
+    let blocks = entry
+        .get_mut("message")
+        .and_then(|m| m.get_mut("content"))
+        .and_then(|c| c.as_array_mut())?;
+
+    let mut freed_total = 0usize;
+    let mut changed = false;
+    for block in blocks.iter_mut() {
+        let id = block
+            .get(if is_assistant { "id" } else { "tool_use_id" })
+            .and_then(|i| i.as_str())
+            .map(str::to_string);
+        let Some(id) = id.filter(|id| pruned_ids.contains(id)) else {
+            continue;
+        };
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
+        if is_assistant {
+            if obj.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let already_empty = matches!(
+                obj.get("input"),
+                Some(serde_json::Value::Object(m)) if m.is_empty()
+            );
+            if !already_empty {
+                obj.insert("input".into(), serde_json::json!({}));
+                changed = true;
+            }
+        } else {
+            if obj.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            // `None` when already blank — keeps re-prune byte-stable. Idempotency +
+            // freed-byte arithmetic live in the shared helper.
+            if let Some(freed) =
+                crate::prune::blank_string_field(obj, "content", PRUNED_PLACEHOLDER)
+            {
+                freed_total += freed;
+                changed = true;
+                outputs_blanked.insert(id);
+            }
+        }
+    }
+
+    changed.then_some(freed_total)
+}
+
+/// Single-target last-only rewrite — the one-round case of [`prune_batch_jsonl`].
+/// Kept as a TEST-ONLY oracle: the batch path must be byte-identical to running
+/// this once per target, so the tests pin that equivalence. Production prunes go
+/// through `prune_batch_jsonl` (one read for the whole burst). Blanks the most
+/// recent eligible match's tool_use input + paired tool_result content; an empty
+/// target (TOCTOU / nothing eligible) is a safe no-op. Claude has no fail-closed
+/// post-scan, so the driver's returned final entries are ignored.
+#[cfg(test)]
+fn prune_jsonl(
+    path: &Path,
+    tool_name: &str,
+    needle: &str,
+) -> std::io::Result<crate::prune::PruneStats> {
+    let (stats, _final_entries) = crate::prune::rewrite_jsonl_last_only(
+        path,
+        |entry, matched| claude_collect_matched(entry, tool_name, needle, matched),
+        claude_collect_pruned,
+        blank_claude_entry,
+    )?;
+    Ok(stats)
+}
+
+/// Batch entry point behind `PRUNE_OPS::prune_batch`: blank the last-only target of
+/// EVERY `(tool_name, needle)` in `targets` in ONE read/write, reproducing exactly
+/// what running [`prune_jsonl`] once per target produced (same blanked set + freed
+/// bytes). The single-read batch driver
+/// ([`crate::prune::rewrite_jsonl_batch_last_only`]) re-derives the per-target
+/// matches from the SAME claude collectors `prune_jsonl` uses, subtracting both the
+/// on-disk `[pruned]` set and the ids already chosen earlier in the batch — so two
+/// same-needle targets pick two DISTINCT successive matches, just as two separate
+/// `prune_jsonl` calls did. Claude has no fail-closed post-scan, so the driver's
+/// final entries are ignored.
+fn prune_batch_jsonl(
+    path: &Path,
+    targets: &[crate::prune::PruneTarget],
+) -> std::io::Result<crate::prune::PruneStats> {
+    let (stats, _final_entries) = crate::prune::rewrite_jsonl_batch_last_only(
+        path,
+        targets.len(),
+        |idx, entry, matched| {
+            let (tool_name, needle) = &targets[idx];
+            claude_collect_matched(entry, tool_name, needle, matched)
+        },
+        claude_collect_pruned,
+        blank_claude_entry,
+    )?;
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,11 +1250,70 @@ mod tests {
     }
 
     #[test]
-    fn user_frame_dropped() {
+    fn tool_result_without_pending_prune_emits_no_cue() {
         let mut a = ClaudeAdapter::new();
+        // No `prune-context` call recorded this turn ⇒ an ordinary tool_result
+        // is skipped silently (the cue is call-keyed, not chat-keyed).
         let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"out"}]}}"#;
-        let events = run(&mut a, line);
-        assert!(events.is_empty());
+        assert!(run(&mut a, line).is_empty());
+    }
+
+    #[test]
+    fn prune_context_result_emits_cue_only_for_its_own_id() {
+        let mut a = ClaudeAdapter::new();
+        // Assistant frame: a `prune-context` call (tu_prune) batched in parallel
+        // with a sibling Read (tu_read).
+        let assistant = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_read","name":"Read","input":{"file_path":"/x"}},{"type":"tool_use","id":"tu_prune","name":"Bash","input":{"command":"\"$ZUCCHINI_SPAWNER_BIN\" prune-context --tool-name Read --args \"*x*\" --reason y"}}],"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}"#;
+        let _ = run(&mut a, assistant);
+        // The sibling's result lands FIRST — must NOT fire the cue.
+        let read_result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_read","content":"big file body"}]}}"#;
+        assert!(run(&mut a, read_result).is_empty());
+        // The prune-context call's OWN result lands second — fires the cue once.
+        let prune_result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_prune","content":"pruned 2 outputs"}]}}"#;
+        assert_eq!(run(&mut a, prune_result), vec!["ToolResult"]);
+        // Id is consumed: a duplicate/late result for the same id does not re-fire.
+        assert!(run(&mut a, prune_result).is_empty());
+    }
+
+    #[test]
+    fn oversized_prune_assistant_frame_still_records_id_and_emits_cue() {
+        // Regression: the prune-context id RECORD must NOT be size-gated. A
+        // batched multi-target prune call (many --tool-name/--args/--summary
+        // triples) can push the assistant frame past MAX_STREAM_FRAME_BYTES.
+        // Previously RECORD lived under that gate while the tool_result EMIT
+        // did not, so an oversized prune frame never recorded its id ⇒ the cue
+        // silently never fired ⇒ the queued prune was a no-op. Record and emit
+        // now share one policy; prove an >64KiB prune frame still records and
+        // its result still emits ToolResult.
+        let mut a = ClaudeAdapter::new();
+        // Pad the prune-context command's --summary with a large needle/summary
+        // so the whole assistant frame exceeds MAX_STREAM_FRAME_BYTES.
+        let huge = "x".repeat(MAX_STREAM_FRAME_BYTES + 4096);
+        let assistant = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tu_prune","name":"Bash","input":{{"command":"\"$ZUCCHINI_SPAWNER_BIN\" prune-context --tool-name Read --args needle --summary {huge}"}}}}],"usage":{{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}}}}"#
+        );
+        assert!(
+            assistant.len() > MAX_STREAM_FRAME_BYTES,
+            "test frame must exceed the size gate (got {} bytes)",
+            assistant.len()
+        );
+        // Oversized assistant frame: usage parse is skipped (size-gated), but
+        // the prune id must still be recorded.
+        let _ = run(&mut a, &assistant);
+        // The prune-context call's own result fires the cue exactly once,
+        // proving the id was recorded despite the oversized frame.
+        let prune_result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_prune","content":"pruned 1 output"}]}}"#;
+        assert_eq!(run(&mut a, prune_result), vec!["ToolResult"]);
+        // Consumed: a duplicate result does not re-fire.
+        assert!(run(&mut a, prune_result).is_empty());
+    }
+
+    #[test]
+    fn user_frame_without_tool_result_dropped_silently() {
+        let mut a = ClaudeAdapter::new();
+        // A plain user frame (no tool_result block) is skipped with no cue.
+        let line = r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#;
+        assert!(run(&mut a, line).is_empty());
     }
 
     #[test]
@@ -991,5 +1465,259 @@ mod tests {
         };
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(!cmd.contains("--model"), "got: {}", cmd);
+    }
+
+    #[test]
+    fn prepare_command_wires_prune_feature() {
+        use crate::adapter::TurnContext;
+        use std::path::PathBuf;
+        let mut a = ClaudeAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let ctx = TurnContext {
+            chat_id: "abcdef012345-6789-...",
+            prompt_file: &prompt_file,
+            project_path: Some("/tmp/proj"),
+            worktree: false,
+            agent_session_id: None,
+            is_sandboxed: false,
+            model: None,
+        };
+        let cmd = a.prepare_command(&ctx).unwrap();
+        // The standing prune-context instruction rides --append-system-prompt …
+        assert!(cmd.contains("prune-context"), "got: {}", cmd);
+        // … and the PostToolUse reminder hook is injected via --settings.
+        assert!(cmd.contains("--settings"), "got: {}", cmd);
+        assert!(cmd.contains("prune-reminder-hook"), "got: {}", cmd);
+        assert!(cmd.contains("PostToolUse"), "got: {}", cmd);
+    }
+
+    mod prune {
+        use super::super::*;
+        use crate::prune::test_util::{read_lines, write_jsonl};
+
+        /// One assistant `tool_use` (Read junk.rs) paired to a user `tool_result`.
+        /// Pruning by (Read, junk) blanks the result content to `[pruned]` and the
+        /// tool_use input to `{}`, preserving every other field.
+        #[test]
+        fn prunes_paired_tool_use_and_result() {
+            let f = write_jsonl(&[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"src/junk.rs"}}]},"uuid":"a1","parentUuid":null}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":"a big file body"}]},"uuid":"u1","parentUuid":"a1"}"#,
+            ]);
+            assert_eq!(count_matches(f.path(), "Read", "junk").unwrap(), 1);
+            let stats = prune_jsonl(f.path(), "Read", "junk").unwrap();
+            assert_eq!(stats.results_blanked, 1);
+            assert!(stats.freed_bytes > 0);
+            let lines = read_lines(f.path());
+            // tool_use input blanked to {}, threading fields intact.
+            assert_eq!(
+                lines[0]["message"]["content"][0]["input"],
+                serde_json::json!({})
+            );
+            assert_eq!(lines[0]["uuid"], "a1");
+            // paired tool_result content blanked to the placeholder.
+            assert_eq!(lines[1]["message"]["content"][0]["content"], "[pruned]");
+            assert_eq!(lines[1]["uuid"], "u1");
+        }
+
+        /// Last-only: with two eligible matches, only the most recent is blanked;
+        /// a repeat blanks the older one; a third call finds nothing.
+        #[test]
+        fn last_only_then_older_then_zero() {
+            let f = write_jsonl(&[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"junk1.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"body one"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"junk2.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"body two"}]}}"#,
+            ]);
+            assert_eq!(count_matches(f.path(), "Read", "junk").unwrap(), 2);
+
+            assert_eq!(
+                prune_jsonl(f.path(), "Read", "junk")
+                    .unwrap()
+                    .results_blanked,
+                1
+            );
+            let lines = read_lines(f.path());
+            // Newest (t2) blanked, oldest (t1) still live.
+            assert_eq!(lines[1]["message"]["content"][0]["content"], "body one");
+            assert_eq!(lines[3]["message"]["content"][0]["content"], "[pruned]");
+            assert_eq!(count_matches(f.path(), "Read", "junk").unwrap(), 1);
+
+            assert_eq!(
+                prune_jsonl(f.path(), "Read", "junk")
+                    .unwrap()
+                    .results_blanked,
+                1
+            );
+            assert_eq!(
+                read_lines(f.path())[1]["message"]["content"][0]["content"],
+                "[pruned]"
+            );
+
+            // Nothing eligible left; a further prune is a byte-stable no-op.
+            assert_eq!(count_matches(f.path(), "Read", "junk").unwrap(), 0);
+            assert_eq!(
+                prune_jsonl(f.path(), "Read", "junk")
+                    .unwrap()
+                    .results_blanked,
+                0
+            );
+        }
+
+        /// A prune NEVER targets the agent's own in-flight `prune-context` call,
+        /// even though its command line carries the same needle (here both the Read
+        /// and the prune call mention `junk.rs`). Only the real Read is blanked.
+        #[test]
+        fn never_targets_own_prune_context_call() {
+            let f = write_jsonl(&[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"junk.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"r1","content":"body"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"p1","name":"Bash","input":{"command":"\"$ZUCCHINI_SPAWNER_BIN\" prune-context --tool-name Read --args junk.rs --summary x"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"p1","content":"pruned 1 tool output"}]}}"#,
+            ]);
+            // Only the real Read is eligible — the prune call is excluded.
+            assert_eq!(count_matches(f.path(), "", "junk").unwrap(), 1);
+            assert_eq!(
+                prune_jsonl(f.path(), "", "junk").unwrap().results_blanked,
+                1
+            );
+            let lines = read_lines(f.path());
+            assert_eq!(lines[1]["message"]["content"][0]["content"], "[pruned]");
+            // The prune call's own result is untouched.
+            assert_eq!(
+                lines[3]["message"]["content"][0]["content"],
+                "pruned 1 tool output"
+            );
+        }
+
+        /// `find_session_jsonl` resolves `<base>/projects/<dir>/<sid>.jsonl`.
+        #[test]
+        fn find_session_locates_sharded_transcript() {
+            let base = std::env::temp_dir().join(format!(
+                "zucchini_claude_find_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let proj = base.join("projects").join("-tmp-proj");
+            std::fs::create_dir_all(&proj).unwrap();
+            let sid = "11111111-2222-3333-4444-555555555555";
+            let target = proj.join(format!("{sid}.jsonl"));
+            std::fs::write(&target, "{}\n").unwrap();
+            assert_eq!(
+                find_session_jsonl(&base, sid).as_deref(),
+                Some(target.as_path())
+            );
+            assert!(find_session_jsonl(&base, "no-such-session").is_none());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// A batch of K DISTINCT-needle targets blanks all K outputs in ONE
+        /// `prune_batch_jsonl` read/write — the coalesced-burst case
+        /// `apply_prune_group` drives. Stats sum to K.
+        #[test]
+        fn batch_distinct_needles_blanks_all_in_one_pass() {
+            let f = write_jsonl(&[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"junk1.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"body one"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"junk2.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"body two"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"junk3.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"body three"}]}}"#,
+            ]);
+            let targets = vec![
+                ("Read".to_string(), "junk1.rs".to_string()),
+                ("Read".to_string(), "junk2.rs".to_string()),
+                ("Read".to_string(), "junk3.rs".to_string()),
+            ];
+            let stats = prune_batch_jsonl(f.path(), &targets).unwrap();
+            assert_eq!(stats.results_blanked, 3, "all 3 distinct targets blanked");
+            assert!(stats.freed_bytes > 0);
+            let lines = read_lines(f.path());
+            for i in [1usize, 3, 5] {
+                assert_eq!(
+                    lines[i]["message"]["content"][0]["content"], "[pruned]",
+                    "line {i} should be pruned"
+                );
+            }
+        }
+
+        /// Two SAME-needle targets in one batch blank two DISTINCT successive
+        /// matches (newest two of three), exactly as two separate `prune_jsonl`
+        /// calls would — the in-memory K-round selection re-derives last-only with a
+        /// running "chosen this batch" set. The oldest match stays live.
+        #[test]
+        fn batch_same_needle_blanks_two_distinct_matches() {
+            let f = write_jsonl(&[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"junk.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"body one"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"junk.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"body two"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"junk.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"body three"}]}}"#,
+            ]);
+            let targets = vec![
+                ("Read".to_string(), "junk".to_string()),
+                ("Read".to_string(), "junk".to_string()),
+            ];
+            let stats = prune_batch_jsonl(f.path(), &targets).unwrap();
+            assert_eq!(
+                stats.results_blanked, 2,
+                "two same-needle targets blank two distinct matches"
+            );
+            let lines = read_lines(f.path());
+            // Oldest (t1) untouched; newest two (t2, t3) pruned.
+            assert_eq!(lines[1]["message"]["content"][0]["content"], "body one");
+            assert_eq!(lines[3]["message"]["content"][0]["content"], "[pruned]");
+            assert_eq!(lines[5]["message"]["content"][0]["content"], "[pruned]");
+            // One eligible match remains for a follow-up prune.
+            assert_eq!(count_matches(f.path(), "Read", "junk").unwrap(), 1);
+        }
+
+        /// The batch path is BYTE-IDENTICAL to running `prune_jsonl` once per target
+        /// in sequence (the equivalence the single-read fold rests on). Same
+        /// transcript, same targets, two independent runs → identical file bytes +
+        /// identical summed stats.
+        #[test]
+        fn batch_is_byte_identical_to_sequential_single_calls() {
+            let lines_src: &[&str] = &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"junk.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"body one"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"junk.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"body two longer"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"other.rs"}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"unrelated body"}]}}"#,
+            ];
+            // Sequential: two same-needle junk prunes, then one other.rs prune.
+            let seq = write_jsonl(lines_src);
+            let mut seq_stats = crate::prune::PruneStats::default();
+            for (tn, nd) in [("Read", "junk"), ("Read", "junk"), ("Read", "other")] {
+                let s = prune_jsonl(seq.path(), tn, nd).unwrap();
+                seq_stats.results_blanked += s.results_blanked;
+                seq_stats.freed_bytes += s.freed_bytes;
+            }
+            let seq_bytes = std::fs::read_to_string(seq.path()).unwrap();
+
+            // Batch: the same three targets in one call.
+            let batch = write_jsonl(lines_src);
+            let targets = vec![
+                ("Read".to_string(), "junk".to_string()),
+                ("Read".to_string(), "junk".to_string()),
+                ("Read".to_string(), "other".to_string()),
+            ];
+            let batch_stats = prune_batch_jsonl(batch.path(), &targets).unwrap();
+            let batch_bytes = std::fs::read_to_string(batch.path()).unwrap();
+
+            assert_eq!(
+                batch_bytes, seq_bytes,
+                "batch rewrite must be byte-identical"
+            );
+            assert_eq!(batch_stats.results_blanked, seq_stats.results_blanked);
+            assert_eq!(batch_stats.freed_bytes, seq_stats.freed_bytes);
+            assert_eq!(batch_stats.results_blanked, 3);
+        }
     }
 }

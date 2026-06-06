@@ -10,6 +10,7 @@ mod envelope;
 mod hermes_support;
 mod power;
 mod powersync;
+mod prune;
 mod shell;
 mod state;
 mod uninstall;
@@ -453,6 +454,11 @@ pub(crate) async fn handle_agent_response(
                 .await;
             supervisor.remove(&topic);
         }
+        // The main loop's `response_rx` arm intercepts `ToolResult` (it drives the
+        // prune restart against `pending_prunes`, which this fn doesn't own), so it
+        // never reaches here at runtime. The arm exists only to keep the match
+        // exhaustive (and stays a no-op if a future caller routes one through).
+        AgentResponse::ToolResult { .. } => {}
     }
 }
 
@@ -675,6 +681,187 @@ async fn handle_message_put(
         agent_kind,
         is_sandboxed,
         model,
+    });
+}
+
+/// Per-chat spawn parameters resolved from the `Mirror`, shared between the
+/// message-put path and the prune-context respawn. `agent_session_id` is `Some`
+/// for any chat that's had at least one turn (always true for a prune request —
+/// it's issued from inside a turn).
+struct ChatSpawnParams {
+    project_path: String,
+    worktree: bool,
+    agent_session_id: Option<String>,
+    agent_kind: AgentKind,
+    is_sandboxed: bool,
+    model: Option<String>,
+}
+
+/// Resolve spawn params for `chat_id`, mirroring `handle_message_put`'s gates
+/// (project-path resolution, owner-vs-member sandbox). `None` (with a logged
+/// reason) if the chat/project isn't synced or a non-owner's `machine_users`
+/// row hasn't landed.
+fn resolve_chat_spawn_params(mirror: &Mirror, chat_id: &str) -> Option<ChatSpawnParams> {
+    let chat = mirror.chats.get(chat_id)?;
+    let project_path = match mirror.projects.get(&chat.project_id) {
+        Some(p) => p.clone(),
+        None => {
+            warn!(chat_id = %chat_id, project_id = %chat.project_id, "project not synced; cannot resolve spawn params");
+            return None;
+        }
+    };
+    // Same owner-vs-member sandbox gate as handle_message_put.
+    let is_sandboxed = if mirror.is_owner(chat.user_id) {
+        false
+    } else {
+        match mirror.member_is_sandboxed(&chat.user_id) {
+            Some(s) => s,
+            None => {
+                warn!(chat_id = %chat_id, user_id = %chat.user_id, "machine_users row not synced; cannot resolve spawn params");
+                return None;
+            }
+        }
+    };
+    Some(ChatSpawnParams {
+        project_path,
+        worktree: chat.worktree,
+        agent_session_id: chat.agent_session_id.clone(),
+        agent_kind: chat.agent_kind,
+        is_sandboxed,
+        model: chat
+            .model
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
+}
+
+/// Abort `chat_id`'s agent (if any) and apply its coalesced prune requests, then
+/// respawn ONCE. Called from the `response_rx` arm on the `ToolResult` cue — i.e.
+/// once claude has emitted (and thus persisted) the `prune-context` call's own
+/// result frame. The abort runs FIRST; because it fires only after that result
+/// landed, the resumed transcript carries the agent's prune call + summary, and
+/// the respawn re-reads the now-rewritten jsonl so the freed context takes effect.
+/// Rewrites run in arrival order, each re-reading the transcript (the last-only /
+/// already-pruned-folds-to-0 contract is `crate::prune`'s). Stats are summed into a
+/// single timeline frame + respawn prompt. No INTERRUPTED frame (transparent
+/// restart, not a user stop); `agent_running` stays true throughout (no ChatRunning
+/// write) so the UI never flickers idle.
+async fn apply_prune_group(
+    chat_id: &str,
+    reqs: Vec<prune::PruneRequest>,
+    mirror: &SharedMirror,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    // Kill the (now-idle-at-a-tool-boundary) agent before touching its transcript:
+    // the rewrite needs exclusive access and the resume must re-read from disk. A
+    // no-op if the turn already exited on its own.
+    supervisor.abort_agent(chat_id).await;
+
+    // Rewrite the transcript via the per-adapter `prune_batch` behind `PruneOps`.
+    // The whole burst for one transcript collapses into ONE read/serialize/fsync
+    // (vs the old K separate `prune` calls) while reproducing the identical
+    // blanked set + freed bytes. Group defensively by `jsonl_path` (in practice a
+    // group is one chat = one transcript, so this is a single bucket) and batch
+    // per path. Even on error we continue/respawn so the chat isn't left with no
+    // running agent. `prune_ops()` is `Some` for any kind that produced a
+    // `PruneRequest` (control.rs only enqueues those); guard anyway rather than
+    // panic if somehow `None`.
+    let mut total = prune::PruneStats::default();
+    let mut groups: std::collections::HashMap<std::path::PathBuf, Vec<&prune::PruneRequest>> =
+        std::collections::HashMap::new();
+    for req in &reqs {
+        groups.entry(req.jsonl_path.clone()).or_default().push(req);
+    }
+    for (jsonl_path, path_reqs) in &groups {
+        // All reqs for a path share an `agent_kind` (control.rs derives both from
+        // the same chat), so resolve ops from the first.
+        let Some(first) = path_reqs.first() else {
+            continue;
+        };
+        match first.agent_kind.prune_ops() {
+            Some(ops) => {
+                let targets: Vec<prune::PruneTarget> = path_reqs
+                    .iter()
+                    .map(|r| (r.tool_name.clone(), r.needle.clone()))
+                    .collect();
+                match (ops.prune_batch)(jsonl_path, &targets) {
+                    Ok(stats) => {
+                        total.results_blanked += stats.results_blanked;
+                        total.freed_bytes += stats.freed_bytes;
+                    }
+                    Err(e) => {
+                        let reasons = path_reqs
+                            .iter()
+                            .map(|r| r.reason.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        error!(chat_id = %chat_id, error = %e, reasons = %reasons, "prune batch rewrite failed; skipping this transcript")
+                    }
+                }
+            }
+            None => {
+                error!(chat_id = %chat_id, kind = ?first.agent_kind, "prune request for kind without PruneOps; skipping")
+            }
+        }
+    }
+    info!(
+        chat_id = %chat_id,
+        requests = reqs.len(),
+        results_blanked = total.results_blanked,
+        freed_bytes = total.freed_bytes,
+        "pruned context (coalesced), respawning"
+    );
+
+    // Emit a synthetic `agent` frame (the user-visible "context pruned" line)
+    // before the respawn so it orders ahead of the resumed agent's frames. One
+    // combined frame for the whole burst; `results_blanked == 0` skips it (the
+    // frame-skip contract is `crate::prune`'s).
+    if total.results_blanked > 0 {
+        let content = prune::pruned_frame_json(total);
+        let g = mirror.read().await;
+        send_agent_line(write_tx, &g, chat_id, content).await;
+    }
+
+    // Build the respawn prompt. On a real prune (≥1 output blanked) tell the agent
+    // explicitly that it succeeded and not to re-issue the command — it was killed
+    // mid-`prune-context`, so otherwise it can't distinguish success from a miss
+    // and loops re-running the now-satisfied prune (which returns "no … call
+    // found"). Fall back to a generic nudge when every rewrite errored or blanked
+    // nothing.
+    let prompt = if total.results_blanked > 0 {
+        prune::pruned_respawn_prompt(total)
+    } else {
+        "context pruning complete, continue".to_string()
+    };
+
+    // Resolve spawn params from the mirror (read guard) and respawn.
+    let params = {
+        let g = mirror.read().await;
+        resolve_chat_spawn_params(&g, chat_id)
+    };
+    let Some(params) = params else {
+        error!(chat_id = %chat_id, "cannot resolve spawn params after prune; chat left idle");
+        return;
+    };
+    if params.agent_session_id.is_none() {
+        // A prune request only fires mid-turn, so the session id is already
+        // harvested — but guard anyway: resuming requires it, and a fresh session
+        // would re-run from scratch with the wrong prompt.
+        error!(chat_id = %chat_id, "no agent_session_id after prune; cannot resume, chat left idle");
+        return;
+    }
+
+    supervisor.spawn_agent(SpawnRequest {
+        chat_id: chat_id.to_string(),
+        prompt,
+        project_path: Some(params.project_path),
+        worktree: params.worktree,
+        agent_session_id: params.agent_session_id,
+        agent_kind: params.agent_kind,
+        is_sandboxed: params.is_sandboxed,
+        model: params.model,
     });
 }
 
@@ -1276,7 +1463,8 @@ async fn publish_spawner_pubkey_if_needed(
         .await;
 }
 
-/// CLI entry point for `zucchini-spawner attach-file --chat-id <UUID> <abs-path>`.
+/// CLI entry point for `zucchini-spawner attach-file <abs-path> [--chat-id <UUID>]`
+/// (`--chat-id` defaults to the `ZUCCHINI_CHAT_ID` env var exported on the spawn).
 ///
 /// Parses argv (hand-rolled — clap is overkill for one flag and a positional
 /// arg), connects to the daemon's `~/.zucchini-spawner/control.sock`, runs
@@ -1285,7 +1473,7 @@ async fn publish_spawner_pubkey_if_needed(
 /// daemon owns the JWT and K_user.
 async fn run_attach_file_cli(args: &[String]) {
     fn usage_and_exit() -> ! {
-        eprintln!("usage: zucchini-spawner attach-file --chat-id <UUID> <absolute-path>");
+        eprintln!("usage: zucchini-spawner attach-file <absolute-path> [--chat-id <UUID>]\n  --chat-id defaults to $ZUCCHINI_CHAT_ID (exported on every spawn).");
         std::process::exit(2);
     }
 
@@ -1305,6 +1493,9 @@ async fn run_attach_file_cli(args: &[String]) {
             _ => usage_and_exit(),
         }
     }
+    // Default `--chat-id` from `ZUCCHINI_CHAT_ID` (agent.rs exports it on spawn);
+    // explicit flag still wins.
+    let chat_id = chat_id.or_else(|| std::env::var("ZUCCHINI_CHAT_ID").ok());
     let (Some(chat_id), Some(path)) = (chat_id, path) else {
         usage_and_exit();
     };
@@ -1322,6 +1513,220 @@ async fn run_attach_file_cli(args: &[String]) {
             std::process::exit(1);
         }
     }
+}
+
+/// CLI entry point for `zucchini-spawner prune-context [--tool-name <Tool>]
+/// --args "<glob>" --summary "<digest>" [... more triples ...] [--chat-id <UUID>]`.
+///
+/// Thin RPC client over the daemon's control socket — mirrors
+/// `run_attach_file_cli`. Accepts ONE OR MORE prune targets in a single call:
+/// each `--summary` (or its `--reason` alias) CLOSES the current target, so a
+/// target is the run of `[--tool-name] --args` flags that precedes its
+/// `--summary`. Batching is the whole point — the agent forgets several outputs
+/// in one process → one RPC → one restart, instead of firing parallel
+/// `prune-context` processes that reap each other (see `control.rs`
+/// `PruneContext`). A lone triple is just a 1-item batch, byte-identical to the
+/// old single-call form (so an agent mid-turn under an older binary stays
+/// compatible across a hot-reload). Per target: `--args` is required (`""` =
+/// no-args selector); `--tool-name` is optional (omit it — or pass `""` — to
+/// prune on the `--args` needle alone, as the codex instruction does); `--summary`
+/// is required (it terminates the target). `--reason` is the legacy alias for
+/// `--summary`. `--chat-id` is call-level (applies to the whole batch) and
+/// defaults to `ZUCCHINI_CHAT_ID`. `--flag=value` form accepted. `--args` globs
+/// each call's argument values; a prune blanks only the most recent matching
+/// call, so the per-target output reports how many matches remain. The daemon
+/// aborts the agent right after replying, so a connection-reset after a
+/// successful send is expected — the prune proceeds regardless.
+/// Append a one-line CLI-invocation record to `spawner.log` (the daemon's
+/// `StandardOutPath`). Used by `run_prune_context_cli` to log that the
+/// subprocess started, BEFORE its RPC — see the call site for why the
+/// daemon-side log can't answer "was the CLI executed?". Best-effort:
+/// open-append-write with O_APPEND so concurrent single-line writes from
+/// parallel prune CLIs (and the daemon) don't interleave; any error is
+/// swallowed (a diagnostic log must never disrupt the prune).
+fn log_prune_cli_invoked(chat_id: &str, tool_name: &str, needle: &str) {
+    use std::io::Write;
+    let path = zucchini_spawner_dir().join("spawner.log");
+    let line = format!(
+        "{} PRUNE-CLI invoked pid={} chat_id={} tool_name={} needle={}\n",
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        std::process::id(),
+        chat_id,
+        tool_name,
+        needle,
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Parse `prune-context` CLI args into the call-level `--chat-id` (if given) plus
+/// the batch of prune targets. `Err(())` signals any structural problem (so the
+/// caller prints usage + exits 2). Pure (no env, no I/O, no process exit) so the
+/// batching/terminator semantics are unit-testable.
+///
+/// Each `--summary` (or `--reason` alias) CLOSES the current target: a target is
+/// the run of `[--tool-name] --args` flags before it. Per target, `--args` is
+/// required by PRESENCE (`--args ""` is the no-args selector); `--tool-name` is
+/// optional (`""` = any-tool selector). A `--summary` with no preceding `--args`,
+/// a dangling `--tool-name`/`--args` not closed by a `--summary`, an unknown flag,
+/// `-h`/`--help`, or an empty batch are all errors. `--flag=value` accepted.
+fn parse_prune_args(args: &[String]) -> Result<(Option<String>, Vec<control::PruneItem>), ()> {
+    fn close_item(
+        items: &mut Vec<control::PruneItem>,
+        tool: &mut Option<String>,
+        needle: &mut Option<String>,
+        summary: String,
+    ) -> Result<(), ()> {
+        let needle = needle.take().ok_or(())?;
+        items.push(control::PruneItem {
+            tool_name: tool.take().unwrap_or_default(),
+            needle,
+            reason: summary,
+        });
+        Ok(())
+    }
+
+    let mut chat_id: Option<String> = None;
+    let mut items: Vec<control::PruneItem> = Vec::new();
+    let mut cur_tool: Option<String> = None;
+    let mut cur_needle: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--tool-name" => cur_tool = Some(it.next().ok_or(())?.clone()),
+            "--args" => cur_needle = Some(it.next().ok_or(())?.clone()),
+            "--chat-id" => chat_id = Some(it.next().ok_or(())?.clone()),
+            "--summary" | "--reason" => {
+                let summary = it.next().ok_or(())?.clone();
+                close_item(&mut items, &mut cur_tool, &mut cur_needle, summary)?;
+            }
+            "-h" | "--help" => return Err(()),
+            s if s.starts_with("--tool-name=") => {
+                cur_tool = Some(s["--tool-name=".len()..].to_string());
+            }
+            s if s.starts_with("--args=") => {
+                cur_needle = Some(s["--args=".len()..].to_string());
+            }
+            s if s.starts_with("--chat-id=") => {
+                chat_id = Some(s["--chat-id=".len()..].to_string());
+            }
+            s if s.starts_with("--summary=") => {
+                let summary = s["--summary=".len()..].to_string();
+                close_item(&mut items, &mut cur_tool, &mut cur_needle, summary)?;
+            }
+            s if s.starts_with("--reason=") => {
+                let summary = s["--reason=".len()..].to_string();
+                close_item(&mut items, &mut cur_tool, &mut cur_needle, summary)?;
+            }
+            _ => return Err(()),
+        }
+    }
+    // Dangling `--tool-name`/`--args` with no closing `--summary` is a malformed
+    // trailing target, not a silent drop. An empty batch is also an error.
+    if cur_tool.is_some() || cur_needle.is_some() || items.is_empty() {
+        return Err(());
+    }
+    Ok((chat_id, items))
+}
+
+async fn run_prune_context_cli(args: &[String]) {
+    fn usage_and_exit() -> ! {
+        eprintln!(
+            "usage: zucchini-spawner prune-context [--tool-name <ToolName>] --args \"<glob>\" --summary \"<digest>\" [... repeat per output ...] [--chat-id <UUID>]\n  Prune one or more tool outputs in a single call: each --summary CLOSES the target made of the --tool-name/--args before it, so repeat the triple to forget several outputs at once (one restart for the whole batch). --tool-name is optional per target — omit it to match on --args alone. --summary is the takeaway from that output you still need going forward — the slice that matters for the task at hand, NOT a recap of the whole output (--reason accepted as a legacy alias). --args is a glob (supports *) over the call's argument VALUES, not key names; blanks only the most recent matching call (repeat to prune older ones). --chat-id is call-level and defaults to $ZUCCHINI_CHAT_ID (exported on every spawn); use --args \"\" to prune a call you made with no arguments."
+        );
+        std::process::exit(2);
+    }
+
+    // `--summary` is the per-target terminator; `--reason` is its legacy alias
+    // (kept so an agent mid-turn under an older binary keeps parsing across a
+    // hot-reload — both feed the same wire field, still named `reason`).
+    let Ok((chat_id, items)) = parse_prune_args(args) else {
+        usage_and_exit();
+    };
+    // Default `--chat-id` from `ZUCCHINI_CHAT_ID` (inherited from the agent
+    // subprocess); explicit flag still wins.
+    let Some(chat_id) = chat_id.or_else(|| std::env::var("ZUCCHINI_CHAT_ID").ok()) else {
+        usage_and_exit();
+    };
+
+    // Record the CLI INVOCATION itself — written here, at the top of the
+    // subprocess and BEFORE any RPC, so it answers "was the prune-context CLI
+    // actually executed?" independently of whether the call ever reaches the
+    // daemon. A CLI subprocess's stdout goes to claude (its parent), not to
+    // `spawner.log`, and the daemon-side `prune-context called` log only fires
+    // after the socket connect. One line per batch item (the pid + high-res
+    // timestamp ties them together). Best-effort — never blocks or fails the
+    // prune.
+    for item in &items {
+        log_prune_cli_invoked(&chat_id, &item.tool_name, &item.needle);
+    }
+
+    match control::prune_context_via_socket(&chat_id, items.clone()).await {
+        Ok(counts) => {
+            // Per-target feedback (parallel to `items`): a `0` count is a miss the
+            // batch tolerated (≥1 other item matched), reported so the agent sees
+            // which needle to fix; a non-zero `n` blanked the most recent of `n`
+            // eligible matches, leaving `n-1`.
+            let mut queued = 0usize;
+            for (item, n) in items.iter().zip(counts.iter()) {
+                let what = control::describe_prune_target(&item.tool_name, &item.needle);
+                match *n {
+                    0 => println!("· no {what} found — skipped"),
+                    1 => {
+                        queued += 1;
+                        println!("· pruned the most recent {what} (the only match)");
+                    }
+                    n => {
+                        queued += 1;
+                        println!(
+                            "· pruned the most recent {what}; {} remain — repeat to prune the next",
+                            n - 1
+                        );
+                    }
+                }
+            }
+            if queued > 0 {
+                // Exit 0 CLEANLY — do NOT trigger the restart from here. The
+                // daemon already has the prune queued; it applies it (abort →
+                // rewrite → respawn) when claude emits THIS call's `tool_result`
+                // frame, i.e. strictly AFTER claude has persisted our stdout
+                // summary to the transcript. That ordering is the whole point: the
+                // resumed agent then sees its own prune call + this summary in
+                // context, so it won't re-run the now-satisfied prune. Triggering
+                // the restart here instead would SIGTERM this CLI mid-call, before
+                // the result persisted — the lost-tool_result bug this avoids.
+                println!("queued {queued} prune(s); the agent will restart to apply them");
+            } else {
+                println!("no eligible matches — nothing pruned");
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("prune-context failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `prune-reminder-hook` subcommand: claude's match-all `PostToolUse` hook
+/// trampoline. Reads the hook JSON payload from stdin, delegates the size gate
+/// to the pure [`crate::prune::prune_reminder_output`], and prints the
+/// `additionalContext` line on a large `tool_response` (nudging the agent to
+/// prune). ALWAYS exits 0 — a failing hook could disrupt claude, so any
+/// read/parse failure is swallowed (silent, exit 0). This hook is reminder-only:
+/// the prune RESTART is driven by the main loop when claude emits the
+/// `prune-context` call's `tool_result` frame, not from here.
+fn run_prune_reminder_hook_cli() {
+    use std::io::Read;
+    let mut payload = String::new();
+    // Best-effort read; on any stdin error, treat as empty → silent.
+    let _ = std::io::stdin().read_to_string(&mut payload);
+
+    if let Some(line) = prune::prune_reminder_output(&payload) {
+        println!("{line}");
+    }
+    std::process::exit(0);
 }
 
 /// Shared shutdown path used by both the `to_uninstall` PowerSync signal
@@ -1355,6 +1760,20 @@ async fn main() {
     if let Some(first) = raw_args.first() {
         if first == "attach-file" {
             run_attach_file_cli(&raw_args[1..]).await;
+            return;
+        }
+        if first == "prune-context" {
+            run_prune_context_cli(&raw_args[1..]).await;
+            return;
+        }
+        if first == "prune-reminder-hook" {
+            // claude `PostToolUse` hook (wired via `--settings`; see
+            // `adapters/claude.rs`). Reads the hook JSON from stdin, gates on
+            // `tool_response` size, and on a large result prints the
+            // additionalContext line that claude surfaces as a
+            // `<system-reminder>` nudging the agent to prune. Inert/exit-0 on any
+            // failure — a failing hook could disrupt claude.
+            run_prune_reminder_hook_cli();
             return;
         }
         if first == "hermes-turn" {
@@ -1556,6 +1975,16 @@ async fn main() {
     let (response_tx, mut response_rx) = mpsc::channel::<AgentResponse>(256);
     let mut supervisor = Supervisor::new(response_tx);
 
+    // Prune-context: the control task does the read-only lookup + transcript
+    // pre-scan, then parks the request in this shared table so the main loop
+    // (sole owner of `supervisor`) can abort the agent, rewrite the jsonl, and
+    // respawn on the same session with a "continue" prompt. A shared lock (not a
+    // channel) so the park is visible the instant the RPC returns — the apply cue
+    // on `response_rx` can't race ahead of it. Coalescing several targets from one
+    // batched call onto a single `Vec` entry folds the burst into ONE respawn.
+    let pending_prunes: prune::PendingPrunes =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Control socket for agent-side CLI subcommands (`attach-file`). Bound
     // before we start consuming sync events so a fast `attach-file` issued
     // right after a chat-created PUT can connect. Failure to bind is logged
@@ -1575,6 +2004,7 @@ async fn main() {
             keys: keys.clone(),
             pending: supervisor.pending_attachments(),
             mirror: mirror.clone(),
+            pending_prunes: pending_prunes.clone(),
         };
         if let Err(e) = control::start(control_state).await {
             warn!(error = %e, "failed to start control socket — `zucchini-spawner attach-file` will be unavailable");
@@ -1604,6 +2034,11 @@ async fn main() {
     // durable guard.
     let mut agents_seed_attempted = false;
 
+    // `pending_prunes` (the shared table above) accumulates requests the control
+    // task parks while claude runs, each waiting for that `prune-context` call's
+    // own `tool_result` frame. The `response_rx` `ToolResult`-cue arm drains a
+    // chat's entry once the result has persisted — coalescing a batch into ONE
+    // abort→rewrite→respawn.
     info!("zucchini-spawner ready, waiting for sync + agent responses");
 
     'main_loop: loop {
@@ -1744,13 +2179,42 @@ async fn main() {
                 }
             }
             Some(resp) = response_rx.recv() => {
-                // Same shape as the sync arm: write guard scoped tightly so
-                // the control task can interleave a read between agent
-                // responses but not within one. `handle_agent_response`
-                // `.await`s on writer-channel sends and the supervisor
-                // remove path, so this MUST be `tokio::sync::RwLock`.
-                let mut g = mirror.write().await;
-                handle_agent_response(resp, &mut g, &write_tx, &mut supervisor).await;
+                match resp {
+                    // This cue is the call-keyed signal that the `prune-context`
+                    // call's OWN result has persisted to the transcript (the adapter
+                    // emits it only for that call, never a sibling tool in the same
+                    // parallel batch). Aborting → rewriting → respawning here lands
+                    // the prune strictly AFTER that result (and its summary) reached
+                    // disk — the resumed agent sees its own prune and won't re-run it.
+                    // A no-op for any chat with nothing pending. The control task
+                    // parked the `PruneRequest` in `pending_prunes` during the
+                    // `prune-context` RPC, which returned before this cue could fire,
+                    // so the entry is guaranteed visible here. Take the lock only long
+                    // enough to lift the chat's batch out, then apply unlocked.
+                    AgentResponse::ToolResult { topic } => {
+                        let reqs = pending_prunes.lock().await.remove(&topic);
+                        if let Some(reqs) = reqs {
+                            apply_prune_group(&topic, reqs, &mirror, &mut supervisor, &write_tx).await;
+                        }
+                    }
+                    other => {
+                        // A turn ending with a prune still parked means its triggering
+                        // cue never arrived (the agent exited/errored mid-`prune-context`,
+                        // so the call's own result was never persisted). Drop the parked
+                        // request: leaving it in `pending_prunes` leaks the entry for the
+                        // process lifetime and would mis-fire on a LATER turn's
+                        // `prune-context` cue for this chat (applying a stale rewrite).
+                        if let AgentResponse::Done { topic, .. } = &other {
+                            pending_prunes.lock().await.remove(topic);
+                        }
+                        // Write guard scoped tightly so the control task can interleave
+                        // a read between agent responses but not within one.
+                        // `handle_agent_response` `.await`s on writer-channel sends and
+                        // the supervisor remove path, so this MUST be `tokio::sync::RwLock`.
+                        let mut g = mirror.write().await;
+                        handle_agent_response(other, &mut g, &write_tx, &mut supervisor).await;
+                    }
+                }
             }
         }
 
@@ -2707,6 +3171,253 @@ mod tests {
         assert!(
             empty_spawn.model.is_none(),
             "empty model collapses to None at the SpawnRequest construction site"
+        );
+    }
+
+    fn sv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_prune_args_single_triple_is_one_item() {
+        let (chat, items) = super::parse_prune_args(&sv(&[
+            "--tool-name",
+            "Read",
+            "--args",
+            "a.ts",
+            "--summary",
+            "kept x",
+        ]))
+        .expect("valid");
+        assert!(chat.is_none());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tool_name, "Read");
+        assert_eq!(items[0].needle, "a.ts");
+        assert_eq!(items[0].reason, "kept x");
+    }
+
+    #[test]
+    fn parse_prune_args_summary_terminates_each_target() {
+        // Three targets in one call; `--chat-id` is call-level and can sit anywhere.
+        let (chat, items) = super::parse_prune_args(&sv(&[
+            "--tool-name",
+            "Read",
+            "--args",
+            "a.ts",
+            "--summary",
+            "s1", //
+            "--args",
+            "TODO",
+            "--summary",
+            "s2", // no --tool-name → any-tool selector
+            "--chat-id",
+            "c1", //
+            "--tool-name",
+            "Grep",
+            "--args",
+            "",
+            "--summary",
+            "s3", // no-args selector
+        ]))
+        .expect("valid");
+        assert_eq!(chat.as_deref(), Some("c1"));
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            (items[0].tool_name.as_str(), items[0].needle.as_str()),
+            ("Read", "a.ts")
+        );
+        assert_eq!(
+            (items[1].tool_name.as_str(), items[1].needle.as_str()),
+            ("", "TODO")
+        );
+        assert_eq!(
+            (items[2].tool_name.as_str(), items[2].needle.as_str()),
+            ("Grep", "")
+        );
+        assert_eq!(items[2].reason, "s3");
+    }
+
+    #[test]
+    fn parse_prune_args_accepts_eq_form_and_reason_alias() {
+        let (_, items) = super::parse_prune_args(&sv(&[
+            "--tool-name=Read",
+            "--args=a.ts",
+            "--reason=legacy", //
+            "--args=b.ts",
+            "--summary=new",
+        ]))
+        .expect("valid");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].reason, "legacy");
+        assert_eq!(items[1].needle, "b.ts");
+    }
+
+    #[test]
+    fn parse_prune_args_rejects_malformed() {
+        // --summary with no preceding --args for this target.
+        assert!(super::parse_prune_args(&sv(&["--tool-name", "Read", "--summary", "s"])).is_err());
+        // Dangling target not closed by a --summary.
+        assert!(super::parse_prune_args(&sv(&[
+            "--args",
+            "a.ts",
+            "--summary",
+            "s",
+            "--args",
+            "b.ts"
+        ]))
+        .is_err());
+        // Empty batch (only call-level flags).
+        assert!(super::parse_prune_args(&sv(&["--chat-id", "c1"])).is_err());
+        // Unknown flag / help.
+        assert!(super::parse_prune_args(&sv(&["--bogus"])).is_err());
+        assert!(super::parse_prune_args(&sv(&["--help"])).is_err());
+        // Flag expecting a value at end of args.
+        assert!(super::parse_prune_args(&sv(&["--args", "a.ts", "--summary"])).is_err());
+    }
+
+    /// Regression for chat 1398d148: a single turn fires several `prune-context`
+    /// calls; they must coalesce into ONE abort→rewrite→respawn. Before the fix
+    /// each request respawned independently, the next request's `abort` SIGTERM'd
+    /// the fresh respawn (thrash), and the storm's tail raced the mirror into
+    /// `resolve → None`, leaving the chat idle ("agent failed to continue").
+    /// Here three distinct prunes are applied as one coalesced batch: assert all
+    /// three transcript outputs get blanked but the agent respawns exactly once.
+    #[tokio::test]
+    async fn prune_burst_coalesces_into_single_respawn() {
+        use crate::prune::test_util::{read_lines, write_jsonl};
+
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let project_id = Uuid::now_v7().to_string();
+        let chat_id = Uuid::now_v7().to_string();
+        let session_id = Uuid::now_v7().to_string();
+
+        // Three distinct Read tool_use/tool_result pairs in one transcript.
+        let transcript = write_jsonl(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"junk1.rs"}}]},"uuid":"a1","parentUuid":null}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"body one"}]},"uuid":"u1","parentUuid":"a1"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"junk2.rs"}}]},"uuid":"a2","parentUuid":"u1"}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"body two"}]},"uuid":"u2","parentUuid":"a2"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"junk3.rs"}}]},"uuid":"a3","parentUuid":"u2"}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"body three"}]},"uuid":"u3","parentUuid":"a3"}"#,
+        ]);
+        let jsonl_path = transcript.path().to_path_buf();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
+        let blobs = empty_blob_downloader();
+        let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+
+        let recorded: Arc<StdMutex<Vec<SpawnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorder = recorded.clone();
+        let spawn_fn: SpawnFn = Arc::new(move |req, _tx, _token, _pending| {
+            recorder.lock().unwrap().push(req);
+            tokio::spawn(async {})
+        });
+        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+        let mut seed_attempted = true;
+
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "projects".into(),
+                id: project_id.clone(),
+                data:
+                    json!({ "id": project_id, "path": "/tmp/zucchini-test-project", "name": "t" })
+                        .to_string(),
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_id.clone(),
+                data: json!({
+                    "id": chat_id,
+                    "project_id": project_id,
+                    "user_id": user_id.to_string(),
+                    "last_seq": 0,
+                    "agent_session_id": session_id,
+                    "agent_kind": "claude",
+                    "worktree": false,
+                    "model": "",
+                })
+                .to_string(),
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+
+        let shared: SharedMirror = Arc::new(tokio::sync::RwLock::new(mirror));
+
+        // The three prunes from one turn coalesce onto a single `pending_prunes`
+        // `Vec` entry in the main loop; `apply_prune_group` is what the loop calls
+        // when claude emits the `prune-context` call's `tool_result` frame, so
+        // exercise it with the coalesced batch directly.
+        let mk = |needle: &str, reason: &str| prune::PruneRequest {
+            jsonl_path: jsonl_path.clone(),
+            agent_kind: crate::adapter::AgentKind::Claude,
+            tool_name: "Read".into(),
+            needle: needle.into(),
+            reason: reason.into(),
+        };
+        let reqs = vec![
+            mk("junk1.rs", "got first"),
+            mk("junk2.rs", "got second"),
+            mk("junk3.rs", "got third"),
+        ];
+
+        apply_prune_group(&chat_id, reqs, &shared, &mut supervisor, &write_tx).await;
+
+        // Exactly ONE respawn for the whole burst — not three.
+        let captured = recorded.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "burst of 3 prunes must coalesce into ONE respawn"
+        );
+        assert_eq!(captured[0].chat_id, chat_id);
+        assert_eq!(
+            captured[0].agent_session_id.as_deref(),
+            Some(session_id.as_str()),
+            "respawn resumes the harvested session"
+        );
+        assert!(
+            captured[0].prompt.contains("Context pruning succeeded"),
+            "respawn prompt signals success, got: {}",
+            captured[0].prompt
+        );
+
+        // All three tool_result outputs blanked — every queued prune applied, not
+        // just the last (stats summed across the coalesced batch).
+        let lines = read_lines(&jsonl_path);
+        let pruned = lines
+            .iter()
+            .filter(|l| l["message"]["content"][0]["content"] == "[pruned]")
+            .count();
+        assert_eq!(
+            pruned, 3,
+            "every queued prune was applied, not just the last"
         );
     }
 }
