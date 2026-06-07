@@ -40,9 +40,9 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::adapter::{
-    claude_assistant_text_envelope, file_nonempty, parse_json_obj, probe_with_blocking_auth,
-    shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, ImportProgress,
-    LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES,
+    claude_assistant_text_envelope, file_nonempty, first_message_capabilities_preamble,
+    parse_json_obj, probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter,
+    AgentEvent, AgentKind, ImportProgress, LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES,
 };
 use crate::writer::WriteEvent;
 
@@ -153,6 +153,13 @@ impl AgentAdapter for HermesAdapter {
         // → spawn → `tokio::fs::remove_file` after `child.wait`).
 
         Ok(cmd)
+    }
+
+    /// No system-prompt injection point, so capabilities ride the first user
+    /// message (prepended to the `--user-prompt-file` plaintext); worktree
+    /// ignored. See [`first_message_capabilities_preamble`].
+    fn prompt_file_preamble(&self, ctx: &TurnContext<'_>) -> Option<String> {
+        first_message_capabilities_preamble(ctx)
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
@@ -341,15 +348,7 @@ mod tests {
         is_sandboxed: bool,
         model: Option<&'a str>,
     ) -> TurnContext<'a> {
-        TurnContext {
-            chat_id: "00000000-0000-0000-0000-000000000000",
-            prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id,
-            is_sandboxed,
-            model,
-        }
+        TurnContext::for_test(prompt_file, agent_session_id, is_sandboxed, model)
     }
 
     #[test]
@@ -402,6 +401,10 @@ mod tests {
             cmd
         );
     }
+
+    // First-turn-prepend / resume-omit covered once in adapter.rs
+    // (`first_message_preamble_first_turn_then_resume`); hermes delegates to
+    // `first_message_capabilities_preamble`, not re-asserted here.
 
     #[test]
     fn prepare_command_model_pass_through() {

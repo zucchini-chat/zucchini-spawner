@@ -254,6 +254,11 @@ pub struct TurnContext<'a> {
     /// labels) — an invalid value surfaces as a CLI error in the chat,
     /// which is the right place to learn about it.
     pub model: Option<&'a str>,
+    /// Sender's IANA timezone (`machine_users.timezone`, migration 0040), or
+    /// `None` (older client / NULL column). Feeds [`current_time_in_tz_line`]
+    /// so the agent knows its current local time each turn for `schedule-message
+    /// --at`. `None` ⇒ line omitted.
+    pub user_timezone: Option<&'a str>,
 }
 
 /// Per-line normalized events the adapter forwards to Supervisor's response
@@ -306,6 +311,27 @@ pub trait AgentAdapter: Send + Sync {
     /// adapter needs to e.g. `git worktree add` first, switch back to async
     /// (or do the I/O upstream in the Supervisor before this hop).
     fn prepare_command(&mut self, ctx: &TurnContext<'_>) -> Result<String>;
+
+    /// Text prepended to the PLAINTEXT prompt file (never the synced/persisted
+    /// `messages` row) for adapters with NO system-prompt injection point, which
+    /// can't convey [`agent_capabilities_instructions`] otherwise. Default `None`
+    /// (claude/cursor inject in `prepare_command`); also `None` on non-first turns
+    /// for prepend-path adapters, so capabilities land exactly once per chat.
+    /// First turn == `ctx.agent_session_id.is_none()` (no harvested session id yet).
+    fn prompt_file_preamble(&self, _ctx: &TurnContext<'_>) -> Option<String> {
+        None
+    }
+
+    /// VOLATILE current-local-time line ([`current_time_in_tz_line`]) prepended
+    /// to the prompt-file plaintext EVERY turn (never the persisted row). Split
+    /// from [`Self::prompt_file_preamble`] (first-message-only) because the time
+    /// must be fresh each turn. Default returns it (correct for prepend-path
+    /// codex/gemini/hermes); claude/cursor fold it into their per-turn capability
+    /// block instead and override to `None` to avoid double-injection. `None` when
+    /// no tz is known.
+    fn prompt_file_time_line(&self, ctx: &TurnContext<'_>) -> Option<String> {
+        current_time_in_tz_line(ctx.user_timezone)
+    }
 
     /// Per-stdout-line processing. Stateful for the lifetime of one turn so
     /// future delta-shaped adapters (hermes/gemini) can buffer internally.
@@ -389,7 +415,7 @@ pub const ATTACH_FILE_INSTRUCTION: &str =
 macro_rules! prune_context_instruction {
     ($toolname_frag:literal, $example:literal) => {
         concat!(
-            "Reclaim context as you go: once you've extracted what you need from a tool output, prune it — noisy grep, an already-answered file, junk: prune with `\"$ZUCCHINI_SPAWNER_BIN\" prune-context ",
+            "Reclaim context as you go: once you've extracted what you need from a tool output, prune it — noisy grep, an already-answered file, a large file you've already edited and moved past, junk: prune with `\"$ZUCCHINI_SPAWNER_BIN\" prune-context ",
             $toolname_frag,
             "--args \"<value glob>\" --summary \"<1-line digest of what you're keeping — the key takeaway from this tool result>\"`. --args is a glob (supports *) over the call's argument VALUES, not key names, and selects which calls match — each prune blanks only the MOST RECENT matching call, so repeat the command to prune older ones. Pass --args \"\" for a call you made with no arguments. To forget several outputs at once, repeat the flags in ONE call (one --summary per output, which closes that target; --tool-name is per-target, so repeat it on each — an omitted one falls back to matching any tool) — they apply as a single batch. E.g. ",
             $example,
@@ -434,6 +460,95 @@ pub const PRUNE_CONTEXT_INSTRUCTION_GEMINI: &str = prune_context_instruction!(
     "--tool-name <ToolName> ",
     "`--tool-name \"read_file\" --args \"src/main.ts\" --summary \"main.ts: initApp() wires routes then listens on PORT — entry point confirmed\" --tool-name read_file --args \"build.log\" --summary \"build: passed, nothing relevant\"` (use your own tool names — `read_file`, `list_directory`, `replace`, `grep_search`, … — not claude's `Read`/`Edit`/`Grep`)"
 );
+
+/// How the agent schedules a follow-up via `zucchini-spawner schedule-message`.
+/// Same env-var contract as `ATTACH_FILE_INSTRUCTION` (`ZUCCHINI_CHAT_ID`,
+/// `ZUCCHINI_SPAWNER_BIN`) so it stays chat-agnostic and cacheable.
+///
+/// The agent emits a NAIVE local wall-clock (no offset/`Z`); the spawner anchors
+/// it in the user's timezone (`normalize_deliver_at`) so the agent never does
+/// offset/DST math (which it gets wrong). It just echoes the digits off the
+/// per-turn current-local-time line ([`current_time_in_tz_line`]).
+pub const SCHEDULE_MESSAGE_INSTRUCTION: &str =
+    "To schedule a follow-up message to yourself in this chat for a specific future time, run the command `\"$ZUCCHINI_SPAWNER_BIN\" schedule-message --chat-id \"$ZUCCHINI_CHAT_ID\" --body \"<text>\" --at <local-datetime>`. Pass `--at` as a naive local datetime — the user's wall-clock time (e.g. \"2026-06-07T09:00:00\" for 9am), read off the current-local-time line. ALWAYS use this command for any scheduling, reminder, or self-follow-up request — it is the only mechanism that actually delivers a message back into this chat. Do NOT use your own built-in scheduling tools (the `/schedule` skill, ScheduleWakeup, cron routines, etc.); those fire in a context the user never sees here and will silently do nothing for them.";
+
+/// Per-turn current-local-time line for the agent prompt, from the sender's IANA
+/// timezone (`machine_users.timezone`, migration 0040). `None` when `iana_tz` is
+/// absent or unknown — the caller omits the line (`SCHEDULE_MESSAGE_INSTRUCTION`
+/// still works, just no tz hint). MUST be recomputed every turn (embeds `Utc::now()`).
+pub fn current_time_in_tz_line(iana_tz: Option<&str>) -> Option<String> {
+    let tz = iana_tz?.parse::<chrono_tz::Tz>().ok()?;
+    let now = chrono::Utc::now().with_timezone(&tz);
+    // Naive wall-clock (no `±HH:MM`/`Z`) — exactly what `schedule-message --at`
+    // wants echoed back; an offset here only invites wrong offset math. The
+    // `(timezone: …)` suffix carries zone identity; the spawner does the
+    // offset/DST in `normalize_deliver_at`.
+    Some(format!(
+        "The user's current local time is {} (timezone: {}).",
+        now.format("%Y-%m-%dT%H:%M:%S"),
+        tz.name(),
+    ))
+}
+
+/// Worktree-containment guidance (absolute worktree path + parent repo). Single
+/// source of truth shared by the system-prompt path (claude, cursor) and the
+/// first-message prepend path (codex, gemini, hermes). Why it's needed: the
+/// harness chdirs into the worktree but doesn't tell the agent (or subagents) to
+/// stay there, so absolute paths into the parent repo "just work" and edits leak
+/// out — this rule plugs that hole.
+pub fn worktree_instructions(worktree_abs: &str, parent_repo: &str) -> String {
+    format!(
+        "Worktree: {worktree_abs}\nParent repo: {parent_repo} (do not touch unless the user explicitly asks).\nKeep all edits and shell commands inside the worktree. If a path under the parent repo appears in context, rewrite it to the worktree before editing or running commands against it. When delegating to a subagent, repeat this rule and the worktree path — subagents don't inherit it."
+    )
+}
+
+/// The capability instructions every adapter conveys — attach-file,
+/// schedule-message, and (when `worktree` is `Some`) the worktree rule. One
+/// helper so the texts can't drift across conveyance mechanisms: claude's
+/// `--append-system-prompt`, cursor's stdin preamble, and the first-message
+/// prepend (codex/gemini/hermes, no system-prompt injection point). `worktree`
+/// is `Some` only when the turn runs in a worktree the agent must stay inside;
+/// `None` omits the rule. `time_line` rides along for claude/cursor (rebuilt
+/// fresh every turn). codex/gemini/hermes pass `None` here and inject the time
+/// line separately every turn (`agent.rs` `prompt_file_time_line`), since this
+/// static block reaches them only on turn 1.
+pub fn agent_capabilities_instructions(
+    worktree: Option<&WorktreeInstructions>,
+    time_line: Option<&str>,
+) -> String {
+    let mut out = format!("{ATTACH_FILE_INSTRUCTION}\n\n{SCHEDULE_MESSAGE_INSTRUCTION}");
+    if let Some(wt) = worktree {
+        out.push_str("\n\n");
+        out.push_str(&worktree_instructions(&wt.worktree_abs, &wt.parent_repo));
+    }
+    if let Some(line) = time_line {
+        out.push_str("\n\n");
+        out.push_str(line);
+    }
+    out
+}
+
+/// Shared `prompt_file_preamble` body for the prepend-path adapters
+/// (codex/gemini/hermes): no system-prompt injection point, worktree ignored,
+/// time line carried separately via `prompt_file_time_line`. Emits the static
+/// capability block on the FIRST turn only (`agent_session_id.is_none()`), `None`
+/// on resume. Centralized so the first-turn gate can't drift between the three.
+/// `worktree`/`time_line` are both `None` here on purpose.
+pub fn first_message_capabilities_preamble(ctx: &TurnContext<'_>) -> Option<String> {
+    if ctx.agent_session_id.is_some() {
+        return None;
+    }
+    Some(agent_capabilities_instructions(None, None))
+}
+
+/// Already-resolved absolute worktree path + parent repo for
+/// [`agent_capabilities_instructions`] / [`worktree_instructions`]. Each adapter
+/// computes these from its own `--worktree` naming scheme (claude:
+/// `<project>/.claude/worktrees/`; cursor: `~/.cursor/worktrees/<repo>/`).
+pub struct WorktreeInstructions {
+    pub worktree_abs: String,
+    pub parent_repo: String,
+}
 
 /// Trim + `starts_with('{')` gate + `serde_json::from_str::<Value>` for
 /// adapters that need to dispatch on a frame's `type` field. Returns `None`
@@ -569,6 +684,31 @@ pub(crate) fn file_nonempty(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+impl<'a> TurnContext<'a> {
+    /// Minimal test `TurnContext` (fixed chat id, `/tmp/proj`, non-worktree, no
+    /// tz). The four args are what adapter tests vary; other fields go via
+    /// struct-update: `TurnContext { user_timezone: Some(..), ..for_test(..) }`.
+    /// One builder so a new field isn't an N-site edit across the test modules.
+    pub(crate) fn for_test(
+        prompt_file: &'a Path,
+        agent_session_id: Option<&'a str>,
+        is_sandboxed: bool,
+        model: Option<&'a str>,
+    ) -> Self {
+        TurnContext {
+            chat_id: "00000000-0000-0000-0000-000000000000",
+            prompt_file,
+            project_path: Some("/tmp/proj"),
+            worktree: false,
+            agent_session_id,
+            is_sandboxed,
+            model,
+            user_timezone: None,
+        }
+    }
+}
+
 /// Test-only stringifier shared by every adapter's `run()` helper. Maps a
 /// turn's emitted events to human-readable tags for assertion equality. Lives
 /// here (next to the enum) so a new `AgentEvent` variant forces exactly ONE
@@ -697,5 +837,66 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn current_time_line_known_tz_is_naive_wall_clock() {
+        // Known IANA id → line names the zone + carries a NAIVE wall-clock (no
+        // offset), the shape the agent echoes to `schedule-message --at`.
+        let line = current_time_in_tz_line(Some("America/Los_Angeles"))
+            .expect("known IANA id yields a line");
+        assert!(
+            line.contains("America/Los_Angeles"),
+            "line names the timezone: {line}"
+        );
+        // No signed `±HH:MM` offset and no `Z` — the timestamp is bare local time.
+        assert!(
+            !line.contains("+00:00")
+                && !line.contains("-08:00")
+                && !line.contains("-07:00")
+                && !line.contains('Z'),
+            "line must carry no UTC offset: {line}"
+        );
+    }
+
+    #[test]
+    fn current_time_line_absent_or_garbage_is_none() {
+        // No tz (older client / NULL column) → no line.
+        assert!(current_time_in_tz_line(None).is_none());
+        // Unparseable IANA id → no line (no tz hint, not a bogus offset).
+        assert!(current_time_in_tz_line(Some("Not/AZone")).is_none());
+        assert!(current_time_in_tz_line(Some("")).is_none());
+    }
+
+    #[test]
+    fn capabilities_block_appends_time_line_when_present() {
+        // Time line lands when passed, absent otherwise.
+        let with = agent_capabilities_instructions(None, Some("CLOCK-MARKER"));
+        assert!(with.contains("CLOCK-MARKER"), "time line appended: {with}");
+        assert!(with.contains("attach-file"), "static block still present");
+        let without = agent_capabilities_instructions(None, None);
+        assert!(
+            !without.contains("CLOCK-MARKER"),
+            "no time line when None: {without}"
+        );
+    }
+
+    #[test]
+    fn first_message_preamble_first_turn_then_resume() {
+        // Prepend-path body: capability block on first turn (no session id),
+        // omitted on resume; worktree never conveyed this way.
+        use std::path::PathBuf;
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let first = TurnContext::for_test(&prompt_file, None, false, None);
+        let preamble = first_message_capabilities_preamble(&first).expect("first turn → Some");
+        assert!(preamble.contains("attach-file"), "got: {preamble}");
+        assert!(preamble.contains("schedule-message"), "got: {preamble}");
+        assert!(!preamble.contains("Worktree:"), "got: {preamble}");
+
+        let resume = TurnContext::for_test(&prompt_file, Some("sid"), false, None);
+        assert!(
+            first_message_capabilities_preamble(&resume).is_none(),
+            "resume → None"
+        );
     }
 }

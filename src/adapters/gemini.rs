@@ -94,10 +94,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::adapter::{
-    claude_assistant_text_envelope, claude_tool_use_envelope, file_nonempty, parse_json_obj,
-    probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind,
-    ImportProgress, LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES,
-    PRUNE_CONTEXT_INSTRUCTION_GEMINI,
+    claude_assistant_text_envelope, claude_tool_use_envelope, file_nonempty,
+    first_message_capabilities_preamble, parse_json_obj, probe_with_blocking_auth, shell_escape,
+    AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, ImportProgress, LastTokensDedup,
+    TurnContext, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_GEMINI,
 };
 use crate::adapters::import_shared::{
     basename_or, collapse_title, emit_chat, is_synthetic_wrapper, mint_project_id,
@@ -277,6 +277,13 @@ impl AgentAdapter for GeminiAdapter {
     /// tool names in the example). See `AgentAdapter::first_turn_prompt_suffix`.
     fn first_turn_prompt_suffix(&self) -> Option<&'static str> {
         Some(PRUNE_CONTEXT_INSTRUCTION_GEMINI)
+    }
+
+    /// No system-prompt injection point (no `--append-system-prompt` on
+    /// gemini-cli 0.44.1), so capabilities ride the first user message; worktree
+    /// ignored. See [`first_message_capabilities_preamble`].
+    fn prompt_file_preamble(&self, ctx: &TurnContext<'_>) -> Option<String> {
+        first_message_capabilities_preamble(ctx)
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
@@ -1636,15 +1643,7 @@ mod tests {
         is_sandboxed: bool,
         model: Option<&'a str>,
     ) -> TurnContext<'a> {
-        TurnContext {
-            chat_id: "00000000-0000-0000-0000-000000000000",
-            prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id,
-            is_sandboxed,
-            model,
-        }
+        TurnContext::for_test(prompt_file, agent_session_id, is_sandboxed, model)
     }
 
     #[test]
@@ -2215,6 +2214,10 @@ mod tests {
         let cmd = a.prepare_command(&c).unwrap();
         assert!(!cmd.contains(" -m "), "got: {}", cmd);
     }
+
+    // First-turn-prepend / resume-omit covered once in adapter.rs
+    // (`first_message_preamble_first_turn_then_resume`); gemini delegates to
+    // `first_message_capabilities_preamble`, not re-asserted here.
 
     // ----- importer unit tests --------------------------------------------
 

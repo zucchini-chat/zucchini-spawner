@@ -27,6 +27,9 @@ base64 = "0.22"
 gethostname = "0.5"
 uuid = { version = "1", features = ["v5", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+# IANA→offset DB for `current_time_in_tz_line` (adapter.rs). chrono's transitive
+# `iana-time-zone` only reads the host zone name, not the offset database.
+chrono-tz = "0.10"
 # Zero K_machine plaintext on drop. Pinned to match the version `crypto_box`
 # pulls in transitively (1.8.x as of crypto_box 0.9.1) so a future `cargo update`
 # can't bump us past the transitive constraint and re-trigger SemVer dual-version.

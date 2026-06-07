@@ -62,9 +62,10 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::adapter::{
-    claude_assistant_text_envelope, claude_tool_use_envelope, file_nonempty, parse_json_obj,
-    probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind,
-    ImportProgress, TurnContext, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_CODEX,
+    claude_assistant_text_envelope, claude_tool_use_envelope, file_nonempty,
+    first_message_capabilities_preamble, parse_json_obj, probe_with_blocking_auth, shell_escape,
+    AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, ImportProgress, TurnContext,
+    MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_CODEX,
 };
 use crate::writer::WriteEvent;
 
@@ -216,21 +217,11 @@ impl AgentAdapter for CodexAdapter {
         // signal back to the UI. Today we just spawn in the project root.
         let _ = ctx.worktree;
 
-        // TODO(codex): no system-prompt injection in v1. Codex has no
-        // `--append-system-prompt` equivalent — the options are (a) write
-        // an `AGENTS.md` in cwd, which clobbers the user's existing one
-        // and persists across turns even after this spawner exits, or
-        // (b) pass `-c instructions="..."` to override the global codex
-        // instructions, which loses the user's own instructions for the
-        // turn. Neither is acceptable as a default. ATTACH_FILE_INSTRUCTION
-        // is therefore NOT injected — the agent-side attach-file flow is
-        // unavailable on codex until this is resolved.
-        //
-        // prune-context: no `--append-system-prompt`, so the nudge rides in on the
-        // first user message via `first_turn_prompt_suffix` (see
-        // `AgentAdapter::first_turn_prompt_suffix`). ATTACH_FILE_INSTRUCTION can't
-        // reuse it — attach-file needs the nudge every turn, and per-turn appends
-        // would pollute the rollout — so it stays deferred above.
+        // Codex has no system-prompt injection point (no `--append-system-prompt`;
+        // `AGENTS.md` would clobber/persist the user's, `-c instructions=` would
+        // drop their global config), so capabilities ride the first user message
+        // via `prompt_file_preamble` below. The prune nudge rides the same path
+        // via `first_turn_prompt_suffix` (codex variant).
 
         // Verbatim pass-through of `chats.model` (migration 0035). Codex
         // uses `-m, --model`; the model label drifts per-release so we
@@ -258,6 +249,13 @@ impl AgentAdapter for CodexAdapter {
     /// See `AgentAdapter::first_turn_prompt_suffix`.
     fn first_turn_prompt_suffix(&self) -> Option<&'static str> {
         Some(PRUNE_CONTEXT_INSTRUCTION_CODEX)
+    }
+
+    /// No system-prompt injection point (see `prepare_command`), so capabilities
+    /// ride the first user message; worktree ignored. See
+    /// [`first_message_capabilities_preamble`].
+    fn prompt_file_preamble(&self, ctx: &TurnContext<'_>) -> Option<String> {
+        first_message_capabilities_preamble(ctx)
     }
 
     /// Read live context-window occupancy from the rollout once the `codex exec`
@@ -1752,15 +1750,50 @@ mod tests {
         is_sandboxed: bool,
         model: Option<&'a str>,
     ) -> TurnContext<'a> {
-        TurnContext {
-            chat_id: "00000000-0000-0000-0000-000000000000",
-            prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id,
-            is_sandboxed,
-            model,
-        }
+        TurnContext::for_test(prompt_file, agent_session_id, is_sandboxed, model)
+    }
+
+    // First-turn-prepend / resume-omit is covered once in adapter.rs's
+    // `first_message_preamble_first_turn_then_resume` (codex/gemini/hermes all
+    // delegate to `first_message_capabilities_preamble`), not re-asserted here.
+
+    #[test]
+    fn time_line_injected_on_resume_turn() {
+        // Capability block is first-message-only, but the volatile time line must
+        // still land on a resumed turn (default `prompt_file_time_line` fires every
+        // turn regardless of session id).
+        let a = CodexAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        // Resumed turn (Some session id) WITH a known tz.
+        let c = TurnContext {
+            user_timezone: Some("America/Los_Angeles"),
+            ..ctx(
+                &prompt_file,
+                Some("0192f00d-7ce0-7e9a-8d6f-abcdef012345"),
+                false,
+                None,
+            )
+        };
+        assert!(
+            a.prompt_file_preamble(&c).is_none(),
+            "resume still omits the once-only capability block"
+        );
+        let time_line = a
+            .prompt_file_time_line(&c)
+            .expect("time line present on resume turn when tz known");
+        assert!(
+            time_line.contains("America/Los_Angeles"),
+            "time line names the zone on resume: {time_line}"
+        );
+        // No tz → no line, even on resume.
+        let c_no_tz = TurnContext {
+            user_timezone: None,
+            ..c
+        };
+        assert!(
+            a.prompt_file_time_line(&c_no_tz).is_none(),
+            "no tz → no time line"
+        );
     }
 
     #[test]

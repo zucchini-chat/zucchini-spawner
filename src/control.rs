@@ -8,7 +8,11 @@
 //!
 //! Wire protocol:
 //!   - request: `{ "action": "attach_file", "chat_id": "<uuid>", "path": "<abs>" }\n`
+//!     or `{ "action": "schedule_message", "chat_id": "<uuid>", "body": "<text>",
+//!     "deliver_at": "<naive-local-datetime|rfc3339>"|null }\n` (null = queue for
+//!     the next agent-free window; non-null = that wall-clock time, zoned daemon-side)
 //!   - response: `{ "ok": true, "blob_key": "...", "name": "..." }\n`
+//!     or `{ "ok": true, "scheduled_message_id": "<uuid>" }\n`
 //!     or `{ "ok": false, "error": "..." }\n`
 //!
 //! Connection is one request/one response then close — the CLI exits and we
@@ -67,6 +71,18 @@ pub enum ControlRequest {
         chat_id: String,
         items: Vec<PruneItem>,
     },
+    /// Insert a `scheduled_messages` row for `chat_id` — the running agent
+    /// enqueues a message at a wall-clock time (`deliver_at` = naive local datetime
+    /// or offset-bearing RFC3339) or for the next agent-free window (`null`). The
+    /// nullness IS the fire condition; the daemon zones a naive value to UTC
+    /// (`normalize_deliver_at`) before the write. `body` is plaintext here; the
+    /// daemon encrypts it with the owner's key into the `messages.body` wire format
+    /// before the `/api/writes` PUT. Same trust model as `AttachFile`.
+    ScheduleMessage {
+        chat_id: String,
+        body: String,
+        deliver_at: Option<String>,
+    },
 }
 
 /// One prune target inside a (possibly batched) `prune-context` call. `tool_name`
@@ -88,13 +104,17 @@ pub struct PruneItem {
 /// JSON via `skip_serializing_if`. One struct (not an untagged enum) keeps
 /// the CLI-side decode a single `serde_json::from_str` instead of poking
 /// at `serde_json::Value`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ControlResponse {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Set only by the `schedule_message` handler — the freshly minted
+    /// `scheduled_messages.id` the daemon PUT to `/api/writes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Per-item eligible-match counts, parallel to the request's `items` — set
@@ -113,26 +133,28 @@ impl ControlResponse {
             ok: true,
             blob_key: Some(blob_key),
             name: Some(name),
-            error: None,
-            pruned_counts: None,
+            ..Default::default()
+        }
+    }
+    fn scheduled(id: String) -> Self {
+        Self {
+            ok: true,
+            scheduled_message_id: Some(id),
+            ..Default::default()
         }
     }
     fn pruned_ok(counts: Vec<usize>) -> Self {
         Self {
             ok: true,
-            blob_key: None,
-            name: None,
-            error: None,
             pruned_counts: Some(counts),
+            ..Default::default()
         }
     }
     fn err(msg: impl Into<String>) -> Self {
+        // `ok` defaults to false here — that's the only failure constructor.
         Self {
-            ok: false,
-            blob_key: None,
-            name: None,
             error: Some(msg.into()),
-            pruned_counts: None,
+            ..Default::default()
         }
     }
 }
@@ -261,6 +283,17 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                 }
             }
         }
+        ControlRequest::ScheduleMessage {
+            chat_id,
+            body,
+            deliver_at,
+        } => match schedule_message(&chat_id, &body, deliver_at.as_deref(), state).await {
+            Ok(id) => ControlResponse::scheduled(id.to_string()),
+            Err(e) => {
+                warn!(chat_id = %chat_id, deliver_at = ?deliver_at, error = %e, "schedule_message failed");
+                ControlResponse::err(format!("{e:#}"))
+            }
+        },
     }
 }
 
@@ -569,12 +602,88 @@ async fn attach_file(
     Ok((blob_key, name))
 }
 
+/// Daemon-side handler for `ScheduleMessage`. Resolves `chat_id → user_id` from
+/// the mirror, encrypts `body` into the `messages.body` wire format, and PUTs a
+/// fresh `scheduled_messages` row to `/api/writes` (inline — one encrypt + one
+/// POST, no presign/upload). Backend stamps `user_id`/`created_at`.
+async fn schedule_message(
+    chat_id: &str,
+    body: &str,
+    deliver_at: Option<&str>,
+    state: &ControlState,
+) -> Result<uuid::Uuid> {
+    // Tight read guard: chat→user lookup + the user's IANA timezone, no `.await`
+    // held. Encrypt + POST happen after it drops.
+    let (user_id, tz_name) = {
+        let g = state.mirror.read().await;
+        let user_id = g
+            .chats
+            .get(chat_id)
+            .map(|c| c.user_id)
+            .ok_or_else(|| anyhow!("no chat with id {chat_id} (unknown or not yet synced)"))?;
+        let tz_name = g.member_timezone(&user_id).map(str::to_string);
+        (user_id, tz_name)
+    };
+
+    // Validate + canonicalize (the socket is its own entry point, so reject bad
+    // values here too, not just at the CLI front-end). Absent stays NULL (queue).
+    let tz = tz_name
+        .as_deref()
+        .and_then(|s| s.parse::<chrono_tz::Tz>().ok());
+    let deliver_at = normalize_deliver_at(deliver_at.map(str::to_string), tz)?;
+
+    // Use `envelope::encode`, NOT `encrypt_field_b64`: the backend promotes this
+    // body verbatim into a `sender='user'` message and the spawner runs
+    // `envelope::decode` on user bodies, so it must be the `{text,attachments}`
+    // JSON envelope — a raw field-encrypted string decrypts to a bare string and
+    // fails the envelope parse, silently dropping the message.
+    let key = state
+        .keys
+        .get(&user_id)
+        .with_context(|| format!("no key for user {user_id}"))?;
+    let body_ct = crate::envelope::encode(body, &key).context("encode scheduled message body")?;
+
+    let id = uuid::Uuid::now_v7();
+    // `deliver_at = None` serializes to explicit JSON null — the backend keys the
+    // fire condition off its nullness (null = queue/agent-free, non-null = timed).
+    let op = serde_json::json!({
+        "op": "PUT",
+        "table": "scheduled_messages",
+        "id": id.to_string(),
+        "data": {
+            "chat_id": chat_id,
+            "body": body_ct,
+            "deliver_at": deliver_at,
+        },
+    });
+
+    let url = format!("{}/api/writes", state.api_base_url.trim_end_matches('/'));
+    let token = (state.fetch_token)()
+        .await
+        .context("fetch JWT for /api/writes")?;
+    let resp = state
+        .http
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "ops": [op] }))
+        .send()
+        .await
+        .context("POST /api/writes (schedule_message)")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("POST /api/writes {}: {}", status, body));
+    }
+    info!(chat_id, %id, deliver_at = ?deliver_at, "scheduled message via /api/writes");
+    Ok(id)
+}
+
 // ===== CLI client side =====
 
-/// Connect to the daemon's control socket and run one `attach-file` RPC.
-/// Returns the (blob_key, name) on success; bubbles up daemon-side errors
-/// (no-such-chat, upload failure) verbatim.
-pub async fn attach_file_via_socket(chat_id: &str, path: &str) -> Result<(String, String)> {
+/// One request/one response round-trip over the control socket: connect → write
+/// newline-framed JSON → half-close → read the response line → bubble up
+/// daemon-side `ok=false` errors. Shared by every CLI subcommand.
+async fn send_control_request(req: &ControlRequest) -> Result<ControlResponse> {
     let sock = control_socket_path();
     let stream = UnixStream::connect(&sock).await.with_context(|| {
         format!(
@@ -583,11 +692,7 @@ pub async fn attach_file_via_socket(chat_id: &str, path: &str) -> Result<(String
         )
     })?;
     let (read_half, mut write_half) = stream.into_split();
-    let req = ControlRequest::AttachFile {
-        chat_id: chat_id.to_string(),
-        path: path.to_string(),
-    };
-    let mut payload = serde_json::to_string(&req).expect("serialize control request");
+    let mut payload = serde_json::to_string(req).expect("serialize control request");
     payload.push('\n');
     write_half
         .write_all(payload.as_bytes())
@@ -609,6 +714,18 @@ pub async fn attach_file_via_socket(chat_id: &str, path: &str) -> Result<(String
             resp.error.unwrap_or_else(|| "unknown error".to_string())
         ));
     }
+    Ok(resp)
+}
+
+/// Connect to the daemon's control socket and run one `attach-file` RPC.
+/// Returns the (blob_key, name) on success; bubbles up daemon-side errors
+/// (no-such-chat, upload failure) verbatim.
+pub async fn attach_file_via_socket(chat_id: &str, path: &str) -> Result<(String, String)> {
+    let resp = send_control_request(&ControlRequest::AttachFile {
+        chat_id: chat_id.to_string(),
+        path: path.to_string(),
+    })
+    .await?;
     let blob_key = resp
         .blob_key
         .ok_or_else(|| anyhow!("response missing blob_key"))?;
@@ -624,39 +741,217 @@ pub async fn attach_file_via_socket(chat_id: &str, path: &str) -> Result<(String
 /// the `prune-context` call's `tool_result` frame, folding the batch into ONE
 /// restart that lands strictly after claude persists the call's result.
 pub async fn prune_context_via_socket(chat_id: &str, items: Vec<PruneItem>) -> Result<Vec<usize>> {
-    let sock = control_socket_path();
-    let stream = UnixStream::connect(&sock).await.with_context(|| {
-        format!(
-            "connect to {} — is zucchini-spawner running?",
-            sock.display()
-        )
-    })?;
-    let (read_half, mut write_half) = stream.into_split();
-    let req = ControlRequest::PruneContext {
+    let resp = send_control_request(&ControlRequest::PruneContext {
         chat_id: chat_id.to_string(),
         items,
-    };
-    let mut payload = serde_json::to_string(&req).expect("serialize control request");
-    payload.push('\n');
-    write_half
-        .write_all(payload.as_bytes())
-        .await
-        .context("write control request")?;
-    write_half.shutdown().await.ok();
-
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("read control response")?;
-    let resp: ControlResponse =
-        serde_json::from_str(line.trim_end_matches('\n')).context("parse control response JSON")?;
-    if !resp.ok {
-        return Err(anyhow!(
-            "{}",
-            resp.error.unwrap_or_else(|| "unknown error".to_string())
-        ));
-    }
+    })
+    .await?;
     Ok(resp.pruned_counts.unwrap_or_default())
+}
+
+/// Validate + canonicalize an optional `deliver_at` to a uniform UTC RFC3339.
+///
+/// `None` (flag omitted) stays `None` → NULL "queue, send when free" row. A
+/// present value resolves via one of two paths:
+///
+///   * **Naive local wall-clock** (no offset/`Z`) — the agent contract, so it
+///     never does timezone/DST math. Anchored in the user's IANA zone `tz` (DST
+///     resolved by the tz database here): ambiguous fall-back hour → earliest
+///     instant; nonexistent spring-forward hour → first valid instant after the
+///     gap. Requires `tz`; without it we error rather than guess UTC.
+///   * **Offset-bearing RFC3339** (`…Z` / `…+02:00`) — absolute instant, `tz`
+///     irrelevant. Backwards tolerance for older agents / explicit offsets.
+///
+/// Anything else (natural language, empty `--at ""`) fails loudly naming the
+/// value, so it can never silently become a misfiring row.
+pub fn normalize_deliver_at(
+    deliver_at: Option<String>,
+    tz: Option<chrono_tz::Tz>,
+) -> Result<Option<String>> {
+    let Some(s) = deliver_at else { return Ok(None) };
+
+    // 1) Offset-bearing RFC3339 → honor as an absolute instant (tz ignored).
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
+        return Ok(Some(dt.with_timezone(&chrono::Utc).to_rfc3339()));
+    }
+
+    // 2) Naive local wall-clock → anchor in the user's zone.
+    if let Some(naive) = parse_naive_local(&s) {
+        let tz = tz.ok_or_else(|| {
+            anyhow!(
+                "--at {s:?} is a local time but the user's timezone is unknown; \
+                 pass an explicit offset (e.g. {s}Z) or omit --at to queue"
+            )
+        })?;
+        return Ok(Some(zone_local_to_utc(naive, tz).to_rfc3339()));
+    }
+
+    Err(anyhow!(
+        "--at {s:?} is not a valid timestamp (expected a local wall-clock like \
+         2026-06-04T09:00:00, or RFC3339 with an offset); \
+         omit --at to queue the message instead"
+    ))
+}
+
+/// Parse a zoneless local datetime in the few shapes the agent might emit
+/// (`T` or space separator, seconds optional).
+fn parse_naive_local(s: &str) -> Option<chrono::NaiveDateTime> {
+    use chrono::NaiveDateTime;
+    const FORMATS: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ];
+    FORMATS
+        .iter()
+        .find_map(|f| NaiveDateTime::parse_from_str(s, f).ok())
+}
+
+/// Map a naive local wall-clock into a UTC instant using `tz`, resolving the
+/// two DST edge cases deterministically (see [`normalize_deliver_at`]).
+fn zone_local_to_utc(
+    naive: chrono::NaiveDateTime,
+    tz: chrono_tz::Tz,
+) -> chrono::DateTime<chrono::Utc> {
+    use chrono::offset::LocalResult;
+    use chrono::TimeZone;
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt.with_timezone(&chrono::Utc),
+        // Fall-back hour occurs twice — pick the earliest (first) occurrence.
+        LocalResult::Ambiguous(earliest, _latest) => earliest.with_timezone(&chrono::Utc),
+        // Spring-forward gap: this wall-clock never occurs. The gap is 1h, so
+        // the same clock time one hour later always lands in a valid window.
+        LocalResult::None => {
+            let bumped = naive + chrono::TimeDelta::hours(1);
+            match tz.from_local_datetime(&bumped) {
+                LocalResult::Single(dt) => dt.with_timezone(&chrono::Utc),
+                LocalResult::Ambiguous(dt, _) => dt.with_timezone(&chrono::Utc),
+                // Unreachable for real zones (no 2h+ gaps); fall back to a
+                // literal UTC reading rather than panic.
+                LocalResult::None => chrono::Utc.from_utc_datetime(&bumped),
+            }
+        }
+    }
+}
+
+/// Run one `schedule-message` RPC. Mirrors `attach_file_via_socket`: CLI never
+/// touches K_user or the JWT — the daemon encrypts + POSTs. Returns the minted
+/// `scheduled_messages.id`. `deliver_at` is forwarded raw and zoned daemon-side
+/// (`normalize_deliver_at`), since only the daemon's mirror holds the user's tz.
+pub async fn schedule_message_via_socket(
+    chat_id: &str,
+    body: &str,
+    deliver_at: Option<String>,
+) -> Result<String> {
+    let resp = send_control_request(&ControlRequest::ScheduleMessage {
+        chat_id: chat_id.to_string(),
+        body: body.to_string(),
+        deliver_at,
+    })
+    .await?;
+    resp.scheduled_message_id
+        .ok_or_else(|| anyhow!("response missing scheduled_message_id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn out_utc(deliver_at: &str, tz: Option<chrono_tz::Tz>) -> chrono::DateTime<chrono::Utc> {
+        let out = normalize_deliver_at(Some(deliver_at.into()), tz)
+            .unwrap()
+            .unwrap();
+        utc(&out)
+    }
+
+    #[test]
+    fn normalize_deliver_at_absent_is_none() {
+        // Flag omitted → NULL queue row.
+        assert_eq!(normalize_deliver_at(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn normalize_deliver_at_valid_rfc3339_canonicalizes() {
+        // Offset-bearing input → absolute instant regardless of tz; `Z` and
+        // `+02:00` forms land on the same instant.
+        assert_eq!(
+            out_utc("2026-06-04T09:00:00Z", None),
+            utc("2026-06-04T09:00:00Z")
+        );
+        assert_eq!(
+            out_utc("2026-06-04T11:00:00+02:00", None),
+            utc("2026-06-04T09:00:00Z")
+        );
+    }
+
+    #[test]
+    fn normalize_deliver_at_naive_local_is_zoned() {
+        // Bare local wall-clock anchored in the user's zone. June NY = EDT
+        // (UTC−4) → 09:00 local = 13:00Z. Seconds-optional + space sep parse same.
+        let ny: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        assert_eq!(
+            out_utc("2026-06-04T09:00:00", Some(ny)),
+            utc("2026-06-04T13:00:00Z")
+        );
+        assert_eq!(
+            out_utc("2026-06-04T09:00", Some(ny)),
+            utc("2026-06-04T13:00:00Z")
+        );
+        assert_eq!(
+            out_utc("2026-06-04 09:00:00", Some(ny)),
+            utc("2026-06-04T13:00:00Z")
+        );
+
+        // Reykjavik is UTC+0 year-round (no DST): the wall-clock IS the UTC
+        // time. This is exactly the "looks like UTC but isn't UTC tz" case.
+        let rvk: chrono_tz::Tz = "Atlantic/Reykjavik".parse().unwrap();
+        assert_eq!(
+            out_utc("2026-06-04T09:00:00", Some(rvk)),
+            utc("2026-06-04T09:00:00Z")
+        );
+    }
+
+    #[test]
+    fn normalize_deliver_at_naive_without_tz_is_rejected() {
+        // Naive local with no zone must error (never assume UTC); error names the
+        // value + the offset escape.
+        let err = normalize_deliver_at(Some("2026-06-04T09:00:00".into()), None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("2026-06-04T09:00:00"), "got: {msg}");
+        assert!(msg.contains("timezone"), "got: {msg}");
+    }
+
+    #[test]
+    fn normalize_deliver_at_dst_spring_forward_gap_snaps_forward() {
+        // 2026-03-08 02:30 doesn't exist in New York (clocks jump 02:00→03:00).
+        // It must resolve deterministically to the first valid instant, not panic.
+        let ny: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        // 03:30 EDT = 07:30Z (the bumped, valid reading).
+        assert_eq!(
+            out_utc("2026-03-08T02:30:00", Some(ny)),
+            utc("2026-03-08T07:30:00Z")
+        );
+    }
+
+    #[test]
+    fn normalize_deliver_at_garbage_is_rejected() {
+        // Natural language the agent might pass → loud error naming the value.
+        let err = normalize_deliver_at(Some("tomorrow 9am".into()), None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("tomorrow 9am"), "got: {msg}");
+    }
+
+    #[test]
+    fn normalize_deliver_at_present_but_empty_is_rejected() {
+        // Present-but-empty (`--at ""`) is NOT the queue sentinel — only an
+        // omitted flag (`None`) is. Empty must fail loudly, not become NULL.
+        assert!(normalize_deliver_at(Some(String::new()), None).is_err());
+    }
 }

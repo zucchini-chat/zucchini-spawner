@@ -332,6 +332,16 @@ async fn handle_sync_event(
                     .map(str::to_string);
                 mirror.set_member_agents(&user_id, agents_raw);
 
+                // `timezone` (migration 0040) — IANA id of the member's most-
+                // recently-active device (validated server-side in `/api/devices`).
+                // Mirror raw (NULL → None) for the spawn-site prompt clock; see
+                // `MemberInfo.timezone`.
+                let timezone_raw = row
+                    .get("timezone")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                mirror.set_member_timezone(&user_id, timezone_raw);
+
                 // Seeding fires when ALL of:
                 //   - row is the spawner-owner's own row
                 //   - column landed NULL (not `[]` — distinct values; `[]`
@@ -672,6 +682,10 @@ async fn handle_message_put(
     // a brand-new chat where the first turn aborted before harvest still has
     // `agent_session_id = None`, so we want a fresh session there too.
     // `agent_kind` picks the adapter at spawn time.
+    // Sender's IANA timezone (migration 0040). `None` → adapter omits the time
+    // line. Looked up here so the volatile clock is fresh per turn.
+    let user_timezone = mirror.member_timezone(&user_id).map(str::to_string);
+
     supervisor.spawn_agent(SpawnRequest {
         chat_id: chat_id.clone(),
         prompt,
@@ -681,6 +695,7 @@ async fn handle_message_put(
         agent_kind,
         is_sandboxed,
         model,
+        user_timezone,
     });
 }
 
@@ -695,6 +710,9 @@ struct ChatSpawnParams {
     agent_kind: AgentKind,
     is_sandboxed: bool,
     model: Option<String>,
+    /// Sender's IANA timezone (migration 0040), mirrored per `handle_message_put`
+    /// so the prune respawn keeps injecting the current-local-time line.
+    user_timezone: Option<String>,
 }
 
 /// Resolve spawn params for `chat_id`, mirroring `handle_message_put`'s gates
@@ -733,6 +751,7 @@ fn resolve_chat_spawn_params(mirror: &Mirror, chat_id: &str) -> Option<ChatSpawn
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        user_timezone: mirror.member_timezone(&chat.user_id).map(str::to_string),
     })
 }
 
@@ -862,6 +881,7 @@ async fn apply_prune_group(
         agent_kind: params.agent_kind,
         is_sandboxed: params.is_sandboxed,
         model: params.model,
+        user_timezone: params.user_timezone,
     });
 }
 
@@ -1463,6 +1483,31 @@ async fn publish_spawner_pubkey_if_needed(
         .await;
 }
 
+/// Match `arg` against `--name value` (consuming the next argv item) or
+/// `--name=value`, returning the value when it matches. Lets each flag in a
+/// hand-rolled argv parse be a one-liner instead of two match arms apiece.
+/// Shared by every `*_cli` subcommand's parser.
+fn take_flag<'a>(
+    arg: &str,
+    name: &str,
+    it: &mut impl Iterator<Item = &'a String>,
+) -> Option<String> {
+    if arg == name {
+        it.next().cloned()
+    } else {
+        arg.strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::to_string)
+    }
+}
+
+/// Default a parsed `--chat-id` from the `ZUCCHINI_CHAT_ID` env var (agent.rs
+/// exports it on every spawn); an explicit flag still wins. Shared so all
+/// subcommands resolve `--chat-id` identically.
+fn chat_id_or_env(chat_id: Option<String>) -> Option<String> {
+    chat_id.or_else(|| std::env::var("ZUCCHINI_CHAT_ID").ok())
+}
+
 /// CLI entry point for `zucchini-spawner attach-file <abs-path> [--chat-id <UUID>]`
 /// (`--chat-id` defaults to the `ZUCCHINI_CHAT_ID` env var exported on the spawn).
 ///
@@ -1481,21 +1526,18 @@ async fn run_attach_file_cli(args: &[String]) {
     let mut path: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "--chat-id" => {
-                chat_id = it.next().cloned();
-            }
-            "-h" | "--help" => usage_and_exit(),
-            s if s.starts_with("--chat-id=") => {
-                chat_id = Some(s["--chat-id=".len()..].to_string());
-            }
-            s if path.is_none() => path = Some(s.to_string()),
-            _ => usage_and_exit(),
+        let s = a.as_str();
+        if s == "-h" || s == "--help" {
+            usage_and_exit();
+        } else if let Some(v) = take_flag(s, "--chat-id", &mut it) {
+            chat_id = Some(v);
+        } else if path.is_none() {
+            path = Some(s.to_string());
+        } else {
+            usage_and_exit();
         }
     }
-    // Default `--chat-id` from `ZUCCHINI_CHAT_ID` (agent.rs exports it on spawn);
-    // explicit flag still wins.
-    let chat_id = chat_id.or_else(|| std::env::var("ZUCCHINI_CHAT_ID").ok());
+    let chat_id = chat_id_or_env(chat_id);
     let (Some(chat_id), Some(path)) = (chat_id, path) else {
         usage_and_exit();
     };
@@ -1515,28 +1557,6 @@ async fn run_attach_file_cli(args: &[String]) {
     }
 }
 
-/// CLI entry point for `zucchini-spawner prune-context [--tool-name <Tool>]
-/// --args "<glob>" --summary "<digest>" [... more triples ...] [--chat-id <UUID>]`.
-///
-/// Thin RPC client over the daemon's control socket — mirrors
-/// `run_attach_file_cli`. Accepts ONE OR MORE prune targets in a single call:
-/// each `--summary` (or its `--reason` alias) CLOSES the current target, so a
-/// target is the run of `[--tool-name] --args` flags that precedes its
-/// `--summary`. Batching is the whole point — the agent forgets several outputs
-/// in one process → one RPC → one restart, instead of firing parallel
-/// `prune-context` processes that reap each other (see `control.rs`
-/// `PruneContext`). A lone triple is just a 1-item batch, byte-identical to the
-/// old single-call form (so an agent mid-turn under an older binary stays
-/// compatible across a hot-reload). Per target: `--args` is required (`""` =
-/// no-args selector); `--tool-name` is optional (omit it — or pass `""` — to
-/// prune on the `--args` needle alone, as the codex instruction does); `--summary`
-/// is required (it terminates the target). `--reason` is the legacy alias for
-/// `--summary`. `--chat-id` is call-level (applies to the whole batch) and
-/// defaults to `ZUCCHINI_CHAT_ID`. `--flag=value` form accepted. `--args` globs
-/// each call's argument values; a prune blanks only the most recent matching
-/// call, so the per-target output reports how many matches remain. The daemon
-/// aborts the agent right after replying, so a connection-reset after a
-/// successful send is expected — the prune proceeds regardless.
 /// Append a one-line CLI-invocation record to `spawner.log` (the daemon's
 /// `StandardOutPath`). Used by `run_prune_context_cli` to log that the
 /// subprocess started, BEFORE its RPC — see the call site for why the
@@ -1593,33 +1613,21 @@ fn parse_prune_args(args: &[String]) -> Result<(Option<String>, Vec<control::Pru
     let mut cur_needle: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "--tool-name" => cur_tool = Some(it.next().ok_or(())?.clone()),
-            "--args" => cur_needle = Some(it.next().ok_or(())?.clone()),
-            "--chat-id" => chat_id = Some(it.next().ok_or(())?.clone()),
-            "--summary" | "--reason" => {
-                let summary = it.next().ok_or(())?.clone();
-                close_item(&mut items, &mut cur_tool, &mut cur_needle, summary)?;
-            }
-            "-h" | "--help" => return Err(()),
-            s if s.starts_with("--tool-name=") => {
-                cur_tool = Some(s["--tool-name=".len()..].to_string());
-            }
-            s if s.starts_with("--args=") => {
-                cur_needle = Some(s["--args=".len()..].to_string());
-            }
-            s if s.starts_with("--chat-id=") => {
-                chat_id = Some(s["--chat-id=".len()..].to_string());
-            }
-            s if s.starts_with("--summary=") => {
-                let summary = s["--summary=".len()..].to_string();
-                close_item(&mut items, &mut cur_tool, &mut cur_needle, summary)?;
-            }
-            s if s.starts_with("--reason=") => {
-                let summary = s["--reason=".len()..].to_string();
-                close_item(&mut items, &mut cur_tool, &mut cur_needle, summary)?;
-            }
-            _ => return Err(()),
+        let s = a.as_str();
+        if s == "-h" || s == "--help" {
+            return Err(());
+        } else if let Some(v) = take_flag(s, "--tool-name", &mut it) {
+            cur_tool = Some(v);
+        } else if let Some(v) = take_flag(s, "--args", &mut it) {
+            cur_needle = Some(v);
+        } else if let Some(v) = take_flag(s, "--chat-id", &mut it) {
+            chat_id = Some(v);
+        } else if let Some(summary) = take_flag(s, "--summary", &mut it) {
+            close_item(&mut items, &mut cur_tool, &mut cur_needle, summary)?;
+        } else if let Some(summary) = take_flag(s, "--reason", &mut it) {
+            close_item(&mut items, &mut cur_tool, &mut cur_needle, summary)?;
+        } else {
+            return Err(());
         }
     }
     // Dangling `--tool-name`/`--args` with no closing `--summary` is a malformed
@@ -1630,6 +1638,23 @@ fn parse_prune_args(args: &[String]) -> Result<(Option<String>, Vec<control::Pru
     Ok((chat_id, items))
 }
 
+/// CLI entry point for `zucchini-spawner prune-context [--tool-name <Tool>]
+/// --args "<glob>" --summary "<digest>" [... more triples ...] [--chat-id <UUID>]`.
+///
+/// Thin RPC client over the control socket (mirrors `run_attach_file_cli`).
+/// Accepts ONE OR MORE prune targets per call: each `--summary` (alias
+/// `--reason`) CLOSES the current target (the `[--tool-name] --args` run before
+/// it). Batching is the point — several outputs forgotten in one process → one
+/// RPC → one restart, vs parallel processes that reap each other (`control.rs`
+/// `PruneContext`). A lone triple is a 1-item batch, byte-identical to the old
+/// single-call form (older-binary mid-turn stays hot-reload compatible). Per
+/// target: `--args` required (`""` = no-args selector); `--tool-name` optional
+/// (omit/`""` to match on `--args` alone, as codex does); `--summary` required
+/// (terminates the target). `--chat-id` is call-level, defaults to
+/// `ZUCCHINI_CHAT_ID`. `--flag=value` accepted. `--args` globs argument values
+/// and blanks only the most recent match (output reports how many remain). The
+/// daemon aborts the agent right after replying, so a post-send connection-reset
+/// is expected — the prune proceeds regardless.
 async fn run_prune_context_cli(args: &[String]) {
     fn usage_and_exit() -> ! {
         eprintln!(
@@ -1638,9 +1663,8 @@ async fn run_prune_context_cli(args: &[String]) {
         std::process::exit(2);
     }
 
-    // `--summary` is the per-target terminator; `--reason` is its legacy alias
-    // (kept so an agent mid-turn under an older binary keeps parsing across a
-    // hot-reload — both feed the same wire field, still named `reason`).
+    // `--reason` is the legacy alias for `--summary` (older binary mid-turn keeps
+    // parsing across a hot-reload); both feed the same wire field `reason`.
     let Ok((chat_id, items)) = parse_prune_args(args) else {
         usage_and_exit();
     };
@@ -1704,6 +1728,62 @@ async fn run_prune_context_cli(args: &[String]) {
         }
         Err(e) => {
             eprintln!("prune-context failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `schedule-message` subcommand. Twin of `run_attach_file_cli`: hand-rolled
+/// argv parse, one RPC over the control socket, human-readable result, exit
+/// 0/1. The daemon owns K_user + the JWT; this CLI only forwards the request.
+///
+/// `--at <local-datetime>` is required. Forwarded raw, zoned + validated
+/// daemon-side by `control::normalize_deliver_at` (naive local anchored in the
+/// user's tz, which only the daemon holds; unparseable values rejected so a
+/// garbage timestamp can't misfire). The queue-when-free path (`deliver_at` null)
+/// is composer-only — no use for the agent, which already runs at turn end.
+async fn run_schedule_message_cli(args: &[String]) {
+    fn usage_and_exit() -> ! {
+        eprintln!(
+            "usage: zucchini-spawner schedule-message --chat-id <UUID> --body <TEXT> --at <local-datetime, e.g. 2026-06-07T09:00:00>"
+        );
+        std::process::exit(2);
+    }
+
+    let mut chat_id: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut at: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let s = a.as_str();
+        if s == "-h" || s == "--help" {
+            usage_and_exit();
+        } else if let Some(v) = take_flag(s, "--chat-id", &mut it) {
+            chat_id = Some(v);
+        } else if let Some(v) = take_flag(s, "--body", &mut it) {
+            body = Some(v);
+        } else if let Some(v) = take_flag(s, "--at", &mut it) {
+            at = Some(v);
+        } else {
+            usage_and_exit();
+        }
+    }
+    // `--chat-id` defaults to $ZUCCHINI_CHAT_ID like the other subcommands (the
+    // agent always passes it explicitly, so this is just consistency).
+    let chat_id = chat_id_or_env(chat_id);
+    let (Some(chat_id), Some(body), Some(at)) = (chat_id, body, at) else {
+        usage_and_exit();
+    };
+
+    match control::schedule_message_via_socket(&chat_id, &body, Some(at)).await {
+        Ok(id) => {
+            // Stable, machine-parseable first line so the agent can grep for
+            // success; the row id follows for cross-referencing.
+            println!("scheduled message {id} on chat {chat_id}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("schedule-message failed: {e:#}");
             std::process::exit(1);
         }
     }
@@ -1774,6 +1854,10 @@ async fn main() {
             // `<system-reminder>` nudging the agent to prune. Inert/exit-0 on any
             // failure — a failing hook could disrupt claude.
             run_prune_reminder_hook_cli();
+            return;
+        }
+        if first == "schedule-message" {
+            run_schedule_message_cli(&raw_args[1..]).await;
             return;
         }
         if first == "hermes-turn" {
@@ -2616,6 +2700,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             is_sandboxed: false,
             model: None,
+            user_timezone: None,
         });
         assert!(
             supervisor.is_running(&chat_id),

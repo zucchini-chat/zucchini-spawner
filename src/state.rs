@@ -108,6 +108,20 @@ struct MemberInfo {
     /// peer iOS write landed while the spawner was offline.
     #[serde(skip)]
     agents: Option<String>,
+    /// Mirror of `machine_users.timezone` (migration 0040) — IANA id of the
+    /// member's most-recently-active device, or `None` (NULL / older client).
+    /// Consulted at spawn to inject the current local time (`current_time_in_tz_line`)
+    /// and zone naive `schedule-message --at` (`control::normalize_deliver_at`).
+    ///
+    /// PERSISTED (unlike `agents`). The `by_machine` bucket resumes incrementally
+    /// from the saved cursor, so an unchanged `machine_users` row is never
+    /// re-streamed after a restart — and nothing bumps it per turn (chats dodge
+    /// this via the per-message `last_seq` UPDATE). So a once-set tz would
+    /// otherwise be lost on the first restart and stay `None` forever, breaking the
+    /// prompt time line + naive `--at`. Accept the staleness window (a peer's tz
+    /// change while offline self-corrects on the next row change) to survive restarts.
+    #[serde(default)]
+    timezone: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -348,6 +362,7 @@ impl Mirror {
                 is_sandboxed,
                 last_sealed_blob: None,
                 agents: None,
+                timezone: None,
             },
         );
         true
@@ -375,6 +390,15 @@ impl Mirror {
     /// caller can fold them together.
     pub fn member_agents(&self, user_id: &Uuid) -> Option<&str> {
         self.members.get(user_id).and_then(|m| m.agents.as_deref())
+    }
+
+    /// Stash the raw `machine_users.timezone` IANA id (migration 0040). `None`
+    /// clears (NULL). No-op if the member entry doesn't exist yet (row_id lands
+    /// first via `upsert_member`). Mirrors `set_member_agents`.
+    pub fn set_member_timezone(&mut self, user_id: &Uuid, timezone: Option<String>) {
+        if let Some(info) = self.members.get_mut(user_id) {
+            info.timezone = timezone;
+        }
     }
 
     /// True if we've already unsealed this exact sealed_blob for this user.
@@ -418,6 +442,15 @@ impl Mirror {
 
     pub fn member_is_sandboxed(&self, user_id: &Uuid) -> Option<bool> {
         self.members.get(user_id).map(|m| m.is_sandboxed)
+    }
+
+    /// Cached `machine_users.timezone` IANA id (migration 0040). `None` = no
+    /// member entry OR NULL column; both mean "no tz hint". Mirrors
+    /// `member_is_sandboxed` / `member_agents`.
+    pub fn member_timezone(&self, user_id: &Uuid) -> Option<&str> {
+        self.members
+            .get(user_id)
+            .and_then(|m| m.timezone.as_deref())
     }
 
     pub fn has_member(&self, user_id: &Uuid) -> bool {

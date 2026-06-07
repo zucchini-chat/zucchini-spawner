@@ -131,6 +131,10 @@ pub struct SpawnRequest {
     /// the `main.rs` construction site so adapters can read `Some(_)`
     /// as "user picked a non-default model".
     pub model: Option<String>,
+    /// Sender's IANA timezone (`machine_users.timezone`, migration 0040), or
+    /// `None`. Injects the user's current local time into the prompt each turn
+    /// for `schedule-message --at`.
+    pub user_timezone: Option<String>,
 }
 
 /// Per-spawn closure: owns the OS-side work (build Command, spawn, drive
@@ -278,6 +282,7 @@ fn default_spawn_fn(
         agent_kind,
         is_sandboxed,
         model,
+        user_timezone,
     } = req;
     let mut adapter = agent_kind.make_adapter();
 
@@ -353,7 +358,32 @@ fn default_spawn_fn(
                 .as_nanos()
         );
         let prompt_file = PathBuf::from(format!("/tmp/zucchini-prompt-{}.txt", unique));
-        if let Err(e) = tokio::fs::write(&prompt_file, &prompt).await {
+
+        let ctx = TurnContext {
+            chat_id: &topic_clone,
+            prompt_file: &prompt_file,
+            project_path: project_path.as_deref(),
+            worktree,
+            agent_session_id: agent_session_id.as_deref(),
+            is_sandboxed,
+            model: model.as_deref(),
+            user_timezone: user_timezone.as_deref(),
+        };
+
+        // Prepend the adapter's prompt-file prefixes (contracts on
+        // `AgentAdapter::prompt_file_time_line` / `prompt_file_preamble`) ONLY into
+        // the plaintext temp file, never the synced/persisted `messages` row.
+        // Injection order: volatile time line, once-only preamble, then the message.
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(time_line) = adapter.prompt_file_time_line(&ctx) {
+            parts.push(time_line);
+        }
+        if let Some(preamble) = adapter.prompt_file_preamble(&ctx) {
+            parts.push(preamble);
+        }
+        parts.push(prompt);
+        let prompt_to_write = parts.join("\n\n---\n\n");
+        if let Err(e) = tokio::fs::write(&prompt_file, &prompt_to_write).await {
             error!("failed to write prompt file: {}", e);
             fail_agent(
                 &tx,
@@ -364,15 +394,6 @@ fn default_spawn_fn(
             return;
         }
 
-        let ctx = TurnContext {
-            chat_id: &topic_clone,
-            prompt_file: &prompt_file,
-            project_path: project_path.as_deref(),
-            worktree,
-            agent_session_id: agent_session_id.as_deref(),
-            is_sandboxed,
-            model: model.as_deref(),
-        };
         let cmd_string = match adapter.prepare_command(&ctx) {
             Ok(s) => s,
             Err(e) => {
@@ -391,13 +412,11 @@ fn default_spawn_fn(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .process_group(0); // new process group so we can kill shell + agent together
-                               // Adapter system prompts reference both vars by name (see
-                               // `adapters/claude.rs` / `adapters/cursor.rs` prompt strings) to tell
-                               // the agent how to invoke `zucchini-spawner attach-file`. We export
-                               // them on the spawn rather than relying on the user's shell rc so a
-                               // stale PATH can't pick up the wrong binary — `current_exe()` is
-                               // whatever launchd/systemd is actually running, which is what the
-                               // RPC handler also listens on.
+                               // Adapter prompts reference both vars to invoke
+                               // `zucchini-spawner attach-file` / `schedule-message`. Exported on
+                               // the spawn (not via shell rc) so a stale PATH can't pick the wrong
+                               // binary — `current_exe()` is whatever launchd/systemd runs, which
+                               // is also what the RPC handler listens on.
         cmd.env("ZUCCHINI_CHAT_ID", &topic_clone);
         if let Ok(exe) = std::env::current_exe() {
             cmd.env("ZUCCHINI_SPAWNER_BIN", exe);

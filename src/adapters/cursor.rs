@@ -44,9 +44,9 @@ use tokio::process::Command;
 use tracing::{debug, warn};
 
 use crate::adapter::{
-    claude_assistant_envelope, claude_tool_use_envelope, parse_json_obj, shell_escape,
-    AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, TurnContext, ATTACH_FILE_INSTRUCTION,
-    MAX_STREAM_FRAME_BYTES,
+    agent_capabilities_instructions, claude_assistant_envelope, claude_tool_use_envelope,
+    current_time_in_tz_line, parse_json_obj, shell_escape, AdapterDescriptor, AgentAdapter,
+    AgentEvent, AgentKind, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -139,11 +139,37 @@ impl AgentAdapter for CursorAdapter {
         if let Some(pp) = ctx.project_path {
             cmd.push_str(&format!("cd {} && ", shell_escape(pp)));
         }
+        // Worktree containment, computed up front so the preamble below carries
+        // the "stay inside" rule. cursor-agent hardcodes the dir at
+        // `~/.cursor/worktrees/<basename(project)>/<wt_name>` (see NOTE at the flag
+        // site below). Wording via the shared `adapter::worktree_instructions`.
+        let worktree_info = ctx.worktree.then(|| {
+            let short: String = ctx.chat_id.chars().take(12).collect();
+            let wt_name = format!("zcm-{}", short);
+            let repo = ctx
+                .project_path
+                .map(|pp| pp.trim_end_matches('/').rsplit('/').next().unwrap_or(pp))
+                .unwrap_or("project");
+            let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+            let worktree_abs = format!("{home}/.cursor/worktrees/{repo}/{wt_name}");
+            WorktreeInstructions {
+                worktree_abs,
+                parent_repo: ctx.project_path.unwrap_or(repo).to_string(),
+            }
+        });
         // cursor-agent has no `--append-system-prompt` (or any other system /
         // prompt-prefix flag — confirmed against `cursor-agent --help` 2026.05).
         // The only injection point is the stdin prompt itself, so we prepend
         // a short preamble before the user's prompt body.
-        let preamble = format!("{}\n\n---\n\n", ATTACH_FILE_INSTRUCTION);
+        // Fold the per-turn time line into this rebuilt-every-turn preamble (hence
+        // the `prompt_file_time_line` override returns `None`).
+        let preamble = format!(
+            "{}\n\n---\n\n",
+            agent_capabilities_instructions(
+                worktree_info.as_ref(),
+                current_time_in_tz_line(ctx.user_timezone).as_deref(),
+            )
+        );
         cmd.push_str(&format!(
             "{{ printf %s {}; cat {}; }} | cursor-agent",
             shell_escape(&preamble),
@@ -200,6 +226,13 @@ impl AgentAdapter for CursorAdapter {
             // entirely — anything user-facing is cross-file from here.
         }
         Ok(cmd)
+    }
+
+    /// The current-local-time line is folded into the per-turn stdin preamble
+    /// (`agent_capabilities_instructions` in `prepare_command`), so suppress the
+    /// prompt-file prepend to avoid injecting it twice.
+    fn prompt_file_time_line(&self, _ctx: &TurnContext<'_>) -> Option<String> {
+        None
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
@@ -1760,18 +1793,43 @@ mod tests {
         let mut a = CursorAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
         let ctx = TurnContext {
+            // chat_id prefix names the worktree dir, asserted below.
             chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
             worktree: true,
-            agent_session_id: None,
-            is_sandboxed: false,
-            model: None,
+            ..TurnContext::for_test(&prompt_file, None, false, None)
         };
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(
             cmd.contains("--worktree 'zcm-abcdef012345'"),
             "got: {}",
+            cmd
+        );
+        // Stdin preamble carries capabilities + (worktree on) the worktree rule
+        // naming cursor's `~/.cursor/worktrees/<repo>/<name>` dir.
+        assert!(cmd.contains("attach-file"), "got: {}", cmd);
+        assert!(cmd.contains("schedule-message"), "got: {}", cmd);
+        assert!(cmd.contains("Worktree:"), "worktree rule present: {}", cmd);
+        assert!(
+            cmd.contains(".cursor/worktrees/proj/zcm-abcdef012345"),
+            "cursor worktree abs path in rule: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn worktree_off_omits_worktree_rule_from_preamble() {
+        use crate::adapter::TurnContext;
+        use std::path::PathBuf;
+        let mut a = CursorAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let ctx = TurnContext::for_test(&prompt_file, None, false, None);
+        let cmd = a.prepare_command(&ctx).unwrap();
+        // Capabilities always present; worktree rule only when worktree is on.
+        assert!(cmd.contains("attach-file"), "got: {}", cmd);
+        assert!(cmd.contains("schedule-message"), "got: {}", cmd);
+        assert!(
+            !cmd.contains("Worktree:"),
+            "worktree off → no rule: {}",
             cmd
         );
     }
@@ -1783,13 +1841,10 @@ mod tests {
         let mut a = CursorAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
         let ctx = TurnContext {
+            // chat_id prefix names the worktree dir, asserted below.
             chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
             worktree: true,
-            agent_session_id: Some("sess-1"),
-            is_sandboxed: false,
-            model: None,
+            ..TurnContext::for_test(&prompt_file, Some("sess-1"), false, None)
         };
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(cmd.contains("--resume 'sess-1'"), "got: {}", cmd);
@@ -1806,15 +1861,7 @@ mod tests {
         use std::path::PathBuf;
         let mut a = CursorAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
-        let ctx = TurnContext {
-            chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: None,
-            is_sandboxed: true,
-            model: None,
-        };
+        let ctx = TurnContext::for_test(&prompt_file, None, true, None);
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(!cmd.contains("--force"), "got: {}", cmd);
         // --trust and --approve-mcps still required for headless to function.
@@ -1828,15 +1875,7 @@ mod tests {
         use std::path::PathBuf;
         let mut a = CursorAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
-        let ctx = TurnContext {
-            chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: None,
-            is_sandboxed: false,
-            model: None,
-        };
+        let ctx = TurnContext::for_test(&prompt_file, None, false, None);
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(cmd.contains("--force"), "got: {}", cmd);
     }
@@ -2401,15 +2440,7 @@ mod tests {
         use std::path::PathBuf;
         let mut a = CursorAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
-        let ctx = TurnContext {
-            chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: None,
-            is_sandboxed: false,
-            model: None,
-        };
+        let ctx = TurnContext::for_test(&prompt_file, None, false, None);
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(!cmd.contains("--worktree"), "got: {}", cmd);
     }
@@ -2423,15 +2454,7 @@ mod tests {
         use std::path::PathBuf;
         let mut a = CursorAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
-        let ctx = TurnContext {
-            chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: None,
-            is_sandboxed: false,
-            model: Some("Composer 2.5 Fast"),
-        };
+        let ctx = TurnContext::for_test(&prompt_file, None, false, Some("Composer 2.5 Fast"));
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(cmd.contains("--model 'Composer 2.5 Fast'"), "got: {}", cmd);
     }
@@ -2444,15 +2467,7 @@ mod tests {
         use std::path::PathBuf;
         let mut a = CursorAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
-        let ctx = TurnContext {
-            chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: None,
-            is_sandboxed: false,
-            model: None,
-        };
+        let ctx = TurnContext::for_test(&prompt_file, None, false, None);
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(!cmd.contains("--model"), "got: {}", cmd);
     }

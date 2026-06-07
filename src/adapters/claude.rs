@@ -17,9 +17,10 @@ use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::adapter::{
-    file_nonempty, probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter,
-    AgentEvent, AgentKind, LastTokensDedup, TurnContext, ATTACH_FILE_INSTRUCTION,
-    MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION,
+    agent_capabilities_instructions, current_time_in_tz_line, file_nonempty,
+    probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind,
+    LastTokensDedup, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
+    PRUNE_CONTEXT_INSTRUCTION,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -139,28 +140,33 @@ impl AgentAdapter for ClaudeAdapter {
             "You are spawned via a harness, no background subagents will wake you when finished, use subagents with `run_in_background: false` only."
         );
 
+        // Worktree containment: when `--worktree` is on and the project path is
+        // known, resolve the absolute worktree path so the capability block can
+        // carry the "stay inside" rule (wording in `adapter::worktree_instructions`).
+        let mut worktree_info: Option<WorktreeInstructions> = None;
         if ctx.worktree {
             // Use the chat_id prefix so the worktree directory name stays short.
             let worktree_name: String = ctx.chat_id.chars().take(8).collect();
             claude_cmd.push_str(&format!(" --worktree {}", shell_escape(&worktree_name)));
-            // Plug the path-containment hole in --worktree: the harness chdirs into
-            // the worktree but doesn't tell the agent (or its subagents) to stay
-            // there, so absolute paths into the parent repo "just work" and edits
-            // leak out. Inject the absolute worktree path with an explicit rule.
             if let Some(pp) = ctx.project_path {
                 let worktree_abs = format!(
                     "{}/.claude/worktrees/{}",
                     pp.trim_end_matches('/'),
                     worktree_name
                 );
-                sys.push_str(&format!(
-                    "\n\nWorktree: {}\nParent repo: {} (do not touch unless the user explicitly asks).\nKeep all edits and Bash commands inside the worktree. If a path under the parent repo appears in context, rewrite it to the worktree before calling Edit/Write/Bash. When delegating via Task, repeat this rule and the worktree path — subagents don't inherit it.",
-                    worktree_abs, pp
-                ));
+                worktree_info = Some(WorktreeInstructions {
+                    worktree_abs,
+                    parent_repo: pp.to_string(),
+                });
             }
         }
         sys.push_str("\n\n");
-        sys.push_str(ATTACH_FILE_INSTRUCTION);
+        // Fold the per-turn time line into this fresh-every-turn block (hence the
+        // `prompt_file_time_line` override returns `None`); prune nudge appended after.
+        sys.push_str(&agent_capabilities_instructions(
+            worktree_info.as_ref(),
+            current_time_in_tz_line(ctx.user_timezone).as_deref(),
+        ));
         sys.push_str("\n\n");
         sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
         claude_cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
@@ -213,6 +219,13 @@ impl AgentAdapter for ClaudeAdapter {
             shell_escape(&settings.to_string())
         ));
         Ok(claude_cmd)
+    }
+
+    /// The current-local-time line is folded into the per-turn system prompt
+    /// (`agent_capabilities_instructions` in `prepare_command`), so suppress the
+    /// prompt-file prepend to avoid injecting it twice.
+    fn prompt_file_time_line(&self, _ctx: &TurnContext<'_>) -> Option<String> {
+        None
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
@@ -1432,15 +1445,7 @@ mod tests {
         use std::path::PathBuf;
         let mut a = ClaudeAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
-        let ctx = TurnContext {
-            chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: None,
-            is_sandboxed: false,
-            model: Some("opus"),
-        };
+        let ctx = TurnContext::for_test(&prompt_file, None, false, Some("opus"));
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(cmd.contains("--model 'opus'"), "got: {}", cmd);
     }
@@ -1454,17 +1459,62 @@ mod tests {
         use std::path::PathBuf;
         let mut a = ClaudeAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
-        let ctx = TurnContext {
-            chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: None,
-            is_sandboxed: false,
-            model: None,
-        };
+        let ctx = TurnContext::for_test(&prompt_file, None, false, None);
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(!cmd.contains("--model"), "got: {}", cmd);
+    }
+
+    #[test]
+    fn injected_system_prompt_carries_capabilities_and_no_worktree_when_off() {
+        // claude injects via --append-system-prompt: block carries capabilities,
+        // no worktree rule (off), and the prepend path is unused.
+        use crate::adapter::TurnContext;
+        use std::path::PathBuf;
+        let mut a = ClaudeAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let ctx = TurnContext::for_test(&prompt_file, None, false, None);
+        let cmd = a.prepare_command(&ctx).unwrap();
+        assert!(cmd.contains("--append-system-prompt"), "got: {}", cmd);
+        assert!(cmd.contains("attach-file"), "got: {}", cmd);
+        assert!(cmd.contains("schedule-message"), "got: {}", cmd);
+        assert!(
+            !cmd.contains("Worktree:"),
+            "worktree off → no rule: {}",
+            cmd
+        );
+        assert!(
+            a.prompt_file_preamble(&ctx).is_none(),
+            "claude conveys via system prompt, not the prepend path"
+        );
+    }
+
+    #[test]
+    fn worktree_on_folds_worktree_rule_into_injected_block() {
+        // worktree=true + known project path → worktree rule (abs path + parent
+        // repo) lands in the same --append-system-prompt block.
+        use crate::adapter::TurnContext;
+        use std::path::PathBuf;
+        let mut a = ClaudeAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let ctx = TurnContext {
+            // chat_id prefix names the worktree dir, asserted below.
+            chat_id: "abcdef012345-6789-...",
+            worktree: true,
+            ..TurnContext::for_test(&prompt_file, None, false, None)
+        };
+        let cmd = a.prepare_command(&ctx).unwrap();
+        assert!(cmd.contains("--worktree"), "got: {}", cmd);
+        assert!(cmd.contains("Worktree:"), "worktree rule present: {}", cmd);
+        // chat_id prefix (first 8 chars) names the worktree dir under the project.
+        assert!(
+            cmd.contains("/tmp/proj/.claude/worktrees/abcdef01"),
+            "absolute worktree path in rule: {}",
+            cmd
+        );
+        assert!(cmd.contains("Parent repo: /tmp/proj"), "got: {}", cmd);
+        // Capability instructions still present in the same block.
+        assert!(cmd.contains("attach-file"), "got: {}", cmd);
+        assert!(cmd.contains("schedule-message"), "got: {}", cmd);
     }
 
     #[test]
@@ -1473,15 +1523,7 @@ mod tests {
         use std::path::PathBuf;
         let mut a = ClaudeAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
-        let ctx = TurnContext {
-            chat_id: "abcdef012345-6789-...",
-            prompt_file: &prompt_file,
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: None,
-            is_sandboxed: false,
-            model: None,
-        };
+        let ctx = TurnContext::for_test(&prompt_file, None, false, None);
         let cmd = a.prepare_command(&ctx).unwrap();
         // The standing prune-context instruction rides --append-system-prompt …
         assert!(cmd.contains("prune-context"), "got: {}", cmd);
