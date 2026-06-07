@@ -318,6 +318,14 @@ pub(crate) fn tool_name_matches(
     }
 }
 
+/// The empty `name → [raw dialect names]` map fed to [`tool_name_matches`] when
+/// the dialect's tool names are ALREADY claude-shape (cursor) — an empty mapping
+/// makes `want` match literally against `actual`. Shared so the trivial
+/// `|_| Vec::new()` map isn't hand-rolled in cursor.rs + the prune.rs tests.
+pub(crate) fn no_tool_map(_: &str) -> Vec<&'static str> {
+    Vec::new()
+}
+
 /// One parsed transcript line: the original verbatim string (kept byte-for-byte
 /// for unchanged / blank / parse-failed lines) alongside its parsed JSON value
 /// (`None` for blank or parse-failed lines).
@@ -710,9 +718,7 @@ mod tests {
 
     #[test]
     fn tool_name_matches_empty_want_is_any_tool_selector() {
-        fn no_map(_: &str) -> Vec<&'static str> {
-            Vec::new()
-        }
+        let no_map = no_tool_map;
         // Empty `--tool-name` matches any actual tool name (prune on args alone) —
         // regardless of whether the map knows the name. This is what lets codex
         // omit `--tool-name`.

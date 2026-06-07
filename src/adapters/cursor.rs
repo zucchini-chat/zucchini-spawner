@@ -47,6 +47,7 @@ use crate::adapter::{
     agent_capabilities_instructions, claude_assistant_envelope, claude_tool_use_envelope,
     current_time_in_tz_line, parse_json_obj, shell_escape, AdapterDescriptor, AgentAdapter,
     AgentEvent, AgentKind, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
+    PRUNE_CONTEXT_INSTRUCTION,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -60,9 +61,19 @@ pub const DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     make: make_boxed,
     probe: probe_boxed,
     import: import_boxed,
-    // No editable local plaintext transcript (history is an opaque VS Code
-    // SQLite blob + server-bound chat id) — prune-context is infeasible.
-    prune: None,
+    // cursor-agent's LIVE CLI session is a content-addressed (git-like) Merkle
+    // blob store in SQLite at `~/.cursor/chats/<projectHash>/<sessionUuid>/
+    // store.db` — NOT the opaque VS Code `state.vscdb` the importer reads (that
+    // earlier "infeasible" note conflated the two). Each blob is keyed by
+    // `sha256(data)`; message blobs are JSON, the conversation root is a
+    // protobuf whose repeated field-1 entries are the message-blob hashes in
+    // order. We prune a tool result by blanking its message blob, re-minting the
+    // root with that hash swapped, and re-pointing `meta.latestRootBlobId`.
+    // VERIFIED ("local replay"): after this + `cursor-agent --resume`, the model
+    // reports the pruned output as `[pruned]` in its own context — so cursor
+    // replays from the LOCAL store, not server-canonical history. Full spec +
+    // PoC: `tmp/cursor-agent-prune-plan.md`.
+    prune: Some(PRUNE_OPS),
 };
 
 fn make_boxed() -> Box<dyn AgentAdapter> {
@@ -159,16 +170,24 @@ impl AgentAdapter for CursorAdapter {
         });
         // cursor-agent has no `--append-system-prompt` (or any other system /
         // prompt-prefix flag — confirmed against `cursor-agent --help` 2026.05).
-        // The only injection point is the stdin prompt itself, so we prepend
-        // a short preamble before the user's prompt body.
-        // Fold the per-turn time line into this rebuilt-every-turn preamble (hence
-        // the `prompt_file_time_line` override returns `None`).
+        // a short preamble before the user's prompt body. `agent_capabilities_instructions`
+        // bundles the attach-file how-to, schedule-message, worktree containment,
+        // and the per-turn time line; we then append the prune-context standing
+        // order (cursor's selective-forgetting nudge — its reads run through
+        // `Read`, so the claude-shape `PRUNE_CONTEXT_INSTRUCTION` is the right
+        // variant, NOT the codex/gemini tool-name variants). The whole preamble
+        // rides every turn (not just the first, unlike codex/gemini's
+        // `first_turn_prompt_suffix`); cursor's `--resume` reconstructs history
+        // from the local store and drops our user-echo frame, so the preamble
+        // never persists and must be re-sent — hence `first_turn_prompt_suffix`
+        // stays `None` and the per-turn time line lives here too.
         let preamble = format!(
-            "{}\n\n---\n\n",
+            "{}\n\n{}\n\n---\n\n",
             agent_capabilities_instructions(
                 worktree_info.as_ref(),
                 current_time_in_tz_line(ctx.user_timezone).as_deref(),
-            )
+            ),
+            PRUNE_CONTEXT_INSTRUCTION
         );
         cmd.push_str(&format!(
             "{{ printf %s {}; cat {}; }} | cursor-agent",
@@ -356,8 +375,30 @@ impl AgentAdapter for CursorAdapter {
                     // tool_call.completed parse below fails — the id is
                     // the source of truth for "how many LLM calls ran."
                     self.record_model_call_id(&obj);
+                    // Call-keyed prune cue: fire ONLY when THIS completed tool is
+                    // the `prune-context` shell call itself, matched on its own
+                    // `tool_call.<verb>ToolCall.args` (the shellToolCall args
+                    // object carrying `{"command":"…prune-context…"}`). A sibling
+                    // tool's completion in the same batch must NOT drive the apply
+                    // — it would abort→respawn before this call's result is
+                    // persisted to the local store, so the resumed agent re-runs
+                    // the prune. The command is right here in the frame, so no
+                    // cross-frame state is needed. Mirrors codex's
+                    // `is_prune_command` posture.
+                    let is_prune_command = tool_call_args_value(&obj)
+                        .is_some_and(|args| crate::prune::value_is_prune_context_call(&args));
                     if let Some(frame) = normalize_tool_call_completed(&obj) {
                         out.push(AgentEvent::Frame(frame));
+                    }
+                    // Emit the content-free `ToolResult` cue AFTER any visible
+                    // frame (so a restart never preempts the tool's own bubble),
+                    // so the main loop applies the queued prune strictly after the
+                    // result landed (the mechanism claude/gemini/codex use too).
+                    // No-op unless a `PruneRequest` is pending. Without this the
+                    // queued prune is silently dropped at turn end — cursor has no
+                    // timeout fallback in the main loop.
+                    if is_prune_command {
+                        out.push(AgentEvent::ToolResult);
                     }
                 } else {
                     // `started` is mutable; wait for `completed`. The
@@ -496,6 +537,20 @@ fn normalize_tool_call_completed(obj: &Value) -> Option<String> {
     let raw_args = verb_payload.get("args").cloned().unwrap_or(Value::Null);
     let (name, input) = map_cursor_tool(verb_key, &raw_args);
     Some(claude_tool_use_envelope(call_id, &name, input))
+}
+
+/// Extract a `tool_call.completed` frame's verb args object
+/// (`tool_call.<verb>ToolCall.args`) for the call-keyed prune cue. Picks the
+/// verb entry by the `…ToolCall` suffix (NOT iteration order — same hazard
+/// `normalize_tool_call_completed` guards against: an alphabetically-earlier
+/// sibling like `_meta` would steal `iter().next()`), then returns its `args`
+/// value. `None` when the frame has no `tool_call` object, no `…ToolCall` entry,
+/// or that entry carries no `args`. Used only to detect the agent's OWN
+/// `prune-context` shell call via `crate::prune::value_is_prune_context_call`.
+fn tool_call_args_value(obj: &Value) -> Option<Value> {
+    let tool_call = obj.get("tool_call")?.as_object()?;
+    let (_verb_key, verb_payload) = tool_call.iter().find(|(k, _)| k.ends_with("ToolCall"))?;
+    verb_payload.get("args").cloned()
 }
 
 /// Substring-based synthesis of a minimal claude-shape tool_use envelope for
@@ -751,6 +806,596 @@ async fn is_authenticated() -> bool {
 struct StatusJson {
     #[serde(rename = "isAuthenticated", default)]
     is_authenticated: bool,
+}
+
+// ===========================================================================
+// Selective forgetting ("prune-context") for the cursor adapter.
+//
+// Unlike claude/gemini/codex (line-oriented JSONL files that share `prune.rs`'s
+// `rewrite_jsonl_*` helpers), cursor's LIVE CLI session is a content-addressed
+// (git-like) Merkle blob store in SQLite at
+// `~/.cursor/chats/<projectHash>/<sessionUuid>/store.db`:
+//   - `blobs(id TEXT PRIMARY KEY = sha256(data), data BLOB)` — message blobs are
+//     JSON `{role, content, …}`; tree nodes (the conversation root + per-turn
+//     checkpoints) are protobuf.
+//   - `meta(key, value)` — key `'0'`'s value is HEX-encoded JSON text; decode →
+//     `{latestRootBlobId: "<hex sha256>", …}`. `latestRootBlobId` is HEAD (the
+//     only root `--resume` loads).
+//   - The root protobuf's repeated field-1 entries (`0x0A 0x20` + raw 32-byte
+//     hash) are the conversation's message-blob hashes in document order, and
+//     the root references the message blobs DIRECTLY (flat — no intermediate
+//     tree), so re-pointing = byte-replacing one (or more) 32-byte hash(es).
+//
+// To prune a tool result we blank its `tool` blob's `result` +
+// `experimental_content`, re-mint that blob (new sha = new id), byte-replace its
+// old hash in the root, re-sha the root, and move `meta.latestRootBlobId`. We
+// NEVER delete blobs or rewrite older checkpoint roots — old roots stay valid so
+// cursor's rewind feature keeps working. All the dialect-agnostic matchers
+// (`tool_name_matches`, `value_glob_match`, `value_is_prune_context_call`,
+// `args_value_is_empty`, `blank_string_field`, `PRUNED_PLACEHOLDER`) are reused
+// from `prune.rs`; only the storage surgery is cursor-specific.
+//
+// Safety (mirrors claude/codex TOCTOU posture): no-op on ANY mismatch, never a
+// partial write. Every guard failure logs a `warn!` breadcrumb (format-drift
+// signal) and returns `PruneStats::default()` (0 blanked ⇒ frame skipped). All
+// writes happen in ONE transaction so a mid-way failure rolls back. Spec + PoC:
+// `tmp/cursor-agent-prune-plan.md`.
+
+use sha2::{Digest, Sha256};
+
+/// `crate::prune::PruneOps` for cursor (content-addressed store surgery). Wired
+/// into the descriptor via `prune: Some(PRUNE_OPS)`.
+pub(crate) const PRUNE_OPS: crate::prune::PruneOps = crate::prune::PruneOps {
+    find_session: find_cursor_store,
+    count_matches: count_cursor_matches,
+    prune_batch: prune_batch_cursor,
+};
+
+/// Hex-encode bytes (lowercase) — sha256 ids + raw-hash hex are compared as
+/// lowercase hex strings throughout.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode a lowercase-hex string to bytes; `None` on any non-hex char or odd
+/// length. Used to turn a blob id (hex) into the raw 32-byte hash the root
+/// protobuf embeds.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// `sha256(data)` as lowercase hex — the cursor blob id of `data`.
+fn blob_id(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    hex_encode(&h.finalize())
+}
+
+/// `find_session(base, session_id)`: `base` = `~/.cursor`. cursor nests each
+/// session's store under an opaque `<projectHash>` dir, so we glob
+/// `base/chats/*/<session_id>/store.db` via `std::fs::read_dir` (no glob crate)
+/// and return the first one that exists. `None` when the base/chats dir is
+/// absent or no matching store.db exists yet.
+fn find_cursor_store(base: &Path, session_id: &str) -> Option<PathBuf> {
+    let chats = base.join("chats");
+    let entries = std::fs::read_dir(&chats).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let candidate = entry.path().join(session_id).join("store.db");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Everything read out of a cursor store needed by both the count pre-scan and
+/// the apply: every blob (`id → data`), the decoded meta JSON text + the
+/// `latestRootBlobId` (HEAD), and the conversation's message-blob ids in
+/// DOCUMENT ORDER (decoded from the root protobuf's field-1 entries).
+struct CursorStore {
+    /// `blob id (hex) → raw blob bytes`.
+    blobs: std::collections::HashMap<String, Vec<u8>>,
+    /// `blob id (hex) → parsed JSON`, for the message blobs that ARE JSON
+    /// (protobuf tree nodes — root + checkpoints — have no entry). Parsed ONCE
+    /// here so the eligibility scan, the blob-target grouping, and the blank
+    /// pass all read the same `Value` instead of `from_slice`-ing each blob 2-3×.
+    parsed: std::collections::HashMap<String, serde_json::Value>,
+    /// The decoded (un-hexlified) `meta['0']` JSON text — string-replaced on
+    /// write to preserve byte-for-byte formatting, exactly like the PoC.
+    meta_text: String,
+    /// `meta_json["latestRootBlobId"]` — HEAD, the root `--resume` loads.
+    root_id: String,
+    /// Message-blob ids (hex) in document order, decoded from the root's field-1
+    /// entries (each `0x0A 0x20` + a 32-byte hash that IS a known blob id).
+    order: Vec<String>,
+}
+
+impl CursorStore {
+    /// The parsed JSON `role` of blob `id`, or `None` for a non-JSON (protobuf)
+    /// blob or one with no string `role`.
+    fn role(&self, id: &str) -> Option<&str> {
+        self.parsed.get(id)?.get("role").and_then(|r| r.as_str())
+    }
+}
+
+/// Read `meta['0']` robustly (stored as TEXT or BLOB, per the PoC's
+/// `if isinstance(v, bytes)`) and return its decoded JSON text (un-hexlified).
+fn read_meta_text(conn: &rusqlite::Connection) -> Option<String> {
+    // SQLite may hand the value back as TEXT or BLOB depending on how it was
+    // written (the PoC's `if isinstance(v, bytes)` handles both). rusqlite's
+    // `Vec<u8>`/`String` FromSql are storage-class-strict, so pull the
+    // `ValueRef` and accept either Text or Blob, normalizing to a hex string.
+    let hex: String = conn
+        .query_row("SELECT value FROM meta WHERE key='0'", [], |r| {
+            use rusqlite::types::ValueRef;
+            match r.get_ref(0)? {
+                ValueRef::Text(b) | ValueRef::Blob(b) => {
+                    Ok(String::from_utf8_lossy(b).into_owned())
+                }
+                _ => Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "value".into(),
+                    rusqlite::types::Type::Text,
+                )),
+            }
+        })
+        .ok()?;
+    let json_bytes = hex_decode(hex.trim())?;
+    String::from_utf8(json_bytes).ok()
+}
+
+/// Scan the root protobuf for the conversation's message-blob hashes in document
+/// order: each is a `0x0A 0x20` (field 1, wire 2, length 32) prefix followed by
+/// 32 raw bytes whose hex IS a known blob id (exactly as `cursor_prune_decode.py`
+/// does — only treat it as a message hash if it's in `blobs`, which skips field-8
+/// aux roots `0x42 0x20 …` and any incidental `0A 20` byte pair). Operates on
+/// raw bytes; no protobuf library.
+fn decode_root_order(
+    root_data: &[u8],
+    blobs: &std::collections::HashMap<String, Vec<u8>>,
+) -> Vec<String> {
+    // Decode the blob-id hexes to raw 32-byte hashes ONCE, so each `0A 20`
+    // candidate compares raw bytes (no per-candidate `hex_encode` alloc); we
+    // only hex-encode the confirmed match for the returned ordered ids.
+    let raw_ids: std::collections::HashSet<[u8; 32]> = blobs
+        .keys()
+        .filter_map(|id| hex_decode(id))
+        .filter_map(|v| <[u8; 32]>::try_from(v).ok())
+        .collect();
+    let mut order = Vec::new();
+    let mut i = 0usize;
+    while i + 34 <= root_data.len() {
+        if root_data[i] == 0x0A && root_data[i + 1] == 0x20 {
+            let hash: [u8; 32] = root_data[i + 2..i + 34].try_into().expect("34-i slice is 32");
+            if raw_ids.contains(&hash) {
+                order.push(hex_encode(&hash));
+                i += 34;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    order
+}
+
+/// Load a [`CursorStore`] from `conn`. `None` (with a `warn!`) when the meta head
+/// is unreadable, the root blob is missing, or any blob fails the
+/// `sha256(data) == id` content-address invariant — fail-closed so a corrupt /
+/// drifted store is never edited.
+fn load_cursor_store(conn: &rusqlite::Connection) -> Option<CursorStore> {
+    let mut stmt = conn.prepare("SELECT id, data FROM blobs").ok()?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .ok()?;
+    let mut blobs: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for row in rows {
+        let (id, data) = row.ok()?;
+        // Content-address invariant: a blob whose id isn't sha256(data) means the
+        // store is corrupt or a future cursor changed the hashing — bail rather
+        // than re-mint against a broken baseline.
+        if blob_id(&data) != id {
+            warn!("cursor prune: blob id != sha256(data) — store drift, skipping");
+            return None;
+        }
+        blobs.insert(id, data);
+    }
+
+    let meta_text = read_meta_text(conn)?;
+    let meta_json: serde_json::Value = serde_json::from_str(&meta_text).ok()?;
+    let root_id = meta_json
+        .get("latestRootBlobId")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let Some(root_data) = blobs.get(&root_id) else {
+        warn!("cursor prune: meta latestRootBlobId not in blobs — store drift, skipping");
+        return None;
+    };
+    let order = decode_root_order(root_data, &blobs);
+    // Parse every JSON blob ONCE. Protobuf tree nodes (root + checkpoints) fail
+    // `from_slice` and are simply absent from the map — downstream only ever
+    // looks up message blobs by id.
+    let parsed: std::collections::HashMap<String, serde_json::Value> = blobs
+        .iter()
+        .filter_map(|(id, data)| {
+            serde_json::from_slice::<serde_json::Value>(data)
+                .ok()
+                .map(|v| (id.clone(), v))
+        })
+        .collect();
+    Some(CursorStore {
+        blobs,
+        parsed,
+        meta_text,
+        root_id,
+        order,
+    })
+}
+
+/// The toolCallIds (in document order) ELIGIBLE to prune for `(tool_name,
+/// needle)`: matched assistant `tool-call` parts MINUS toolCallIds whose paired
+/// `tool-result` is ALREADY `[pruned]` (idempotent re-prune ⇒ clean no-op).
+/// Mirrors the JSONL adapters' "ordered matched minus already-pruned", but over
+/// the blob store's `order`. Reuses the `prune.rs` matchers: `toolName` is
+/// already claude-shape, so `tool_name_matches` gets `prune::no_tool_map`
+/// (literal compare / any-tool selector); `needle == ""` is the no-args selector.
+fn cursor_eligible_ids(store: &CursorStore, tool_name: &str, needle: &str) -> Vec<String> {
+    let mut matched: Vec<String> = Vec::new();
+    let mut pruned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for id in &store.order {
+        let Some(blob) = store.parsed.get(id) else {
+            continue;
+        };
+        let role = blob.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let Some(parts) = blob.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        if role == "assistant" {
+            for part in parts {
+                if part.get("type").and_then(|t| t.as_str()) != Some("tool-call") {
+                    continue;
+                }
+                let Some(call_id) = part.get("toolCallId").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let part_tool = part.get("toolName").and_then(|v| v.as_str()).unwrap_or("");
+                if !crate::prune::tool_name_matches(part_tool, tool_name, crate::prune::no_tool_map)
+                {
+                    continue;
+                }
+                let args = part.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                // Never target the agent's OWN prune-context shell call.
+                if crate::prune::value_is_prune_context_call(&args) {
+                    continue;
+                }
+                let arg_ok = if needle.is_empty() {
+                    crate::prune::args_value_is_empty(Some(&args))
+                } else {
+                    crate::prune::value_glob_match(&args, needle)
+                };
+                if arg_ok {
+                    matched.push(call_id.to_string());
+                }
+            }
+        } else if role == "tool" {
+            for part in parts {
+                if part.get("type").and_then(|t| t.as_str()) != Some("tool-result") {
+                    continue;
+                }
+                let Some(call_id) = part.get("toolCallId").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if part.get("result").and_then(|r| r.as_str())
+                    == Some(crate::prune::PRUNED_PLACEHOLDER)
+                {
+                    pruned.insert(call_id.to_string());
+                }
+            }
+        }
+    }
+    matched.retain(|id| !pruned.contains(id));
+    matched
+}
+
+/// `count_matches`: read-only pre-scan (opens `?immutable=1`). How many ELIGIBLE
+/// matches across the conversation. `0` → control errors back to the live agent
+/// (no abort). Returns `0` (not an error) on any store-read failure so a drifted
+/// store reads as "nothing to prune" rather than aborting the turn.
+fn count_cursor_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::Result<usize> {
+    let Some(conn) = open_store_readonly(path) else {
+        return Ok(0);
+    };
+    let Some(store) = load_cursor_store(&conn) else {
+        return Ok(0);
+    };
+    Ok(cursor_eligible_ids(&store, tool_name, needle).len())
+}
+
+/// Open the store read-only + immutable (`?immutable=1`) for the count/scan
+/// paths — never locks a (dead) cursor-agent's db file. `None` on open failure.
+fn open_store_readonly(path: &Path) -> Option<rusqlite::Connection> {
+    let uri = format!("file:{}?immutable=1", path.display());
+    rusqlite::Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()
+}
+
+/// `prune_batch`: blank the last-only target of EACH `(tool_name, needle)` in
+/// `targets`, reproducing K sequential last-only passes (the contract codex's
+/// `prune_batch` follows). For each target in order: compute its eligible ids
+/// (document order, minus already-`[pruned]` on disk AND ids already chosen in
+/// THIS batch), take the LAST, add to `chosen`. Then blank every chosen
+/// toolCallId's tool-result (`result` + `experimental_content`), re-mint the
+/// affected `tool` blobs, byte-replace ALL changed hashes in the root in one
+/// pass, re-sha the root, and move `meta.latestRootBlobId` — all in ONE
+/// transaction. No-op (`PruneStats::default()`) on any mismatch.
+fn prune_batch_cursor(
+    path: &Path,
+    targets: &[crate::prune::PruneTarget],
+) -> std::io::Result<crate::prune::PruneStats> {
+    let default = crate::prune::PruneStats::default();
+    // RW connection (the apply edits the db). A dead cursor-agent means no lock
+    // fight; the main loop only prunes after aborting the agent.
+    let Ok(conn) = rusqlite::Connection::open(path) else {
+        warn!("cursor prune: failed to open store RW, skipping");
+        return Ok(default);
+    };
+    let Some(store) = load_cursor_store(&conn) else {
+        // load_cursor_store already logged the specific guard failure.
+        return Ok(default);
+    };
+
+    // Select the chosen toolCallIds across all targets (last-only per target,
+    // subtracting earlier rounds' picks — reproduces K on-disk passes).
+    let mut chosen: Vec<String> = Vec::new();
+    let mut chosen_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (tool_name, needle) in targets {
+        let eligible = cursor_eligible_ids(&store, tool_name, needle);
+        if let Some(pick) = eligible.into_iter().rev().find(|id| !chosen_set.contains(id)) {
+            chosen_set.insert(pick.clone());
+            chosen.push(pick);
+        }
+    }
+    if chosen.is_empty() {
+        // Nothing eligible (TOCTOU after the control pre-check, or all already
+        // pruned) — safe no-op, frame skipped.
+        return Ok(default);
+    }
+
+    // Group chosen ids by the `tool` blob that holds their result, so a blob with
+    // multiple tool-result parts is re-minted once. `tool_blob_id → set(callId)`.
+    let mut blob_targets: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for id in &store.order {
+        if store.role(id) != Some("tool") {
+            continue;
+        }
+        let Some(blob) = store.parsed.get(id) else {
+            continue;
+        };
+        let Some(parts) = blob.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(|t| t.as_str()) != Some("tool-result") {
+                continue;
+            }
+            if let Some(call_id) = part.get("toolCallId").and_then(|v| v.as_str()) {
+                if chosen_set.contains(call_id) {
+                    blob_targets
+                        .entry(id.clone())
+                        .or_default()
+                        .insert(call_id.to_string());
+                }
+            }
+        }
+    }
+    if blob_targets.is_empty() {
+        // A chosen call had no tool-result blob to blank (in-flight, or store
+        // drift) — fail closed, no partial write.
+        warn!("cursor prune: chosen toolCallId(s) have no tool-result blob, skipping");
+        return Ok(default);
+    }
+
+    // Build the new blobs + accumulate (old_hash → new_hash) re-point pairs and
+    // the freed-byte / blanked-result tally.
+    let mut repoints: Vec<(String, String)> = Vec::new();
+    let mut new_blobs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut results_blanked = 0usize;
+    let mut freed_bytes = 0usize;
+    for (old_tool_id, call_ids) in &blob_targets {
+        // Clone the parsed-once value (these are JSON message blobs, present in
+        // `parsed`) so we can blank in place without re-`from_slice`-ing bytes.
+        let Some(mut blob) = store.parsed.get(old_tool_id).cloned() else {
+            warn!("cursor prune: tool blob vanished mid-build, skipping");
+            return Ok(default);
+        };
+        let Some(parts) = blob.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            warn!("cursor prune: tool blob has no content array, skipping");
+            return Ok(default);
+        };
+        for part in parts.iter_mut() {
+            let Some(obj) = part.as_object_mut() else {
+                continue;
+            };
+            if obj.get("type").and_then(|t| t.as_str()) != Some("tool-result") {
+                continue;
+            }
+            let is_target = obj
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .map(|c| call_ids.contains(c))
+                .unwrap_or(false);
+            if !is_target {
+                continue;
+            }
+            freed_bytes += blank_tool_result_twins(obj);
+            results_blanked += 1;
+        }
+        // serde_json::to_vec is compact (no spaces) — matches the PoC's
+        // separators=(",",":") so the re-minted blob round-trips byte-stably.
+        let Ok(new_data) = serde_json::to_vec(&blob) else {
+            warn!("cursor prune: re-serialize of blanked tool blob failed, skipping");
+            return Ok(default);
+        };
+        let new_id = blob_id(&new_data);
+        new_blobs.push((new_id.clone(), new_data));
+        repoints.push((old_tool_id.clone(), new_id));
+    }
+    if results_blanked == 0 {
+        // Every chosen result was already `[pruned]` (idempotent) — no-op.
+        return Ok(default);
+    }
+
+    // Re-mint the root: byte-replace each changed 32-byte hash. The root
+    // references message blobs DIRECTLY (flat), so each old hash must appear
+    // EXACTLY ONCE — guard it (a drifted/nested layout where the count isn't 1
+    // bails the whole prune rather than corrupt the tree).
+    let Some(old_root_data) = store.blobs.get(&store.root_id) else {
+        warn!("cursor prune: root blob vanished, skipping");
+        return Ok(default);
+    };
+    let mut new_root_data = old_root_data.clone();
+    for (old_id, new_id) in &repoints {
+        let (Some(old_raw), Some(new_raw)) = (hex_decode(old_id), hex_decode(new_id)) else {
+            warn!("cursor prune: bad hash hex during re-point, skipping");
+            return Ok(default);
+        };
+        // old/new are both 32-byte hashes (equal length), so re-point is an
+        // in-place `copy_from_slice` at the unique offset — no realloc.
+        let (occ, first) = scan_subslice(&new_root_data, &old_raw);
+        if occ != 1 {
+            warn!(
+                "cursor prune: old hash appears {occ} times in root (expected 1) — drift, skipping"
+            );
+            return Ok(default);
+        }
+        let at = first.expect("occ == 1 implies an offset");
+        new_root_data[at..at + new_raw.len()].copy_from_slice(&new_raw);
+    }
+    let new_root_id = blob_id(&new_root_data);
+
+    // Re-point meta: string-replace the old root id with the new (preserves the
+    // JSON's original formatting, exactly like the PoC). Must be uniquely
+    // replaceable or we bail.
+    if store.meta_text.matches(&store.root_id).count() != 1 {
+        warn!("cursor prune: root id not uniquely replaceable in meta json, skipping");
+        return Ok(default);
+    }
+    let new_meta_text = store.meta_text.replace(&store.root_id, &new_root_id);
+    let new_meta_hex = hex_encode(new_meta_text.as_bytes());
+
+    // Single transaction: INSERT OR IGNORE the new blobs + root (never delete —
+    // old roots stay valid checkpoints), then move the meta head. A mid-way
+    // failure rolls back, so the store is never left half-edited.
+    let apply = || -> rusqlite::Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        for (id, data) in &new_blobs {
+            tx.execute(
+                "INSERT OR IGNORE INTO blobs(id, data) VALUES(?, ?)",
+                rusqlite::params![id, data],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO blobs(id, data) VALUES(?, ?)",
+            rusqlite::params![new_root_id, new_root_data],
+        )?;
+        tx.execute(
+            "UPDATE meta SET value = ? WHERE key='0'",
+            rusqlite::params![new_meta_hex],
+        )?;
+        tx.commit()
+    };
+    if let Err(e) = apply() {
+        warn!(error = %e, "cursor prune: transaction failed, rolled back");
+        return Ok(default);
+    }
+    // Best-effort WAL checkpoint so the edit is visible to the next `--resume`
+    // even if it opens the main db file directly (matches the PoC).
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+
+    Ok(crate::prune::PruneStats {
+        results_blanked,
+        freed_bytes,
+    })
+}
+
+/// Blank BOTH twins of one `tool-result` part in place: the text twin `result`
+/// (via the shared `prune::blank_string_field`) and the multimodal twin
+/// `experimental_content` (the model could otherwise still read the output from
+/// it). Returns the combined freed-byte estimate — both twins' original
+/// serialized length counts, so the `~Nk freed` tally doesn't undercount when
+/// the output lived in `experimental_content`.
+fn blank_tool_result_twins(obj: &mut serde_json::Map<String, serde_json::Value>) -> usize {
+    let mut freed = 0usize;
+    if let Some(f) =
+        crate::prune::blank_string_field(obj, "result", crate::prune::PRUNED_PLACEHOLDER)
+    {
+        freed += f;
+    }
+    // `experimental_content` is an array (not a plain string), so it can't go
+    // through `blank_string_field`; count its original serialized length minus
+    // the replacement's footprint, then overwrite with the placeholder block.
+    let replacement =
+        serde_json::json!([{"type": "text", "text": crate::prune::PRUNED_PLACEHOLDER}]);
+    if let Some(existing) = obj.get("experimental_content") {
+        freed += existing
+            .to_string()
+            .len()
+            .saturating_sub(replacement.to_string().len());
+    }
+    obj.insert("experimental_content".to_string(), replacement);
+    freed
+}
+
+/// One-pass scan: count non-overlapping occurrences of `needle` in `haystack`
+/// (raw bytes) and report the FIRST offset. The re-point caller asserts the
+/// count is exactly 1, then `copy_from_slice`s the equal-length replacement at
+/// `first` — so one scan serves both the uniqueness guard and the locate.
+fn scan_subslice(haystack: &[u8], needle: &[u8]) -> (usize, Option<usize>) {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return (0, None);
+    }
+    let mut count = 0;
+    let mut first = None;
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            if first.is_none() {
+                first = Some(i);
+            }
+            count += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    (count, first)
 }
 
 // ===========================================================================
@@ -2470,5 +3115,289 @@ mod tests {
         let ctx = TurnContext::for_test(&prompt_file, None, false, None);
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(!cmd.contains("--model"), "got: {}", cmd);
+    }
+
+    #[test]
+    fn preamble_carries_attach_and_prune_instructions() {
+        // The stdin preamble must inject BOTH the attach-file how-to and the
+        // prune-context standing order (cursor has no system-prompt flag).
+        use crate::adapter::TurnContext;
+        use std::path::PathBuf;
+        let mut a = CursorAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let ctx = TurnContext {
+            chat_id: "abcdef012345-6789-...",
+            prompt_file: &prompt_file,
+            project_path: Some("/tmp/proj"),
+            worktree: false,
+            agent_session_id: None,
+            is_sandboxed: false,
+            model: None,
+            user_timezone: None,
+        };
+        let cmd = a.prepare_command(&ctx).unwrap();
+        // The instructions are shell-escaped into the `printf %s '<preamble>'`
+        // arg; assert a distinctive token from each is present.
+        assert!(cmd.contains("prune-context"), "got: {}", cmd);
+        assert!(cmd.contains("attach"), "missing attach instruction: {}", cmd);
+    }
+
+    // ===== prune-context cue tests (correction B) =====
+
+    #[test]
+    fn prune_context_shell_call_completion_fires_tool_result_cue() {
+        // A `tool_call.completed` whose shellToolCall command is a prune-context
+        // invocation must emit the visible bubble THEN the ToolResult cue.
+        let mut a = CursorAdapter::new();
+        let cmd = r#"\"$ZUCCHINI_SPAWNER_BIN\" prune-context --tool-name Read --args \"*BACKLOG.md*\" --reason x"#;
+        let line = format!(
+            r#"{{"type":"tool_call","subtype":"completed","call_id":"tool_p","tool_call":{{"shellToolCall":{{"args":{{"command":"{cmd}"}},"result":{{"success":{{"stdout":"ok"}}}}}}}}}}"#
+        );
+        let events = run(&mut a, &line);
+        assert_eq!(events.len(), 2, "bubble + cue, got {events:?}");
+        assert_eq!(events[1], "ToolResult");
+    }
+
+    #[test]
+    fn ordinary_shell_call_completion_does_not_fire_cue() {
+        // A sibling/ordinary shell call's completion renders its bubble only —
+        // no cue (call-keyed). Firing here would drop the queued prune.
+        let mut a = CursorAdapter::new();
+        let line = r#"{"type":"tool_call","subtype":"completed","call_id":"tool_s","tool_call":{"shellToolCall":{"args":{"command":"grep -rn foo src/"},"result":{"success":{"stdout":"hits"}}}}}"#;
+        let events = run(&mut a, line);
+        assert_eq!(events.len(), 1, "bubble only, got {events:?}");
+        assert_ne!(events[0], "ToolResult");
+    }
+
+    // ===== prune-context store surgery tests (correction A + plan §7) =====
+
+    /// Owns a unique temp dir holding a `store.db`, deleted on drop. Hand-rolled
+    /// (no `tempfile` dep), mirroring the importer tests' temp-file pattern.
+    struct TempStore {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempStore {
+        fn db_path(&self) -> std::path::PathBuf {
+            self.dir.join("store.db")
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// sha256 → hex, exactly the production `blob_id`.
+    fn sha_hex(data: &[u8]) -> String {
+        blob_id(data)
+    }
+
+    /// Compact JSON bytes (matches the production `serde_json::to_vec`).
+    fn json_bytes(v: &serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(v).unwrap()
+    }
+
+    /// Build a minimal cursor store.db from a list of (already-serialized)
+    /// message blobs IN ORDER, minting a flat root protobuf whose field-1 entries
+    /// (`0A 20` + raw hash) reference each blob, and a hex-encoded meta head. The
+    /// blobs are content-addressed (id = sha256(data)), so the store passes the
+    /// production load guard. Returns the temp store + the ordered blob ids.
+    fn build_store(message_blobs: &[Vec<u8>]) -> (TempStore, Vec<String>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "zucchini_cursor_prune_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = TempStore { dir };
+
+        let mut ids: Vec<String> = Vec::new();
+        let mut root = Vec::new();
+        for data in message_blobs {
+            let id = sha_hex(data);
+            // field 1, wire 2, len 32 = 0x0A 0x20, then the raw hash.
+            root.push(0x0Au8);
+            root.push(0x20u8);
+            root.extend_from_slice(&hex_decode(&id).unwrap());
+            ids.push(id);
+        }
+        let root_id = sha_hex(&root);
+        let meta_json =
+            serde_json::json!({"agentId": "agent-1", "latestRootBlobId": root_id, "name": "t"});
+        let meta_text = serde_json::to_string(&meta_json).unwrap();
+        let meta_hex = hex_encode(meta_text.as_bytes());
+
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
+             CREATE TABLE meta  (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        for (data, id) in message_blobs.iter().zip(ids.iter()) {
+            conn.execute(
+                "INSERT INTO blobs(id, data) VALUES(?, ?)",
+                rusqlite::params![id, data],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO blobs(id, data) VALUES(?, ?)",
+            rusqlite::params![root_id, root],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('0', ?)",
+            rusqlite::params![meta_hex],
+        )
+        .unwrap();
+        (store, ids)
+    }
+
+    /// Read the current meta head + that root's referenced (blanked-or-not) tool
+    /// blob, from a freshly opened connection.
+    fn read_head(path: &std::path::Path) -> (String, Vec<String>) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let store = load_cursor_store(&conn).unwrap();
+        (store.root_id, store.order)
+    }
+
+    fn blob_data(path: &std::path::Path, id: &str) -> Option<Vec<u8>> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT data FROM blobs WHERE id = ?",
+            rusqlite::params![id],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .ok()
+    }
+
+    fn standard_convo() -> Vec<Vec<u8>> {
+        let system = json_bytes(&serde_json::json!({"role":"system","content":"you are helpful"}));
+        let user = json_bytes(&serde_json::json!({"role":"user","content":"read BACKLOG.md"}));
+        let assistant = json_bytes(&serde_json::json!({
+            "role":"assistant",
+            "content":[{"type":"tool-call","toolCallId":"tool_1","toolName":"Read","args":{"path":"/repo/BACKLOG.md"}}]
+        }));
+        let tool = json_bytes(&serde_json::json!({
+            "role":"tool",
+            "content":[{"type":"tool-result","toolCallId":"tool_1","result":"line1\nline2\nlots of text here","experimental_content":[{"type":"text","text":"line1\nline2\nlots of text here"}]}]
+        }));
+        vec![system, user, assistant, tool]
+    }
+
+    #[test]
+    fn count_and_prune_blanks_last_only_and_repoints_head() {
+        let (store, ids) = build_store(&standard_convo());
+        let path = store.db_path();
+        let (old_root, _old_order) = read_head(&path);
+        let old_tool_id = ids[3].clone();
+
+        // count: exactly one eligible Read match (any-needle path).
+        assert_eq!(
+            count_cursor_matches(&path, "Read", "*BACKLOG.md*").unwrap(),
+            1
+        );
+
+        // prune one target.
+        let stats =
+            prune_batch_cursor(&path, &[("Read".to_string(), "*BACKLOG.md*".to_string())]).unwrap();
+        assert_eq!(stats.results_blanked, 1);
+        assert!(stats.freed_bytes > 0, "freed_bytes should be positive");
+
+        // meta head moved to a NEW root.
+        let (new_root, new_order) = read_head(&path);
+        assert_ne!(new_root, old_root, "head must move to a new root");
+        // new root references the blanked (new) tool blob, not the old one.
+        assert!(!new_order.contains(&old_tool_id), "old tool hash repointed");
+        let new_tool_id = new_order[3].clone();
+        let blanked: serde_json::Value =
+            serde_json::from_slice(&blob_data(&path, &new_tool_id).unwrap()).unwrap();
+        assert_eq!(
+            blanked["content"][0]["result"],
+            crate::prune::PRUNED_PLACEHOLDER
+        );
+        assert_eq!(
+            blanked["content"][0]["experimental_content"][0]["text"],
+            crate::prune::PRUNED_PLACEHOLDER
+        );
+
+        // checkpoints intact: old root + old tool blob still present.
+        assert!(blob_data(&path, &old_root).is_some(), "old root preserved");
+        assert!(
+            blob_data(&path, &old_tool_id).is_some(),
+            "old tool blob preserved"
+        );
+
+        // idempotent: a second identical prune is a clean no-op.
+        let stats2 =
+            prune_batch_cursor(&path, &[("Read".to_string(), "*BACKLOG.md*".to_string())]).unwrap();
+        assert_eq!(stats2.results_blanked, 0, "re-prune must be a no-op");
+        let (root_after, _) = read_head(&path);
+        assert_eq!(root_after, new_root, "no-op must not move the head");
+    }
+
+    #[test]
+    fn multi_tool_call_blob_prunes_one_sibling_untouched() {
+        // One assistant blob with two tool-calls; their results live in one tool
+        // blob with two tool-result parts. Prune Read of A only → its result
+        // blanked, the sibling (Read of B) left intact.
+        let system = json_bytes(&serde_json::json!({"role":"system","content":"sys"}));
+        let assistant = json_bytes(&serde_json::json!({
+            "role":"assistant",
+            "content":[
+                {"type":"tool-call","toolCallId":"tc_a","toolName":"Read","args":{"path":"/repo/A.md"}},
+                {"type":"tool-call","toolCallId":"tc_b","toolName":"Read","args":{"path":"/repo/B.md"}}
+            ]
+        }));
+        let tool = json_bytes(&serde_json::json!({
+            "role":"tool",
+            "content":[
+                {"type":"tool-result","toolCallId":"tc_a","result":"AAA content","experimental_content":[{"type":"text","text":"AAA content"}]},
+                {"type":"tool-result","toolCallId":"tc_b","result":"BBB content","experimental_content":[{"type":"text","text":"BBB content"}]}
+            ]
+        }));
+        let (store, _ids) = build_store(&[system, assistant, tool]);
+        let path = store.db_path();
+
+        let stats =
+            prune_batch_cursor(&path, &[("Read".to_string(), "*A.md*".to_string())]).unwrap();
+        assert_eq!(stats.results_blanked, 1);
+
+        let (_new_root, new_order) = read_head(&path);
+        let tool_blob: serde_json::Value =
+            serde_json::from_slice(&blob_data(&path, &new_order[2]).unwrap()).unwrap();
+        let parts = tool_blob["content"].as_array().unwrap();
+        let a = parts.iter().find(|p| p["toolCallId"] == "tc_a").unwrap();
+        let b = parts.iter().find(|p| p["toolCallId"] == "tc_b").unwrap();
+        assert_eq!(a["result"], crate::prune::PRUNED_PLACEHOLDER, "A pruned");
+        assert_eq!(b["result"], "BBB content", "sibling B untouched");
+    }
+
+    #[test]
+    fn prune_context_shell_call_is_never_selected() {
+        // An assistant whose tool-call is the agent's own prune-context shell
+        // invocation must never be eligible (self-exclusion).
+        let system = json_bytes(&serde_json::json!({"role":"system","content":"sys"}));
+        let assistant = json_bytes(&serde_json::json!({
+            "role":"assistant",
+            "content":[{"type":"tool-call","toolCallId":"tc_p","toolName":"Bash","args":{"command":"\"$ZUCCHINI_SPAWNER_BIN\" prune-context --tool-name Read --args \"*A.md*\" --reason x"}}]
+        }));
+        let tool = json_bytes(&serde_json::json!({
+            "role":"tool",
+            "content":[{"type":"tool-result","toolCallId":"tc_p","result":"pruned 1 tool output","experimental_content":[{"type":"text","text":"pruned 1 tool output"}]}]
+        }));
+        let (store, _ids) = build_store(&[system, assistant, tool]);
+        let path = store.db_path();
+
+        // any-tool, prune-context's own needle → zero eligible.
+        assert_eq!(count_cursor_matches(&path, "", "*A.md*").unwrap(), 0);
+        let stats = prune_batch_cursor(&path, &[("".to_string(), "*A.md*".to_string())]).unwrap();
+        assert_eq!(stats.results_blanked, 0, "self-call must not be pruned");
     }
 }

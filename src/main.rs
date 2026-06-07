@@ -1823,6 +1823,66 @@ async fn run_uninstall(
     uninstall::spawn_detached_cleanup();
 }
 
+/// Hold an exclusive `flock` on the pidfile `~/.zucchini-spawner/spawner.pid`
+/// for the
+/// daemon's whole lifetime so only ONE spawner can run against this runtime
+/// dir. A second daemon — a stray `zucchini-spawner … | head` probe that fell
+/// through to boot, a leftover dev `cargo run`, a double start — would join the
+/// same PowerSync stream and spawn a *duplicate* agent for every user message,
+/// so the chat shows two responses and two `[result]`s (the bug this guards).
+///
+/// `flock` is crash-safe: the kernel releases it when the holder exits, so
+/// there's no stale-lock recovery. The lock fd is `O_CLOEXEC` (Rust std default)
+/// so spawned agents don't inherit it and pin the lock past the daemon's death.
+///
+/// On contention this prints the running pid and exits. On any I/O failure
+/// taking the lock it logs and continues unlocked (best-effort — never wedge
+/// the service over a lock we couldn't acquire). The returned handle MUST be
+/// kept alive by the caller; dropping it unlocks.
+fn acquire_single_instance_lock() -> Option<std::fs::File> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    let path = zucchini_spawner_dir().join("spawner.pid");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        // Never truncate on open: a contender that opens the file but fails the
+        // flock below must not erase the holder's recorded pid. We clear+rewrite
+        // it via `set_len` only after we actually hold the lock.
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "could not open single-instance lock; continuing unlocked");
+            return None;
+        }
+    };
+
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            let pid = existing.trim();
+            let pid = if pid.is_empty() { "unknown" } else { pid };
+            eprintln!(
+                "zucchini-spawner: another instance is already running (pid {pid}); exiting."
+            );
+            error!(pid = %pid, "another spawner instance already holds the lock; exiting");
+            std::process::exit(0);
+        }
+        warn!(error = %err, "flock on single-instance lock failed; continuing unlocked");
+        return None;
+    }
+
+    // Lock held — record our pid so a future contender can name us.
+    let _ = file.set_len(0);
+    let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
+    Some(file)
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -1879,6 +1939,22 @@ async fn main() {
             let code = hermes_support::trampoline::run_hermes_turn(parsed).await;
             std::process::exit(code);
         }
+
+        // Any other first argument is NOT a recognized subcommand. Print usage
+        // and exit WITHOUT falling through to the daemon boot below. The daemon
+        // is only ever started with zero args (launchd/systemd `ProgramArguments`
+        // is just the binary path), so a stray flag, a typo, or a probe like
+        // `zucchini-spawner --help | head` must never silently launch a SECOND
+        // spawner — a second instance joins the same sync stream and double-spawns
+        // an agent for every user message (real incident: a `--help` invocation
+        // ran as a 52-minute zombie spawner alongside the service).
+        let is_help = first == "--help" || first == "-h";
+        eprintln!(
+            "zucchini-spawner — run with NO arguments to start the daemon.\n\
+             subcommands: attach-file, prune-context, prune-reminder-hook, schedule-message, hermes-turn\n\
+             flags: --version|-V, --help|-h"
+        );
+        std::process::exit(if is_help { 0 } else { 2 });
     }
 
     let _sentry_guard = sentry::init((
@@ -1892,6 +1968,13 @@ async fn main() {
 
     init_logging();
     info!("zucchini-spawner starting");
+
+    // Single-instance guard. MUST stay bound for the whole daemon lifetime —
+    // dropping the handle releases the lock. A second daemon would otherwise
+    // join the same sync stream and spawn a duplicate agent for every user
+    // message (two responses + two `[result]`s per chat). See
+    // `acquire_single_instance_lock`.
+    let _instance_lock = acquire_single_instance_lock();
 
     let prod = load_prod_config();
     if let Some(p) = &prod {

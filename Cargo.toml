@@ -41,6 +41,10 @@ smallvec = "1"
 # trade-off the rest of the Rust ecosystem makes. No `vtab` / `serde_json`
 # integration features: we only need basic prepared-statement reads.
 rusqlite = { version = "0.39", features = ["bundled"] }
+# Content-addressed blob re-hashing in the cursor pruner (`adapters/cursor.rs`):
+# cursor's live CLI store keys each blob by `sha256(data)`, so re-minting a
+# blanked message blob + the conversation root requires a sha256 impl.
+sha2 = "0.10"
 
 # Force vendored OpenSSL on Linux so cross-builds don't need libssl-dev in the
 # Docker image. Pulled in transitively by sentry → reqwest-0.13 → native-tls.

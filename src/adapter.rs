@@ -69,7 +69,7 @@ pub struct AdapterDescriptor {
     pub probe: fn() -> BoxFuture<'static, (bool, bool)>,
     pub import:
         fn(Uuid, Uuid, mpsc::Sender<WriteEvent>, ImportProgress) -> BoxFuture<'static, Result<()>>,
-    /// Selective-forgetting ("prune-context") hooks, or `None` for cursor/hermes;
+    /// Selective-forgetting ("prune-context") hooks, or `None` for hermes;
     /// see `crate::prune::PruneOps`. Set by each adapter's `PRUNE_OPS` const;
     /// dispatch goes through `AgentKind::prune_ops()`.
     pub prune: Option<crate::prune::PruneOps>,
@@ -152,7 +152,7 @@ impl AgentKind {
         (self.descriptor().probe)().await
     }
 
-    /// Selective-forgetting hooks for this kind, or `None` for cursor/hermes;
+    /// Selective-forgetting hooks for this kind, or `None` for hermes;
     /// see `crate::prune::PruneOps`. The `prune-context` flow (`control.rs`
     /// pre-scan, `main.rs` rewrite) dispatches through here rather than matching
     /// the variant, so prune support is a per-kind `AdapterDescriptor::prune` flip.
@@ -163,7 +163,7 @@ impl AgentKind {
     /// Base dir the kind's CLI stores per-session transcripts under — searched by
     /// the prune resolvers (`PruneOps::find_session`). Honors each CLI's
     /// relocation env var (semantics differ, hence the per-kind match), else
-    /// `$HOME/.<cli>`. `None` for cursor/hermes (no `PruneOps`).
+    /// `$HOME/.<cli>`. `None` for hermes (no `PruneOps`).
     ///
     /// gemini: `GEMINI_CLI_HOME` REPLACES `$HOME`, then gemini-cli appends
     /// `.gemini`, so we join `.gemini` onto it. Verified against the bundled
@@ -192,7 +192,12 @@ impl AgentKind {
             AgentKind::Gemini => env_dir("GEMINI_CLI_HOME")
                 .map(|h| h.join(".gemini"))
                 .or_else(|| home_subdir(".gemini")),
-            AgentKind::Cursor | AgentKind::Hermes => None,
+            // Cursor's per-session content-addressed store lives under
+            // `~/.cursor/chats/<projectHash>/<sessionUuid>/store.db` (the prune
+            // path globs beneath this base). cursor-agent has no documented
+            // home-relocation env var, so there's no `env_dir` override here.
+            AgentKind::Cursor => home_subdir(".cursor"),
+            AgentKind::Hermes => None,
         }
     }
 
@@ -350,9 +355,13 @@ pub trait AgentAdapter: Send + Sync {
     /// the reconstructed history, so re-appending would pollute every turn.
     ///
     /// Default `None`. Claude injects via `--append-system-prompt` instead;
-    /// cursor/hermes don't support prune-context. Gemini and codex override to
-    /// their tool-name-corrected variants (`Some(PRUNE_CONTEXT_INSTRUCTION_GEMINI)`
-    /// / `Some(PRUNE_CONTEXT_INSTRUCTION_CODEX)`) — their only hook for persisting
+    /// hermes doesn't support prune-context. Cursor supports it but doesn't use
+    /// this hook — it has no resumable conversation history to bake a suffix into
+    /// (`--resume` rebuilds from the local store), so it re-sends the prune nudge
+    /// in its every-turn stdin preamble instead (`adapters/cursor.rs`). Gemini and
+    /// codex override to their tool-name-corrected variants
+    /// (`Some(PRUNE_CONTEXT_INSTRUCTION_GEMINI)` /
+    /// `Some(PRUNE_CONTEXT_INSTRUCTION_CODEX)`) — their only hook for persisting
     /// the prune nudge into the conversation.
     ///
     /// MUST be appended after the user's text, not prepended: codex derives the
@@ -813,8 +822,9 @@ mod tests {
 
     /// Only gemini/codex (no `--append-system-prompt` hook) carry the prune nudge
     /// on the first user message. The rest must return `None`: a non-`None` would
-    /// double-inject (claude) or inject a no-op nudge (cursor/hermes). Gemini and
-    /// codex each use a tool-name-corrected variant (native names / Bash, not Read).
+    /// double-inject (claude via `--append-system-prompt`, cursor via its every-turn
+    /// stdin preamble) or inject a no-op nudge (hermes has no prune support). Gemini
+    /// and codex each use a tool-name-corrected variant (native names / Bash, not Read).
     #[test]
     fn first_turn_prompt_suffix_only_for_gemini_and_codex() {
         for v in AgentKind::ALL {
