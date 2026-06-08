@@ -5,6 +5,11 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+
+# Test-only: `test-util` adds the pausable clock (`tokio::time::advance`,
+# `#[tokio::test(start_paused)]`) the idle-reaper tests use to age sessions
+# past IDLE_TTL/MAX_TASK_LIFETIME without real-time waits. NOT in `full`, and
+# kept out of the shipped binary by living in dev-dependencies.
 tokio-util = "0.7.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -57,3 +62,8 @@ core-foundation-sys = "0.8"
 # O_NOFOLLOW for atomic_write_private on shared-UID hosts.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# See the note on `tokio` above — enables the pausable test clock for the
+# idle-reaper tests only.
+tokio = { version = "1", features = ["full", "test-util"] }

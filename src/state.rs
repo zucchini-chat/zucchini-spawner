@@ -276,6 +276,22 @@ impl Mirror {
         self.user_id == Some(uid)
     }
 
+    /// The owner's own `machine_users` row identity (`row_id`, `user_id`) once
+    /// it has streamed in. Used by the probe-completion seed retry in `main`:
+    /// the boot-time owner-row PUT usually lands ~5s before the async install
+    /// probes finish, so the in-PUT `seed_default_agents_if_needed` defers with
+    /// no probe data and the row is never re-PUT to retry on. After probes are
+    /// cached we re-run the seed against this identity. Returns `None` until the
+    /// owner row is known (its `row_id` is non-empty).
+    pub fn owner_row(&self) -> Option<(String, Uuid)> {
+        let uid = self.user_id?;
+        let m = self.members.get(&uid)?;
+        if m.row_id.is_empty() {
+            return None;
+        }
+        Some((m.row_id.clone(), uid))
+    }
+
     pub fn set_spawner_pubkey(&mut self, pubkey: Option<&str>) -> bool {
         if self.spawner_pubkey.as_deref() == pubkey {
             return false;

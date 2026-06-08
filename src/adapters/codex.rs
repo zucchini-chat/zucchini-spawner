@@ -378,7 +378,9 @@ impl AgentAdapter for CodexAdapter {
                 // Emit Result on every turn.completed; the supervisor
                 // latches it (so AgentResponse::Done.has_result is set
                 // once and only once).
-                out.push(AgentEvent::Result);
+                out.push(AgentEvent::Result {
+                    origin_is_task: false,
+                });
             }
             "turn.failed" => {
                 // Codex emits a terminal failure frame instead of a claude
@@ -386,7 +388,9 @@ impl AgentAdapter for CodexAdapter {
                 // already renders and emit the Result marker so the
                 // supervisor does not append the generic interrupted line.
                 out.push(AgentEvent::Frame(normalize_turn_failed_frame(&obj)));
-                out.push(AgentEvent::Result);
+                out.push(AgentEvent::Result {
+                    origin_is_task: false,
+                });
             }
             other => {
                 // Defensive forward — codex format drift shouldn't silently

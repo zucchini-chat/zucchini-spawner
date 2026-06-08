@@ -266,6 +266,34 @@ pub struct TurnContext<'a> {
     pub user_timezone: Option<&'a str>,
 }
 
+/// Inputs the Supervisor hands to `prepare_session_command` for a RESIDENT
+/// session (claude). Same fields as `TurnContext` MINUS `prompt_file` — a
+/// resident session is spawned once with stdin held open, and per-turn prompts
+/// arrive as `encode_user_turn` stdin frames rather than a piped prompt file.
+/// The session-level knobs (`model`, `worktree`, `is_sandboxed`,
+/// `project_path`) are fixed at spawn; a change in any of them forces a
+/// teardown + respawn-with-`--resume` (the Supervisor compares them against the
+/// live session).
+pub struct SessionContext<'a> {
+    pub chat_id: &'a str,
+    pub project_path: Option<&'a str>,
+    pub worktree: bool,
+    /// `Some(_)` to resume a prior on-disk transcript when (re)starting a
+    /// resident process for a chat that already harvested a session id
+    /// (torn down / crashed / knob-changed). `None` for a brand-new chat — claude
+    /// self-generates the id and we harvest it from `system/init`.
+    pub agent_session_id: Option<&'a str>,
+    /// See `TurnContext::is_sandboxed`.
+    pub is_sandboxed: bool,
+    /// See `TurnContext::model`.
+    pub model: Option<&'a str>,
+    /// See `TurnContext::user_timezone`. Folded into the resident session's
+    /// per-(re)spawn `--append-system-prompt` time line; refreshed on every
+    /// teardown + respawn (the resident process can't get a fresh time line
+    /// mid-session, so it's only as current as the last spawn).
+    pub user_timezone: Option<&'a str>,
+}
+
 /// Per-line normalized events the adapter forwards to Supervisor's response
 /// channel. `Frame(s)` lands verbatim in `messages.body`; the other variants
 /// are side-channel events written to `chats` columns.
@@ -284,9 +312,29 @@ pub enum AgentEvent {
     /// Harvested from the agent's first stdout frame; persisted to
     /// `chats.agent_session_id` so subsequent turns can resume.
     SessionIdHarvested(String),
-    /// Marks a final/result frame seen — Supervisor uses this to set
-    /// `Done.has_result`.
-    Result,
+    /// Marks a `result` frame seen — Supervisor uses this to set
+    /// `Done.has_result` (one-shot adapters) and, in the resident claude
+    /// session model, to drive the turn/Waiting state machine.
+    ///
+    /// `origin_is_task` distinguishes the two kinds of `result` a resident
+    /// claude process emits on the same stdout: a **user-turn** result (the
+    /// `origin` field is absent — this ends the in-flight turn, `false`) vs a
+    /// **background-task wake** result (`origin = {"kind":"task-notification"}`
+    /// — a monitor/`run_in_background` task fired post-turn; the user turn is
+    /// already done, so this must NOT clear `turn_in_flight`, `true`). One-shot
+    /// adapters never produce task-driven results and always emit `false`.
+    Result { origin_is_task: bool },
+    /// Resident model only — a background task (a `run_in_background` Bash, a
+    /// `Monitor`) was armed and started. Carries the claude `task_id`. The
+    /// Supervisor inserts it into the session's `live_tasks` set; a non-empty
+    /// set with no in-flight turn is the "Waiting…" state. One-shot adapters
+    /// never emit this (their process exits at the first `result`, before any
+    /// task can fire).
+    TaskStarted(String),
+    /// Resident model only — a previously-`TaskStarted` background task reached
+    /// a terminal `task_notification` (completed/failed/cancelled). Carries the
+    /// same `task_id`; the Supervisor removes it from `live_tasks`.
+    TaskFinished(String),
     /// The agent's own `prune-context` call has PERSISTED its result. Content-free
     /// CUE the main loop uses to drive the prune restart: when the chat has a queued
     /// `PruneRequest`, the loop aborts → rewrites → respawns NOW (strictly after the
@@ -336,6 +384,29 @@ pub trait AgentAdapter: Send + Sync {
     /// no tz is known.
     fn prompt_file_time_line(&self, ctx: &TurnContext<'_>) -> Option<String> {
         current_time_in_tz_line(ctx.user_timezone)
+    }
+
+    /// Resident adapters (claude) run ONE process across many turns with stdin
+    /// held open; one-shot adapters (codex/gemini/cursor/hermes — default
+    /// `false`) keep the per-turn `prepare_command` spawn path. The Supervisor
+    /// branches on this to pick the session vs one-shot lifecycle.
+    fn is_resident(&self) -> bool {
+        false
+    }
+
+    /// Resident: build the per-SESSION shell command (spawned once; stdin
+    /// piped). Like `prepare_command` but with no prompt piping — turns arrive
+    /// as `encode_user_turn` stdin frames. Default `unreachable!` because the
+    /// Supervisor only calls it when `is_resident()` returned `true`, and the
+    /// one-shot adapters never set that.
+    fn prepare_session_command(&mut self, _ctx: &SessionContext<'_>) -> Result<String> {
+        unreachable!("prepare_session_command called on a one-shot adapter")
+    }
+
+    /// Resident: serialize one user turn as a newline-terminated stdin frame.
+    /// Default `unreachable!` (one-shot adapters pipe the prompt instead).
+    fn encode_user_turn(&self, _text: &str) -> String {
+        unreachable!("encode_user_turn called on a one-shot adapter")
     }
 
     /// Per-stdout-line processing. Stateful for the lifetime of one turn so
@@ -731,7 +802,14 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             AgentEvent::ContextTokens(n) => format!("ContextTokens({})", n),
             AgentEvent::CompactBoundary(n) => format!("CompactBoundary({})", n),
             AgentEvent::SessionIdHarvested(s) => format!("SessionIdHarvested({})", s),
-            AgentEvent::Result => "Result".to_string(),
+            AgentEvent::Result {
+                origin_is_task: false,
+            } => "Result".to_string(),
+            AgentEvent::Result {
+                origin_is_task: true,
+            } => "Result(task)".to_string(),
+            AgentEvent::TaskStarted(s) => format!("TaskStarted({})", s),
+            AgentEvent::TaskFinished(s) => format!("TaskFinished({})", s),
             AgentEvent::ToolResult => "ToolResult".to_string(),
         })
         .collect()

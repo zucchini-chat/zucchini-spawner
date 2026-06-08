@@ -459,10 +459,21 @@ pub(crate) async fn handle_agent_response(
             if !has_result {
                 send_agent_line(write_tx, mirror, &topic, INTERRUPTED_RESULT.to_string()).await;
             }
-            let _ = write_tx
-                .send(WriteEvent::chat_running(topic.clone(), false))
-                .await;
+            // Idle clears agent_running (→ false). Required for the resident path
+            // (a session that exits while still busy — turn in flight or a task
+            // armed — must clear the indicator); for one-shot it's the normal
+            // busy→idle flip.
+            send_run_state(write_tx, topic.clone(), false).await;
             supervisor.remove(&topic);
+        }
+        // Resident path: the reader emits this on every busy↔idle transition.
+        // Drives the boolean `agent_running` (true the whole time the agent is
+        // busy, including while a background task / monitor is still armed —
+        // the Thinking-vs-Waiting sub-state is re-derived on the client, not on
+        // the wire). No optimistic flips — these come straight from the reader's
+        // frame-derived FSM (CLAUDE.md "No optimistic patches").
+        AgentResponse::RunState { topic, running } => {
+            send_run_state(write_tx, topic, running).await;
         }
         // The main loop's `response_rx` arm intercepts `ToolResult` (it drives the
         // prune restart against `pending_prunes`, which this fn doesn't own), so it
@@ -470,6 +481,31 @@ pub(crate) async fn handle_agent_response(
         // exhaustive (and stays a no-op if a future caller routes one through).
         AgentResponse::ToolResult { .. } => {}
     }
+}
+
+/// Publish the canned `INTERRUPTED_RESULT` system frame for an aborted /
+/// interrupted turn. Shared by the resident interrupt arms (/stop +
+/// interrupt-then-send) and the one-shot abort arm so the frame is emitted
+/// identically from all three.
+async fn publish_interrupted(write_tx: &mpsc::Sender<WriteEvent>, chat_id: &str, user_id: Uuid) {
+    let _ = write_tx
+        .send(WriteEvent::agent_line(
+            chat_id.to_string(),
+            user_id,
+            INTERRUPTED_RESULT.to_string(),
+        ))
+        .await;
+}
+
+/// Emit the resident run state as a single boolean `agent_running` patch.
+/// `running` stays true the whole time the agent is busy — including while a
+/// background task / monitor is still armed (the old "Waiting…" window). The
+/// Thinking-vs-Waiting sub-state is re-derived on the client, so the spawner
+/// does NOT distinguish them on the wire. One write per busy↔idle transition.
+async fn send_run_state(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String, running: bool) {
+    let _ = write_tx
+        .send(WriteEvent::chat_running(chat_id, running))
+        .await;
 }
 
 async fn handle_message_put(
@@ -604,8 +640,9 @@ async fn handle_message_put(
     //
     // Evaluated BEFORE the abort+INTERRUPTED publish below so an invitee whose
     // membership row hasn't synced can't trigger a stray agent abort on an
-    // already-running chat. Also BEFORE `chat_running=true`: a `return` here
-    // after sending true would strand the UI on a perpetual spinner.
+    // already-running chat. Also BEFORE the optimistic `agent_running=true`
+    // flip: a `return` here after sending it would strand the UI on a
+    // perpetual spinner.
     let is_owner = mirror.is_owner(user_id);
     let is_sandboxed = if is_owner {
         false
@@ -621,32 +658,57 @@ async fn handle_message_put(
         s
     };
 
-    // Membership gate passed — safe to abort any running agent on this chat
-    // and publish INTERRUPTED_RESULT. Runs for both the explicit /stop button
-    // and the "interrupt then send new message" UX (non-/stop body arriving
-    // while an agent is still running). For /stop with no running agent this
-    // is a no-op (no INTERRUPTED frame emitted out of nowhere).
+    // Resident adapters (claude) host one process across a turn PLUS its
+    // in-process background tasks/Monitors; one-shot adapters (codex/gemini/
+    // cursor/hermes) spawn per turn. There is NO warm reuse: a new message
+    // hard-aborts any in-flight turn (SIGTERM the group — also kills armed
+    // monitors) then respawns a FRESH `--resume` process below.
+    let is_resident = agent_kind.make_adapter().is_resident();
     let was_running = supervisor.is_running(&chat_id);
-    if was_running {
-        info!(chat_id = %chat_id, "aborting running agent before handling new message");
-        supervisor.abort_agent(&chat_id).await;
-        let _ = write_tx
-            .send(WriteEvent::agent_line(
-                chat_id.clone(),
-                user_id,
-                INTERRUPTED_RESULT.to_string(),
-            ))
-            .await;
-    }
 
-    if is_stop {
-        // Explicit stop: signal chat_running=false (idempotent if already
-        // false) and return. The abort+INTERRUPTED above (if was_running)
-        // is the full story — don't spawn a replacement agent.
-        let _ = write_tx
-            .send(WriteEvent::chat_running(chat_id.clone(), false))
-            .await;
-        return;
+    if is_resident {
+        if is_stop {
+            // RESIDENT /stop is an explicit HARD stop: SIGTERM the process
+            // group, killing claude AND any armed background tasks/monitors, so
+            // the chat returns to Idle. (A new message below also hard-aborts —
+            // /stop differs only in that it returns without respawning.)
+            // `abort_agent` on a resident session emits NO `Done`, so we clear
+            // the run state explicitly. The next message respawns with `--resume`.
+            if was_running {
+                info!(chat_id = %chat_id, "stop: tearing down resident session (kills armed monitors)");
+                publish_interrupted(write_tx, &chat_id, user_id).await;
+                supervisor.abort_agent(&chat_id).await;
+                send_run_state(write_tx, chat_id.clone(), false).await;
+            }
+            return;
+        }
+        // RESIDENT new message ("Send now (Interrupt)"). Hard-abort the running
+        // turn (SIGTERM the process group — also kills armed monitors), publish
+        // INTERRUPTED_RESULT, then fall through to spawn a FRESH `--resume`
+        // process below. `abort_agent` emits NO `Done`, so we clear the run state
+        // explicitly (mirrors the /stop arm above). Only abort when actually
+        // running — an Idle/torn-down session has nothing to interrupt and we
+        // must NOT abort a Waiting session's armed monitors prematurely.
+        if was_running {
+            info!(chat_id = %chat_id, "interrupt-then-send: aborting in-flight resident turn, will respawn fresh");
+            publish_interrupted(write_tx, &chat_id, user_id).await;
+            supervisor.abort_agent(&chat_id).await;
+            send_run_state(write_tx, chat_id.clone(), false).await;
+        }
+    } else {
+        // ONE-SHOT path (historic): abort any running agent + publish
+        // INTERRUPTED_RESULT, then either return (/stop) or spawn a fresh turn.
+        if was_running {
+            info!(chat_id = %chat_id, "aborting running one-shot agent before handling new message");
+            supervisor.abort_agent(&chat_id).await;
+            publish_interrupted(write_tx, &chat_id, user_id).await;
+        }
+        if is_stop {
+            let _ = write_tx
+                .send(WriteEvent::chat_running(chat_id.clone(), false))
+                .await;
+            return;
+        }
     }
 
     let Some(project_path) = mirror.projects.get(&project_id).cloned() else {
@@ -668,15 +730,6 @@ async fn handle_message_put(
     };
     let prompt = blobs::build_prompt(&envelope.text, &downloaded);
 
-    // Only PATCH when transitioning idle→running. The abort-then-respawn path
-    // (was_running==true) leaves agent_running already true from the prior
-    // spawn — re-sending it would fan out a no-op write to every listening
-    // client and re-trigger their chat-list re-decrypt.
-    if !was_running {
-        let _ = write_tx
-            .send(WriteEvent::chat_running(chat_id.clone(), true))
-            .await;
-    }
     // Resume keys off `agent_session_id`, not `seq>1`: a freshly created chat
     // may already have a backfilled `agent_session_id` (pre-migration rows) and
     // a brand-new chat where the first turn aborted before harvest still has
@@ -686,7 +739,7 @@ async fn handle_message_put(
     // line. Looked up here so the volatile clock is fresh per turn.
     let user_timezone = mirror.member_timezone(&user_id).map(str::to_string);
 
-    supervisor.spawn_agent(SpawnRequest {
+    let req = SpawnRequest {
         chat_id: chat_id.clone(),
         prompt,
         project_path: Some(project_path),
@@ -696,7 +749,28 @@ async fn handle_message_put(
         is_sandboxed,
         model,
         user_timezone,
-    });
+    };
+
+    if is_resident {
+        // Always (re)spawn a FRESH `claude --resume <agent_session_id>` process —
+        // no warm reuse. Any in-flight turn was already hard-aborted above (the
+        // `was_running` interrupt-then-send path); `spawn_resident` drops any
+        // stale entry and spawns fresh, threading the harvested session id (from
+        // the mirror, in `SpawnRequest.agent_session_id`) into `--resume`. NO
+        // optimistic agent_running flip — the reader's RunState drives it.
+        supervisor.spawn_agent(req);
+    } else {
+        // One-shot: optimistic-free idle→running flip preserved. The
+        // abort-then-respawn path already had agent_running=true, so only PATCH
+        // when transitioning idle→running. One-shot adapters never arm
+        // background tasks, so they're simply busy until the turn ends.
+        if !was_running {
+            let _ = write_tx
+                .send(WriteEvent::chat_running(chat_id.clone(), true))
+                .await;
+        }
+        supervisor.spawn_agent(req);
+    }
 }
 
 /// Per-chat spawn parameters resolved from the `Mirror`, shared between the
@@ -764,8 +838,8 @@ fn resolve_chat_spawn_params(mirror: &Mirror, chat_id: &str) -> Option<ChatSpawn
 /// Rewrites run in arrival order, each re-reading the transcript (the last-only /
 /// already-pruned-folds-to-0 contract is `crate::prune`'s). Stats are summed into a
 /// single timeline frame + respawn prompt. No INTERRUPTED frame (transparent
-/// restart, not a user stop); `agent_running` stays true throughout (no ChatRunning
-/// write) so the UI never flickers idle.
+/// restart, not a user stop); `agent_running` stays true throughout (no
+/// ChatRunning write) so the UI never flickers idle.
 async fn apply_prune_group(
     chat_id: &str,
     reqs: Vec<prune::PruneRequest>,
@@ -773,6 +847,14 @@ async fn apply_prune_group(
     supervisor: &mut Supervisor,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
+    // Snapshot how many background tasks / monitors this restart will terminate
+    // BEFORE the abort drops the session (and clears its live-task set). Normally
+    // 0 — the control task blocks a prune while tasks are live unless `--force`,
+    // so a non-zero count here means the agent forced it (or a task armed in the
+    // same instant the RPC's check passed). Surfaced in the respawn prompt so the
+    // resumed agent knows the tasks are gone and can re-arm/re-run consciously.
+    let killed_tasks = supervisor.live_task_count(chat_id);
+
     // Kill the (now-idle-at-a-tool-boundary) agent before touching its transcript:
     // the rewrite needs exclusive access and the resume must re-read from disk. A
     // no-op if the turn already exited on its own.
@@ -849,11 +931,24 @@ async fn apply_prune_group(
     // and loops re-running the now-satisfied prune (which returns "no … call
     // found"). Fall back to a generic nudge when every rewrite errored or blanked
     // nothing.
-    let prompt = if total.results_blanked > 0 {
+    let mut prompt = if total.results_blanked > 0 {
         prune::pruned_respawn_prompt(total)
     } else {
         "context pruning complete, continue".to_string()
     };
+    // If the restart killed live background tasks / monitors (forced prune, or a
+    // same-instant race), tell the resumed agent: their in-process runtime is
+    // gone and `--resume` does not bring it back, so it must re-arm/re-run any it
+    // still needs (and re-check the status of anything side-effecting, e.g. a
+    // deploy that was mid-flight).
+    if killed_tasks > 0 {
+        prompt.push_str(&format!(
+            " NOTE: this prune restarted the session and terminated {killed_tasks} \
+             background task(s)/monitor(s) that were running — they are NOT \
+             automatically resumed. Re-arm or re-run any you still need, and check \
+             the status of anything that was making changes (e.g. a deploy/build)."
+        ));
+    }
 
     // Resolve spawn params from the mirror (read guard) and respawn.
     let params = {
@@ -933,9 +1028,12 @@ async fn seed_default_agents_if_needed(
         return;
     }
     let Some(statuses) = probe_statuses else {
-        // Probes haven't completed yet — the next re-emission of this row
-        // will retry. (Heartbeat re-fans `machine_users` rows every ~60s,
-        // probe latency is typically < 1s, so this race window is short.)
+        // Probes haven't completed yet. The boot-time owner-row PUT lands
+        // ~5s before the login-shell probes finish, and the owner's own row
+        // is never re-PUT (no heartbeat re-fans it — that was a wrong
+        // assumption that left rosters NULL). The retry is driven instead by
+        // the `probe_ready_rx` arm in `main`, which re-runs this seed against
+        // `Mirror::owner_row` the moment the probe cache is populated.
         return;
     };
     // Closed deterministic order for compatibility seed defaults. Do not
@@ -1237,6 +1335,7 @@ fn spawn_startup_info_report(
     machine_id: Uuid,
     write_tx: mpsc::Sender<WriteEvent>,
     cache: ProbeStatusesCache,
+    probe_ready_tx: mpsc::Sender<()>,
 ) {
     tokio::spawn(async move {
         let statuses: Vec<(AgentKind, (bool, bool))> = futures_util::future::join_all(
@@ -1251,6 +1350,12 @@ fn spawn_startup_info_report(
         // we keep the first value and log nothing — the wire-side report
         // below still runs.
         let _ = cache.set(statuses.clone());
+        // Cache is now populated — nudge the main loop to retry the owner-row
+        // agents seed that the boot-time PUT deferred (the PUT lands ~5s before
+        // this point, with no probe data, and the row is never re-PUT). Send
+        // AFTER `cache.set` so the retry observes the populated snapshot. A full
+        // channel (capacity 1) means a signal is already pending — fine, drop.
+        let _ = probe_ready_tx.try_send(());
         let _ = write_tx
             .send(WriteEvent::ReportStartupInfo {
                 machine_id,
@@ -1591,7 +1696,9 @@ fn log_prune_cli_invoked(chat_id: &str, tool_name: &str, needle: &str) {
 /// optional (`""` = any-tool selector). A `--summary` with no preceding `--args`,
 /// a dangling `--tool-name`/`--args` not closed by a `--summary`, an unknown flag,
 /// `-h`/`--help`, or an empty batch are all errors. `--flag=value` accepted.
-fn parse_prune_args(args: &[String]) -> Result<(Option<String>, Vec<control::PruneItem>), ()> {
+fn parse_prune_args(
+    args: &[String],
+) -> Result<(Option<String>, bool, Vec<control::PruneItem>), ()> {
     fn close_item(
         items: &mut Vec<control::PruneItem>,
         tool: &mut Option<String>,
@@ -1608,6 +1715,7 @@ fn parse_prune_args(args: &[String]) -> Result<(Option<String>, Vec<control::Pru
     }
 
     let mut chat_id: Option<String> = None;
+    let mut force = false;
     let mut items: Vec<control::PruneItem> = Vec::new();
     let mut cur_tool: Option<String> = None;
     let mut cur_needle: Option<String> = None;
@@ -1616,6 +1724,10 @@ fn parse_prune_args(args: &[String]) -> Result<(Option<String>, Vec<control::Pru
         let s = a.as_str();
         if s == "-h" || s == "--help" {
             return Err(());
+        } else if s == "--force" {
+            // Call-level boolean flag (no value): prune even while background
+            // tasks / monitors are live, terminating them on the restart.
+            force = true;
         } else if let Some(v) = take_flag(s, "--tool-name", &mut it) {
             cur_tool = Some(v);
         } else if let Some(v) = take_flag(s, "--args", &mut it) {
@@ -1635,7 +1747,7 @@ fn parse_prune_args(args: &[String]) -> Result<(Option<String>, Vec<control::Pru
     if cur_tool.is_some() || cur_needle.is_some() || items.is_empty() {
         return Err(());
     }
-    Ok((chat_id, items))
+    Ok((chat_id, force, items))
 }
 
 /// CLI entry point for `zucchini-spawner prune-context [--tool-name <Tool>]
@@ -1658,14 +1770,14 @@ fn parse_prune_args(args: &[String]) -> Result<(Option<String>, Vec<control::Pru
 async fn run_prune_context_cli(args: &[String]) {
     fn usage_and_exit() -> ! {
         eprintln!(
-            "usage: zucchini-spawner prune-context [--tool-name <ToolName>] --args \"<glob>\" --summary \"<digest>\" [... repeat per output ...] [--chat-id <UUID>]\n  Prune one or more tool outputs in a single call: each --summary CLOSES the target made of the --tool-name/--args before it, so repeat the triple to forget several outputs at once (one restart for the whole batch). --tool-name is optional per target — omit it to match on --args alone. --summary is the takeaway from that output you still need going forward — the slice that matters for the task at hand, NOT a recap of the whole output (--reason accepted as a legacy alias). --args is a glob (supports *) over the call's argument VALUES, not key names; blanks only the most recent matching call (repeat to prune older ones). --chat-id is call-level and defaults to $ZUCCHINI_CHAT_ID (exported on every spawn); use --args \"\" to prune a call you made with no arguments."
+            "usage: zucchini-spawner prune-context [--tool-name <ToolName>] --args \"<glob>\" --summary \"<digest>\" [... repeat per output ...] [--chat-id <UUID>] [--force]\n  Prune one or more tool outputs in a single call: each --summary CLOSES the target made of the --tool-name/--args before it, so repeat the triple to forget several outputs at once (one restart for the whole batch). --tool-name is optional per target — omit it to match on --args alone. --summary is the takeaway from that output you still need going forward — the slice that matters for the task at hand, NOT a recap of the whole output (--reason accepted as a legacy alias). --args is a glob (supports *) over the call's argument VALUES, not key names; blanks only the most recent matching call (repeat to prune older ones). --chat-id is call-level and defaults to $ZUCCHINI_CHAT_ID (exported on every spawn); use --args \"\" to prune a call you made with no arguments. --force prunes even while background tasks/monitors are running (the restart terminates them); without it, prune-context errors so you can wait for them to finish."
         );
         std::process::exit(2);
     }
 
     // `--reason` is the legacy alias for `--summary` (older binary mid-turn keeps
     // parsing across a hot-reload); both feed the same wire field `reason`.
-    let Ok((chat_id, items)) = parse_prune_args(args) else {
+    let Ok((chat_id, force, items)) = parse_prune_args(args) else {
         usage_and_exit();
     };
     // Default `--chat-id` from `ZUCCHINI_CHAT_ID` (inherited from the agent
@@ -1686,7 +1798,7 @@ async fn run_prune_context_cli(args: &[String]) {
         log_prune_cli_invoked(&chat_id, &item.tool_name, &item.needle);
     }
 
-    match control::prune_context_via_socket(&chat_id, items.clone()).await {
+    match control::prune_context_via_socket(&chat_id, items.clone(), force).await {
         Ok(counts) => {
             // Per-target feedback (parallel to `items`): a `0` count is a miss the
             // batch tolerated (≥1 other item matched), reported so the agent sees
@@ -2116,11 +2228,26 @@ async fn main() {
         }
     };
 
+    // Probe-completion signal: `spawn_startup_info_report` sends once after it
+    // fills `probe_statuses_cache`, so the main loop can retry the owner-row
+    // agents seed that the boot-time `machine_users` PUT deferred (the PUT lands
+    // ~5s before probes finish, with no probe data, and the row is never re-PUT
+    // to retry on). Capacity 1 + `try_send` = at-most-one pending nudge. In dev
+    // (no prod config) the probe task is never spawned, so the signal never
+    // fires and the select arm stays idle — dev never seeds anyway (no
+    // machine_id).
+    let (probe_ready_tx, mut probe_ready_rx) = mpsc::channel::<()>(1);
+
     let heartbeat_cancel = CancellationToken::new();
     if let Some(p) = &prod {
         info!(machine_id = %p.machine_id, "starting heartbeat task");
         spawn_heartbeat(p.machine_id, write_tx.clone(), heartbeat_cancel.clone());
-        spawn_startup_info_report(p.machine_id, write_tx.clone(), probe_statuses_cache.clone());
+        spawn_startup_info_report(
+            p.machine_id,
+            write_tx.clone(),
+            probe_statuses_cache.clone(),
+            probe_ready_tx,
+        );
 
         // Startup pubkey publish: read guard is fine — we only inspect
         // `mirror.spawner_pubkey`. The call inside `handle_sync_event` runs
@@ -2171,6 +2298,7 @@ async fn main() {
             keys: keys.clone(),
             pending: supervisor.pending_attachments(),
             mirror: mirror.clone(),
+            live_sessions: supervisor.live_sessions(),
             pending_prunes: pending_prunes.clone(),
         };
         if let Err(e) = control::start(control_state).await {
@@ -2194,11 +2322,10 @@ async fn main() {
     let mut key_files_reconciled = false;
 
     // Process-lifetime guard for the `machine_users.agents` seeding pass
-    // (migration 0035 — see `seed_default_agents_if_needed`). Once we
-    // emit the seeding PATCH this flag flips to `true` so heartbeat-driven
-    // re-emissions of the owner's row don't re-seed before the DB
-    // transition lands. Restart re-checks via the DB NULL → non-NULL
-    // durable guard.
+    // (migration 0035 — see `seed_default_agents_if_needed`). Once we emit the
+    // seeding PATCH this flag flips to `true` so neither a re-PUT of the owner's
+    // row nor the `probe_ready_rx` retry re-seeds before the DB transition
+    // lands. Restart re-checks via the DB NULL → non-NULL durable guard.
     let mut agents_seed_attempted = false;
 
     // `pending_prunes` (the shared table above) accumulates requests the control
@@ -2229,6 +2356,37 @@ async fn main() {
                 info!(new_version = %new_version, "update available, will apply when idle");
                 update_pending = Some(new_version);
                 supervisor.cleanup();
+            }
+            Some(()) = probe_ready_rx.recv() => {
+                // Install probes just finished and `probe_statuses_cache` is now
+                // populated. Retry the owner-row agents seed that the boot-time
+                // `machine_users` PUT deferred — that PUT lands ~5s before the
+                // login-shell probes complete, so the in-PUT pass saw no probe
+                // data and bailed, and the owner's own row is never re-PUT to
+                // retry on. `seed_default_agents_if_needed` re-checks every guard
+                // (owner row, `agents IS NULL`, ≥1 CLI installed, not-already-
+                // attempted), so this is a no-op when the in-PUT pass already won
+                // the race or the user has a non-NULL list. A read guard suffices
+                // — the seed only reads the mirror and emits a PATCH via
+                // `write_tx`. Fires at most once: the probe task drops its sender
+                // afterward, so `recv()` then yields `None` and this arm self-
+                // disables for the rest of the loop.
+                if let Some(mid) = prod.as_ref().map(|p| p.machine_id) {
+                    let probe_snap = probe_statuses_cache.get().map(|v| v.as_slice());
+                    let g = mirror.read().await;
+                    if let Some((row_id, uid)) = g.owner_row() {
+                        seed_default_agents_if_needed(
+                            &row_id,
+                            uid,
+                            mid,
+                            &g,
+                            probe_snap,
+                            &mut agents_seed_attempted,
+                            &write_tx,
+                        )
+                        .await;
+                    }
+                }
             }
             Some(event) = sync_rx.recv() => {
                 let machine_id = prod.as_ref().map(|p| p.machine_id);
@@ -2359,9 +2517,77 @@ async fn main() {
                     // so the entry is guaranteed visible here. Take the lock only long
                     // enough to lift the chat's batch out, then apply unlocked.
                     AgentResponse::ToolResult { topic } => {
+                        // The `prune-context` call's own result has persisted to the
+                        // transcript. Apply NOW regardless of resident-busy state:
+                        // abort (SIGTERM) the agent → rewrite the jsonl → respawn-with-
+                        // `--resume`, so the freed context takes effect immediately,
+                        // within the SAME task — not deferred to the turn boundary
+                        // (which made the prune useless to the turn that asked for it).
+                        // This is a HARD RESTART of the resident session, and it has to
+                        // be: a transcript rewrite only lands via respawn (a live in-
+                        // memory session ignores the on-disk edit), so pruning a
+                        // resident agent is necessarily kill+resume. The cue fires only
+                        // AFTER the prune call's result reached disk, so the resumed
+                        // transcript carries the agent's prune call + summary and it
+                        // won't re-issue the now-satisfied command. A no-op for any chat
+                        // with nothing pending. The control task parked the
+                        // `PruneRequest` in `pending_prunes` during the `prune-context`
+                        // RPC (which returned before this cue could fire), so the entry
+                        // is guaranteed visible here.
+                        //
+                        // This restart kills any background task / Monitor armed in
+                        // the resident session — their runtime is in-process, not in
+                        // the transcript, so `--resume` does not re-arm them. The
+                        // control task GUARDS against this: `prune_context` refuses a
+                        // prune while `live_tasks` is non-empty unless the agent
+                        // passed `--force`, so reaching here with live tasks means a
+                        // forced prune (or a task armed in the same instant the RPC's
+                        // check passed). Either way `apply_prune_group` reads the
+                        // live-task count first and tells the resumed agent in the
+                        // respawn prompt how many it terminated, so the kill is never
+                        // silent. (Earlier this DEFERRED until Idle to spare the
+                        // monitor; the immediate apply — so the freed context helps the
+                        // turn that asked for it — is the behavior we kept.)
                         let reqs = pending_prunes.lock().await.remove(&topic);
                         if let Some(reqs) = reqs {
                             apply_prune_group(&topic, reqs, &mirror, &mut supervisor, &write_tx).await;
+                        }
+                    }
+                    AgentResponse::RunState { topic, running } => {
+                        // Safety net only: a prune is normally applied the instant its
+                        // `ToolResult` cue fires (arm above). If that cue never arrived
+                        // for a still-parked request and the session reaches Idle
+                        // (running=false), drain + apply it here rather than leak the
+                        // entry. Normal prunes don't reach this path. Then write the
+                        // run-state column.
+                        if !running {
+                            let reqs = pending_prunes.lock().await.remove(&topic);
+                            if let Some(reqs) = reqs {
+                                apply_prune_group(&topic, reqs, &mirror, &mut supervisor, &write_tx).await;
+                                // `apply_prune_group` respawned the session, which
+                                // will emit its own RunState; don't also write the
+                                // idle column from this (now-stale) transition.
+                                continue 'main_loop;
+                            }
+                        }
+                        {
+                            let mut g = mirror.write().await;
+                            handle_agent_response(
+                                AgentResponse::RunState { topic: topic.clone(), running },
+                                &mut g,
+                                &write_tx,
+                                &mut supervisor,
+                            ).await;
+                        }
+                        // Idle sessions are not kept warm. `RunState{running:false}`
+                        // is emitted only on a `Result` turn-boundary frame with no
+                        // live background task (see the reader's emission gate), so
+                        // this edge means the turn ended and nothing is in flight:
+                        // tear the resident down to free its child process and let
+                        // `is_empty()` go true (e.g. for a pending self-update). The
+                        // next message respawns with `--resume`.
+                        if !running {
+                            supervisor.abort_agent(&topic).await;
                         }
                     }
                     other => {
@@ -2423,12 +2649,49 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::SpawnFn;
+    use crate::agent::{ResidentHandles, ResidentSpawnFn, SessionState, SpawnFn};
     use crate::powersync::SyncEvent;
     use crate::writer::WriteEvent;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use serde_json::json;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    /// Build a Supervisor whose RESIDENT spawn fn records every session
+    /// `SpawnRequest` into `recorded` and returns inert handles: a real (but
+    /// never-drained) stdin channel, a `turn_in_flight=true` state, and a reader
+    /// task that stays alive until its `cancel` token fires (so `is_running`
+    /// sees a live session, and `abort_agent` can join it).
+    /// This is the resident analogue of the one-shot recorder seam — claude is
+    /// resident, so claude-flow tests route here, not through the one-shot fn.
+    fn supervisor_with_resident_recorder(
+        resp_tx: mpsc::Sender<AgentResponse>,
+    ) -> (Supervisor, StdArc<StdMutex<Vec<SpawnRequest>>>) {
+        let recorded: StdArc<StdMutex<Vec<SpawnRequest>>> = StdArc::new(StdMutex::new(Vec::new()));
+        let rec = recorded.clone();
+        let resident_fn: ResidentSpawnFn = StdArc::new(move |req, _tx, cancel, _pending| {
+            rec.lock().unwrap().push(req);
+            let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+            let state = StdArc::new(StdMutex::new(SessionState {
+                turn_in_flight: true,
+                live_tasks: Default::default(),
+            }));
+            // Keep the stdin receiver alive for the reader's lifetime so stdin
+            // sends don't error; the reader exits on cancel.
+            let reader = tokio::spawn(async move {
+                let _keep = _stdin_rx;
+                cancel.cancelled().await;
+            });
+            ResidentHandles {
+                stdin_tx,
+                reader,
+                state,
+            }
+        });
+        // One-shot fn is unused for claude tests but required by the ctor.
+        let one_shot: SpawnFn = StdArc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
+        let supervisor = Supervisor::with_spawn_fns(resp_tx, one_shot, resident_fn);
+        (supervisor, recorded)
+    }
 
     /// Sync → spawn pipeline: a `projects` PUT + `chats` PUT + user `messages`
     /// PUT must converge into one `Supervisor::spawn_agent` call carrying the
@@ -2465,15 +2728,9 @@ mod tests {
         let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
 
-        // Recorder spawn fn: captures the SpawnRequest and returns a dummy
-        // JoinHandle (no shell, no Command::spawn).
-        let recorded: Arc<StdMutex<Vec<SpawnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
-        let recorder = recorded.clone();
-        let spawn_fn: SpawnFn = Arc::new(move |req, _tx, _token, _pending| {
-            recorder.lock().unwrap().push(req);
-            tokio::spawn(async {})
-        });
-        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+        // Claude is RESIDENT, so the spawn routes through the resident recorder
+        // (captures the session SpawnRequest; returns a live inert session).
+        let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
 
         // Seeding-guard flag the test reuses across calls (the original
         // single-spawn flow doesn't trigger seeding because mirror.user_id
@@ -2586,23 +2843,28 @@ mod tests {
         // No attachments → prompt is the raw envelope text (see blobs::build_prompt).
         assert_eq!(req.prompt, plaintext);
 
-        // The idle→running transition must have emitted exactly one
-        // ChatRunning(true) PATCH on the writer channel.
+        // RESIDENT path: NO optimistic `ChatRunning(true)` PATCH at message-put
+        // time (CLAUDE.md "No optimistic patches of local sync state") — the
+        // reader's `RunState` drives `agent_running` instead. The session IS live
+        // + busy, though (turn marked in flight).
         let mut saw_running_true = false;
         while let Ok(ev) = write_rx.try_recv() {
             if let WriteEvent::ChatRunning {
-                chat_id: cid,
                 agent_running: true,
+                ..
             } = ev
             {
-                if cid == chat_id {
-                    saw_running_true = true;
-                }
+                saw_running_true = true;
             }
         }
         assert!(
-            saw_running_true,
-            "expected one ChatRunning(true) on the writer channel"
+            !saw_running_true,
+            "resident path must NOT optimistically flip agent_running at put time"
+        );
+        drop(captured);
+        assert!(
+            supervisor.is_running(&chat_id),
+            "resident session is live and busy after the first user turn"
         );
     }
 
@@ -2643,10 +2905,11 @@ mod tests {
         );
 
         // Supervisor is only needed because the `Done` arm calls
-        // `supervisor.remove(&topic)`. The spawn closure is never invoked.
+        // `supervisor.remove(&topic)` and step 5 pre-registers a claude
+        // (resident) session via `spawn_agent`. The resident recorder returns a
+        // live inert session so `is_running` is observable.
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
-        let spawn_fn: SpawnFn = Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
-        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+        let (mut supervisor, _recorded) = supervisor_with_resident_recorder(resp_tx);
 
         let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(256);
 
@@ -2772,7 +3035,7 @@ mod tests {
         }
 
         // --- 5. Done{has_result=false}: synthesize INTERRUPTED_RESULT line,
-        // then flip agent_running=false. Supervisor slot is gone.
+        // then clear agent_running (→ false / idle). Supervisor slot is gone.
         // Pre-register a fake handle so we can observe `supervisor.remove`.
         supervisor.spawn_agent(SpawnRequest {
             chat_id: chat_id.clone(),
@@ -2800,7 +3063,11 @@ mod tests {
         )
         .await;
         let events = drain(&mut write_rx);
-        assert_eq!(events.len(), 2, "INTERRUPTED line + ChatRunning(false)");
+        assert_eq!(
+            events.len(),
+            2,
+            "INTERRUPTED line + ChatRunning(false) (idle clears the run state)"
+        );
         match &events[0] {
             WriteEvent::PutMessage {
                 content,
@@ -2831,7 +3098,7 @@ mod tests {
             "Done arm must remove the topic from supervisor"
         );
 
-        // --- 6. Done{has_result=true}: just the ChatRunning(false), no synthesized line.
+        // --- 6. Done{has_result=true}: ChatRunning(false), no synthesized line.
         handle_agent_response(
             AgentResponse::Done {
                 topic: chat_id.clone(),
@@ -3173,6 +3440,111 @@ mod tests {
         assert!(!seed_attempted, "non-NULL path must not flip the seed flag");
     }
 
+    /// Regression: the boot-time owner-row PUT lands ~5s before the async
+    /// install probes finish, so the in-PUT seed sees `probe_statuses=None`
+    /// and defers. The owner's own row is never re-PUT, so without a separate
+    /// retry the roster stays NULL forever. This reproduces that sequence:
+    /// (1) PUT with probes NOT yet available → no PATCH, flag stays unset;
+    /// (2) the probe-completion retry path (`Mirror::owner_row` +
+    /// `seed_default_agents_if_needed`) runs once probes are cached → exactly
+    /// one PATCH. Mirrors how `main`'s `probe_ready_rx` arm drives the retry.
+    #[tokio::test]
+    async fn deferred_seed_retries_once_probes_complete() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let row_id = Uuid::now_v7();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
+        let blobs = empty_blob_downloader();
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let spawn_fn: crate::agent::SpawnFn =
+            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
+        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+        let mut seed_attempted = false;
+
+        let mu_row = json!({
+            "id": row_id.to_string(),
+            "user_id": user_id.to_string(),
+            "machine_id": machine_id.to_string(),
+            "is_sandboxed": 0,
+            "sealed_blob": serde_json::Value::Null,
+            "agents": serde_json::Value::Null,
+        })
+        .to_string();
+
+        // (1) PUT arrives BEFORE probes complete: `probe_statuses = None`.
+        handle_sync_event(
+            SyncEvent::Put {
+                table: "machine_users".into(),
+                id: row_id.to_string(),
+                data: mu_row,
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None, // probes not in yet
+            &mut seed_attempted,
+        )
+        .await;
+
+        let mut saw_seed_patch = false;
+        while let Ok(ev) = write_rx.try_recv() {
+            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
+                saw_seed_patch = true;
+            }
+        }
+        assert!(
+            !saw_seed_patch,
+            "PUT before probes complete must defer (no PATCH)"
+        );
+        assert!(!seed_attempted, "deferral must not flip the seed flag");
+
+        // (2) Probes complete → the main loop's retry path. The owner row is
+        // now known to the mirror, so `owner_row` resolves the same identity
+        // the deferred PUT carried.
+        let (retry_row_id, retry_uid) = mirror
+            .owner_row()
+            .expect("owner row known after the PUT synced");
+        assert_eq!(retry_row_id, row_id.to_string());
+        assert_eq!(retry_uid, user_id);
+
+        let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
+            (AgentKind::Claude, (true, true)),
+            (AgentKind::Cursor, (false, false)),
+        ];
+        seed_default_agents_if_needed(
+            &retry_row_id,
+            retry_uid,
+            machine_id,
+            &mirror,
+            Some(&probe_statuses),
+            &mut seed_attempted,
+            &write_tx,
+        )
+        .await;
+
+        let mut patches: Vec<WriteEvent> = Vec::new();
+        while let Ok(ev) = write_rx.try_recv() {
+            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
+                patches.push(ev);
+            }
+        }
+        assert_eq!(
+            patches.len(),
+            1,
+            "retry after probes complete must emit exactly one seed PATCH"
+        );
+        assert!(seed_attempted, "successful retry must flip the seed flag");
+    }
+
     /// `chats.model` flows from the row → ChatState → SpawnRequest.model.
     /// Empty / NULL both collapse to `None`; non-empty is preserved verbatim
     /// (the adapter is responsible for `--model <X>` shell-escaping).
@@ -3197,13 +3569,8 @@ mod tests {
         let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
 
-        let recorded: Arc<StdMutex<Vec<SpawnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
-        let recorder = recorded.clone();
-        let spawn_fn: crate::agent::SpawnFn = Arc::new(move |req, _tx, _token, _pending| {
-            recorder.lock().unwrap().push(req);
-            tokio::spawn(async {})
-        });
-        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+        // Claude is resident → capture via the resident recorder.
+        let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
 
         let mut seed_attempted = true; // skip seeding path in this test
 
@@ -3348,7 +3715,7 @@ mod tests {
 
     #[test]
     fn parse_prune_args_single_triple_is_one_item() {
-        let (chat, items) = super::parse_prune_args(&sv(&[
+        let (chat, force, items) = super::parse_prune_args(&sv(&[
             "--tool-name",
             "Read",
             "--args",
@@ -3358,6 +3725,7 @@ mod tests {
         ]))
         .expect("valid");
         assert!(chat.is_none());
+        assert!(!force, "force defaults off");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].tool_name, "Read");
         assert_eq!(items[0].needle, "a.ts");
@@ -3367,7 +3735,7 @@ mod tests {
     #[test]
     fn parse_prune_args_summary_terminates_each_target() {
         // Three targets in one call; `--chat-id` is call-level and can sit anywhere.
-        let (chat, items) = super::parse_prune_args(&sv(&[
+        let (chat, force, items) = super::parse_prune_args(&sv(&[
             "--tool-name",
             "Read",
             "--args",
@@ -3379,7 +3747,8 @@ mod tests {
             "--summary",
             "s2", // no --tool-name → any-tool selector
             "--chat-id",
-            "c1", //
+            "c1",      //
+            "--force", // call-level, can sit anywhere
             "--tool-name",
             "Grep",
             "--args",
@@ -3389,6 +3758,7 @@ mod tests {
         ]))
         .expect("valid");
         assert_eq!(chat.as_deref(), Some("c1"));
+        assert!(force, "--force parsed as call-level boolean");
         assert_eq!(items.len(), 3);
         assert_eq!(
             (items[0].tool_name.as_str(), items[0].needle.as_str()),
@@ -3407,7 +3777,7 @@ mod tests {
 
     #[test]
     fn parse_prune_args_accepts_eq_form_and_reason_alias() {
-        let (_, items) = super::parse_prune_args(&sv(&[
+        let (_, _, items) = super::parse_prune_args(&sv(&[
             "--tool-name=Read",
             "--args=a.ts",
             "--reason=legacy", //
@@ -3478,13 +3848,10 @@ mod tests {
         let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
 
-        let recorded: Arc<StdMutex<Vec<SpawnRequest>>> = Arc::new(StdMutex::new(Vec::new()));
-        let recorder = recorded.clone();
-        let spawn_fn: SpawnFn = Arc::new(move |req, _tx, _token, _pending| {
-            recorder.lock().unwrap().push(req);
-            tokio::spawn(async {})
-        });
-        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+        // Claude is resident; `apply_prune_group`'s respawn routes through the
+        // resident recorder. The pre-prune abort_agent is a no-op (no live
+        // session in this unit test), then the respawn records exactly one.
+        let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
         let mut seed_attempted = true;
 
         handle_sync_event(
@@ -3586,6 +3953,53 @@ mod tests {
         assert_eq!(
             pruned, 3,
             "every queued prune was applied, not just the last"
+        );
+    }
+
+    /// Resident lifecycle: NO warm reuse. Every user turn spawns a FRESH
+    /// `--resume` process, so two turns for the same chat record TWO spawns —
+    /// the second carrying the harvested session id for `--resume`. Drives
+    /// `Supervisor::spawn_agent` directly (it's the dispatch the message-put path
+    /// calls) so the assertion is on the recorded session `SpawnRequest`s.
+    #[tokio::test]
+    async fn resident_each_turn_respawns_fresh_with_resume() {
+        let chat_id = Uuid::now_v7().to_string();
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
+
+        let mk = |prompt: &str, model: Option<&str>, sid: Option<&str>| SpawnRequest {
+            chat_id: chat_id.clone(),
+            prompt: prompt.to_string(),
+            project_path: Some("/tmp/p".to_string()),
+            worktree: false,
+            agent_session_id: sid.map(str::to_string),
+            agent_kind: AgentKind::Claude,
+            is_sandboxed: false,
+            model: model.map(str::to_string),
+            user_timezone: None,
+        };
+
+        // First turn: fresh session → one recorded spawn.
+        supervisor.spawn_agent(mk("first", Some("opus"), None));
+        assert_eq!(recorded.lock().unwrap().len(), 1, "first turn spawns once");
+        assert!(supervisor.is_running(&chat_id), "session live + busy");
+
+        // Second turn: the message-put path hard-aborts the running turn first
+        // (interrupt-then-send), then spawns FRESH with `--resume`. Mirror that
+        // here — abort then respawn — and assert a SECOND spawn was recorded
+        // (no warm reuse) carrying the harvested session id.
+        supervisor.abort_agent(&chat_id).await;
+        supervisor.spawn_agent(mk("second", Some("opus"), Some("sid-1")));
+        let captured = recorded.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            2,
+            "every turn respawns fresh — no warm reuse"
+        );
+        assert_eq!(
+            captured[1].agent_session_id.as_deref(),
+            Some("sid-1"),
+            "respawn resumes the harvested session id"
         );
     }
 }

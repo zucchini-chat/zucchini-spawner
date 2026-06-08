@@ -70,6 +70,14 @@ pub enum ControlRequest {
     PruneContext {
         chat_id: String,
         items: Vec<PruneItem>,
+        /// When false (default) the daemon REFUSES to prune while the resident
+        /// session has live background tasks / monitors — a prune restarts the
+        /// agent (abort → rewrite → respawn) and their in-process runtime is not
+        /// restored by `--resume`, so they'd be silently killed. `--force`
+        /// overrides (prune anyway, terminating them). `#[serde(default)]` keeps
+        /// an older CLI binary that omits the field decoding across a hot-reload.
+        #[serde(default)]
+        force: bool,
     },
     /// Insert a `scheduled_messages` row for `chat_id` — the running agent
     /// enqueues a message at a wall-clock time (`deliver_at` = naive local datetime
@@ -172,6 +180,10 @@ pub struct ControlState {
     pub keys: Arc<KeyStore>,
     pub pending: PendingAttachments,
     pub mirror: SharedMirror,
+    /// Shared directory of live resident sessions (same `SessionState` Arcs the
+    /// reader mutates), so `prune_context` can read a chat's live-task count and
+    /// refuse a prune that would restart the agent out from under a running task.
+    pub live_sessions: crate::agent::LiveSessions,
     /// Shared park-table of `PruneRequest`s, keyed by `chat_id`. We push under the
     /// lock here, inside the `prune-context` RPC; the main `select!` loop (sole
     /// owner of the `Supervisor`) drains the chat's entry and applies the
@@ -273,9 +285,13 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                 }
             }
         }
-        ControlRequest::PruneContext { chat_id, items } => {
-            info!(chat_id = %chat_id, n_items = items.len(), "prune-context called");
-            match prune_context(&chat_id, &items, state).await {
+        ControlRequest::PruneContext {
+            chat_id,
+            items,
+            force,
+        } => {
+            info!(chat_id = %chat_id, n_items = items.len(), force, "prune-context called");
+            match prune_context(&chat_id, &items, force, state).await {
                 Ok(counts) => ControlResponse::pruned_ok(counts),
                 Err(e) => {
                     warn!(chat_id = %chat_id, n_items = items.len(), error = %e, "prune_context failed");
@@ -322,10 +338,43 @@ pub fn describe_prune_target(tool_name: &str, needle: &str) -> String {
 async fn prune_context(
     chat_id: &str,
     items: &[PruneItem],
+    force: bool,
     state: &ControlState,
 ) -> Result<Vec<usize>> {
     if items.is_empty() {
         return Err(anyhow!("prune-context called with no items"));
+    }
+
+    // Refuse to prune while the resident session has live background tasks /
+    // monitors, unless `--force`. Applying a prune hard-restarts the agent
+    // (abort → rewrite jsonl → respawn-with-`--resume`), and a task/monitor's
+    // runtime lives in the agent process — `--resume` does NOT re-arm it — so the
+    // restart would silently kill it (e.g. a running deploy whose status the
+    // agent then can't recover). Block by default; the agent should wait for the
+    // task to finish, or pass `--force` to prune and terminate it.
+    //
+    // The count is read from the shared `live_sessions` directory (the same
+    // `SessionState` the stdout reader mutates). It's a hair behind the stdout
+    // stream — a task armed in the SAME instant as this call can slip through —
+    // but for the real flow (arm a task, decide to prune seconds later) the
+    // `task_started` frame is long since reduced by the time this RPC lands. A
+    // synchronous error here is the only way to tell the agent at the tool
+    // boundary (exit 1); the perfectly-ordered signal arrives only post-exit.
+    if !force {
+        let live = {
+            let dir = state.live_sessions.lock().expect("LiveSessions mutex");
+            dir.get(chat_id)
+                .map(|st| st.lock().expect("SessionState mutex").live_tasks.len())
+                .unwrap_or(0)
+        };
+        if live > 0 {
+            return Err(anyhow!(
+                "{live} background task(s)/monitor(s) still running in this session — \
+                 pruning now restarts the agent and terminates them (a `--resume` does \
+                 not re-arm them). Wait until they finish and prune then, or re-run with \
+                 --force to prune and kill them."
+            ));
+        }
     }
     // Tight read-guard scope: no `.await` held under it.
     let (agent_kind, agent_session_id) = {
@@ -740,10 +789,15 @@ pub async fn attach_file_via_socket(chat_id: &str, path: &str) -> Result<(String
 /// The actual abort/rewrite/respawn is driven by the main loop when claude emits
 /// the `prune-context` call's `tool_result` frame, folding the batch into ONE
 /// restart that lands strictly after claude persists the call's result.
-pub async fn prune_context_via_socket(chat_id: &str, items: Vec<PruneItem>) -> Result<Vec<usize>> {
+pub async fn prune_context_via_socket(
+    chat_id: &str,
+    items: Vec<PruneItem>,
+    force: bool,
+) -> Result<Vec<usize>> {
     let resp = send_control_request(&ControlRequest::PruneContext {
         chat_id: chat_id.to_string(),
         items,
+        force,
     })
     .await?;
     Ok(resp.pruned_counts.unwrap_or_default())

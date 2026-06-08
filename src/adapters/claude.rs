@@ -110,6 +110,123 @@ fn extract_tool_result_id(line: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// Append every claude flag AFTER the base invocation (`cat … | claude` for
+/// one-shot, bare `claude` for resident) to `cmd`. Shared by `prepare_command`
+/// and `prepare_session_command` so the flag set (session-id resume, worktree
+/// containment, `--append-system-prompt`, `--print --verbose
+/// --output-format stream-json`, sandbox, model, the prune `--settings` hook)
+/// can't drift between the two paths. `sys_leadin` is the first sentence of the
+/// `--append-system-prompt` block (the only intentional difference); `resident`
+/// adds `--input-format stream-json` before `--output-format` so claude reads
+/// turns from the held-open stdin.
+#[allow(clippy::too_many_arguments)]
+fn append_claude_flags(
+    cmd: &mut String,
+    sys_leadin: &str,
+    chat_id: &str,
+    project_path: Option<&str>,
+    worktree: bool,
+    agent_session_id: Option<&str>,
+    is_sandboxed: bool,
+    model: Option<&str>,
+    user_timezone: Option<&str>,
+    resident: bool,
+) {
+    // First turn / fresh session: pass no session flag — claude generates a
+    // session id and emits it in the `system/init` stdout frame, which we
+    // harvest and persist to `chats.agent_session_id`. Subsequent (re)starts
+    // resume that id. Pre-migration rows were backfilled with
+    // `agent_session_id = id::text`, so existing chats keep using the same id
+    // claude already knows about.
+    if let Some(sid) = agent_session_id {
+        cmd.push_str(&format!(" --resume {}", shell_escape(sid)));
+    }
+
+    let mut sys = String::from(sys_leadin);
+    // Worktree containment: when `--worktree` is on and the project path is
+    // known, resolve the absolute worktree path so the capability block can
+    // carry the "stay inside" rule (wording in `adapter::worktree_instructions`).
+    let mut worktree_info: Option<WorktreeInstructions> = None;
+    if worktree {
+        // Use the chat_id prefix so the worktree directory name stays short.
+        let worktree_name: String = chat_id.chars().take(8).collect();
+        cmd.push_str(&format!(" --worktree {}", shell_escape(&worktree_name)));
+        if let Some(pp) = project_path {
+            let worktree_abs = format!(
+                "{}/.claude/worktrees/{}",
+                pp.trim_end_matches('/'),
+                worktree_name
+            );
+            worktree_info = Some(WorktreeInstructions {
+                worktree_abs,
+                parent_repo: pp.to_string(),
+            });
+        }
+    }
+    sys.push_str("\n\n");
+    // Fold the per-turn time line into this fresh-every-turn block (hence the
+    // `prompt_file_time_line` override returns `None`); prune nudge appended after.
+    sys.push_str(&agent_capabilities_instructions(
+        worktree_info.as_ref(),
+        current_time_in_tz_line(user_timezone).as_deref(),
+    ));
+    sys.push_str("\n\n");
+    sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
+    cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
+    // Resident: read user/control turns from the held-open stdin pipe.
+    if resident {
+        cmd.push_str(" --input-format stream-json");
+    }
+    cmd.push_str(
+        " --print --verbose --output-format stream-json --disallowedTools AskUserQuestion",
+    );
+    // Sender's `machine_users.is_sandboxed`. Non-sandboxed = bypass permission
+    // gating; sandboxed = claude's default permission mode auto-denies tools
+    // in `--print`, which is the actual sandboxing mechanism.
+    if !is_sandboxed {
+        cmd.push_str(" --dangerously-skip-permissions");
+    }
+    // Verbatim pass-through of `chats.model` (migration 0035). Empty / blank
+    // values are already filtered to `None` at the construction site in
+    // `main.rs`, so any `Some` here is a non-empty model name the user picked in
+    // the composer's agent roster. We don't validate the model name — claude
+    // prints a clean error if it doesn't recognize it, and the closed set drifts
+    // per-release.
+    if let Some(model) = model {
+        cmd.push_str(&format!(" --model {}", shell_escape(model)));
+    }
+    // Register a `PostToolUse` hook that nudges the agent to prune large tool
+    // outputs once they're no longer needed (selective forgetting). The hook
+    // command re-invokes THIS binary (`prune-reminder-hook`), so there's no
+    // bash+jq script and no external dep — the spawner parses the hook JSON and
+    // applies the size gate in Rust. `$ZUCCHINI_SPAWNER_BIN` is exported on the
+    // spawn (agent.rs); shell_escape wraps the settings JSON in single quotes, so
+    // the var is passed through LITERALLY and claude's hook runner expands it at
+    // hook time against the inherited env (NOT the outer login shell). Added
+    // unconditionally (harmless when nothing's large), same as the prune-context
+    // system-prompt nudge. `--settings` MERGES with (never replaces) the user's
+    // settings.json / project hooks, so user-configured hooks survive the spawn
+    // (verified empirically). See `zucchini-spawner/CLAUDE.md`.
+    let settings = serde_json::json!({
+        "hooks": {
+            "PostToolUse": [{
+                // Match-all. claude treats the matcher as a REGEX, so the
+                // documented match-all is the empty string (`""`), NOT `"*"`
+                // (a bare `*` is not a valid standalone quantifier).
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": "\"$ZUCCHINI_SPAWNER_BIN\" prune-reminder-hook"
+                }]
+            }]
+        }
+    });
+    cmd.push_str(&format!(
+        " --settings {}",
+        shell_escape(&settings.to_string())
+    ));
+}
+
 impl AgentAdapter for ClaudeAdapter {
     fn kind(&self) -> AgentKind {
         AgentKind::Claude
@@ -120,116 +237,107 @@ impl AgentAdapter for ClaudeAdapter {
         if let Some(pp) = ctx.project_path {
             claude_cmd.push_str(&format!("cd {} && ", shell_escape(pp)));
         }
+        // One-shot: pipe the prompt file into `claude`.
         claude_cmd.push_str(&format!(
             "cat {} | claude",
             shell_escape(&ctx.prompt_file.to_string_lossy())
         ));
-        // First turn: pass no session flag — claude generates a session id
-        // and emits it in the `system/init` stdout frame, which we harvest
-        // below and persist to `chats.agent_session_id`. Subsequent turns
-        // resume that id. Pre-migration rows were backfilled with
-        // `agent_session_id = id::text`, so existing chats keep using the
-        // same id claude already knows about.
-        if let Some(sid) = ctx.agent_session_id {
-            claude_cmd.push_str(&format!(" --resume {}", shell_escape(sid)));
-        }
-        // claude --print is one-shot; once the result frame emits, the process
-        // exits and the spawner stops reading stdout. Background work has no
-        // way to reach the chat afterwards, so steer agents away from it.
-        let mut sys = String::from(
-            "You are spawned via a harness, no background subagents will wake you when finished, use subagents with `run_in_background: false` only."
+        // One-shot `--print` is print-and-exit: the process dies at its first
+        // `result`, so any background subagent it armed is abandoned. Steer the
+        // agent away from `run_in_background:true`. (The resident session uses a
+        // DIFFERENT lead-in — see `RESIDENT_SYS_LEADIN` — because background
+        // tasks work there.)
+        const ONESHOT_SYS_LEADIN: &str =
+            "You are spawned via a harness, no background subagents will wake you when finished, use subagents with `run_in_background: false` only.";
+        append_claude_flags(
+            &mut claude_cmd,
+            ONESHOT_SYS_LEADIN,
+            ctx.chat_id,
+            ctx.project_path,
+            ctx.worktree,
+            ctx.agent_session_id,
+            ctx.is_sandboxed,
+            ctx.model,
+            ctx.user_timezone,
+            /* resident = */ false,
         );
-
-        // Worktree containment: when `--worktree` is on and the project path is
-        // known, resolve the absolute worktree path so the capability block can
-        // carry the "stay inside" rule (wording in `adapter::worktree_instructions`).
-        let mut worktree_info: Option<WorktreeInstructions> = None;
-        if ctx.worktree {
-            // Use the chat_id prefix so the worktree directory name stays short.
-            let worktree_name: String = ctx.chat_id.chars().take(8).collect();
-            claude_cmd.push_str(&format!(" --worktree {}", shell_escape(&worktree_name)));
-            if let Some(pp) = ctx.project_path {
-                let worktree_abs = format!(
-                    "{}/.claude/worktrees/{}",
-                    pp.trim_end_matches('/'),
-                    worktree_name
-                );
-                worktree_info = Some(WorktreeInstructions {
-                    worktree_abs,
-                    parent_repo: pp.to_string(),
-                });
-            }
-        }
-        sys.push_str("\n\n");
-        // Fold the per-turn time line into this fresh-every-turn block (hence the
-        // `prompt_file_time_line` override returns `None`); prune nudge appended after.
-        sys.push_str(&agent_capabilities_instructions(
-            worktree_info.as_ref(),
-            current_time_in_tz_line(ctx.user_timezone).as_deref(),
-        ));
-        sys.push_str("\n\n");
-        sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
-        claude_cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
-        claude_cmd.push_str(
-            " --print --verbose --output-format stream-json --disallowedTools AskUserQuestion",
-        );
-        // Sender's `machine_users.is_sandboxed`. Non-sandboxed = bypass permission
-        // gating; sandboxed = claude's default permission mode auto-denies tools
-        // in `--print`, which is the actual sandboxing mechanism.
-        if !ctx.is_sandboxed {
-            claude_cmd.push_str(" --dangerously-skip-permissions");
-        }
-        // Verbatim pass-through of `chats.model` (migration 0035). Empty /
-        // blank values are already filtered to `None` at the construction
-        // site in `main.rs`, so any `Some` here is a non-empty model name
-        // the user picked in the composer's agent roster. We don't validate
-        // the model name — claude prints a clean error if it doesn't
-        // recognize it, and the closed set drifts per-release.
-        if let Some(model) = ctx.model {
-            claude_cmd.push_str(&format!(" --model {}", shell_escape(model)));
-        }
-        // Register a `PostToolUse` hook that nudges the agent to prune large tool
-        // outputs once they're no longer needed (selective forgetting). The hook
-        // command re-invokes THIS binary (`prune-reminder-hook`), so there's no
-        // bash+jq script and no external dep — the spawner parses the hook JSON
-        // and applies the size gate in Rust. `$ZUCCHINI_SPAWNER_BIN` is exported
-        // on the spawn (agent.rs); shell_escape wraps the settings JSON in single
-        // quotes, so the var is passed through LITERALLY and claude's hook runner
-        // expands it at hook time against the inherited env (NOT the outer login
-        // shell). Added unconditionally (harmless when nothing's large), same as
-        // the prune-context system-prompt nudge. `--settings` MERGES with (never
-        // replaces) the user's settings.json / project hooks, so user-configured
-        // hooks survive the spawn (verified empirically). See `zucchini-spawner/CLAUDE.md`.
-        let settings = serde_json::json!({
-            "hooks": {
-                "PostToolUse": [{
-                    // Match-all. claude treats the matcher as a REGEX, so the
-                    // documented match-all is the empty string (`""`), NOT `"*"`
-                    // (a bare `*` is not a valid standalone quantifier).
-                    "matcher": "",
-                    "hooks": [{
-                        "type": "command",
-                        "command": "\"$ZUCCHINI_SPAWNER_BIN\" prune-reminder-hook"
-                    }]
-                }]
-            }
-        });
-        claude_cmd.push_str(&format!(
-            " --settings {}",
-            shell_escape(&settings.to_string())
-        ));
         Ok(claude_cmd)
     }
 
     /// The current-local-time line is folded into the per-turn system prompt
-    /// (`agent_capabilities_instructions` in `prepare_command`), so suppress the
-    /// prompt-file prepend to avoid injecting it twice.
+    /// (`agent_capabilities_instructions` in `append_claude_flags`), so suppress
+    /// the prompt-file prepend to avoid injecting it twice.
     fn prompt_file_time_line(&self, _ctx: &TurnContext<'_>) -> Option<String> {
         None
     }
 
+    fn is_resident(&self) -> bool {
+        true
+    }
+
+    fn prepare_session_command(
+        &mut self,
+        ctx: &crate::adapter::SessionContext<'_>,
+    ) -> Result<String> {
+        let mut claude_cmd = String::new();
+        if let Some(pp) = ctx.project_path {
+            claude_cmd.push_str(&format!("cd {} && ", shell_escape(pp)));
+        }
+        // Resident: NO prompt piping — turns arrive as `encode_user_turn` stdin
+        // frames over the held-open pipe. Just spawn bare `claude`; the
+        // `--input-format stream-json` flag (added by `append_claude_flags` with
+        // `resident=true`) tells it to read user/control frames from stdin.
+        claude_cmd.push_str("claude");
+        // The whole point of the resident model is that background tasks/monitors
+        // run to completion and stream their results back, so DROP the one-shot
+        // "no background subagents" lead-in.
+        const RESIDENT_SYS_LEADIN: &str =
+            "You are running in a resident session; background tasks and monitors you arm will run to completion and stream their results back.";
+        append_claude_flags(
+            &mut claude_cmd,
+            RESIDENT_SYS_LEADIN,
+            ctx.chat_id,
+            ctx.project_path,
+            ctx.worktree,
+            ctx.agent_session_id,
+            ctx.is_sandboxed,
+            ctx.model,
+            ctx.user_timezone,
+            /* resident = */ true,
+        );
+        Ok(claude_cmd)
+    }
+
+    fn encode_user_turn(&self, text: &str) -> String {
+        // Build via serde so the user's text (quotes / newlines / control chars)
+        // is encoded safely — never string concat. Newline-terminated: claude's
+        // stream-json input is newline-delimited frames.
+        let frame = serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{ "type": "text", "text": text }],
+            },
+        });
+        format!("{}\n", frame)
+    }
+
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
         let mut out: SmallVec<[AgentEvent; 2]> = SmallVec::new();
+
+        // [DIAG tasktrace] TEMPORARY — capture every frame that touches a
+        // background task/monitor so we can see the exact terminal frame the
+        // LIVE resident claude emits (Monitor tool vs Bash run_in_background,
+        // task_started/updated/notification subtype + the id field actually
+        // present). Remove once the stuck-Waiting bug is pinned.
+        if line.starts_with('{')
+            && (line.contains("task_id")
+                || line.contains("task-notification")
+                || line.contains("\"subtype\":\"task_"))
+        {
+            let snip: String = line.chars().take(900).collect();
+            tracing::info!(diag = "tasktrace", "raw task frame: {snip}");
+        }
 
         // Pre-skip-filter: thinking-only frames also carry usage. The
         // token-usage parse stays under MAX_STREAM_FRAME_BYTES — it runs on
@@ -309,6 +417,34 @@ impl AgentAdapter for ClaudeAdapter {
                     if let Some(post_tokens) = parse_compact_post_tokens(&line) {
                         out.push(AgentEvent::CompactBoundary(post_tokens));
                     }
+                } else if line.contains("\"subtype\":\"task_started\"") {
+                    // Resident model: a background task / Monitor was armed. The
+                    // `task_id` lets the Supervisor track it in `live_tasks`
+                    // (Waiting state) until its terminal `task_notification`.
+                    if let Some(id) = parse_task_id(&line) {
+                        out.push(AgentEvent::TaskStarted(id));
+                    }
+                } else if line.contains("\"subtype\":\"task_notification\"")
+                    || (line.contains("\"subtype\":\"task_updated\"")
+                        && task_updated_is_terminal(&line))
+                {
+                    // Terminal task signal (completed/failed/cancelled) — clears
+                    // the task from `live_tasks`. Two frame shapes carry it:
+                    // claude's one-shot `--print` mode emits a dedicated
+                    // `task_notification`, but the resident `stream-json` session
+                    // signals completion via `task_updated` with `patch.status` =
+                    // completed/failed/cancelled and never sends a
+                    // `task_notification` (verified live: chat c06c30b2, task
+                    // bo87ftywa — only a task_started then a task_updated{completed}
+                    // ever crossed the wire). Match BOTH, or the resident session's
+                    // `live_tasks` never empties → `running` sticks true → no
+                    // `chat_running(false)` is ever written and the chat is pinned
+                    // to agent_running / "Waiting…" forever after a Monitor ends. A
+                    // `task_updated` PROGRESS frame (status running/pending) is not
+                    // terminal and still falls through to skip.
+                    if let Some(id) = parse_task_id(&line) {
+                        out.push(AgentEvent::TaskFinished(id));
+                    }
                 }
                 skip = true;
             } else if line.contains("\"type\":\"user\"") {
@@ -348,7 +484,34 @@ impl AgentAdapter for ClaudeAdapter {
             } else if line.contains("\"type\":\"result\"") {
                 // Emit Result on every result frame; the supervisor latches it
                 // (so AgentResponse::Done.has_result is set once and only once).
-                out.push(AgentEvent::Result);
+                // `origin = {"kind":"task-notification"}` marks a background-task
+                // wake's result (vs an absent `origin` on a user-turn result) so
+                // the resident session FSM doesn't clear `turn_in_flight` for it.
+                // Parse-free: both needles are structural (any occurrence inside
+                // the JSON-escaped result text would be `\"`-escaped).
+                let origin_is_task =
+                    line.contains("\"origin\"") && line.contains("\"kind\":\"task-notification\"");
+                out.push(AgentEvent::Result { origin_is_task });
+                // Resident interrupt suppression. Now mainly covers the /stop
+                // SIGTERM race (and interrupt-then-send, also a SIGTERM): we
+                // publish our own canonical `{"type":"result","subtype":
+                // "interrupted"}` row, and claude may flush a real abort result
+                // for the killed turn before the process dies.
+                // claude ALSO emits a real abort result for the killed turn —
+                // empirically (real claude 2.1.165, tmp/claude_proto_probe.py):
+                //   {"subtype":"error_during_execution",...,
+                //    "terminal_reason":"aborted_streaming"}
+                // Forwarding that as a Frame too would render a SECOND terminal
+                // row ("[result: error_during_execution]" right after "Agent
+                // interrupted"). Suppress the row (keep the Result above so the
+                // FSM still clears `turn_in_flight`). Gated on BOTH needles so we
+                // fail OPEN — a genuine execution error (different subtype or
+                // terminal_reason) still renders.
+                if line.contains("\"subtype\":\"error_during_execution\"")
+                    && line.contains("\"terminal_reason\":\"aborted_streaming\"")
+                {
+                    skip = true;
+                }
             }
         }
 
@@ -429,6 +592,53 @@ fn parse_init_session_id(line: &str) -> Option<String> {
             debug!("failed to parse init frame for session_id: {}", e);
             None
         }
+    }
+}
+
+/// Reads `task_id` from a `task_started` / `task_notification` system frame.
+/// Both carry it at the top level. Narrow Deserialize struct so serde skips the
+/// rest of the (small) frame. `None` on parse failure or a missing id — the
+/// Supervisor treats a dropped start/finish as "task never tracked", which is
+/// safe (a never-inserted task can't wedge the Waiting state).
+fn parse_task_id(line: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Frame {
+        task_id: String,
+    }
+    match serde_json::from_str::<Frame>(line) {
+        Ok(f) => Some(f.task_id),
+        Err(e) => {
+            debug!("failed to parse task frame for task_id: {}", e);
+            None
+        }
+    }
+}
+
+/// True when a `task_updated` system frame reports a TERMINAL `patch.status`
+/// (completed / failed / cancelled) rather than progress (running / pending).
+/// The resident `stream-json` session uses this frame — not `task_notification`
+/// — to signal a background task / Monitor has finished, so it's the only edge
+/// that empties `live_tasks` for a live session (see the caller). Parses the
+/// nested `patch.status`; an unparsable frame or a non-terminal/absent status is
+/// treated as non-terminal, leaving the frame to skip (a missed completion would
+/// wedge Waiting, but a never-tracked task can't, so failing non-terminal here is
+/// only safe because `task_started` is parsed by the same strict path).
+fn task_updated_is_terminal(line: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Frame {
+        patch: Patch,
+    }
+    #[derive(serde::Deserialize)]
+    struct Patch {
+        #[serde(default)]
+        status: Option<String>,
+    }
+    match serde_json::from_str::<Frame>(line) {
+        Ok(f) => matches!(
+            f.patch.status.as_deref(),
+            Some("completed") | Some("failed") | Some("cancelled")
+        ),
+        Err(_) => false,
     }
 }
 
@@ -1231,6 +1441,235 @@ mod tests {
         let line = r#"{"type":"system","subtype":"init","session_id":"abc-123","model":"sonnet"}"#;
         let events = run(&mut a, line);
         assert_eq!(events, vec!["SessionIdHarvested(abc-123)"]);
+    }
+
+    #[test]
+    fn task_started_frame_emits_taskstarted_and_drops_frame() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"system","subtype":"task_started","task_id":"t-7","tool_use_id":"tu9","task_type":"local_bash","description":"monitor"}"#;
+        assert_eq!(run(&mut a, line), vec!["TaskStarted(t-7)"]);
+    }
+
+    #[test]
+    fn task_notification_frame_emits_taskfinished_and_drops_frame() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"system","subtype":"task_notification","task_id":"t-7","status":"completed","output_file":"/tmp/x","summary":"done"}"#;
+        assert_eq!(run(&mut a, line), vec!["TaskFinished(t-7)"]);
+    }
+
+    #[test]
+    fn task_updated_progress_frame_is_skipped_silently() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"system","subtype":"task_updated","task_id":"t-7","patch":{"status":"running"}}"#;
+        assert!(run(&mut a, line).is_empty());
+    }
+
+    /// The resident `stream-json` session signals a finished Monitor with a
+    /// `task_updated{patch.status:"completed"}` and NO `task_notification` — verbatim
+    /// frame captured live (chat c06c30b2, task bo87ftywa). It must emit TaskFinished
+    /// so `live_tasks` empties; otherwise `running` sticks true forever (stuck Waiting).
+    #[test]
+    fn task_updated_completed_frame_emits_taskfinished() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"system","subtype":"task_updated","task_id":"bo87ftywa","patch":{"status":"completed","end_time":1780889095302},"uuid":"c2a6a1a4-a71d-4b06-b7bd-187eb6147796","session_id":"d1883d0c-8e31-4537-9963-47d282a6ab31"}"#;
+        assert_eq!(run(&mut a, line), vec!["TaskFinished(bo87ftywa)"]);
+    }
+
+    #[test]
+    fn task_updated_failed_and_cancelled_frames_emit_taskfinished() {
+        let mut a = ClaudeAdapter::new();
+        let failed = r#"{"type":"system","subtype":"task_updated","task_id":"t-7","patch":{"status":"failed"}}"#;
+        assert_eq!(run(&mut a, failed), vec!["TaskFinished(t-7)"]);
+        let cancelled = r#"{"type":"system","subtype":"task_updated","task_id":"t-8","patch":{"status":"cancelled"}}"#;
+        assert_eq!(run(&mut a, cancelled), vec!["TaskFinished(t-8)"]);
+    }
+
+    #[test]
+    fn encode_user_turn_is_valid_json_with_trailing_newline() {
+        let a = ClaudeAdapter::new();
+        let frame = a.encode_user_turn("hello \"world\"\nwith newline");
+        assert!(frame.ends_with('\n'), "frame must be newline-terminated");
+        let v: serde_json::Value = serde_json::from_str(frame.trim_end()).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"][0]["type"], "text");
+        assert_eq!(
+            v["message"]["content"][0]["text"],
+            "hello \"world\"\nwith newline"
+        );
+    }
+
+    #[test]
+    fn prepare_session_command_drops_prompt_pipe_and_adds_input_format() {
+        use crate::adapter::SessionContext;
+        let mut a = ClaudeAdapter::new();
+        let ctx = SessionContext {
+            chat_id: "abcdef012345-6789",
+            project_path: Some("/tmp/proj"),
+            worktree: false,
+            agent_session_id: Some("sid-9"),
+            is_sandboxed: false,
+            model: Some("opus"),
+            user_timezone: Some("Asia/Bangkok"),
+        };
+        let cmd = a.prepare_session_command(&ctx).unwrap();
+        // No prompt-file piping in the resident path.
+        assert!(
+            !cmd.contains("cat "),
+            "resident cmd must not pipe a prompt file: {cmd}"
+        );
+        // Reads turns from stdin.
+        assert!(cmd.contains("--input-format stream-json"), "got: {cmd}");
+        assert!(cmd.contains("--output-format stream-json"), "got: {cmd}");
+        // Resume + model + sandbox bypass + prune hook all preserved.
+        assert!(cmd.contains("--resume 'sid-9'"), "got: {cmd}");
+        assert!(cmd.contains("--model 'opus'"), "got: {cmd}");
+        assert!(cmd.contains("--dangerously-skip-permissions"), "got: {cmd}");
+        assert!(cmd.contains("prune-reminder-hook"), "got: {cmd}");
+        // cd prefix retained.
+        assert!(cmd.starts_with("cd '/tmp/proj' && claude"), "got: {cmd}");
+    }
+
+    #[test]
+    fn claude_adapter_is_resident() {
+        assert!(ClaudeAdapter::new().is_resident());
+    }
+
+    #[test]
+    fn user_turn_result_is_not_task_origin() {
+        let mut a = ClaudeAdapter::new();
+        // `result` frames are latched (Result) AND forwarded as the result row
+        // (Frame) — they are not skipped, unlike init/task frames.
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
+        let events = run(&mut a, line);
+        assert_eq!(events[0], "Result");
+        assert!(events[1].starts_with("Frame("));
+    }
+
+    #[test]
+    fn task_wake_result_is_task_origin() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"origin":{"kind":"task-notification"},"result":"task done"}"#;
+        let events = run(&mut a, line);
+        assert_eq!(events[0], "Result(task)");
+        assert!(events[1].starts_with("Frame("));
+    }
+
+    // --- Regression fixtures captured from REAL claude 2.1.165 ---------------
+    // (tmp/claude_proto_probe.py, 2026-06-07). These lock the parser + FSM to
+    // the genuine wire shapes so a silent format drift breaks a test, not a
+    // user's Thinking/Waiting indicator or /stop.
+
+    /// Drives the verbatim background-task frames through `handle_line` →
+    /// `reduce` and asserts the headline transition: arming-turn result with a
+    /// live task ⇒ WAITING; the task's `task_notification` ⇒ back to Idle; and
+    /// the task-wake result (origin = task-notification) must NOT clear an
+    /// unrelated in-flight turn.
+    #[test]
+    fn real_background_task_lifecycle_drives_fsm_idle_waiting_idle() {
+        use crate::agent::{reduce, SessionState};
+        let mut a = ClaudeAdapter::new();
+        let mut st = SessionState {
+            turn_in_flight: true, // the arming user turn is in flight
+            ..Default::default()
+        };
+        let feed = |a: &mut ClaudeAdapter, st: &mut SessionState, line: &str| {
+            for ev in a.handle_line(line.to_string()) {
+                reduce(st, &ev);
+            }
+        };
+
+        // 1. Background task armed (run_in_background Bash). Real shape.
+        feed(
+            &mut a,
+            &mut st,
+            r#"{"type":"system","subtype":"task_started","task_id":"bzdt1ec2n","tool_use_id":"toolu_01","description":"sleep 8 && echo BG_DONE","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        assert!(
+            st.live_tasks.contains("bzdt1ec2n"),
+            "task_started must register the task"
+        );
+
+        // 2. The arming turn finishes (no origin). turn clears; task still live.
+        feed(
+            &mut a,
+            &mut st,
+            r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"started"}"#,
+        );
+        assert!(st.waiting(), "turn done + live task ⇒ WAITING");
+        assert!(st.running(), "WAITING is a running sub-state");
+        assert!(!st.is_idle());
+
+        // 3. Progress ping (non-terminal status) — must be a no-op (task stays live).
+        feed(
+            &mut a,
+            &mut st,
+            r#"{"type":"system","subtype":"task_updated","task_id":"bzdt1ec2n","patch":{"status":"running"}}"#,
+        );
+        assert!(
+            st.waiting(),
+            "task_updated progress must not change run state"
+        );
+
+        // 4. Terminal task signal ⇒ task removed ⇒ Idle. The resident stream-json
+        //    session emits this as a `task_updated{patch.status:"completed"}` (NOT a
+        //    `task_notification`); failing to treat it as terminal here is exactly the
+        //    bug that pinned chats to agent_running/"Waiting…" after a Monitor ended
+        //    (chat c06c30b2). The `task_notification` shape is covered by
+        //    `task_notification_frame_emits_taskfinished_and_drops_frame`.
+        feed(
+            &mut a,
+            &mut st,
+            r#"{"type":"system","subtype":"task_updated","task_id":"bzdt1ec2n","patch":{"status":"completed","end_time":1780889095302}}"#,
+        );
+        assert!(
+            st.is_idle(),
+            "task_updated{{completed}} clears the last live task"
+        );
+
+        // 5. The task-wake turn's result carries origin=task-notification — it
+        //    must NOT touch turn state. Pretend a real user turn is in flight to
+        //    prove the wake result doesn't clear it.
+        st.turn_in_flight = true;
+        feed(
+            &mut a,
+            &mut st,
+            r#"{"type":"result","subtype":"success","is_error":false,"origin":{"kind":"task-notification"},"terminal_reason":"completed","result":"bg output: BG_DONE"}"#,
+        );
+        assert!(
+            st.turn_in_flight,
+            "a task-wake result must NOT clear an unrelated in-flight user turn"
+        );
+    }
+
+    /// Real claude emits an abort result for the killed turn on /stop. We
+    /// publish our own canonical `interrupted` row, so this one must be
+    /// suppressed (no Frame) to avoid a double terminal indicator — while still
+    /// emitting `Result` so the FSM clears `turn_in_flight`.
+    #[test]
+    fn interrupt_abort_result_suppresses_row_but_emits_result() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming","result":"[Request interrupted by user]"}"#;
+        let events = run(&mut a, line);
+        assert_eq!(
+            events,
+            vec!["Result"],
+            "abort result must emit Result for the FSM but NO Frame (row suppressed)"
+        );
+    }
+
+    /// Fail-open guard: a genuine execution error (NOT the aborted-streaming
+    /// interrupt signature) still renders as a row so real failures stay visible.
+    #[test]
+    fn genuine_execution_error_still_renders_a_row() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"error","result":"boom"}"#;
+        let events = run(&mut a, line);
+        assert_eq!(events[0], "Result");
+        assert!(
+            events[1].starts_with("Frame("),
+            "non-abort execution errors must still render: {events:?}"
+        );
     }
 
     #[test]

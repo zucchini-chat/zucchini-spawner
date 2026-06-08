@@ -463,7 +463,9 @@ impl AgentAdapter for CursorAdapter {
                 out.push(AgentEvent::Frame(frame));
                 // Emit Result on every result frame; the supervisor latches it
                 // (so AgentResponse::Done.has_result is set once and only once).
-                out.push(AgentEvent::Result);
+                out.push(AgentEvent::Result {
+                    origin_is_task: false,
+                });
                 // Reset per-turn state. One adapter per spawn today, but a
                 // future supervisor change that reuses an adapter across
                 // turns would otherwise carry stale call ids forward.
@@ -986,7 +988,9 @@ fn decode_root_order(
     let mut i = 0usize;
     while i + 34 <= root_data.len() {
         if root_data[i] == 0x0A && root_data[i + 1] == 0x20 {
-            let hash: [u8; 32] = root_data[i + 2..i + 34].try_into().expect("34-i slice is 32");
+            let hash: [u8; 32] = root_data[i + 2..i + 34]
+                .try_into()
+                .expect("34-i slice is 32");
             if raw_ids.contains(&hash) {
                 order.push(hex_encode(&hash));
                 i += 34;
@@ -1176,7 +1180,11 @@ fn prune_batch_cursor(
     let mut chosen_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (tool_name, needle) in targets {
         let eligible = cursor_eligible_ids(&store, tool_name, needle);
-        if let Some(pick) = eligible.into_iter().rev().find(|id| !chosen_set.contains(id)) {
+        if let Some(pick) = eligible
+            .into_iter()
+            .rev()
+            .find(|id| !chosen_set.contains(id))
+        {
             chosen_set.insert(pick.clone());
             chosen.push(pick);
         }
@@ -3139,7 +3147,11 @@ mod tests {
         // The instructions are shell-escaped into the `printf %s '<preamble>'`
         // arg; assert a distinctive token from each is present.
         assert!(cmd.contains("prune-context"), "got: {}", cmd);
-        assert!(cmd.contains("attach"), "missing attach instruction: {}", cmd);
+        assert!(
+            cmd.contains("attach"),
+            "missing attach instruction: {}",
+            cmd
+        );
     }
 
     // ===== prune-context cue tests (correction B) =====
