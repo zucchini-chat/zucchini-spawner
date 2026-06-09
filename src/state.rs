@@ -31,9 +31,12 @@ pub struct ChatState {
     pub last_seq: i64,
     /// `chats.agent_session_id` from Postgres. `None` on the first turn of a
     /// freshly created chat; populated on the first stdout frame from the
-    /// agent (harvested from its `system/init` frame) or backfilled from
-    /// `id::text` for pre-migration rows. When `Some(s)`, the spawner resumes
-    /// via `--resume s`; when `None`, the agent generates a fresh session id.
+    /// agent (harvested from its `system/init` frame, via `set_agent_session_id`)
+    /// or backfilled from `id::text` for pre-migration rows. When `Some(s)`, the
+    /// spawner resumes via `--resume s`; when `None`, the agent generates a fresh
+    /// session id. `upsert_chat` stores the incoming value verbatim (including a
+    /// stale NULL); the locally-harvested id is preserved across such a re-stream
+    /// by the checkpoint-window restore in main.rs (`SyncEvent::CheckpointComplete`).
     pub agent_session_id: Option<String>,
     /// `chats.agent_kind` from Postgres. Defaults to `AgentKind::Claude`
     /// when the column is absent (chats synced before the column was
@@ -179,31 +182,11 @@ impl Mirror {
             },
         };
 
-        // Merge-on-upsert for `agent_session_id`: when the incoming row
-        // carries `NULL` but we already harvested a session id locally,
-        // keep the local value. The race we're guarding against: the
-        // writer queues a PATCH for `agent_session_id` after harvesting
-        // it from the agent's first stdout frame, but before that PATCH
-        // lands in Postgres the writer may also flush an unrelated
-        // PATCH on the same chat row (e.g. `last_message_at`,
-        // `agent_running`, `context_tokens`). PowerSync re-streams the
-        // chat row on each PATCH; the early re-stream still has
-        // `agent_session_id=NULL`, and a naive overwrite here would wipe
-        // the harvested id — a fast-followup user message would then
-        // spawn the agent without `--resume`, dropping prior context.
-        //
-        // Safe against the row-was-actually-reset case: the importer
-        // takeover path in `backend/src/writes.rs` DELETEs the foreign
-        // chat row before re-inserting, and the DELETE op clears
-        // `mirror.chats` (see `remove_chat` callsite in main.rs), so the
-        // subsequent PUT lands with no in-memory state to merge against.
-        let merged_agent_session_id = match (
-            incoming_agent_session_id,
-            self.chats.get(&id).and_then(|c| c.agent_session_id.clone()),
-        ) {
-            (None, Some(local)) => Some(local),
-            (incoming, _) => incoming,
-        };
+        // Store the incoming `agent_session_id` verbatim (including None). The
+        // harvested-id-survives-a-stale-NULL race is now handled at apply time
+        // by the checkpoint-window restore in main.rs
+        // (`SyncEvent::CheckpointComplete`): it captures the local id before
+        // upsert and restores it when the applied row landed NULL.
 
         // `chats.model` is migration 0035. Pre-migration rows omit the column
         // entirely; an empty string also lands as `None` so the
@@ -222,7 +205,7 @@ impl Mirror {
                 project_id: project_id.to_string(),
                 worktree,
                 last_seq,
-                agent_session_id: merged_agent_session_id,
+                agent_session_id: incoming_agent_session_id,
                 agent_kind,
                 model,
             },

@@ -207,11 +207,38 @@ pub(crate) enum SyncEventOutcome {
     UninstallRequested,
 }
 
+/// Per-checkpoint-window staging for hazard tables. PowerSync emits
+/// PUT → REMOVE → PUT on every row update (slot move, not a delete); staging
+/// the last op per id and applying at `CheckpointComplete` collapses that to
+/// the net result, so a transient REMOVE never evicts a chat mid-turn (which
+/// would drop the turn's `result` frame via `send_agent_line`). Owned by the
+/// main loop, NEVER part of `Mirror` (not serialized, not visible to the
+/// control task). Apply order at checkpoint: projects → chats → messages.
+#[derive(Default)]
+struct SyncStaging {
+    chats: std::collections::HashMap<String, StagedRow>, // id -> last op this window
+    projects: std::collections::HashMap<String, StagedRow>, // id -> last op this window
+    messages: Vec<String>, // deferred user-message raw row JSON, arrival order
+}
+
+/// A staged chats/projects op for one id within a window (last-write-wins).
+enum StagedRow {
+    Put(String), // raw row JSON
+    Remove,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_sync_event(
     event: SyncEvent,
     machine_id: Option<Uuid>,
     mirror: &mut Mirror,
+    // Per-checkpoint-window staging for hazard tables (chats/projects/messages).
+    // Stage arms record the last op per id (chats/projects) or push deferred
+    // user-message rows; the `CheckpointComplete` arm applies them in order
+    // (projects → chats → messages) against the now-consistent mirror. Owned by
+    // the main loop, never part of `Mirror` (not serialized, control task never
+    // sees it).
+    staging: &mut SyncStaging,
     supervisor: &mut Supervisor,
     blobs: &BlobDownloader,
     keys: &KeyStore,
@@ -240,15 +267,38 @@ async fn handle_sync_event(
     match event {
         SyncEvent::Put { table, id, data } => match table.as_str() {
             "projects" => {
-                mirror.upsert_project(id, &data);
-                SyncEventOutcome::StateChanged
+                // Stage; applied (and persisted via CheckpointReached) at the
+                // checkpoint. No per-op StateChanged anymore.
+                staging.projects.insert(id, StagedRow::Put(data));
+                SyncEventOutcome::Nothing
             }
             "chats" => {
-                mirror.upsert_chat(id, &data);
+                // Stage last-write-wins; a transient PUT→REMOVE→PUT slot move
+                // collapses to the net result at the checkpoint, so a stale
+                // REMOVE never evicts a chat mid-turn.
+                staging.chats.insert(id, StagedRow::Put(data));
                 SyncEventOutcome::Nothing
             }
             "messages" => {
-                handle_message_put(&data, mirror, supervisor, blobs, keys, write_tx).await;
+                // Defer the spawn to the checkpoint so a new chat + its first
+                // message arriving in the same window apply in dependency order
+                // (chat present before the message spawns). Cheap pre-filter
+                // (mirrors the early-outs in `handle_message_put`) keeps staging
+                // free of agent/imported noise — `handle_message_put` still does
+                // the authoritative filtering/decode/replay-guard at apply time.
+                let stage = match serde_json::from_str::<serde_json::Value>(&data) {
+                    Ok(row) => {
+                        let is_user = row.get("sender").and_then(|v| v.as_str()) == Some("user");
+                        let imported = json_pg_bool(row.get("imported"));
+                        is_user && !imported
+                    }
+                    // Unparseable here → stage it; `handle_message_put` logs +
+                    // bails on the same parse failure at apply.
+                    Err(_) => true,
+                };
+                if stage {
+                    staging.messages.push(data);
+                }
                 SyncEventOutcome::Nothing
             }
             "machines" => {
@@ -375,17 +425,18 @@ async fn handle_sync_event(
         },
         SyncEvent::Remove { table, id } => match table.as_str() {
             "chats" => {
-                // PowerSync emits PUT → REMOVE → PUT on every row update (moves the
-                // storage slot, not a real delete), so a lone REMOVE here does NOT
-                // mean the user deleted the chat — abort-on-delete needs a separate
-                // signal (TODO: debounce until CheckpointComplete shows the row is
-                // really gone, or add a chats.deleted_at column).
-                mirror.remove_chat(&id);
+                // PowerSync emits PUT → REMOVE → PUT on every row update (moves
+                // the storage slot, not a real delete). Stage last-write-wins:
+                // a window whose final op is REMOVE applies remove_chat at the
+                // checkpoint (real delete); a transient REMOVE followed by a
+                // re-PUT collapses to the PUT, so a chat is never evicted
+                // mid-turn (which would drop the turn's `result` frame).
+                staging.chats.insert(id, StagedRow::Remove);
                 SyncEventOutcome::Nothing
             }
             "projects" => {
-                mirror.remove_project(&id);
-                SyncEventOutcome::StateChanged
+                staging.projects.insert(id, StagedRow::Remove);
+                SyncEventOutcome::Nothing
             }
             "machine_users" => {
                 // Owner K_user lifecycle is install.sh / uninstall.sh territory
@@ -405,6 +456,56 @@ async fn handle_sync_event(
             _ => SyncEventOutcome::Nothing,
         },
         SyncEvent::CheckpointComplete { buckets } => {
+            // Apply the staged window in dependency order: projects → chats →
+            // messages, so chat.project_id and message.chat resolve against a
+            // now-consistent mirror. Then advance the persisted cursor.
+
+            // 1. projects
+            for (id, row) in staging.projects.drain() {
+                match row {
+                    StagedRow::Put(json) => mirror.upsert_project(id, &json),
+                    StagedRow::Remove => mirror.remove_project(&id),
+                }
+            }
+
+            // 2. chats (with agent_session_id restore — replaces the old inline
+            //    merge-on-upsert hack in state.rs::upsert_chat)
+            for (id, row) in staging.chats.drain() {
+                match row {
+                    StagedRow::Put(json) => {
+                        // Preserve a locally-harvested session id across a
+                        // checkpoint that re-delivers the row with
+                        // agent_session_id=NULL (the harvest is set locally
+                        // between checkpoints via set_agent_session_id; PowerSync
+                        // can re-stream a stale NULL). A window containing a real
+                        // REMOVE collapses to remove_chat first (last-write-wins),
+                        // so nothing is restored for a genuine delete.
+                        let local_session = mirror
+                            .chats
+                            .get(&id)
+                            .and_then(|c| c.agent_session_id.clone());
+                        mirror.upsert_chat(id.clone(), &json);
+                        if let Some(local) = local_session {
+                            if mirror
+                                .chats
+                                .get(&id)
+                                .map(|c| c.agent_session_id.is_none())
+                                .unwrap_or(false)
+                            {
+                                mirror.set_agent_session_id(&id, local);
+                            }
+                        }
+                    }
+                    StagedRow::Remove => mirror.remove_chat(&id),
+                }
+            }
+
+            // 3. messages — spawn against the now-consistent mirror, arrival order
+            let pending_messages = std::mem::take(&mut staging.messages);
+            for raw in pending_messages {
+                handle_message_put(&raw, mirror, supervisor, blobs, keys, write_tx).await;
+            }
+
             mirror.buckets = buckets;
             SyncEventOutcome::CheckpointReached
         }
@@ -2328,6 +2429,12 @@ async fn main() {
     // lands. Restart re-checks via the DB NULL → non-NULL durable guard.
     let mut agents_seed_attempted = false;
 
+    // Per-checkpoint-window staging for hazard tables (chats/projects/messages).
+    // Lives across loop iterations — accumulates ops within a checkpoint window
+    // and is drained/applied at `CheckpointComplete`. Main()-local, passed by
+    // `&mut`; the control task never sees it. Unused this step (threaded only).
+    let mut staging = SyncStaging::default();
+
     // `pending_prunes` (the shared table above) accumulates requests the control
     // task parks while claude runs, each waiting for that `prune-context` call's
     // own `tool_result` frame. The `response_rx` `ToolResult`-cue arm drains a
@@ -2402,6 +2509,7 @@ async fn main() {
                         event,
                         machine_id,
                         &mut g,
+                        &mut staging,
                         &mut supervisor,
                         &blob_downloader,
                         &keys,
@@ -2737,6 +2845,10 @@ mod tests {
         // is set but no `machine_users` PUT is fed; flag stays `false`).
         let mut seed_attempted = false;
 
+        // Shared staging across the window — chats/projects/messages now stage
+        // and only apply (spawn) at the trailing CheckpointComplete.
+        let mut staging = SyncStaging::default();
+
         // 1. Project PUT — populates mirror.projects so handle_message_put
         // can resolve project_path from project_id.
         let project_row =
@@ -2749,6 +2861,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut staging,
             &mut supervisor,
             &blobs,
             &keys,
@@ -2780,6 +2893,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut staging,
             &mut supervisor,
             &blobs,
             &keys,
@@ -2814,6 +2928,27 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut staging,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+
+        // 4. CheckpointComplete — applies the staged window (projects → chats →
+        // messages) and triggers the deferred spawn.
+        handle_sync_event(
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut staging,
             &mut supervisor,
             &blobs,
             &keys,
@@ -3191,6 +3326,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut SyncStaging::default(),
             &mut supervisor,
             &blobs,
             &keys,
@@ -3280,6 +3416,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut SyncStaging::default(),
             &mut supervisor,
             &blobs,
             &keys,
@@ -3348,6 +3485,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut SyncStaging::default(),
             &mut supervisor,
             &blobs,
             &keys,
@@ -3415,6 +3553,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut SyncStaging::default(),
             &mut supervisor,
             &blobs,
             &keys,
@@ -3484,6 +3623,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut SyncStaging::default(),
             &mut supervisor,
             &blobs,
             &keys,
@@ -3574,6 +3714,9 @@ mod tests {
 
         let mut seed_attempted = true; // skip seeding path in this test
 
+        // Shared staging — apply (spawn) happens at the trailing CheckpointComplete.
+        let mut staging = SyncStaging::default();
+
         // Project PUT.
         handle_sync_event(
             SyncEvent::Put {
@@ -3583,6 +3726,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut staging,
             &mut supervisor,
             &blobs,
             &keys,
@@ -3613,6 +3757,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut staging,
             &mut supervisor,
             &blobs,
             &keys,
@@ -3643,6 +3788,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut staging,
             &mut supervisor,
             &blobs,
             &keys,
@@ -3676,6 +3822,7 @@ mod tests {
                 },
                 Some(machine_id),
                 &mut mirror,
+                &mut staging,
                 &mut supervisor,
                 &blobs,
                 &keys,
@@ -3687,6 +3834,25 @@ mod tests {
             )
             .await;
         }
+
+        // CheckpointComplete — applies the staged window and fires both spawns.
+        handle_sync_event(
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut staging,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
 
         let captured = recorded.lock().unwrap();
         assert_eq!(captured.len(), 2, "two chats → two spawns");
@@ -3706,6 +3872,490 @@ mod tests {
         assert!(
             empty_spawn.model.is_none(),
             "empty model collapses to None at the SpawnRequest construction site"
+        );
+    }
+
+    /// Within ONE checkpoint window: project PUT, chat PUT, chat REMOVE, chat
+    /// PUT (same id). Last-write-wins per id collapses the transient REMOVE, so
+    /// at CheckpointComplete the chat is PRESENT (the dropped-`[result]`-frame
+    /// PUT→REMOVE→PUT slot-move race, reproduced at the mirror level). A
+    /// follow-up user message in a fresh window must then spawn exactly once.
+    #[tokio::test]
+    async fn chats_put_remove_put_nets_present() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let chat_id = Uuid::now_v7().to_string();
+        let project_id = Uuid::now_v7().to_string();
+        let project_path = "/tmp/zucchini-test-project".to_string();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let key_bytes = [0u8; 32];
+        let keys = KeyStore::with_keys([(user_id, key_bytes)]);
+        let key = keys.get(&user_id).expect("seeded key");
+        let blobs = empty_blob_downloader();
+        let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
+        let mut seed_attempted = true; // skip seeding path
+        let mut staging = SyncStaging::default();
+
+        let chat_row = json!({
+            "id": chat_id,
+            "project_id": project_id,
+            "user_id": user_id.to_string(),
+            "last_seq": 0,
+            "agent_session_id": serde_json::Value::Null,
+            "agent_kind": "claude",
+            "worktree": false,
+        })
+        .to_string();
+
+        // Window 1: project PUT, chat PUT, chat REMOVE, chat PUT (same id).
+        for ev in [
+            SyncEvent::Put {
+                table: "projects".into(),
+                id: project_id.clone(),
+                data: json!({ "id": project_id, "path": project_path, "name": "t" }).to_string(),
+            },
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_id.clone(),
+                data: chat_row.clone(),
+            },
+            SyncEvent::Remove {
+                table: "chats".into(),
+                id: chat_id.clone(),
+            },
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_id.clone(),
+                data: chat_row.clone(),
+            },
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+        ] {
+            handle_sync_event(
+                ev,
+                Some(machine_id),
+                &mut mirror,
+                &mut staging,
+                &mut supervisor,
+                &blobs,
+                &keys,
+                None,
+                None,
+                &write_tx,
+                None,
+                &mut seed_attempted,
+            )
+            .await;
+        }
+
+        assert!(
+            mirror.chats.contains_key(&chat_id),
+            "transient REMOVE inside a window must not evict the re-PUT chat"
+        );
+
+        // Window 2: a user message must spawn exactly one agent.
+        let envelope_json =
+            serde_json::json!({ "text": "hi after slot-move", "attachments": [] }).to_string();
+        let body_b64 = B64.encode(crypto::encrypt(&key, envelope_json.as_bytes()));
+        let msg_id = Uuid::now_v7().to_string();
+        for ev in [
+            SyncEvent::Put {
+                table: "messages".into(),
+                id: msg_id.clone(),
+                data: json!({
+                    "id": msg_id,
+                    "chat_id": chat_id,
+                    "sender": "user",
+                    "seq": 1,
+                    "body": body_b64,
+                    "imported": false,
+                })
+                .to_string(),
+            },
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+        ] {
+            handle_sync_event(
+                ev,
+                Some(machine_id),
+                &mut mirror,
+                &mut staging,
+                &mut supervisor,
+                &blobs,
+                &keys,
+                None,
+                None,
+                &write_tx,
+                None,
+                &mut seed_attempted,
+            )
+            .await;
+        }
+
+        let captured = recorded.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "exactly one spawn after the survived chat takes a message"
+        );
+        assert_eq!(captured[0].chat_id, chat_id);
+    }
+
+    /// A genuine delete still applies: chat PUT + CheckpointComplete (present),
+    /// then chat REMOVE with NO re-PUT + CheckpointComplete → the chat is gone.
+    #[tokio::test]
+    async fn chats_put_remove_nets_absent() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let chat_id = Uuid::now_v7().to_string();
+        let project_id = Uuid::now_v7().to_string();
+        let project_path = "/tmp/zucchini-test-project".to_string();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
+        let blobs = empty_blob_downloader();
+        let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let (mut supervisor, _recorded) = supervisor_with_resident_recorder(resp_tx);
+        let mut seed_attempted = true;
+        let mut staging = SyncStaging::default();
+
+        // Window 1: project + chat PUT → chat present.
+        for ev in [
+            SyncEvent::Put {
+                table: "projects".into(),
+                id: project_id.clone(),
+                data: json!({ "id": project_id, "path": project_path, "name": "t" }).to_string(),
+            },
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_id.clone(),
+                data: json!({
+                    "id": chat_id,
+                    "project_id": project_id,
+                    "user_id": user_id.to_string(),
+                    "last_seq": 0,
+                    "agent_session_id": serde_json::Value::Null,
+                    "agent_kind": "claude",
+                    "worktree": false,
+                })
+                .to_string(),
+            },
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+        ] {
+            handle_sync_event(
+                ev,
+                Some(machine_id),
+                &mut mirror,
+                &mut staging,
+                &mut supervisor,
+                &blobs,
+                &keys,
+                None,
+                None,
+                &write_tx,
+                None,
+                &mut seed_attempted,
+            )
+            .await;
+        }
+        assert!(
+            mirror.chats.contains_key(&chat_id),
+            "chat present after its first checkpoint"
+        );
+
+        // Window 2: REMOVE with no re-PUT → genuine delete applies at checkpoint.
+        for ev in [
+            SyncEvent::Remove {
+                table: "chats".into(),
+                id: chat_id.clone(),
+            },
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+        ] {
+            handle_sync_event(
+                ev,
+                Some(machine_id),
+                &mut mirror,
+                &mut staging,
+                &mut supervisor,
+                &blobs,
+                &keys,
+                None,
+                None,
+                &write_tx,
+                None,
+                &mut seed_attempted,
+            )
+            .await;
+        }
+        assert!(
+            !mirror.chats.contains_key(&chat_id),
+            "a real REMOVE with no re-PUT evicts the chat at checkpoint"
+        );
+    }
+
+    /// Apply order is projects → chats → messages regardless of delivery order
+    /// within the window: feed the user message PUT BEFORE the chat PUT, then
+    /// the project PUT, then CheckpointComplete → exactly one spawn.
+    #[tokio::test]
+    async fn new_chat_plus_first_message_same_window_spawns() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let chat_id = Uuid::now_v7().to_string();
+        let project_id = Uuid::now_v7().to_string();
+        let project_path = "/tmp/zucchini-test-project".to_string();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let key_bytes = [0u8; 32];
+        let keys = KeyStore::with_keys([(user_id, key_bytes)]);
+        let key = keys.get(&user_id).expect("seeded key");
+        let blobs = empty_blob_downloader();
+        let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
+        let mut seed_attempted = true;
+        let mut staging = SyncStaging::default();
+
+        let envelope_json =
+            serde_json::json!({ "text": "first turn", "attachments": [] }).to_string();
+        let body_b64 = B64.encode(crypto::encrypt(&key, envelope_json.as_bytes()));
+        let msg_id = Uuid::now_v7().to_string();
+
+        // Deliberately out of dependency order: message, then chat, then project.
+        for ev in [
+            SyncEvent::Put {
+                table: "messages".into(),
+                id: msg_id.clone(),
+                data: json!({
+                    "id": msg_id,
+                    "chat_id": chat_id,
+                    "sender": "user",
+                    "seq": 1,
+                    "body": body_b64,
+                    "imported": false,
+                })
+                .to_string(),
+            },
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_id.clone(),
+                data: json!({
+                    "id": chat_id,
+                    "project_id": project_id,
+                    "user_id": user_id.to_string(),
+                    "last_seq": 0,
+                    "agent_session_id": serde_json::Value::Null,
+                    "agent_kind": "claude",
+                    "worktree": false,
+                })
+                .to_string(),
+            },
+            SyncEvent::Put {
+                table: "projects".into(),
+                id: project_id.clone(),
+                data: json!({ "id": project_id, "path": project_path, "name": "t" }).to_string(),
+            },
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+        ] {
+            handle_sync_event(
+                ev,
+                Some(machine_id),
+                &mut mirror,
+                &mut staging,
+                &mut supervisor,
+                &blobs,
+                &keys,
+                None,
+                None,
+                &write_tx,
+                None,
+                &mut seed_attempted,
+            )
+            .await;
+        }
+
+        let captured = recorded.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "apply orders projects→chats→messages regardless of in-window delivery order"
+        );
+        assert_eq!(captured[0].chat_id, chat_id);
+        assert_eq!(
+            captured[0].project_path.as_deref(),
+            Some(project_path.as_str())
+        );
+    }
+
+    /// Guards the merge-hack retirement: a locally-harvested `agent_session_id`
+    /// must survive a later checkpoint that re-streams the row with a stale NULL
+    /// session id, and a fast-followup user message must `--resume` it.
+    #[tokio::test]
+    async fn fast_followup_resume_survives_checkpoint_window() {
+        let user_id = Uuid::now_v7();
+        let machine_id = Uuid::now_v7();
+        let chat_id = Uuid::now_v7().to_string();
+        let project_id = Uuid::now_v7().to_string();
+        let project_path = "/tmp/zucchini-test-project".to_string();
+
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user_id);
+        let key_bytes = [0u8; 32];
+        let keys = KeyStore::with_keys([(user_id, key_bytes)]);
+        let key = keys.get(&user_id).expect("seeded key");
+        let blobs = empty_blob_downloader();
+        let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
+        let mut seed_attempted = true;
+        let mut staging = SyncStaging::default();
+
+        // The chat row always carries agent_session_id=NULL (PowerSync never
+        // round-trips the locally-harvested id back into the streamed row here).
+        let null_chat_row = json!({
+            "id": chat_id,
+            "project_id": project_id,
+            "user_id": user_id.to_string(),
+            "last_seq": 0,
+            "agent_session_id": serde_json::Value::Null,
+            "agent_kind": "claude",
+            "worktree": false,
+        })
+        .to_string();
+
+        // Window 1: project PUT + chat PUT (NULL session id).
+        for ev in [
+            SyncEvent::Put {
+                table: "projects".into(),
+                id: project_id.clone(),
+                data: json!({ "id": project_id, "path": project_path, "name": "t" }).to_string(),
+            },
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_id.clone(),
+                data: null_chat_row.clone(),
+            },
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+        ] {
+            handle_sync_event(
+                ev,
+                Some(machine_id),
+                &mut mirror,
+                &mut staging,
+                &mut supervisor,
+                &blobs,
+                &keys,
+                None,
+                None,
+                &write_tx,
+                None,
+                &mut seed_attempted,
+            )
+            .await;
+        }
+
+        // Mimic the harvest (main.rs SessionIdHarvested → set_agent_session_id).
+        mirror.set_agent_session_id(&chat_id, "sess-1".into());
+
+        // Window 2: a stale re-stream of the same row, STILL NULL.
+        for ev in [
+            SyncEvent::Put {
+                table: "chats".into(),
+                id: chat_id.clone(),
+                data: null_chat_row.clone(),
+            },
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+        ] {
+            handle_sync_event(
+                ev,
+                Some(machine_id),
+                &mut mirror,
+                &mut staging,
+                &mut supervisor,
+                &blobs,
+                &keys,
+                None,
+                None,
+                &write_tx,
+                None,
+                &mut seed_attempted,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            mirror
+                .chats
+                .get(&chat_id)
+                .and_then(|c| c.agent_session_id.clone()),
+            Some("sess-1".to_string()),
+            "apply-phase restore must preserve the harvested id across a NULL re-stream"
+        );
+
+        // Window 3: a fast-followup user message must resume sess-1.
+        let envelope_json =
+            serde_json::json!({ "text": "follow up", "attachments": [] }).to_string();
+        let body_b64 = B64.encode(crypto::encrypt(&key, envelope_json.as_bytes()));
+        let msg_id = Uuid::now_v7().to_string();
+        for ev in [
+            SyncEvent::Put {
+                table: "messages".into(),
+                id: msg_id.clone(),
+                data: json!({
+                    "id": msg_id,
+                    "chat_id": chat_id,
+                    "sender": "user",
+                    "seq": 1,
+                    "body": body_b64,
+                    "imported": false,
+                })
+                .to_string(),
+            },
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+        ] {
+            handle_sync_event(
+                ev,
+                Some(machine_id),
+                &mut mirror,
+                &mut staging,
+                &mut supervisor,
+                &blobs,
+                &keys,
+                None,
+                None,
+                &write_tx,
+                None,
+                &mut seed_attempted,
+            )
+            .await;
+        }
+
+        let captured = recorded.lock().unwrap();
+        assert_eq!(captured.len(), 1, "fast-followup spawns exactly once");
+        assert_eq!(
+            captured[0].agent_session_id.as_deref(),
+            Some("sess-1"),
+            "fast-followup --resume preserved the harvested session id"
         );
     }
 
@@ -3854,6 +4504,10 @@ mod tests {
         let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
         let mut seed_attempted = true;
 
+        // Shared staging; the trailing CheckpointComplete (before the SharedMirror
+        // wrap) applies the project + chat into the mirror.
+        let mut staging = SyncStaging::default();
+
         handle_sync_event(
             SyncEvent::Put {
                 table: "projects".into(),
@@ -3864,6 +4518,7 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut staging,
             &mut supervisor,
             &blobs,
             &keys,
@@ -3892,6 +4547,26 @@ mod tests {
             },
             Some(machine_id),
             &mut mirror,
+            &mut staging,
+            &mut supervisor,
+            &blobs,
+            &keys,
+            None,
+            None,
+            &write_tx,
+            None,
+            &mut seed_attempted,
+        )
+        .await;
+
+        // Apply the staged project + chat before wrapping in SharedMirror.
+        handle_sync_event(
+            SyncEvent::CheckpointComplete {
+                buckets: Default::default(),
+            },
+            Some(machine_id),
+            &mut mirror,
+            &mut staging,
             &mut supervisor,
             &blobs,
             &keys,
