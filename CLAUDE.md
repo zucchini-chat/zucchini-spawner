@@ -28,7 +28,7 @@ The resident `claude` process lives only while a foreground turn **or** an in-pr
 
 ## Hot reload (author's machine)
 
-Two launchd agents — see `tmp/spawner-dev-watcher.md`. `WatchPaths` only covers `src/`, so after a `Cargo.toml` bump `touch zucchini-spawner/src/main.rs` to force a rebuild.
+Two launchd agents in `~/Library/LaunchAgents/`: `chat.zucchini.spawner` (the spawner) and `chat.zucchini.spawner-watcher` (runs `dev-watch.sh` on changes — builds and stages into `~/.zucchini-spawner/dev-update/`, which the running spawner's updater applies when idle). Watcher `WatchPaths` covers `src/` **and** `Cargo.toml`, so version bumps rebuild automatically. The machine's `spawner_version` shown in app settings is the *running* binary's `CARGO_PKG_VERSION`, written at startup — it lags until the updater swaps the binary and the spawner respawns.
 
 ## Public GitHub mirror
 
