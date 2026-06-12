@@ -83,6 +83,13 @@ pub struct Mirror {
     /// `machine_users` rows).
     #[serde(default)]
     members: HashMap<Uuid, MemberInfo>,
+    /// One-shot latch for the install-time `machine_users.agents` seed
+    /// (`seed_initial_agents_if_pending` in main.rs). `serde(default)` FALSE
+    /// for a pre-upgrade state.json is deliberate: the cohort stranded with a
+    /// NULL roster gets one healing attempt post-upgrade; non-NULL rosters
+    /// drain it on the backend's seed-only guard (`WHERE agents IS NULL`).
+    #[serde(default)]
+    pub initial_agents_seed_done: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -100,23 +107,12 @@ struct MemberInfo {
     /// tick). `None` until the first sealed_blob lands.
     #[serde(default)]
     last_sealed_blob: Option<String>,
-    /// Mirror of `machine_users.agents` (migration 0035) as the raw JSON
-    /// string the column stores. `Some(s)` for any non-NULL value (`s` may
-    /// be the literal `"[]"` if the user emptied the list — distinct from
-    /// `None`, which means the column is NULL and the spawner should seed
-    /// defaults on its own row). Only consulted for the spawner's own row;
-    /// other members' agents lists never reach the spawner via the
-    /// `by_machine` projection. Not persisted to state.json — the column is
-    /// re-streamed on every boot, and persisting it would risk drift if a
-    /// peer iOS write landed while the spawner was offline.
-    #[serde(skip)]
-    agents: Option<String>,
     /// Mirror of `machine_users.timezone` (migration 0040) — IANA id of the
     /// member's most-recently-active device, or `None` (NULL / older client).
     /// Consulted at spawn to inject the current local time (`current_time_in_tz_line`)
     /// and zone naive `schedule-message --at` (`control::normalize_deliver_at`).
     ///
-    /// PERSISTED (unlike `agents`). The `by_machine` bucket resumes incrementally
+    /// PERSISTED. The `by_machine` bucket resumes incrementally
     /// from the saved cursor, so an unchanged `machine_users` row is never
     /// re-streamed after a restart — and nothing bumps it per turn (chats dodge
     /// this via the per-message `last_seq` UPDATE). So a once-set tz would
@@ -259,20 +255,15 @@ impl Mirror {
         self.user_id == Some(uid)
     }
 
-    /// The owner's own `machine_users` row identity (`row_id`, `user_id`) once
-    /// it has streamed in. Used by the probe-completion seed retry in `main`:
-    /// the boot-time owner-row PUT usually lands ~5s before the async install
-    /// probes finish, so the in-PUT `seed_default_agents_if_needed` defers with
-    /// no probe data and the row is never re-PUT to retry on. After probes are
-    /// cached we re-run the seed against this identity. Returns `None` until the
-    /// owner row is known (its `row_id` is non-empty).
-    pub fn owner_row(&self) -> Option<(String, Uuid)> {
+    /// The owner's own `machine_users` row id once it has streamed in (`None`
+    /// until its `row_id` is non-empty). Gates `seed_initial_agents_if_pending`.
+    pub fn owner_row(&self) -> Option<String> {
         let uid = self.user_id?;
         let m = self.members.get(&uid)?;
         if m.row_id.is_empty() {
             return None;
         }
-        Some((m.row_id.clone(), uid))
+        Some(m.row_id.clone())
     }
 
     pub fn set_spawner_pubkey(&mut self, pubkey: Option<&str>) -> bool {
@@ -360,40 +351,15 @@ impl Mirror {
                 row_id,
                 is_sandboxed,
                 last_sealed_blob: None,
-                agents: None,
                 timezone: None,
             },
         );
         true
     }
 
-    /// Stash the raw `machine_users.agents` JSON string (migration 0035) for
-    /// the given user. The spawner only reads this for its own row (owner
-    /// case) to decide whether to seed defaults — see
-    /// `seed_default_agents_if_needed` in main.rs. Pass `None` to clear
-    /// (column was streamed as NULL); pass `Some("[]")` to record the
-    /// user-emptied case (distinct from NULL — do NOT re-seed). No-op when
-    /// the member entry doesn't exist yet (the row_id must land first via
-    /// `upsert_member`).
-    pub fn set_member_agents(&mut self, user_id: &Uuid, agents_json: Option<String>) {
-        if let Some(info) = self.members.get_mut(user_id) {
-            info.agents = agents_json;
-        }
-    }
-
-    /// Read back the cached `agents` JSON string for `user_id`. `None` here
-    /// means EITHER the member entry is missing OR the column is NULL —
-    /// callers that need to distinguish should check `has_member` first.
-    /// For the seeding decision in main.rs, both cases mean "don't seed
-    /// yet" (no member → row hasn't arrived; NULL → seed pass) so the
-    /// caller can fold them together.
-    pub fn member_agents(&self, user_id: &Uuid) -> Option<&str> {
-        self.members.get(user_id).and_then(|m| m.agents.as_deref())
-    }
-
     /// Stash the raw `machine_users.timezone` IANA id (migration 0040). `None`
     /// clears (NULL). No-op if the member entry doesn't exist yet (row_id lands
-    /// first via `upsert_member`). Mirrors `set_member_agents`.
+    /// first via `upsert_member`).
     pub fn set_member_timezone(&mut self, user_id: &Uuid, timezone: Option<String>) {
         if let Some(info) = self.members.get_mut(user_id) {
             info.timezone = timezone;
@@ -445,7 +411,7 @@ impl Mirror {
 
     /// Cached `machine_users.timezone` IANA id (migration 0040). `None` = no
     /// member entry OR NULL column; both mean "no tz hint". Mirrors
-    /// `member_is_sandboxed` / `member_agents`.
+    /// `member_is_sandboxed`.
     pub fn member_timezone(&self, user_id: &Uuid) -> Option<&str> {
         self.members
             .get(user_id)

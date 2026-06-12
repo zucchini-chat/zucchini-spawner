@@ -116,9 +116,10 @@ pub enum WriteEvent {
         machine_id: Uuid,
         pubkey_b64: String,
     },
-    /// Seed the owner's `machine_users.agents` JSON column when it lands
-    /// NULL (migration 0035 — see `seed_default_agents_if_needed` in
-    /// main.rs). The backend routes this through `put_machine_user_envelope`
+    /// One-shot install-time seed of the owner's `machine_users.agents` JSON
+    /// column (migration 0035 — see `seed_initial_agents_if_pending` in
+    /// main.rs; the write is seed-only server-side, `WHERE agents IS NULL`).
+    /// The backend routes this through `put_machine_user_envelope`
     /// (same path iOS uses for `wrapped_key` / `sealed_blob`). For a
     /// machine principal that handler gates writes to the `agents` field
     /// only AND requires `expected_machine_id == jwt.machine_id`, so a

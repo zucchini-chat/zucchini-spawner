@@ -41,7 +41,7 @@ use uuid::Uuid;
 use writer::{WriteEvent, Writer, WriterConfig};
 
 /// Shared probe-results cache shape — fan-out from `spawn_startup_info_report`
-/// into the sync-event handler so `seed_default_agents_if_needed` can decide
+/// into the sync-event handler so `seed_initial_agents_if_pending` can decide
 /// which compatibility-seeded agents are installed without re-shelling. `OnceLock` lets
 /// the producer set it exactly once and lets readers snapshot without locking.
 type ProbeStatusesCache = Arc<std::sync::OnceLock<Vec<(AgentKind, (bool, bool))>>>;
@@ -247,17 +247,8 @@ async fn handle_sync_event(
     write_tx: &mpsc::Sender<WriteEvent>,
     // Probe statuses fan-out cache (`spawn_startup_info_report` fills it
     // once at boot). `None` here means probes haven't completed yet — the
-    // seeding pass is a no-op in that case and re-tries on the next
-    // re-emission of the row (heartbeat fan-out OR after the probe lands).
+    // initial agents seed defers (see `seed_initial_agents_if_pending`).
     probe_statuses: Option<&[(AgentKind, (bool, bool))]>,
-    // Process-lifetime "already attempted seeding once" flag. Flipped to
-    // `true` after we emit the seeding PATCH; subsequent re-emissions of
-    // the same `machine_users` row (heartbeat fan-out, ~every 60s) skip
-    // re-seeding even if the DB hasn't transitioned NULL → `[]` yet. The
-    // DB transition is the durable guard; this flag prevents a transient
-    // re-seed before the round-trip lands. Restart re-checks (state.json
-    // doesn't persist it).
-    agents_seed_attempted: &mut bool,
 ) -> SyncEventOutcome {
     // `&mut Mirror` here is borrowed from the same `Arc<tokio::sync::RwLock<Mirror>>`
     // the control task reads (see `control::ControlState::mirror`); callers in
@@ -369,18 +360,9 @@ async fn handle_sync_event(
                 let state_changed =
                     apply_machine_users_put(&id, user_id, &row, x25519_secret, keys, mirror);
 
-                // `agents` (migration 0035) is a TEXT column carrying a JSON
-                // array. Mirror the raw value (NULL → None; "[]" → Some) so
-                // the seeding decision below has the freshest value, AND so
-                // future per-member features (cross-user agent broadcasts,
-                // etc.) have a single source of truth. The `by_machine`
-                // bucket only ships the spawner's own row + other actives'
-                // rows; only the OWN row matters for seeding.
-                let agents_raw = row
-                    .get("agents")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                mirror.set_member_agents(&user_id, agents_raw);
+                // `agents` (migration 0035) is deliberately NOT mirrored: the
+                // spawner never needs the roster's server state (see
+                // `seed_initial_agents_if_pending`).
 
                 // `timezone` (migration 0040) — IANA id of the member's most-
                 // recently-active device (validated server-side in `/api/devices`).
@@ -391,29 +373,6 @@ async fn handle_sync_event(
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 mirror.set_member_timezone(&user_id, timezone_raw);
-
-                // Seeding fires when ALL of:
-                //   - row is the spawner-owner's own row
-                //   - column landed NULL (not `[]` — distinct values; `[]`
-                //     means user emptied the list and we leave it alone)
-                //   - probe results are in AND at least one CLI is installed
-                //   - we haven't already attempted this process lifetime
-                // The DB NULL → `[]`-or-non-empty transition is the durable
-                // guard that prevents re-seeding on subsequent boots; the
-                // in-memory flag covers the round-trip window before that
-                // transition lands.
-                if let Some(mid) = machine_id {
-                    seed_default_agents_if_needed(
-                        &id,
-                        user_id,
-                        mid,
-                        mirror,
-                        probe_statuses,
-                        agents_seed_attempted,
-                        write_tx,
-                    )
-                    .await;
-                }
 
                 if state_changed {
                     SyncEventOutcome::StateChanged
@@ -505,6 +464,11 @@ async fn handle_sync_event(
             for raw in pending_messages {
                 handle_message_put(&raw, mirror, supervisor, blobs, keys, write_tx).await;
             }
+
+            // One-shot agents seed — driven here because the owner row only
+            // arrives via sync; the set flag persists with the cursor at the
+            // CheckpointReached save.
+            seed_initial_agents_if_pending(machine_id, mirror, probe_statuses, write_tx).await;
 
             mirror.buckets = buckets;
             SyncEventOutcome::CheckpointReached
@@ -1087,98 +1051,91 @@ async fn apply_prune_group(
 /// kinds explicitly from clients that know how to write them.
 const DEFAULT_SEED_AGENT_KINDS: &[AgentKind] = &[AgentKind::Claude, AgentKind::Cursor];
 
-/// Seed `machine_users.agents` defaults (migration 0035) when the owner's
-/// row lands with `agents IS NULL`. Emits exactly one
-/// `WriteEvent::SetMachineUserAgents` carrying a default list — one entry
-/// per installed CLI in `DEFAULT_SEED_AGENT_KINDS` — and flips the
-/// `agents_seed_attempted` in-memory guard to skip re-seeding on the next
-/// heartbeat-driven re-emission.
+/// One seeded roster entry. Serialized field order = declaration order and
+/// MUST stay alphabetical — the payload bytes are a frozen contract with the
+/// client-side seeders (iOS `.sortedKeys`, Android hand-sorted keys).
+#[derive(serde::Serialize)]
+struct SeedAgentEntry {
+    agent_kind: &'static str,
+    /// Deterministic `"seed-<wire_name>"` so concurrent seeds from different
+    /// writers converge on identical rows. Opaque — never parsed as a UUID.
+    id: String,
+    model: &'static str,
+    name: &'static str,
+}
+
+/// One-shot install-time seed of `machine_users.agents` defaults (migration
+/// 0035; design + back-compat rationale: CLAUDE.md "Agent-roster seeding").
+/// Gates: flag unset, machine id known (dev never seeds), owner row streamed,
+/// probes cached. Drivers: every `CheckpointComplete` plus the
+/// `probe_ready_rx` arm in `main`. Correctness doesn't depend on the flag —
+/// the backend write is seed-only (`WHERE agents IS NULL`), so a redundant
+/// attempt drains as a 0-rows no-op.
 ///
-/// The contract with the iOS app: NULL means "spawner hasn't seeded yet"
-/// and `[]` means "user explicitly removed everything". So we only seed
-/// on NULL, never on `[]`. The DB write (NULL → non-NULL) is the durable
-/// guard against repeat-seeding across boots; the in-memory flag handles
-/// the round-trip window before the write lands and is re-streamed.
-///
-/// Defaults shape, deterministic order:
-///   1. `{id: <uuid-v7>, agent_kind: "claude", model: "", name: ""}` (if claude installed)
-///   2. `{id: <uuid-v7>, agent_kind: "cursor", model: "", name: ""}` (if cursor installed)
-///
-/// Codex is intentionally not in the default seed set yet: older iOS clients
-/// can receive the owner's roster before they know how to render codex rows.
-/// If no compatibility-seeded kind is installed, no PATCH is emitted (would
-/// be `[]`, which the contract treats as user-emptied — never the spawner's
-/// call to make).
-async fn seed_default_agents_if_needed(
-    row_id: &str,
-    row_user_id: Uuid,
-    machine_id: Uuid,
-    mirror: &Mirror,
+/// Returns true iff the flag was set — the caller must then persist
+/// state.json.
+async fn seed_initial_agents_if_pending(
+    machine_id: Option<Uuid>,
+    mirror: &mut Mirror,
     probe_statuses: Option<&[(AgentKind, (bool, bool))]>,
-    agents_seed_attempted: &mut bool,
     write_tx: &mpsc::Sender<WriteEvent>,
-) {
-    if *agents_seed_attempted {
-        return;
+) -> bool {
+    if mirror.initial_agents_seed_done {
+        return false;
     }
-    if !mirror.is_owner(row_user_id) {
-        return;
-    }
-    // NULL = "not seeded yet" → seed; Some(_) (including `"[]"`) = leave alone.
-    if mirror.member_agents(&row_user_id).is_some() {
-        return;
-    }
+    let Some(machine_id) = machine_id else {
+        return false; // dev mode (no machine id) never seeds
+    };
+    let Some(row_id) = mirror.owner_row() else {
+        return false; // owner's machine_users row hasn't streamed yet
+    };
     let Some(statuses) = probe_statuses else {
-        // Probes haven't completed yet. The boot-time owner-row PUT lands
-        // ~5s before the login-shell probes finish, and the owner's own row
-        // is never re-PUT (no heartbeat re-fans it — that was a wrong
-        // assumption that left rosters NULL). The retry is driven instead by
-        // the `probe_ready_rx` arm in `main`, which re-runs this seed against
-        // `Mirror::owner_row` the moment the probe cache is populated.
-        return;
+        // Boot checkpoint applies ~5s before the login-shell probes finish,
+        // and an idle machine may never see another checkpoint — the
+        // `probe_ready_rx` arm in `main` is the retry.
+        return false;
     };
-    // Closed deterministic order for compatibility seed defaults. Do not
-    // iterate `AgentKind::ALL` here: adding a new adapter is safe for spawn
-    // dispatch but not necessarily safe for persisted rosters consumed by
-    // older clients.
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    for kind in DEFAULT_SEED_AGENT_KINDS {
-        let installed = statuses
-            .iter()
-            .find_map(|(k, (i, _))| (k == kind).then_some(*i))
-            .unwrap_or(false);
-        if !installed {
-            continue;
-        }
-        let id = Uuid::now_v7();
-        entries.push(serde_json::json!({
-            "id": id.to_string(),
-            "agent_kind": kind.descriptor().wire_name,
-            "model": "",
-            "name": "",
-        }));
-    }
-    if entries.is_empty() {
-        // No CLI installed → nothing to seed. Skip without setting the
-        // attempted-flag so a future re-emission (after the user runs
-        // `claude /login` / `cursor-agent login` and restarts the spawner)
-        // can still seed. NOTE: probe results don't re-fire in-process
-        // today, so this branch effectively waits for a process restart.
-        return;
-    }
-    let Some(row_uuid) = parse_uuid_str(row_id) else {
+    let Some(row_uuid) = parse_uuid_str(&row_id) else {
         warn!(row_id, "machine_users.id is not a UUID; cannot seed agents");
-        return;
+        return false;
     };
+    // Closed deterministic order — do not iterate `AgentKind::ALL` (see
+    // `DEFAULT_SEED_AGENT_KINDS`).
+    let entries: Vec<SeedAgentEntry> = DEFAULT_SEED_AGENT_KINDS
+        .iter()
+        .filter(|kind| {
+            statuses
+                .iter()
+                .find_map(|(k, (installed, _))| (k == *kind).then_some(*installed))
+                .unwrap_or(false)
+        })
+        .map(|kind| SeedAgentEntry {
+            agent_kind: kind.descriptor().wire_name,
+            id: format!("seed-{}", kind.descriptor().wire_name),
+            model: "",
+            name: "",
+        })
+        .collect();
+    // Flag set BEFORE the write round-trips: a crash before the caller's
+    // persist just re-attempts next boot and drains on the seed-only guard.
+    mirror.initial_agents_seed_done = true;
+    if entries.is_empty() {
+        // Nothing installed → no write (an explicit `[]` would read as
+        // user-emptied), but still drain the one-shot — clients seed residual
+        // NULL rows themselves.
+        info!(
+            "no default-seed CLI installed; initial agents seed skipped (clients own the roster)"
+        );
+        return true;
+    }
     let agents_json =
-        serde_json::to_string(&entries).expect("array of small objects is always serializable");
+        serde_json::to_string(&entries).expect("array of small structs is always serializable");
     info!(
         %row_uuid,
         n = entries.len(),
         agents_json = %agents_json,
-        "seeding default machine_users.agents for owner row"
+        "seeding initial machine_users.agents defaults for owner row"
     );
-    *agents_seed_attempted = true;
     let _ = write_tx
         .send(WriteEvent::SetMachineUserAgents {
             row_id: row_uuid,
@@ -1186,6 +1143,7 @@ async fn seed_default_agents_if_needed(
             agents_json,
         })
         .await;
+    true
 }
 
 fn apply_machine_users_put(
@@ -2292,11 +2250,10 @@ async fn main() {
     let write_tx = writer.tx.clone();
 
     // Probe results cache: populated once by `spawn_startup_info_report`,
-    // read by `seed_default_agents_if_needed` on every `machine_users` PUT.
+    // read by `seed_initial_agents_if_pending` at every CheckpointComplete.
     // `OnceLock` (not `RwLock`) because the write happens exactly once and
     // the read side never blocks. `None` means "probes not in yet"; the
-    // seeding pass treats that as "skip this PUT, retry on the next
-    // re-emission".
+    // seeding pass defers until they're cached.
     let probe_statuses_cache: ProbeStatusesCache = Arc::new(std::sync::OnceLock::new());
 
     // Hermes plugin self-heal: write the embedded plugin payload to
@@ -2329,14 +2286,10 @@ async fn main() {
         }
     };
 
-    // Probe-completion signal: `spawn_startup_info_report` sends once after it
-    // fills `probe_statuses_cache`, so the main loop can retry the owner-row
-    // agents seed that the boot-time `machine_users` PUT deferred (the PUT lands
-    // ~5s before probes finish, with no probe data, and the row is never re-PUT
-    // to retry on). Capacity 1 + `try_send` = at-most-one pending nudge. In dev
-    // (no prod config) the probe task is never spawned, so the signal never
-    // fires and the select arm stays idle — dev never seeds anyway (no
-    // machine_id).
+    // Probe-completion signal: `spawn_startup_info_report` sends once after
+    // it fills `probe_statuses_cache` — the retry for the seed the boot
+    // checkpoint deferred. Capacity 1 + `try_send` = at-most-one pending
+    // nudge. Never fires in dev (probe task not spawned; dev never seeds).
     let (probe_ready_tx, mut probe_ready_rx) = mpsc::channel::<()>(1);
 
     let heartbeat_cancel = CancellationToken::new();
@@ -2422,13 +2375,6 @@ async fn main() {
     // `key_<uuid>` files for non-members. Process-lifetime flag.
     let mut key_files_reconciled = false;
 
-    // Process-lifetime guard for the `machine_users.agents` seeding pass
-    // (migration 0035 — see `seed_default_agents_if_needed`). Once we emit the
-    // seeding PATCH this flag flips to `true` so neither a re-PUT of the owner's
-    // row nor the `probe_ready_rx` retry re-seeds before the DB transition
-    // lands. Restart re-checks via the DB NULL → non-NULL durable guard.
-    let mut agents_seed_attempted = false;
-
     // Per-checkpoint-window staging for hazard tables (chats/projects/messages).
     // Lives across loop iterations — accumulates ops within a checkpoint window
     // and is drained/applied at `CheckpointComplete`. Main()-local, passed by
@@ -2465,34 +2411,23 @@ async fn main() {
                 supervisor.cleanup();
             }
             Some(()) = probe_ready_rx.recv() => {
-                // Install probes just finished and `probe_statuses_cache` is now
-                // populated. Retry the owner-row agents seed that the boot-time
-                // `machine_users` PUT deferred — that PUT lands ~5s before the
-                // login-shell probes complete, so the in-PUT pass saw no probe
-                // data and bailed, and the owner's own row is never re-PUT to
-                // retry on. `seed_default_agents_if_needed` re-checks every guard
-                // (owner row, `agents IS NULL`, ≥1 CLI installed, not-already-
-                // attempted), so this is a no-op when the in-PUT pass already won
-                // the race or the user has a non-NULL list. A read guard suffices
-                // — the seed only reads the mirror and emits a PATCH via
-                // `write_tx`. Fires at most once: the probe task drops its sender
-                // afterward, so `recv()` then yields `None` and this arm self-
-                // disables for the rest of the loop.
-                if let Some(mid) = prod.as_ref().map(|p| p.machine_id) {
-                    let probe_snap = probe_statuses_cache.get().map(|v| v.as_slice());
-                    let g = mirror.read().await;
-                    if let Some((row_id, uid)) = g.owner_row() {
-                        seed_default_agents_if_needed(
-                            &row_id,
-                            uid,
-                            mid,
-                            &g,
-                            probe_snap,
-                            &mut agents_seed_attempted,
-                            &write_tx,
-                        )
-                        .await;
-                    }
+                // Probes just cached — retry the seed the boot checkpoint
+                // deferred (all gates live in `seed_initial_agents_if_pending`).
+                // Fires at most once: the probe task drops its sender, so this
+                // arm self-disables after the `None`.
+                let probe_snap = probe_statuses_cache.get().map(|v| v.as_slice());
+                let seed_done = {
+                    let mut g = mirror.write().await;
+                    seed_initial_agents_if_pending(
+                        prod.as_ref().map(|p| p.machine_id),
+                        &mut g,
+                        probe_snap,
+                        &write_tx,
+                    )
+                    .await
+                };
+                if seed_done {
+                    save_mirror(&state_path, &mirror).await;
                 }
             }
             Some(event) = sync_rx.recv() => {
@@ -2517,7 +2452,6 @@ async fn main() {
                         our_pubkey_b64.as_deref(),
                         &write_tx,
                         probe_snap,
-                        &mut agents_seed_attempted,
                     ).await
                 };
                 match outcome {
@@ -2840,11 +2774,6 @@ mod tests {
         // (captures the session SpawnRequest; returns a live inert session).
         let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
 
-        // Seeding-guard flag the test reuses across calls (the original
-        // single-spawn flow doesn't trigger seeding because mirror.user_id
-        // is set but no `machine_users` PUT is fed; flag stays `false`).
-        let mut seed_attempted = false;
-
         // Shared staging across the window — chats/projects/messages now stage
         // and only apply (spawn) at the trailing CheckpointComplete.
         let mut staging = SyncStaging::default();
@@ -2869,7 +2798,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
@@ -2901,7 +2829,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
@@ -2936,7 +2863,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
@@ -2956,7 +2882,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
@@ -3257,20 +3182,7 @@ mod tests {
         }
     }
 
-    // ===== machine_users.agents seeding (migration 0035) =====
-    //
-    // These tests exercise the seeding decision in `handle_sync_event`'s
-    // `machine_users` arm via `seed_default_agents_if_needed`. The contract:
-    //   - NULL `agents` + ≥1 CLI installed + owner row → emit one PATCH
-    //     carrying a valid JSON array with one entry per installed default
-    //     seed kind (claude first, then cursor; ids are uuid-v7 strings).
-    //     Newer kinds like codex are spawnable but are not auto-seeded into
-    //     rosters because older iOS clients fail closed on unknown
-    //     `agent_kind` enum values.
-    //   - Non-NULL `agents` (including `"[]"`) → no PATCH (user-emptied is
-    //     distinct from spawner-not-seeded-yet).
-    //   - Re-emission of the same row within process lifetime → no PATCH
-    //     (in-memory `agents_seed_attempted` flag).
+    // ===== machine_users.agents one-shot install-time seeding (migration 0035) =====
 
     /// Helper: build the bare-bones args set `handle_sync_event` needs that
     /// the agents-seeding tests reuse — keeps each test focused on the
@@ -3282,37 +3194,114 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn machine_users_null_agents_with_claude_installed_seeds_defaults() {
-        let user_id = Uuid::now_v7();
-        let machine_id = Uuid::now_v7();
-        let row_id = Uuid::now_v7();
-
-        let mut mirror = Mirror::default();
-        mirror.set_user_id(user_id); // owner classification
-        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
-        let blobs = empty_blob_downloader();
-        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
-        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+    /// Supervisor with an inert spawn fn. The receiver is returned so a stray
+    /// send doesn't error on a dropped channel.
+    fn inert_supervisor() -> (Supervisor, mpsc::Receiver<AgentResponse>) {
+        let (resp_tx, resp_rx) = mpsc::channel::<AgentResponse>(64);
         let spawn_fn: crate::agent::SpawnFn =
             Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
-        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+        (Supervisor::with_spawn_fn(resp_tx, spawn_fn), resp_rx)
+    }
 
-        // Claude installed + authenticated; cursor not installed.
+    /// Owner mirror plus the inert collaborators `handle_sync_event` needs.
+    struct SeedFixture {
+        user_id: Uuid,
+        machine_id: Uuid,
+        row_id: Uuid,
+        mirror: Mirror,
+        keys: KeyStore,
+        blobs: BlobDownloader,
+        write_tx: mpsc::Sender<WriteEvent>,
+        write_rx: mpsc::Receiver<WriteEvent>,
+        supervisor: Supervisor,
+        /// Kept alive so a stray Supervisor send doesn't error.
+        _resp_rx: mpsc::Receiver<AgentResponse>,
+    }
+
+    impl SeedFixture {
+        /// Owner classified and the owner's `machine_users` row latched.
+        fn new() -> Self {
+            let mut f = Self::without_member();
+            assert!(f
+                .mirror
+                .upsert_member(f.row_id.to_string(), f.user_id, false));
+            f
+        }
+
+        /// Owner classified but no `machine_users` row yet.
+        fn without_member() -> Self {
+            let user_id = Uuid::now_v7();
+            let mut mirror = Mirror::default();
+            mirror.set_user_id(user_id); // owner classification
+            let (write_tx, write_rx) = mpsc::channel::<WriteEvent>(64);
+            let (supervisor, _resp_rx) = inert_supervisor();
+            Self {
+                user_id,
+                machine_id: Uuid::now_v7(),
+                row_id: Uuid::now_v7(),
+                mirror,
+                keys: KeyStore::with_keys([(user_id, [0u8; 32])]),
+                blobs: empty_blob_downloader(),
+                write_tx,
+                write_rx,
+                supervisor,
+                _resp_rx,
+            }
+        }
+
+        /// Drive one `CheckpointComplete` with an empty staging window.
+        /// `probe_statuses` stays explicit — some tests pass `None` to pin
+        /// which driver seeds.
+        async fn checkpoint(&mut self, probe_statuses: Option<&[(AgentKind, (bool, bool))]>) {
+            handle_sync_event(
+                SyncEvent::CheckpointComplete {
+                    buckets: Default::default(),
+                },
+                Some(self.machine_id),
+                &mut self.mirror,
+                &mut SyncStaging::default(),
+                &mut self.supervisor,
+                &self.blobs,
+                &self.keys,
+                None,
+                None,
+                &self.write_tx,
+                probe_statuses,
+            )
+            .await;
+        }
+
+        /// Drain the writer channel, returning only seed PATCHes.
+        fn seed_patches(&mut self) -> Vec<WriteEvent> {
+            let mut patches = Vec::new();
+            while let Ok(ev) = self.write_rx.try_recv() {
+                if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
+                    patches.push(ev);
+                }
+            }
+            patches
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_install_with_claude_installed_seeds_frozen_payload_once() {
+        let mut f = SeedFixture::without_member();
+        assert!(
+            !f.mirror.initial_agents_seed_done,
+            "a brand-new state must default to seed-not-done"
+        );
+
+        // Codex installed but must NOT be seeded (see `DEFAULT_SEED_AGENT_KINDS`).
         let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
             (AgentKind::Claude, (true, true)),
             (AgentKind::Cursor, (false, false)),
             (AgentKind::Codex, (true, true)),
         ];
-        let mut seed_attempted = false;
 
-        // `machine_users` PUT with `agents = null` (the missing-key shape
-        // is treated identically; we use explicit null here to mirror the
-        // wire shape when iOS deliberately clears the column).
         let mu_row = json!({
-            "id": row_id.to_string(),
-            "user_id": user_id.to_string(),
-            "machine_id": machine_id.to_string(),
+            "id": f.row_id.to_string(),
+            "user_id": f.user_id.to_string(),
+            "machine_id": f.machine_id.to_string(),
             "is_sandboxed": 0,
             "sealed_blob": serde_json::Value::Null,
             "agents": serde_json::Value::Null,
@@ -3321,30 +3310,24 @@ mod tests {
         handle_sync_event(
             SyncEvent::Put {
                 table: "machine_users".into(),
-                id: row_id.to_string(),
+                id: f.row_id.to_string(),
                 data: mu_row,
             },
-            Some(machine_id),
-            &mut mirror,
+            Some(f.machine_id),
+            &mut f.mirror,
             &mut SyncStaging::default(),
-            &mut supervisor,
-            &blobs,
-            &keys,
+            &mut f.supervisor,
+            &f.blobs,
+            &f.keys,
             None,
             None,
-            &write_tx,
+            &f.write_tx,
             Some(&probe_statuses),
-            &mut seed_attempted,
         )
         .await;
+        f.checkpoint(Some(&probe_statuses)).await;
 
-        // Exactly one SetMachineUserAgents PATCH on the writer channel.
-        let mut patches: Vec<WriteEvent> = Vec::new();
-        while let Ok(ev) = write_rx.try_recv() {
-            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
-                patches.push(ev);
-            }
-        }
+        let patches = f.seed_patches();
         assert_eq!(
             patches.len(),
             1,
@@ -3359,330 +3342,145 @@ mod tests {
         else {
             panic!("variant mismatch")
         };
-        assert_eq!(*emitted_row, row_id);
-        assert_eq!(*emitted_machine, machine_id);
-        // Decode + shape-check: one claude entry, model+name empty, id parses as UUID.
-        let parsed: serde_json::Value =
-            serde_json::from_str(agents_json).expect("agents_json is JSON");
-        let arr = parsed.as_array().expect("agents is array");
-        assert_eq!(arr.len(), 1, "claude installed only → one entry");
-        let entry = &arr[0];
-        assert_eq!(entry["agent_kind"], "claude");
-        assert_eq!(entry["model"], "");
-        assert_eq!(entry["name"], "");
-        let id_str = entry["id"].as_str().expect("id is string");
-        Uuid::parse_str(id_str).expect("id is uuid");
+        assert_eq!(*emitted_row, f.row_id);
+        assert_eq!(*emitted_machine, f.machine_id);
+        // Frozen payload bytes shared with the client-side seeders (see
+        // `SeedAgentEntry`).
+        assert_eq!(
+            agents_json,
+            r#"[{"agent_kind":"claude","id":"seed-claude","model":"","name":""}]"#
+        );
+        assert!(
+            f.mirror.initial_agents_seed_done,
+            "one-shot drained after the send"
+        );
 
-        // Seeding flag flipped → second feed of the same row is a no-op.
-        assert!(seed_attempted, "seed flag must flip after one PATCH");
+        f.checkpoint(Some(&probe_statuses)).await;
+        assert!(
+            f.seed_patches().is_empty(),
+            "done flag → no second write on the next checkpoint"
+        );
     }
 
     #[tokio::test]
-    async fn machine_users_null_agents_with_default_kinds_installed_seeds_claude_then_cursor() {
-        let user_id = Uuid::now_v7();
-        let machine_id = Uuid::now_v7();
-        let row_id = Uuid::now_v7();
-
-        let mut mirror = Mirror::default();
-        mirror.set_user_id(user_id);
-        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
-        let blobs = empty_blob_downloader();
-        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
-        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
-        let spawn_fn: crate::agent::SpawnFn =
-            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
-        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
-
+    async fn claude_and_cursor_installed_seed_in_frozen_order() {
+        let mut f = SeedFixture::new();
         let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
             (AgentKind::Claude, (true, true)),
             (AgentKind::Cursor, (true, true)),
             (AgentKind::Codex, (true, true)),
         ];
-        let mut seed_attempted = false;
 
-        let mu_row = json!({
-            "id": row_id.to_string(),
-            "user_id": user_id.to_string(),
-            "machine_id": machine_id.to_string(),
-            "is_sandboxed": 0,
-            "agents": serde_json::Value::Null,
-        })
-        .to_string();
-        handle_sync_event(
-            SyncEvent::Put {
-                table: "machine_users".into(),
-                id: row_id.to_string(),
-                data: mu_row,
-            },
-            Some(machine_id),
-            &mut mirror,
-            &mut SyncStaging::default(),
-            &mut supervisor,
-            &blobs,
-            &keys,
-            None,
-            None,
-            &write_tx,
-            Some(&probe_statuses),
-            &mut seed_attempted,
-        )
-        .await;
+        f.checkpoint(Some(&probe_statuses)).await;
 
-        let ev = write_rx
-            .try_recv()
-            .expect("expected one writer event for the seed PATCH");
-        let WriteEvent::SetMachineUserAgents { agents_json, .. } = ev else {
-            panic!("expected SetMachineUserAgents")
+        let patches = f.seed_patches();
+        assert_eq!(patches.len(), 1, "exactly one seed PATCH");
+        let WriteEvent::SetMachineUserAgents { agents_json, .. } = &patches[0] else {
+            panic!("variant mismatch")
         };
-        let arr: Vec<serde_json::Value> = serde_json::from_str(&agents_json).unwrap();
         assert_eq!(
-            arr.len(),
-            2,
-            "claude + cursor seed; codex installed must not be auto-seeded"
+            agents_json,
+            r#"[{"agent_kind":"claude","id":"seed-claude","model":"","name":""},{"agent_kind":"cursor","id":"seed-cursor","model":"","name":""}]"#
         );
-        // Deterministic order: claude first, then cursor. Matches the task
-        // spec so iOS sees a stable agent-picker ordering across builds.
-        assert_eq!(arr[0]["agent_kind"], "claude");
-        assert_eq!(arr[1]["agent_kind"], "cursor");
     }
 
     #[tokio::test]
-    async fn machine_users_null_agents_with_only_codex_installed_does_not_seed() {
-        let user_id = Uuid::now_v7();
-        let machine_id = Uuid::now_v7();
-        let row_id = Uuid::now_v7();
+    async fn done_seed_flag_never_writes() {
+        // Post-seed restart: every other gate open — the flag alone must block.
+        let mut f = SeedFixture::new();
+        f.mirror.initial_agents_seed_done = true;
+        let probe_statuses: Vec<(AgentKind, (bool, bool))> =
+            vec![(AgentKind::Claude, (true, true))];
 
-        let mut mirror = Mirror::default();
-        mirror.set_user_id(user_id);
-        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
-        let blobs = empty_blob_downloader();
-        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
-        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
-        let spawn_fn: crate::agent::SpawnFn =
-            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
-        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
+        f.checkpoint(Some(&probe_statuses)).await;
 
+        assert!(
+            f.seed_patches().is_empty(),
+            "drained one-shot must never write again"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_only_install_does_not_seed_but_drains_flag() {
+        // Codex never auto-seeds (see `DEFAULT_SEED_AGENT_KINDS`); with claude
+        // and cursor absent this also covers the zero-installs shape.
+        let mut f = SeedFixture::new();
         let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
             (AgentKind::Claude, (false, false)),
             (AgentKind::Cursor, (false, false)),
             (AgentKind::Codex, (true, true)),
         ];
-        let mut seed_attempted = false;
 
-        let mu_row = json!({
-            "id": row_id.to_string(),
-            "user_id": user_id.to_string(),
-            "machine_id": machine_id.to_string(),
-            "is_sandboxed": 0,
-            "agents": serde_json::Value::Null,
-        })
-        .to_string();
-        handle_sync_event(
-            SyncEvent::Put {
-                table: "machine_users".into(),
-                id: row_id.to_string(),
-                data: mu_row,
-            },
-            Some(machine_id),
-            &mut mirror,
-            &mut SyncStaging::default(),
-            &mut supervisor,
-            &blobs,
-            &keys,
-            None,
-            None,
-            &write_tx,
-            Some(&probe_statuses),
-            &mut seed_attempted,
-        )
-        .await;
+        f.checkpoint(Some(&probe_statuses)).await;
 
-        let mut saw_seed_patch = false;
-        while let Ok(ev) = write_rx.try_recv() {
-            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
-                saw_seed_patch = true;
-            }
-        }
         assert!(
-            !saw_seed_patch,
+            f.seed_patches().is_empty(),
             "codex-only install must not seed a roster older clients cannot decode"
         );
         assert!(
-            !seed_attempted,
-            "no default seed entries means a later restart may still seed compatibility defaults"
+            f.mirror.initial_agents_seed_done,
+            "the one-shot still drains — clients cover the install-CLI-later case"
         );
     }
 
-    #[tokio::test]
-    async fn machine_users_non_null_agents_does_not_seed() {
-        // `agents = "[]"` is the explicit "user emptied the list" state —
-        // the spawner MUST NOT re-seed over it. Same for any non-empty array.
-        let user_id = Uuid::now_v7();
-        let machine_id = Uuid::now_v7();
-        let row_id = Uuid::now_v7();
-
-        let mut mirror = Mirror::default();
-        mirror.set_user_id(user_id);
-        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
-        let blobs = empty_blob_downloader();
-        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
-        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
-        let spawn_fn: crate::agent::SpawnFn =
-            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
-        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
-
-        let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
-            (AgentKind::Claude, (true, true)),
-            (AgentKind::Cursor, (true, true)),
-        ];
-        let mut seed_attempted = false;
-
-        let mu_row = json!({
-            "id": row_id.to_string(),
-            "user_id": user_id.to_string(),
-            "machine_id": machine_id.to_string(),
-            "is_sandboxed": 0,
-            "agents": "[]",
-        })
-        .to_string();
-        handle_sync_event(
-            SyncEvent::Put {
-                table: "machine_users".into(),
-                id: row_id.to_string(),
-                data: mu_row,
-            },
-            Some(machine_id),
-            &mut mirror,
-            &mut SyncStaging::default(),
-            &mut supervisor,
-            &blobs,
-            &keys,
-            None,
-            None,
-            &write_tx,
-            Some(&probe_statuses),
-            &mut seed_attempted,
-        )
-        .await;
-
-        // No SetMachineUserAgents PATCH on the channel.
-        let mut saw_seed_patch = false;
-        while let Ok(ev) = write_rx.try_recv() {
-            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
-                saw_seed_patch = true;
-            }
-        }
-        assert!(
-            !saw_seed_patch,
-            "non-NULL agents (including empty array) must not trigger seeding"
-        );
-        assert!(!seed_attempted, "non-NULL path must not flip the seed flag");
-    }
-
-    /// Regression: the boot-time owner-row PUT lands ~5s before the async
-    /// install probes finish, so the in-PUT seed sees `probe_statuses=None`
-    /// and defers. The owner's own row is never re-PUT, so without a separate
-    /// retry the roster stays NULL forever. This reproduces that sequence:
-    /// (1) PUT with probes NOT yet available → no PATCH, flag stays unset;
-    /// (2) the probe-completion retry path (`Mirror::owner_row` +
-    /// `seed_default_agents_if_needed`) runs once probes are cached → exactly
-    /// one PATCH. Mirrors how `main`'s `probe_ready_rx` arm drives the retry.
+    /// Checkpoint-before-probes and missing-owner-row both defer WITHOUT
+    /// draining the one-shot; the `probe_ready_rx` retry then completes the
+    /// seed.
     #[tokio::test]
     async fn deferred_seed_retries_once_probes_complete() {
-        let user_id = Uuid::now_v7();
-        let machine_id = Uuid::now_v7();
-        let row_id = Uuid::now_v7();
-
-        let mut mirror = Mirror::default();
-        mirror.set_user_id(user_id);
-        let keys = KeyStore::with_keys([(user_id, [0u8; 32])]);
-        let blobs = empty_blob_downloader();
-        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
-        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
-        let spawn_fn: crate::agent::SpawnFn =
-            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
-        let mut supervisor = Supervisor::with_spawn_fn(resp_tx, spawn_fn);
-        let mut seed_attempted = false;
-
-        let mu_row = json!({
-            "id": row_id.to_string(),
-            "user_id": user_id.to_string(),
-            "machine_id": machine_id.to_string(),
-            "is_sandboxed": 0,
-            "sealed_blob": serde_json::Value::Null,
-            "agents": serde_json::Value::Null,
-        })
-        .to_string();
-
-        // (1) PUT arrives BEFORE probes complete: `probe_statuses = None`.
-        handle_sync_event(
-            SyncEvent::Put {
-                table: "machine_users".into(),
-                id: row_id.to_string(),
-                data: mu_row,
-            },
-            Some(machine_id),
-            &mut mirror,
-            &mut SyncStaging::default(),
-            &mut supervisor,
-            &blobs,
-            &keys,
-            None,
-            None,
-            &write_tx,
-            None, // probes not in yet
-            &mut seed_attempted,
-        )
-        .await;
-
-        let mut saw_seed_patch = false;
-        while let Ok(ev) = write_rx.try_recv() {
-            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
-                saw_seed_patch = true;
-            }
-        }
-        assert!(
-            !saw_seed_patch,
-            "PUT before probes complete must defer (no PATCH)"
-        );
-        assert!(!seed_attempted, "deferral must not flip the seed flag");
-
-        // (2) Probes complete → the main loop's retry path. The owner row is
-        // now known to the mirror, so `owner_row` resolves the same identity
-        // the deferred PUT carried.
-        let (retry_row_id, retry_uid) = mirror
-            .owner_row()
-            .expect("owner row known after the PUT synced");
-        assert_eq!(retry_row_id, row_id.to_string());
-        assert_eq!(retry_uid, user_id);
-
+        let mut f = SeedFixture::without_member();
         let probe_statuses: Vec<(AgentKind, (bool, bool))> = vec![
             (AgentKind::Claude, (true, true)),
             (AgentKind::Cursor, (false, false)),
         ];
-        seed_default_agents_if_needed(
-            &retry_row_id,
-            retry_uid,
-            machine_id,
-            &mirror,
+
+        // (1) Probes cached but no owner row → defer.
+        let done = seed_initial_agents_if_pending(
+            Some(f.machine_id),
+            &mut f.mirror,
             Some(&probe_statuses),
-            &mut seed_attempted,
-            &write_tx,
+            &f.write_tx,
         )
         .await;
+        assert!(!done, "no owner row → defer");
+        assert!(
+            !f.mirror.initial_agents_seed_done,
+            "deferral must not drain the one-shot"
+        );
 
-        let mut patches: Vec<WriteEvent> = Vec::new();
-        while let Ok(ev) = write_rx.try_recv() {
-            if matches!(ev, WriteEvent::SetMachineUserAgents { .. }) {
-                patches.push(ev);
-            }
-        }
+        // (2) Owner row lands, probes still in flight → defer.
+        assert!(f
+            .mirror
+            .upsert_member(f.row_id.to_string(), f.user_id, false));
+        f.checkpoint(None).await; // probes not in yet
+        assert!(
+            f.seed_patches().is_empty(),
+            "checkpoint before probes complete must defer (no PATCH)"
+        );
+        assert!(
+            !f.mirror.initial_agents_seed_done,
+            "probe deferral must not drain the one-shot"
+        );
+
+        // (3) Probes complete → the `probe_ready_rx` retry seeds.
+        let done = seed_initial_agents_if_pending(
+            Some(f.machine_id),
+            &mut f.mirror,
+            Some(&probe_statuses),
+            &f.write_tx,
+        )
+        .await;
+        assert!(done, "the probe driver persists state on `true`");
+        let patches = f.seed_patches();
         assert_eq!(
             patches.len(),
             1,
             "retry after probes complete must emit exactly one seed PATCH"
         );
-        assert!(seed_attempted, "successful retry must flip the seed flag");
+        assert!(
+            f.mirror.initial_agents_seed_done,
+            "one-shot drained after the send"
+        );
     }
 
     /// `chats.model` flows from the row → ChatState → SpawnRequest.model.
@@ -3712,8 +3510,6 @@ mod tests {
         // Claude is resident → capture via the resident recorder.
         let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
 
-        let mut seed_attempted = true; // skip seeding path in this test
-
         // Shared staging — apply (spawn) happens at the trailing CheckpointComplete.
         let mut staging = SyncStaging::default();
 
@@ -3734,7 +3530,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
@@ -3765,7 +3560,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
@@ -3796,7 +3590,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
@@ -3830,7 +3623,6 @@ mod tests {
                 None,
                 &write_tx,
                 None,
-                &mut seed_attempted,
             )
             .await;
         }
@@ -3850,7 +3642,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
@@ -3897,7 +3688,6 @@ mod tests {
         let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
         let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
-        let mut seed_attempted = true; // skip seeding path
         let mut staging = SyncStaging::default();
 
         let chat_row = json!({
@@ -3948,7 +3738,6 @@ mod tests {
                 None,
                 &write_tx,
                 None,
-                &mut seed_attempted,
             )
             .await;
         }
@@ -3993,7 +3782,6 @@ mod tests {
                 None,
                 &write_tx,
                 None,
-                &mut seed_attempted,
             )
             .await;
         }
@@ -4024,7 +3812,6 @@ mod tests {
         let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
         let (mut supervisor, _recorded) = supervisor_with_resident_recorder(resp_tx);
-        let mut seed_attempted = true;
         let mut staging = SyncStaging::default();
 
         // Window 1: project + chat PUT → chat present.
@@ -4064,7 +3851,6 @@ mod tests {
                 None,
                 &write_tx,
                 None,
-                &mut seed_attempted,
             )
             .await;
         }
@@ -4095,7 +3881,6 @@ mod tests {
                 None,
                 &write_tx,
                 None,
-                &mut seed_attempted,
             )
             .await;
         }
@@ -4125,7 +3910,6 @@ mod tests {
         let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
         let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
-        let mut seed_attempted = true;
         let mut staging = SyncStaging::default();
 
         let envelope_json =
@@ -4183,7 +3967,6 @@ mod tests {
                 None,
                 &write_tx,
                 None,
-                &mut seed_attempted,
             )
             .await;
         }
@@ -4221,7 +4004,6 @@ mod tests {
         let (write_tx, _write_rx) = mpsc::channel::<WriteEvent>(64);
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
         let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
-        let mut seed_attempted = true;
         let mut staging = SyncStaging::default();
 
         // The chat row always carries agent_session_id=NULL (PowerSync never
@@ -4265,7 +4047,6 @@ mod tests {
                 None,
                 &write_tx,
                 None,
-                &mut seed_attempted,
             )
             .await;
         }
@@ -4296,7 +4077,6 @@ mod tests {
                 None,
                 &write_tx,
                 None,
-                &mut seed_attempted,
             )
             .await;
         }
@@ -4345,7 +4125,6 @@ mod tests {
                 None,
                 &write_tx,
                 None,
-                &mut seed_attempted,
             )
             .await;
         }
@@ -4502,7 +4281,6 @@ mod tests {
         // resident recorder. The pre-prune abort_agent is a no-op (no live
         // session in this unit test), then the respawn records exactly one.
         let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
-        let mut seed_attempted = true;
 
         // Shared staging; the trailing CheckpointComplete (before the SharedMirror
         // wrap) applies the project + chat into the mirror.
@@ -4526,7 +4304,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
         handle_sync_event(
@@ -4555,7 +4332,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
@@ -4574,7 +4350,6 @@ mod tests {
             None,
             &write_tx,
             None,
-            &mut seed_attempted,
         )
         .await;
 
