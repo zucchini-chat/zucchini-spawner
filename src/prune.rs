@@ -613,6 +613,15 @@ pub fn prune_reminder_output(payload: &str) -> Option<String> {
     if parsed.get("agent_id").is_some() {
         return None;
     }
+    // A `Skill` call's big body rides in a separate injected frame, not in
+    // `tool_response` (a tiny ack), so the size gate never fires for it — yet it's
+    // the biggest prunable chunk a turn accrues, and the body frame triggers no hook
+    // of its own. The Skill call is our only handle, so nudge unconditionally; it's
+    // reclaimable via `prune-context --tool-name Skill` (which blanks the linked body
+    // too, see `adapters/claude.rs::blank_claude_entry`).
+    if parsed.get("tool_name").and_then(|t| t.as_str()) == Some("Skill") {
+        return Some(prune_reminder_json());
+    }
     let len = match parsed.get("tool_response") {
         None | Some(serde_json::Value::Null) => 0,
         // A string's "serialized length" for the gate is its content length,
@@ -622,18 +631,24 @@ pub fn prune_reminder_output(payload: &str) -> Option<String> {
         Some(other) => other.to_string().len(),
     };
     if len > PRUNE_REMINDER_MIN_TOOL_RESPONSE_BYTES {
-        Some(
-            serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": PRUNE_REMINDER_TEXT,
-                }
-            })
-            .to_string(),
-        )
+        Some(prune_reminder_json())
     } else {
         None
     }
+}
+
+/// The exact `additionalContext` JSON line the prune reminder emits — built via
+/// serde_json so the apostrophe + quoting escape correctly, matching the proven
+/// shape `{"hookSpecificOutput":{"hookEventName":"PostToolUse",
+/// "additionalContext":"<text>"}}`. Shared by the size-gated and Skill paths.
+fn prune_reminder_json() -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": PRUNE_REMINDER_TEXT,
+        }
+    })
+    .to_string()
 }
 
 /// Test helpers shared by every dialect pruner's test module, so the temp-file
@@ -1041,6 +1056,35 @@ mod tests {
             prune_reminder_output(&over_payload).is_some(),
             "{} bytes must fire",
             PRUNE_REMINDER_MIN_TOOL_RESPONSE_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn prune_reminder_fires_for_skill_despite_tiny_response() {
+        // A `Skill` call injects its big body as a separate frame; its own
+        // `tool_response` is a tiny ack well under the size gate. The reminder must
+        // fire anyway — keyed on `tool_name == "Skill"`, not response size.
+        let payload = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Skill",
+            "tool_input": { "skill": "claude-api", "args": "" },
+            "tool_response": "Running claude-api skill",
+        })
+        .to_string();
+        let out = prune_reminder_output(&payload).expect("Skill must fire regardless of size");
+        assert!(out.contains(PRUNE_REMINDER_TEXT), "{out}");
+
+        // A Skill sub-agent call (carries `agent_id`) still must NOT fire — the
+        // sub-agent gate takes precedence over the Skill branch.
+        let sub = serde_json::json!({
+            "tool_name": "Skill",
+            "tool_response": "Running claude-api skill",
+            "agent_id": "ae75401ac3661b0a5",
+        })
+        .to_string();
+        assert!(
+            prune_reminder_output(&sub).is_none(),
+            "sub-agent Skill call must stay silent"
         );
     }
 

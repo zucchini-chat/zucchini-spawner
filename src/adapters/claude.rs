@@ -1266,10 +1266,18 @@ fn claude_collect_matched(
     }
 }
 
+/// Top-level `sourceToolUseID` linking a Skill / slash-command expansion BODY frame
+/// (a `user`/`isMeta` entry, see [`blank_claude_entry`]) back to its `tool_use`. It's
+/// at the entry top level, NOT in a content block. One accessor so the wire key isn't
+/// retyped in [`claude_collect_pruned`] + [`blank_claude_entry`].
+fn claude_entry_source_id(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("sourceToolUseID").and_then(|i| i.as_str())
+}
+
 /// Pass-1 already-pruned collector shared by `eligible_matches` and `prune_jsonl`
-/// (same call sites as [`claude_collect_matched`]). Walks user `tool_result`
-/// blocks whose `content` is already the `[pruned]` placeholder, marking their
-/// `tool_use_id` ineligible.
+/// (same call sites as [`claude_collect_matched`]). Marks a `tool_use` ineligible
+/// when either its `tool_result` content OR its expansion-body text is already
+/// `[pruned]` — the latter keeps re-prune a no-op even if the tiny ack is absent.
 fn claude_collect_pruned(
     entry: &serde_json::Value,
     already_pruned: &mut std::collections::HashSet<String>,
@@ -1285,15 +1293,26 @@ fn claude_collect_pruned(
     else {
         return;
     };
+    let source_id = claude_entry_source_id(entry);
     for block in blocks {
-        if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
-            continue;
-        }
-        // A `[pruned]` tool_result marks its tool_use ineligible.
-        if block.get("content").and_then(|c| c.as_str()) == Some(PRUNED_PLACEHOLDER) {
-            if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
-                already_pruned.insert(id.to_string());
+        match block.get("type").and_then(|t| t.as_str()) {
+            // tool_result → keyed by its own `tool_use_id`.
+            Some("tool_result") => {
+                if block.get("content").and_then(|c| c.as_str()) == Some(PRUNED_PLACEHOLDER) {
+                    if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
+                        already_pruned.insert(id.to_string());
+                    }
+                }
             }
+            // expansion-body text → keyed by the entry's `sourceToolUseID`.
+            Some("text") => {
+                if let Some(id) = source_id {
+                    if block.get("text").and_then(|t| t.as_str()) == Some(PRUNED_PLACEHOLDER) {
+                        already_pruned.insert(id.to_string());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1313,10 +1332,17 @@ fn count_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::Result<
 ///   - user: each `tool_result` whose `tool_use_id` ∈ set → `content` blanked to
 ///     the placeholder and the id recorded in `outputs_blanked` (drives the
 ///     user-facing `results_blanked` count + `freed_bytes`).
+///   - user EXPANSION BODY: a Skill/command expansion's real payload rides in a
+///     SEPARATE `user`/`isMeta` entry (a `text` block, NOT a `tool_result`) threaded
+///     by [`claude_entry_source_id`]; its `tool_result` is just a tiny ack. When that
+///     source id ∈ set we blank the text and record the SAME id in `outputs_blanked`
+///     — the set dedups it against the ack ("1 output") while `freed_bytes` picks up
+///     the body. Without this a `--tool-name Skill` prune freed ~nothing (a 570KB
+///     claude-api body once survived a prune that freed 19 bytes).
 ///
-/// Cross-line by design: the tool_use lives on the assistant line and its
-/// tool_result on a later user line; the driver runs this per-entry, so each is
-/// blanked when its own line comes through. Returns `None` when the entry was
+/// Cross-line by design: the tool_use lives on the assistant line, its tool_result
+/// and any expansion body on later user lines; the driver runs this per-entry, so
+/// each is blanked when its own line comes through. Returns `None` when the entry was
 /// left untouched, or `Some(freed_bytes)` when a field was blanked (`freed` may be
 /// `0` for an input-only blank or a tiny output — the driver still re-serializes).
 /// Idempotent: already-blank fields no-op so a re-prune stays byte-stable.
@@ -1334,6 +1360,14 @@ fn blank_claude_entry(
         return None;
     }
 
+    // Resolved before the mutable content borrow; `Some` only for a user body whose
+    // source tool_use is a prune target.
+    let body_source_id = is_user
+        .then(|| claude_entry_source_id(entry))
+        .flatten()
+        .filter(|id| pruned_ids.contains(*id))
+        .map(str::to_string);
+
     let blocks = entry
         .get_mut("message")
         .and_then(|m| m.get_mut("content"))
@@ -1342,6 +1376,21 @@ fn blank_claude_entry(
     let mut freed_total = 0usize;
     let mut changed = false;
     for block in blocks.iter_mut() {
+        // Expansion-body text → blank it, counting freed bytes under the source id.
+        if let Some(source_id) = &body_source_id {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(obj) = block.as_object_mut() {
+                    if let Some(freed) =
+                        crate::prune::blank_string_field(obj, "text", PRUNED_PLACEHOLDER)
+                    {
+                        freed_total += freed;
+                        changed = true;
+                        outputs_blanked.insert(source_id.clone());
+                    }
+                }
+                continue;
+            }
+        }
         let id = block
             .get(if is_assistant { "id" } else { "tool_use_id" })
             .and_then(|i| i.as_str())
@@ -2018,6 +2067,49 @@ mod tests {
             // paired tool_result content blanked to the placeholder.
             assert_eq!(lines[1]["message"]["content"][0]["content"], "[pruned]");
             assert_eq!(lines[1]["uuid"], "u1");
+        }
+
+        /// A Skill prune blanks BOTH the tiny ack AND the big body in the separate
+        /// `sourceToolUseID`-threaded frame. Regression for chat bf70c589, where the
+        /// body survived a prune that freed only 19 bytes.
+        #[test]
+        fn prunes_skill_ack_and_expansion_body() {
+            let big = "MODEL claude-opus-4-8 ".repeat(50);
+            let f = write_jsonl(&[
+                &format!(
+                    r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"sk1","name":"Skill","input":{{"skill":"claude-api","args":""}}}}]}},"uuid":"a1"}}"#
+                ),
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"sk1","content":"Running claude-api skill"}]},"uuid":"u1"}"#,
+                &format!(
+                    r#"{{"type":"user","isMeta":true,"sourceToolUseID":"sk1","message":{{"content":[{{"type":"text","text":"{big}"}}]}},"uuid":"u2"}}"#
+                ),
+            ]);
+            assert_eq!(count_matches(f.path(), "Skill", "claude-api").unwrap(), 1);
+            let stats = prune_jsonl(f.path(), "Skill", "claude-api").unwrap();
+            // One user-facing output (the source id dedups ack + body), but the
+            // freed bytes reflect the BODY, not just the 24-char ack.
+            assert_eq!(stats.results_blanked, 1);
+            assert!(
+                stats.freed_bytes > big.len() - 16,
+                "freed {} should reflect the {}-byte body",
+                stats.freed_bytes,
+                big.len()
+            );
+            let lines = read_lines(f.path());
+            assert_eq!(lines[0]["message"]["content"][0]["input"], serde_json::json!({}));
+            assert_eq!(lines[1]["message"]["content"][0]["content"], "[pruned]");
+            // The expansion body text is blanked; threading fields intact.
+            assert_eq!(lines[2]["message"]["content"][0]["text"], "[pruned]");
+            assert_eq!(lines[2]["sourceToolUseID"], "sk1");
+            assert_eq!(lines[2]["isMeta"], true);
+            // Idempotent + already-pruned aware: re-prune finds nothing.
+            assert_eq!(count_matches(f.path(), "Skill", "claude-api").unwrap(), 0);
+            assert_eq!(
+                prune_jsonl(f.path(), "Skill", "claude-api")
+                    .unwrap()
+                    .results_blanked,
+                0
+            );
         }
 
         /// Last-only: with two eligible matches, only the most recent is blanked;
