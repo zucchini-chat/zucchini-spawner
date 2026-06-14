@@ -62,7 +62,7 @@ pub enum WriteEvent {
         chat_id: String,
         tokens: i64,
     },
-    /// `compactMetadata.postTokens` from a `compact_boundary` system frame.
+    /// `compact_metadata.post_tokens` from a `compact_boundary` system frame.
     /// Backend resolves `context_tokens = baseline_tokens + post_tokens`.
     CompactBoundary {
         chat_id: String,

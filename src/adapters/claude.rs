@@ -642,17 +642,25 @@ fn task_updated_is_terminal(line: &str) -> bool {
     }
 }
 
-/// Reads `compactMetadata.postTokens` from a `compact_boundary` system frame.
+/// Reads `compact_metadata.post_tokens` from a `compact_boundary` system frame.
 /// Narrow Deserialize struct so serde skips the rest of the frame without allocating it.
+///
+/// The public `--output-format stream-json` wire frame is snake_case
+/// (`compact_metadata` / `post_tokens`) — verified live against claude 2.1.170.
+/// The on-disk transcript jsonl and older builds use camelCase
+/// (`compactMetadata` / `postTokens`); the `alias` accepts both so a future
+/// format flip doesn't silently break the harvest again. (The earlier struct
+/// only knew the camelCase transcript shape, so every real stdout frame failed
+/// to parse with "missing field 'compactMetadata'".)
 fn parse_compact_post_tokens(line: &str) -> Option<i64> {
     #[derive(serde::Deserialize)]
     struct Frame {
-        #[serde(rename = "compactMetadata")]
+        #[serde(rename = "compact_metadata", alias = "compactMetadata")]
         metadata: Metadata,
     }
     #[derive(serde::Deserialize)]
     struct Metadata {
-        #[serde(rename = "postTokens")]
+        #[serde(rename = "post_tokens", alias = "postTokens")]
         post_tokens: i64,
     }
     match serde_json::from_str::<Frame>(line) {
@@ -1778,6 +1786,17 @@ mod tests {
     #[test]
     fn compact_boundary_frame_harvests_post_tokens_and_skips() {
         let mut a = ClaudeAdapter::new();
+        // Real `--output-format stream-json` wire shape (snake_case), captured
+        // live from claude 2.1.170. The frame the spawner actually sees.
+        let line = r#"{"type":"system","subtype":"compact_boundary","session_id":"s","uuid":"u","compact_metadata":{"trigger":"manual","pre_tokens":46139,"post_tokens":2388,"duration_ms":37287}}"#;
+        let events = run(&mut a, line);
+        assert_eq!(events, vec!["CompactBoundary(2388)"]);
+    }
+
+    #[test]
+    fn compact_boundary_frame_accepts_legacy_camelcase_shape() {
+        let mut a = ClaudeAdapter::new();
+        // Transcript-jsonl / older-build camelCase shape — accepted via serde alias.
         let line = r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"postTokens":1234,"trigger":"manual"}}"#;
         let events = run(&mut a, line);
         assert_eq!(events, vec!["CompactBoundary(1234)"]);

@@ -154,7 +154,7 @@ pub enum AgentResponse {
         topic: String,
         tokens: i64,
     },
-    /// Manual `/compact` or auto-compact completed; carries `compactMetadata.postTokens`.
+    /// Manual `/compact` or auto-compact completed; carries `compact_metadata.post_tokens`.
     CompactBoundary {
         topic: String,
         post_tokens: i64,

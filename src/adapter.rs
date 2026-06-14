@@ -307,7 +307,7 @@ pub enum AgentEvent {
     /// `chats.context_tokens`.
     ContextTokens(i64),
     /// Claude only — manual `/compact` or auto-compact completed. Carries
-    /// `compactMetadata.postTokens`. Other adapters don't expose this signal.
+    /// `compact_metadata.post_tokens`. Other adapters don't expose this signal.
     CompactBoundary(i64),
     /// Harvested from the agent's first stdout frame; persisted to
     /// `chats.agent_session_id` so subsequent turns can resume.
