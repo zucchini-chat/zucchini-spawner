@@ -11,7 +11,7 @@
 //! task, and discards it when the turn ends.
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -792,27 +792,13 @@ fn default_spawn_fn(
         let agent_started = Arc::new(AtomicBool::new(false));
         let agent_started_stderr = agent_started.clone();
 
-        // Read stderr in a separate task. Before the agent starts we buffer lines silently;
-        // after startup any stderr is a genuine warning. We return the buffer so the main
-        // task can report it to Sentry only if the agent never started.
-        let stderr_handle = if let Some(stderr) = child.stderr.take() {
-            let topic_for_stderr = topic_clone.clone();
-            Some(tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                let mut startup_buf: Vec<String> = Vec::new();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if agent_started_stderr.load(Ordering::Relaxed) {
-                        warn!(topic = %topic_for_stderr, "agent stderr: {}", line);
-                    } else if startup_buf.len() < 200 {
-                        startup_buf.push(line);
-                    }
-                }
-                startup_buf
-            }))
-        } else {
-            None
-        };
+        // Read stderr in a separate task (see `spawn_stderr_reader`): buffer
+        // startup lines silently, keep a rolling tail, warn-log the rest. The
+        // capture is surfaced to the user only on a failed exit.
+        let stderr_handle = child
+            .stderr
+            .take()
+            .map(|stderr| spawn_stderr_reader(stderr, agent_started_stderr, topic_clone.clone()));
 
         let mut has_result = false;
 
@@ -940,15 +926,21 @@ fn default_spawn_fn(
             }
         }
 
+        // Surface stderr as the failure reason when the process never started,
+        // or when it died mid-turn without a `result` (e.g. cursor printing
+        // "You've hit your usage limit" to stderr after its init frame). The
+        // cancel arms `return` earlier, so reaching here is always a spontaneous
+        // exit — `has_result` is the clean-exit signal. Without this the user
+        // only sees the bare INTERRUPTED_RESULT the `Done` below triggers.
         if let Some(h) = stderr_handle {
-            if let Ok(startup_buf) = h.await {
-                if !agent_started.load(Ordering::Relaxed) && !startup_buf.is_empty() {
-                    let stderr = startup_buf.join("\n");
-                    error!(topic = %topic_clone, "agent failed to start. startup stderr:\n{}", stderr);
+            if let Ok(cap) = h.await {
+                let started = agent_started.load(Ordering::Relaxed);
+                if let Some(msg) = stderr_failure_message(&cap, started, has_result) {
+                    error!(topic = %topic_clone, "{}", msg);
                     let _ = tx
                         .send(AgentResponse::Line {
                             topic: topic_clone.clone(),
-                            content: format!("Error: agent failed to start.\n{}", stderr),
+                            content: msg,
                         })
                         .await;
                 }
@@ -1123,24 +1115,10 @@ fn default_resident_spawn_fn(
 
         let agent_started = Arc::new(AtomicBool::new(false));
         let agent_started_stderr = agent_started.clone();
-        let stderr_handle = if let Some(stderr) = child.stderr.take() {
-            let topic_for_stderr = topic.clone();
-            Some(tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                let mut startup_buf: Vec<String> = Vec::new();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if agent_started_stderr.load(Ordering::Relaxed) {
-                        warn!(topic = %topic_for_stderr, "agent stderr: {}", line);
-                    } else if startup_buf.len() < 200 {
-                        startup_buf.push(line);
-                    }
-                }
-                startup_buf
-            }))
-        } else {
-            None
-        };
+        let stderr_handle = child
+            .stderr
+            .take()
+            .map(|stderr| spawn_stderr_reader(stderr, agent_started_stderr, topic.clone()));
 
         // Last `running` value emitted, so we dedup identical transitions. The
         // internal "waiting" sub-state (armed background task, no turn in flight)
@@ -1261,15 +1239,24 @@ fn default_resident_spawn_fn(
             }
         }
 
+        // Surface stderr on a failed exit (same contract as the one-shot path).
+        // A deliberate teardown (`cancelled`) or an exit while fully idle is a
+        // clean exit and shows nothing; a never-started or mid-turn-crash exit
+        // surfaces its startup buffer / tail.
         if let Some(h) = stderr_handle {
-            if let Ok(startup_buf) = h.await {
-                if !agent_started.load(Ordering::Relaxed) && !startup_buf.is_empty() {
-                    let stderr = startup_buf.join("\n");
-                    error!(topic = %topic, "resident agent failed to start. startup stderr:\n{}", stderr);
+            if let Ok(cap) = h.await {
+                let started = agent_started.load(Ordering::Relaxed);
+                let clean_exit = cancelled
+                    || state_for_reader
+                        .lock()
+                        .expect("SessionState mutex")
+                        .is_idle();
+                if let Some(msg) = stderr_failure_message(&cap, started, clean_exit) {
+                    error!(topic = %topic, "{}", msg);
                     let _ = tx
                         .send(AgentResponse::Line {
                             topic: topic.clone(),
-                            content: format!("Error: agent failed to start.\n{}", stderr),
+                            content: msg,
                         })
                         .await;
                 }
@@ -1371,6 +1358,79 @@ async fn kill_agent_process_group(child: &mut tokio::process::Child) {
     } else {
         let _ = child.kill().await;
     }
+}
+
+/// How many trailing stderr lines we keep to surface as a failure diagnostic
+/// when the process dies without a clean result.
+const STDERR_TAIL_LINES: usize = 40;
+
+/// Captured stderr from an agent process. `startup` holds the lines emitted
+/// before the agent produced its first stdout line (used for "never started"
+/// diagnostics); `tail` is a rolling window of the most recent lines overall.
+/// The tail exists because some CLIs (e.g. cursor-agent) emit a `system/init`
+/// frame to stdout — which flips `agent_started` true — and only *then* print
+/// the real failure ("You've hit your usage limit") to stderr; the startup
+/// buffer misses it, so without the tail the user would see a bare
+/// "Agent interrupted" with no reason.
+struct CapturedStderr {
+    startup: Vec<String>,
+    tail: VecDeque<String>,
+}
+
+/// Spawn the stderr reader task. Buffers startup lines silently (capped), keeps
+/// a rolling tail of the last `STDERR_TAIL_LINES` lines, and `warn!`-logs every
+/// post-startup line. Shared by the one-shot and resident spawn paths.
+fn spawn_stderr_reader(
+    stderr: tokio::process::ChildStderr,
+    agent_started: Arc<AtomicBool>,
+    topic: String,
+) -> tokio::task::JoinHandle<CapturedStderr> {
+    tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        let mut startup: Vec<String> = Vec::new();
+        let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
+        while let Ok(Some(line)) = lines.next_line().await {
+            if agent_started.load(Ordering::Relaxed) {
+                warn!(topic = %topic, "agent stderr: {}", line);
+            } else if startup.len() < 200 {
+                startup.push(line.clone());
+            }
+            if tail.len() == STDERR_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        CapturedStderr { startup, tail }
+    })
+}
+
+/// Build the diagnostic to surface when an agent process exits, or `None` when
+/// there's nothing useful to show. `started` is the `agent_started` latch;
+/// `clean_exit` is true when the turn completed normally (one-shot: emitted a
+/// `result`; resident: died fully idle or via a deliberate teardown) — in that
+/// case we never surface stderr. A process that never started reports its
+/// startup buffer; one that started but died mid-turn reports its tail.
+fn stderr_failure_message(cap: &CapturedStderr, started: bool, clean_exit: bool) -> Option<String> {
+    if !started {
+        if cap.startup.is_empty() {
+            return None;
+        }
+        return Some(format!("Error: agent failed to start.\n{}", cap.startup.join("\n")));
+    }
+    if clean_exit {
+        return None;
+    }
+    let tail: Vec<&str> = cap
+        .tail
+        .iter()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if tail.is_empty() {
+        return None;
+    }
+    Some(format!("Error: agent exited unexpectedly.\n{}", tail.join("\n")))
 }
 
 async fn fail_agent(tx: &mpsc::Sender<AgentResponse>, topic: &str, msg: String) {
@@ -1735,5 +1795,54 @@ mod live_session_tests {
             0,
             "respawn publishes the fresh session's (empty) task set"
         );
+    }
+}
+
+#[cfg(test)]
+mod stderr_diagnostic_tests {
+    use super::*;
+
+    fn cap(startup: &[&str], tail: &[&str]) -> CapturedStderr {
+        CapturedStderr {
+            startup: startup.iter().map(|s| s.to_string()).collect(),
+            tail: tail.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn never_started_reports_startup_buffer() {
+        let c = cap(&["zsh: command not found: cursor-agent"], &["zsh: command not found: cursor-agent"]);
+        let msg = stderr_failure_message(&c, false, false).expect("startup failure surfaced");
+        assert!(msg.starts_with("Error: agent failed to start."));
+        assert!(msg.contains("command not found"));
+    }
+
+    #[test]
+    fn never_started_but_empty_stderr_is_silent() {
+        assert!(stderr_failure_message(&cap(&[], &[]), false, false).is_none());
+    }
+
+    #[test]
+    fn started_then_died_midturn_surfaces_tail() {
+        // The cursor no-subscription case: init frame flips `started` true, then
+        // the usage-limit line lands on stderr and the process exits non-zero
+        // without a `result` (clean_exit = false).
+        let c = cap(&[], &["S: You've hit your usage limit Get Cursor Pro for more Agent usage."]);
+        let msg = stderr_failure_message(&c, true, false).expect("mid-turn failure surfaced");
+        assert!(msg.starts_with("Error: agent exited unexpectedly."));
+        assert!(msg.contains("usage limit"));
+    }
+
+    #[test]
+    fn clean_exit_never_surfaces_stderr() {
+        // A normal turn that emitted a `result` (or a deliberate teardown) must
+        // not surface benign stderr noise.
+        let c = cap(&[], &["some benign warning"]);
+        assert!(stderr_failure_message(&c, true, true).is_none());
+    }
+
+    #[test]
+    fn started_died_with_only_blank_stderr_is_silent() {
+        assert!(stderr_failure_message(&cap(&[], &["", "  ", "\t"]), true, false).is_none());
     }
 }
