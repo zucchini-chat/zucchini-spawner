@@ -1653,12 +1653,29 @@ fn read_state_db(db_path: &std::path::Path) -> anyhow::Result<RawScan> {
     })
 }
 
+/// Read the `value` column (index 0) as raw bytes regardless of whether SQLite
+/// stored it as BLOB or TEXT. Cursor's `ItemTable`/`cursorDiskKV` declare
+/// `value BLOB`, but some Cursor versions persist the JSON as TEXT; rusqlite's
+/// `Vec<u8>` `FromSql` rejects the TEXT storage class with "Invalid column type
+/// Text at index: 0" (SPAWNER-Y), so coerce both here. Downstream callers feed
+/// the bytes straight into `serde_json::from_slice`, which is byte-agnostic.
+fn value_bytes(r: &rusqlite::Row) -> rusqlite::Result<Vec<u8>> {
+    use rusqlite::types::ValueRef;
+    match r.get_ref(0)? {
+        ValueRef::Text(t) => Ok(t.to_vec()),
+        ValueRef::Blob(b) => Ok(b.to_vec()),
+        // Null / numeric: defer to the typed getter so the error stays accurate
+        // (these never occur for Cursor's JSON value columns).
+        _ => r.get::<_, Vec<u8>>(0),
+    }
+}
+
 fn read_composer_headers(conn: &rusqlite::Connection) -> anyhow::Result<Vec<ComposerHeader>> {
     let blob: Option<Vec<u8>> = conn
         .query_row(
             "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'",
             [],
-            |r| r.get::<_, Vec<u8>>(0),
+            value_bytes,
         )
         .optional_or_none()?;
     let Some(blob) = blob else {
@@ -1732,7 +1749,7 @@ fn load_composer_rows(
     for id in ids {
         let key = format!("composerData:{id}");
         let blob: Option<Vec<u8>> = stmt
-            .query_row([&key], |r| r.get::<_, Vec<u8>>(0))
+            .query_row([&key], value_bytes)
             .optional_or_none()?;
         let Some(blob) = blob else {
             tracing::warn!(composer_id = %id, "cursor: composerData row missing for header, skipping");
@@ -1769,7 +1786,7 @@ fn load_bubble_rows(
             };
             let key = format!("bubbleId:{composer_id}:{bubble_id}");
             let blob: Option<Vec<u8>> = stmt
-                .query_row([&key], |r| r.get::<_, Vec<u8>>(0))
+                .query_row([&key], value_bytes)
                 .optional_or_none()?;
             let Some(blob) = blob else {
                 tracing::warn!(
@@ -2737,6 +2754,41 @@ mod tests {
         assert!(!accept_header(&bestof));
         assert!(!accept_header(&subagent));
         assert!(accept_header(&normal));
+    }
+
+    /// SPAWNER-Y: Cursor declares `value BLOB` but some versions persist the
+    /// JSON as TEXT. `value_bytes` must read both storage classes, where the
+    /// plain `get::<Vec<u8>>` getter rejects TEXT with "Invalid column type".
+    #[test]
+    fn value_bytes_reads_text_and_blob() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES('as_text', ?)",
+            rusqlite::params!["{\"a\":1}"], // bound as TEXT
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable(key, value) VALUES('as_blob', ?)",
+            rusqlite::params![b"{\"a\":1}".to_vec()], // bound as BLOB
+        )
+        .unwrap();
+
+        for key in ["as_text", "as_blob"] {
+            let bytes: Vec<u8> = conn
+                .query_row("SELECT value FROM ItemTable WHERE key = ?", [key], value_bytes)
+                .unwrap();
+            assert_eq!(&bytes, b"{\"a\":1}", "value_bytes failed for {key}");
+        }
+
+        // Document the regression: the typed getter still fails on the TEXT row.
+        let direct: rusqlite::Result<Vec<u8>> = conn.query_row(
+            "SELECT value FROM ItemTable WHERE key = 'as_text'",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        );
+        assert!(direct.is_err());
     }
 
     /// End-to-end with an in-memory SQLite db: insert a composerHeaders
