@@ -1,22 +1,25 @@
 # zucchini-spawner
 
-The Rust daemon that runs Claude Code agents on a developer's machine in response to messages from the [Zucchini Chat](https://zucchini.chat) iOS app.
+The Rust daemon that runs coding agents on a developer's machine in response to messages from the [Zucchini Chat](https://zucchini.chat) iOS and Android apps.
 
 ## How it fits in
 
-Zucchini is a chat-style remote control for coding agents. The iOS app talks to a backend (PowerSync + Postgres + a Rust auth service); the backend syncs end-to-end-encrypted messages to the spawner running on the machine that hosts the chat's project. The spawner decrypts the message, forks `claude` in the project's working directory, and streams the response back as encrypted message rows.
+Zucchini is a chat-style messenger for coding agents. The apps talk to a backend (PowerSync + Postgres + a Rust auth service); the backend syncs end-to-end-encrypted messages to the spawner running on the machine that hosts the chat's project. The spawner decrypts the message, forks the chat's agent CLI in the project's working directory, and streams the response back as encrypted message rows.
+
+Agents are pluggable adapters — **Claude Code**, **Cursor** (`cursor-agent`), **Codex**, **Hermes**, and **Gemini** (`gemini-cli`) ship today, and each is one entry in the `ADAPTERS` registry (`src/adapter.rs`). The chat picks which CLI gets spawned.
 
 ```
-iOS app  ──►  backend  ──►  spawner (this repo)  ──►  claude CLI
-                                       ▲
-                                       └─ runs on your Mac or Linux box
+iOS / Android app  ──►  backend  ──►  spawner (this repo)  ──►  agent CLI
+                                              ▲                  (claude / cursor-agent /
+                                              │                   codex / hermes / gemini)
+                                              └─ runs on your Mac or Linux box
 ```
 
-The iOS app, the backend, and the website are closed-source. The spawner is the only Zucchini code that runs on your machine — and it's open here.
+The apps, the backend, and the website are closed-source. The spawner is the only Zucchini code that runs on your machine — and it's open here.
 
 ## Why this repo is open
 
-The spawner has access to your Claude credentials, your source trees, your ssh keys, and the user encryption key (`K_user`) that decrypts your message bodies. The most consequential trust decision in the Zucchini stack is "what code is this binary actually running."
+The spawner has access to your agent credentials (Claude, Codex, Gemini, …), your source trees, your ssh keys, and the user encryption key (`K_user`) that decrypts your message bodies. The most consequential trust decision in the Zucchini stack is "what code is this binary actually running."
 
 This repo is the source of truth. The plan is for releases to be built and signed entirely inside GitHub Actions using [Sigstore](https://www.sigstore.dev/) keyless OIDC signing — the signing certificate bound to the public workflow file at the tagged commit, recorded in the [Rekor](https://docs.sigstore.dev/logging/overview/) public transparency log. The spawner's autoupdater (`src/updater.rs`) will verify the signature against the pinned workflow identity before installing, so a release that wasn't produced by this exact public workflow is rejected. See [Status](#status) for what's shipped vs. planned.
 
@@ -27,7 +30,7 @@ This repo is the source of truth. The plan is for releases to be built and signe
 | macOS | arm64, x86_64 |
 | Linux | x86_64, aarch64 |
 
-Windows is not currently planned. It would depend on Claude Code's native Windows support, which is outside this project's control.
+Windows is not currently planned. It would depend on the underlying agent CLIs' native Windows support, which is outside this project's control.
 
 ## Building
 
@@ -58,10 +61,10 @@ This repo is being opened in stages. Current state:
 
 ## Contributing
 
-Bug reports and patches welcome. The spawner is small (~3k lines of Rust); no formal contribution guide yet — open an issue or PR. Note that this repo is a one-way mirror of a directory in a private monorepo; PRs are reviewed here and cherry-picked back upstream.
+Bug reports and patches welcome. No formal contribution guide yet — open an issue or PR. Note that this repo is a one-way mirror of a directory in a private monorepo; PRs are reviewed here and cherry-picked back upstream.
 
 ## License
 
 [FSL-1.1-MIT](LICENSE.md) — [Functional Source License](https://fsl.software/), MIT Future License. Source-available now; each release auto-converts to plain MIT two years after it's published.
 
-This repo's purpose is so users can verify what binary runs on their machine — not to seed a fork that swaps the backend URL and ships a competing messenger for Claude Code. FSL's `Competing Use` clause forbids exactly that, and only that, until the 2-year MIT conversion kicks in.
+This repo's purpose is so users can verify what binary runs on their machine — not to seed a fork that swaps the backend URL and ships a competing messenger for coding agents. FSL's `Competing Use` clause forbids exactly that, and only that, until the 2-year MIT conversion kicks in.
