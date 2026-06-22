@@ -40,9 +40,10 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::adapter::{
-    claude_assistant_text_envelope, file_nonempty, first_message_capabilities_preamble,
-    parse_json_obj, probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter,
-    AgentEvent, AgentKind, ImportProgress, LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES,
+    claude_assistant_text_envelope, extract_json_type, file_nonempty,
+    first_message_capabilities_preamble, parse_json_obj, probe_with_blocking_auth, shell_escape,
+    AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, ImportProgress, LastTokensDedup,
+    TurnContext, MAX_STREAM_FRAME_BYTES,
 };
 use crate::writer::WriteEvent;
 
@@ -166,14 +167,38 @@ impl AgentAdapter for HermesAdapter {
         // Same dispatch shape as codex.rs: parse the inner claude-shape
         // envelope (the trampoline has already stripped the outer
         // `{chat_id, proactive, event}` wrapper) and route based on
-        // `event.type`. Oversize-frame guard prevents a tool_result frame
-        // embedding a multi-MB stdout from churning the heap on the
-        // `serde_json::Value` parse — forward verbatim above the cap.
+        // `event.type`.
         let mut out: SmallVec<[AgentEvent; 2]> = SmallVec::new();
 
+        // Oversize-frame fast-path. UNLIKE the transforming adapters
+        // (codex/gemini/cursor/pi), hermes's inner `event` is ALREADY a
+        // claude-shape envelope — the plugin emits the iOS wire format and the
+        // `system`/`assistant`/`user`/`result`/unknown arms forward it verbatim
+        // (see the comments below). So for those types forwarding the raw
+        // oversize line is CORRECT (same posture as claude.rs): the size cap
+        // exists only to skip a full `serde_json::Value` parse of a multi-MB
+        // tool_result on the heap. The ONE arm that TRANSFORMS its body is
+        // `error` (it synthesizes a claude `result` envelope + latches
+        // `AgentEvent::Result`); an oversize raw `error` line would render as
+        // literal `[error]` AND never latch the terminator → spurious "Agent
+        // interrupted". So classify cheaply (no parse) and only special-case
+        // `error`: fall through to its transform arm (its `message` body is
+        // realistically small, so the one-time parse blip is a non-issue).
         if line.len() > MAX_STREAM_FRAME_BYTES {
-            out.push(AgentEvent::Frame(line));
-            return out;
+            match extract_json_type(&line) {
+                // Body-derived terminal transform — fall through to the normal
+                // full-parse `error` arm so the result envelope is synthesized
+                // and `Result` is latched. Parse-cost tradeoff: an oversize
+                // error is rare and correctness beats the one-time heap blip.
+                Some("error") => {}
+                // Every other type is forwarded verbatim by its arm anyway
+                // (the inner event is already claude-wire), so forwarding the
+                // raw oversize line is wire-correct — no parse needed.
+                _ => {
+                    out.push(AgentEvent::Frame(line));
+                    return out;
+                }
+            }
         }
 
         let Some(obj) = parse_json_obj(&line) else {
@@ -493,6 +518,39 @@ mod tests {
         assert_eq!(v["is_error"], true);
         assert_eq!(v["error"]["message"], "AIAgent init failed: provider 500");
         assert_eq!(events[1], "Result");
+    }
+
+    #[test]
+    fn oversize_error_frame_still_normalized_and_latches_result() {
+        // An oversize `error` frame is the one transforming arm: it must STILL
+        // synthesize a claude `result:error` envelope and latch `Result` (not be
+        // forwarded raw, which would render as literal `[error]` + spurious
+        // "Agent interrupted"). It falls through to the full-parse `error` arm.
+        let mut a = HermesAdapter::new();
+        let pad = "x".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        let line = format!(r#"{{"type":"error","message":"{pad}"}}"#);
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        let events = run(&mut a, &line);
+        assert_eq!(events.len(), 2);
+        let v = frame_value(&events[0]);
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["subtype"], "error");
+        assert_eq!(v["is_error"], true);
+        assert_eq!(events[1], "Result");
+    }
+
+    #[test]
+    fn oversize_passthrough_frame_forwarded_verbatim() {
+        // Non-`error` types carry an already-claude-shape inner event, so an
+        // oversize line is forwarded verbatim (wire-correct, like claude.rs) —
+        // no parse, no drop. A huge `assistant` tool_result is the realistic case.
+        let mut a = HermesAdapter::new();
+        let pad = "y".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        let line = format!(r#"{{"type":"assistant","big":"{pad}"}}"#);
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        let events = run(&mut a, &line);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], format!("Frame({line})"));
     }
 
     #[test]

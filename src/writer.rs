@@ -518,7 +518,11 @@ fn backend_has_install_columns(kind: AgentKind) -> bool {
         | AgentKind::Cursor
         | AgentKind::Codex
         | AgentKind::Hermes
-        | AgentKind::Gemini => true,
+        | AgentKind::Gemini
+        // pi's `pi_installed` / `pi_authenticated` columns are live (migration
+        // 0046, deployed to prod) and `process_machine_patch`'s `machine_fields`
+        // allowlist knows them, so reporting Pi's install/auth status is safe.
+        | AgentKind::Pi => true,
     }
 }
 

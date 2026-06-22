@@ -50,6 +50,7 @@ pub enum AgentKind {
     Codex,
     Hermes,
     Gemini,
+    Pi,
 }
 
 /// Per-kind metadata + behavior table. Each `adapters/<kind>.rs` exports a
@@ -86,6 +87,7 @@ pub const ADAPTERS: &[&AdapterDescriptor] = &[
     &crate::adapters::codex::DESCRIPTOR,
     &crate::adapters::hermes::DESCRIPTOR,
     &crate::adapters::gemini::DESCRIPTOR,
+    &crate::adapters::pi::DESCRIPTOR,
 ];
 
 impl AgentKind {
@@ -112,6 +114,7 @@ impl AgentKind {
         AgentKind::Codex,
         AgentKind::Hermes,
         AgentKind::Gemini,
+        AgentKind::Pi,
     ];
 
     /// Look up this variant's descriptor in `ADAPTERS`. Panics if the
@@ -198,6 +201,11 @@ impl AgentKind {
             // home-relocation env var, so there's no `env_dir` override here.
             AgentKind::Cursor => home_subdir(".cursor"),
             AgentKind::Hermes => None,
+            // pi stores sessions under `~/.pi/agent/sessions/<cwd-mangled>/`; the
+            // prune resolver (`find_session`) walks beneath this base. pi has no
+            // documented home-relocation env var, so there's no `env_dir`
+            // override (mirrors cursor's plain `home_subdir`).
+            AgentKind::Pi => home_subdir(".pi"),
         }
     }
 
@@ -471,6 +479,40 @@ pub trait AgentAdapter: Send + Sync {
 /// of KB. Lives here so adapters can't drift on the threshold.
 pub(crate) const MAX_STREAM_FRAME_BYTES: usize = 65_536;
 
+/// Cheaply extract the value of the first top-level `"type"` field from a
+/// JSONL line WITHOUT a full `serde_json::Value` parse. pi/claude/etc. emit
+/// `type` as (effectively) the leading key, so this lets an oversize-frame
+/// fast-path classify a frame without paying the parse cost. Returns `None` if
+/// no `"type":"..."` string value is found near the start.
+///
+/// Conservative scan: find `"type"`, require a `:` (with optional whitespace)
+/// then a `"`-delimited string value, and return the slice up to the next `"`.
+/// pi/claude `type` values are simple identifiers (`agent_end`, `message_end`,
+/// `result`, …) with no embedded quotes/escapes, so a plain scan to the next
+/// `"` is correct; on any malformed/escaped input we return `None` rather than
+/// risk a wrong classification.
+pub(crate) fn extract_json_type(line: &str) -> Option<&str> {
+    // Locate the `"type"` key. `find` on the literal is fine — a `"type"`
+    // substring inside an earlier string value is vanishingly unlikely as the
+    // FIRST occurrence (type is the leading key), and a wrong hit just yields a
+    // value that fails the conservative checks below → None.
+    let key = line.find("\"type\"")?;
+    let rest = &line[key + "\"type\"".len()..];
+    // Skip whitespace, require a single `:`, skip whitespace again.
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix(':')?;
+    let rest = rest.trim_start();
+    // Require a `"`-delimited string value.
+    let rest = rest.strip_prefix('"')?;
+    // Plain scan to the next `"`. A backslash before it means an escape →
+    // bail out (pi/claude type values never contain escapes).
+    let end = rest.find('"')?;
+    if rest[..end].contains('\\') {
+        return None;
+    }
+    Some(&rest[..end])
+}
+
 /// Shared shell-escape helper. Every adapter uses single-quote escaping for
 /// command strings handed to the user's login shell. Kept here so all
 /// `adapters/*.rs` modules can share it without reaching back into
@@ -628,6 +670,88 @@ pub fn first_message_capabilities_preamble(ctx: &TurnContext<'_>) -> Option<Stri
 pub struct WorktreeInstructions {
     pub worktree_abs: String,
     pub parent_repo: String,
+}
+
+/// Resolved spawner-side worktree location for a chat. Deterministic from
+/// `chat_id` (first 8 chars), lives under the spawner runtime dir OUTSIDE any
+/// repo so it never pollutes a parent repo's `git status`. Shared by every
+/// flagless adapter that wants worktree support (pi/codex/gemini run pi/etc.
+/// with `dir` as cwd; hermes will pass `dir` as its `--project-path`).
+pub struct Worktree {
+    pub dir: PathBuf,
+    pub branch: String, // "zc-<chat8>"
+}
+
+/// Compute the deterministic worktree dir + branch for a chat. `<chat8>` is the
+/// first 8 chars of `chat_id`; dir is `<runtime>/worktrees/<chat8>`, branch is
+/// `zc-<chat8>`. No filesystem access — pure path math, recomputable every turn
+/// with no stored state.
+pub fn worktree_for(chat_id: &str) -> Worktree {
+    let chat8: String = chat_id.chars().take(8).collect();
+    let dir = crate::zucchini_spawner_dir().join("worktrees").join(&chat8);
+    Worktree {
+        dir,
+        branch: format!("zc-{chat8}"),
+    }
+}
+
+/// The absolute path the agent actually runs in this turn: the worktree dir when
+/// worktree mode is on AND a project path exists, else the project path; `None`
+/// when there's no project path. This is exactly the dir `worktree_cwd_prefix`
+/// cd's into — adapters that ALSO need the cwd as an explicit flag (codex's `-C`)
+/// call this so the shell cwd and the flag can never disagree.
+pub fn effective_cwd(ctx: &TurnContext<'_>) -> Option<String> {
+    let pp = ctx.project_path?;
+    if ctx.worktree {
+        Some(worktree_for(ctx.chat_id).dir.to_string_lossy().into_owned())
+    } else {
+        Some(pp.to_string())
+    }
+}
+
+/// The leading shell fragment that puts a flagless shell-string adapter in the
+/// right cwd, encapsulating the entire spawner-side worktree decision. Returns a
+/// fragment ENDING in ` && ` (or an empty string when there is no project path
+/// and worktree is off). Cases:
+/// - worktree off: `cd <project> && ` (empty String if project_path is None)
+/// - worktree on + project, FIRST turn (agent_session_id None):
+///   `git -C <project> worktree add <dir> -b <branch> && cd <dir> && `
+/// - worktree on + project, resume: `cd <dir> && `
+/// - worktree on but project_path None: empty String (no worktree without a repo)
+///
+/// The cd target is [`effective_cwd`] (the worktree dir under worktree mode, else
+/// the project path) — shared with codex's `-C` so the shell cwd and the flag
+/// can't drift. The `git -C <PROJECT>` repo arg uses the PROJECT path (the repo to
+/// branch off), NOT the worktree dir.
+///
+/// A failed `git worktree add` propagates as the turn's stderr failure (no guard).
+pub fn worktree_cwd_prefix(ctx: &TurnContext<'_>) -> String {
+    let mut prefix = String::new();
+    let Some(pp) = ctx.project_path else {
+        // No project path ⇒ no cwd to set (worktree on or off).
+        return prefix;
+    };
+    // Resolve the cwd. Under worktree mode we compute `worktree_for` ONCE here and
+    // reuse its `.dir` (the cwd) and `.branch` for both the `git worktree add` and
+    // the `cd` below; off, the cwd is just the project path. (This is exactly what
+    // `effective_cwd` returns — kept in sync with it.)
+    let cwd = if ctx.worktree {
+        let wt = worktree_for(ctx.chat_id);
+        // The repo to branch off is the PROJECT path. Create on the first turn only.
+        if ctx.agent_session_id.is_none() {
+            prefix.push_str(&format!(
+                "git -C {} worktree add {} -b {} && ",
+                shell_escape(pp),
+                shell_escape(&wt.dir.to_string_lossy()),
+                wt.branch,
+            ));
+        }
+        wt.dir.to_string_lossy().into_owned()
+    } else {
+        pp.to_string()
+    };
+    prefix.push_str(&format!("cd {} && ", shell_escape(&cwd)));
+    prefix
 }
 
 /// Trim + `starts_with('{')` gate + `serde_json::from_str::<Value>` for
@@ -898,6 +1022,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn extract_json_type_basic() {
+        // Normal leading-key.
+        assert_eq!(
+            extract_json_type(r#"{"type":"agent_end","messages":[]}"#),
+            Some("agent_end")
+        );
+        // Whitespace around the colon and value.
+        assert_eq!(
+            extract_json_type(r#"{ "type" : "message_end" , "x":1}"#),
+            Some("message_end")
+        );
+        // Leading whitespace before the object.
+        assert_eq!(
+            extract_json_type("   {\"type\":\"result\"}"),
+            Some("result")
+        );
+        // Missing type → None.
+        assert_eq!(extract_json_type(r#"{"foo":"bar"}"#), None);
+        // type present but value is not a string → None.
+        assert_eq!(extract_json_type(r#"{"type":3}"#), None);
+        // Not JSON at all → None (no "type" key).
+        assert_eq!(extract_json_type("not json"), None);
+    }
+
     /// Only gemini/codex (no `--append-system-prompt` hook) carry the prune nudge
     /// on the first user message. The rest must return `None`: a non-`None` would
     /// double-inject (claude via `--append-system-prompt`, cursor via its every-turn
@@ -986,5 +1135,110 @@ mod tests {
             first_message_capabilities_preamble(&resume).is_none(),
             "resume → None"
         );
+    }
+
+    // `for_test` hard-codes chat_id="0000...0" → chat8 "00000000".
+    const WT_CHAT8: &str = "00000000";
+
+    #[test]
+    fn worktree_for_is_deterministic_from_chat_id() {
+        let wt = worktree_for("00000000-0000-0000-0000-000000000000");
+        // basename of the dir == first 8 chars of the chat id.
+        assert_eq!(wt.dir.file_name().unwrap().to_str().unwrap(), WT_CHAT8);
+        // branch is zc-<chat8>.
+        assert_eq!(wt.branch, format!("zc-{WT_CHAT8}"));
+        // dir lives under the runtime `worktrees/` dir, outside any repo.
+        let expected_parent = crate::zucchini_spawner_dir().join("worktrees");
+        assert_eq!(wt.dir.parent().unwrap(), expected_parent.as_path());
+    }
+
+    #[test]
+    fn effective_cwd_resolves_worktree_off_and_no_project() {
+        use std::path::PathBuf;
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        // worktree on + project → worktree dir.
+        let on = TurnContext {
+            worktree: true,
+            ..TurnContext::for_test(&prompt_file, None, false, None)
+        };
+        let wt = worktree_for(on.chat_id);
+        assert_eq!(
+            effective_cwd(&on),
+            Some(wt.dir.to_string_lossy().into_owned())
+        );
+        // worktree off + project → project path.
+        let off = TurnContext::for_test(&prompt_file, None, false, None);
+        assert_eq!(effective_cwd(&off), Some("/tmp/proj".to_string()));
+        // no project → None (worktree on or off).
+        let no_proj = TurnContext {
+            worktree: true,
+            project_path: None,
+            ..TurnContext::for_test(&prompt_file, None, false, None)
+        };
+        assert_eq!(effective_cwd(&no_proj), None);
+    }
+
+    #[test]
+    fn worktree_cwd_prefix_off_with_project_cds_into_project() {
+        use std::path::PathBuf;
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        // worktree=false, project_path=Some("/tmp/proj") (for_test defaults).
+        let ctx = TurnContext::for_test(&prompt_file, None, false, None);
+        assert_eq!(worktree_cwd_prefix(&ctx), "cd '/tmp/proj' && ");
+    }
+
+    #[test]
+    fn worktree_cwd_prefix_off_no_project_is_empty() {
+        use std::path::PathBuf;
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let ctx = TurnContext {
+            project_path: None,
+            ..TurnContext::for_test(&prompt_file, None, false, None)
+        };
+        assert_eq!(worktree_cwd_prefix(&ctx), "");
+    }
+
+    #[test]
+    fn worktree_cwd_prefix_on_first_turn_creates_and_cds() {
+        use std::path::PathBuf;
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let ctx = TurnContext {
+            worktree: true,
+            ..TurnContext::for_test(&prompt_file, None, false, None)
+        };
+        let wt = worktree_for(ctx.chat_id);
+        let wt_esc = shell_escape(&wt.dir.to_string_lossy());
+        // Exact create-case string: `git -C <proj> worktree add <dir> -b zc-<chat8> && cd <dir> && `.
+        assert_eq!(
+            worktree_cwd_prefix(&ctx),
+            format!("git -C '/tmp/proj' worktree add {wt_esc} -b zc-{WT_CHAT8} && cd {wt_esc} && "),
+        );
+    }
+
+    #[test]
+    fn worktree_cwd_prefix_on_resume_cds_only() {
+        use std::path::PathBuf;
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let ctx = TurnContext {
+            worktree: true,
+            ..TurnContext::for_test(&prompt_file, Some("sid"), false, None)
+        };
+        let wt = worktree_for(ctx.chat_id);
+        let wt_esc = shell_escape(&wt.dir.to_string_lossy());
+        // Resume: cd-only, no `worktree add`.
+        assert_eq!(worktree_cwd_prefix(&ctx), format!("cd {wt_esc} && "));
+    }
+
+    #[test]
+    fn worktree_cwd_prefix_on_no_project_is_empty() {
+        use std::path::PathBuf;
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let ctx = TurnContext {
+            worktree: true,
+            project_path: None,
+            ..TurnContext::for_test(&prompt_file, None, false, None)
+        };
+        // No worktree without a repo path.
+        assert_eq!(worktree_cwd_prefix(&ctx), "");
     }
 }

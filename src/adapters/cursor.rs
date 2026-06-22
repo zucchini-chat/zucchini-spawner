@@ -45,8 +45,8 @@ use tracing::{debug, warn};
 
 use crate::adapter::{
     agent_capabilities_instructions, claude_assistant_envelope, claude_tool_use_envelope,
-    current_time_in_tz_line, parse_json_obj, shell_escape, AdapterDescriptor, AgentAdapter,
-    AgentEvent, AgentKind, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
+    current_time_in_tz_line, extract_json_type, parse_json_obj, shell_escape, AdapterDescriptor,
+    AgentAdapter, AgentEvent, AgentKind, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
     PRUNE_CONTEXT_INSTRUCTION,
 };
 
@@ -284,37 +284,64 @@ impl AgentAdapter for CursorAdapter {
             }
         }
 
-        // Oversize-frame guard. `serde_json::from_str` on a multi-MB line
-        // allocates a tree of `Map<String, Value>` nodes; the `tool_call`
-        // dispatch below needs the parsed tree, so without this guard a
-        // single big edit can churn the heap by megabytes. For lines past
-        // the cap we sniff the type substring and synthesize a minimal
-        // envelope without a full parse. Mirrors the pattern in
-        // `claude.rs::handle_line` (see `MAX_USAGE_FRAME_BYTES`).
+        // Oversize-frame fast-path. `serde_json::from_str` on a multi-MB line
+        // allocates a tree of `Map<String, Value>` nodes; without this guard a
+        // single big edit can churn the heap by megabytes. cursor frames are
+        // NEVER iOS-wire-compatible (we always transform), so forwarding a raw
+        // cursor line verbatim is wrong — iOS renders an unknown
+        // `{"type":"X"}` as literal `[X]`. So classify CHEAPLY via
+        // `extract_json_type` (no full parse) and branch per type. Mirrors the
+        // pattern in `pi.rs::handle_line` / `claude.rs::handle_line`.
         if line.len() > MAX_STREAM_FRAME_BYTES {
-            if line.starts_with('{')
-                && line.contains("\"type\":\"tool_call\"")
-                && line.contains("\"subtype\":\"completed\"")
-            {
-                if let Some(frame) = synthesize_oversize_tool_call_completed(&line) {
-                    out.push(AgentEvent::Frame(frame));
-                } else {
-                    warn!(
-                        "cursor-agent dropping oversize tool_call.completed frame ({} bytes): \
-                         could not recover call_id/verb via substring sniff",
-                        line.len()
-                    );
+            match extract_json_type(&line) {
+                // Content-bearing, handled without a full parse: a big edit's
+                // `tool_call.completed` is recovered via substring sniff (we
+                // still need the `subtype` substring to confirm it's the
+                // immutable variant). The synth path is the whole reason this
+                // fast-path exists.
+                Some("tool_call") if line.contains("\"subtype\":\"completed\"") => {
+                    if let Some(frame) = synthesize_oversize_tool_call_completed(&line) {
+                        out.push(AgentEvent::Frame(frame));
+                    } else {
+                        warn!(
+                            "cursor-agent dropping oversize tool_call.completed frame ({} bytes): \
+                             could not recover call_id/verb via substring sniff",
+                            line.len()
+                        );
+                    }
+                    return out;
                 }
-                return out;
+                // The body (the reply text) is what we render, so a >64KB
+                // assistant frame needs the full parse. Rare, and correctness
+                // beats the one-time heap blip — DON'T early-return; fall
+                // through to the normal `"assistant"` arm below (mirrors pi's
+                // `message_end => {}` fall-through).
+                Some("assistant") => {}
+                // CRITICAL: the `result` arm is the TERMINAL — it emits
+                // ContextTokens (from usage), the result Frame, AND
+                // `AgentEvent::Result` (which latches `has_result`). All three
+                // are body-derived, so we must full-parse. Dropping an oversize
+                // `result` means the turn never latches Result → the user sees
+                // "Agent interrupted" instead of `[result: success]`. cursor
+                // result frames are realistically tiny (so the heap blip
+                // basically never happens), but falling through GUARANTEES
+                // correctness if one is ever oversize. DON'T early-return.
+                Some("result") => {}
+                // Lifecycle (system, user, thinking, tool_call.started) + any
+                // unknown type → DROP. Forwarding raw cursor JSON is strictly
+                // worse than dropping (iOS can't render it). Matches the
+                // prefilter drops above.
+                Some(other) => {
+                    debug!(ty = %other, "cursor-agent oversize lifecycle frame dropped");
+                    return out;
+                }
+                // Couldn't classify (no `"type"` near the start, escaped value,
+                // …). Drop: raw cursor JSON is never renderable.
+                None => {
+                    debug!("cursor-agent oversize frame without classifiable type dropped");
+                    return out;
+                }
             }
-            // Any other oversize frame type is dropped — `result` and
-            // `assistant` payloads are normally tiny, so this branch
-            // signals something unexpected on the wire.
-            warn!(
-                "cursor-agent dropping oversize frame ({} bytes) without full parse",
-                line.len()
-            );
-            return out;
         }
 
         let Some(obj) = parse_json_obj(&line) else {
@@ -1748,9 +1775,7 @@ fn load_composer_rows(
     let mut out = std::collections::HashMap::with_capacity(ids.len());
     for id in ids {
         let key = format!("composerData:{id}");
-        let blob: Option<Vec<u8>> = stmt
-            .query_row([&key], value_bytes)
-            .optional_or_none()?;
+        let blob: Option<Vec<u8>> = stmt.query_row([&key], value_bytes).optional_or_none()?;
         let Some(blob) = blob else {
             tracing::warn!(composer_id = %id, "cursor: composerData row missing for header, skipping");
             continue;
@@ -1785,9 +1810,7 @@ fn load_bubble_rows(
                 continue;
             };
             let key = format!("bubbleId:{composer_id}:{bubble_id}");
-            let blob: Option<Vec<u8>> = stmt
-                .query_row([&key], value_bytes)
-                .optional_or_none()?;
+            let blob: Option<Vec<u8>> = stmt.query_row([&key], value_bytes).optional_or_none()?;
             let Some(blob) = blob else {
                 tracing::warn!(
                     composer_id = %composer_id,
@@ -2329,15 +2352,65 @@ mod tests {
     }
 
     #[test]
-    fn oversize_non_tool_call_frame_dropped() {
+    fn oversize_assistant_frame_falls_through_and_renders() {
+        // A >64KB assistant reply is body-derived (the text is what we render),
+        // so the oversize fast-path must fall through to the normal `assistant`
+        // arm rather than drop. Rare, but correctness beats the heap blip.
         let mut a = CursorAdapter::new();
-        // A pathological huge `assistant` frame — drop without parse.
         let big = "x".repeat(MAX_STREAM_FRAME_BYTES + 1024);
         let line = format!(
-            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{}"}}]}},"session_id":"abc-1"}}"#,
             big
         );
-        assert!(run(&mut a, &line).is_empty());
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        let events = run(&mut a, &line);
+        assert_eq!(events.len(), 1);
+        let v = frame_value(&events[0]);
+        assert_eq!(v["type"], "assistant");
+        assert_eq!(v["message"]["content"][0]["text"], big);
+    }
+
+    #[test]
+    fn oversize_result_frame_falls_through_emits_terminal() {
+        // CRITICAL regression guard: the `result` arm is the TERMINAL. An
+        // oversize `result` must NOT be dropped — dropping it means the turn
+        // never latches Result and the user sees "Agent interrupted" instead of
+        // `[result: success]`. cursor result frames are realistically tiny, but
+        // we pad past the cap to force the oversize path, with `"type":"result"`
+        // first so `extract_json_type` classifies it before the padding.
+        let mut a = CursorAdapter::new();
+        let pad = "x".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        let line = format!(
+            r#"{{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"usage":{{"inputTokens":100,"outputTokens":5,"cacheReadTokens":20,"cacheWriteTokens":0}},"pad":"{}"}}"#,
+            pad
+        );
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        let events = run(&mut a, &line);
+        // ContextTokens (100+20+0 over N_calls=1), Frame, Result.
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], "ContextTokens(120)");
+        let v = frame_value(&events[1]);
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["subtype"], "success");
+        assert_eq!(events[2], "Result");
+    }
+
+    #[test]
+    fn oversize_lifecycle_frame_dropped_not_forwarded() {
+        // An oversize lifecycle/unknown frame emits NOTHING (dropped, never
+        // forwarded raw — raw cursor JSON renders as literal `[type]` on iOS).
+        let mut a = CursorAdapter::new();
+        let big = "x".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        let thinking = format!(
+            r#"{{"type":"thinking","subtype":"delta","text":"{}"}}"#,
+            big
+        );
+        assert!(thinking.len() > MAX_STREAM_FRAME_BYTES);
+        assert!(run(&mut a, &thinking).is_empty());
+
+        let system = format!(r#"{{"type":"system","subtype":"init","pad":"{}"}}"#, big);
+        assert!(system.len() > MAX_STREAM_FRAME_BYTES);
+        assert!(run(&mut a, &system).is_empty());
     }
 
     #[test]
@@ -2777,7 +2850,11 @@ mod tests {
 
         for key in ["as_text", "as_blob"] {
             let bytes: Vec<u8> = conn
-                .query_row("SELECT value FROM ItemTable WHERE key = ?", [key], value_bytes)
+                .query_row(
+                    "SELECT value FROM ItemTable WHERE key = ?",
+                    [key],
+                    value_bytes,
+                )
                 .unwrap();
             assert_eq!(&bytes, b"{\"a\":1}", "value_bytes failed for {key}");
         }

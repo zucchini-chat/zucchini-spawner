@@ -384,10 +384,10 @@ async fn prune_context(
             .map(|c| (c.agent_kind, c.agent_session_id.clone()))
             .ok_or_else(|| anyhow!("no chat with id {chat_id} (unknown or not yet synced)"))?
     };
-    // Selective-forgetting hooks (claude/gemini/codex only).
+    // Selective-forgetting hooks (claude/gemini/codex/pi only).
     let ops = agent_kind
         .prune_ops()
-        .ok_or_else(|| anyhow!("prune-context supports claude, gemini and codex only"))?;
+        .ok_or_else(|| anyhow!("prune-context supports claude, gemini, codex and pi only"))?;
 
     // Locate by the agent SESSION id, which for spawner-created chats is NOT the
     // chat id. Fall back to chat_id for backfilled/imported rows (or before one's

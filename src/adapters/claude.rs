@@ -2096,7 +2096,10 @@ mod tests {
                 big.len()
             );
             let lines = read_lines(f.path());
-            assert_eq!(lines[0]["message"]["content"][0]["input"], serde_json::json!({}));
+            assert_eq!(
+                lines[0]["message"]["content"][0]["input"],
+                serde_json::json!({})
+            );
             assert_eq!(lines[1]["message"]["content"][0]["content"], "[pruned]");
             // The expansion body text is blanked; threading fields intact.
             assert_eq!(lines[2]["message"]["content"][0]["text"], "[pruned]");

@@ -6,12 +6,12 @@ The Rust daemon that runs coding agents on a developer's machine in response to 
 
 Zucchini is a chat-style messenger for coding agents. The apps talk to a backend (PowerSync + Postgres + a Rust auth service); the backend syncs end-to-end-encrypted messages to the spawner running on the machine that hosts the chat's project. The spawner decrypts the message, forks the chat's agent CLI in the project's working directory, and streams the response back as encrypted message rows.
 
-Agents are pluggable adapters — **Claude Code**, **Cursor** (`cursor-agent`), **Codex**, **Hermes**, and **Gemini** (`gemini-cli`) ship today, and each is one entry in the `ADAPTERS` registry (`src/adapter.rs`). The chat picks which CLI gets spawned.
+Agents are pluggable adapters — **Claude Code**, **Cursor** (`cursor-agent`), **Codex**, **Hermes**, **Gemini** (`gemini-cli`), and **Pi** (`pi`) ship today, and each is one entry in the `ADAPTERS` registry (`src/adapter.rs`). The chat picks which CLI gets spawned.
 
 ```
 iOS / Android app  ──►  backend  ──►  spawner (this repo)  ──►  agent CLI
                                               ▲                  (claude / cursor-agent /
-                                              │                   codex / hermes / gemini)
+                                              │                   codex / hermes / gemini / pi)
                                               └─ runs on your Mac or Linux box
 ```
 

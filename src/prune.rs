@@ -326,6 +326,38 @@ pub(crate) fn no_tool_map(_: &str) -> Vec<&'static str> {
     Vec::new()
 }
 
+/// Does a `{name, args}`-shaped tool call (gemini `toolCall`, pi `toolCall`)
+/// match (`tool_name`, `needle`)? The shared predicate for adapters whose `args`
+/// is already a parsed `Value` (NOT codex's JSON-encoded string, NOT claude's
+/// whole `tool_use` block). Four steps: name gate (`tool_name_matches` via the
+/// dialect's inverse `map`) → skip the agent's own in-flight prune-context call
+/// → empty `needle` is the empty-args selector ([`args_value_is_empty`]) → else
+/// glob over `args` VALUE leaves ([`value_glob_match`], never keys). `map` is the
+/// dialect's claude-name → raw-dialect-name inverse (e.g. `claude_to_pi_tool_names`).
+pub(crate) fn value_args_tool_call_matches(
+    name: &str,
+    args: Option<&serde_json::Value>,
+    tool_name: &str,
+    needle: &str,
+    map: fn(&str) -> Vec<&'static str>,
+) -> bool {
+    if !tool_name_matches(name, tool_name, map) {
+        return false;
+    }
+    // Skip the agent's own in-flight prune-context call — see
+    // [`value_is_prune_context_call`].
+    if args.is_some_and(value_is_prune_context_call) {
+        return false;
+    }
+    if needle.is_empty() {
+        return args_value_is_empty(args);
+    }
+    match args {
+        Some(a) => value_glob_match(a, needle),
+        None => false,
+    }
+}
+
 /// One parsed transcript line: the original verbatim string (kept byte-for-byte
 /// for unchanged / blank / parse-failed lines) alongside its parsed JSON value
 /// (`None` for blank or parse-failed lines).

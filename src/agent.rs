@@ -1416,7 +1416,10 @@ fn stderr_failure_message(cap: &CapturedStderr, started: bool, clean_exit: bool)
         if cap.startup.is_empty() {
             return None;
         }
-        return Some(format!("Error: agent failed to start.\n{}", cap.startup.join("\n")));
+        return Some(format!(
+            "Error: agent failed to start.\n{}",
+            cap.startup.join("\n")
+        ));
     }
     if clean_exit {
         return None;
@@ -1430,7 +1433,10 @@ fn stderr_failure_message(cap: &CapturedStderr, started: bool, clean_exit: bool)
     if tail.is_empty() {
         return None;
     }
-    Some(format!("Error: agent exited unexpectedly.\n{}", tail.join("\n")))
+    Some(format!(
+        "Error: agent exited unexpectedly.\n{}",
+        tail.join("\n")
+    ))
 }
 
 async fn fail_agent(tx: &mpsc::Sender<AgentResponse>, topic: &str, msg: String) {
@@ -1811,7 +1817,10 @@ mod stderr_diagnostic_tests {
 
     #[test]
     fn never_started_reports_startup_buffer() {
-        let c = cap(&["zsh: command not found: cursor-agent"], &["zsh: command not found: cursor-agent"]);
+        let c = cap(
+            &["zsh: command not found: cursor-agent"],
+            &["zsh: command not found: cursor-agent"],
+        );
         let msg = stderr_failure_message(&c, false, false).expect("startup failure surfaced");
         assert!(msg.starts_with("Error: agent failed to start."));
         assert!(msg.contains("command not found"));
@@ -1827,7 +1836,10 @@ mod stderr_diagnostic_tests {
         // The cursor no-subscription case: init frame flips `started` true, then
         // the usage-limit line lands on stderr and the process exits non-zero
         // without a `result` (clean_exit = false).
-        let c = cap(&[], &["S: You've hit your usage limit Get Cursor Pro for more Agent usage."]);
+        let c = cap(
+            &[],
+            &["S: You've hit your usage limit Get Cursor Pro for more Agent usage."],
+        );
         let msg = stderr_failure_message(&c, true, false).expect("mid-turn failure surfaced");
         assert!(msg.starts_with("Error: agent exited unexpectedly."));
         assert!(msg.contains("usage limit"));

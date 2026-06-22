@@ -59,8 +59,10 @@
 //!   diagnostic, e.g. `ModelNotFoundError`, lands on STDERR, which the
 //!   Supervisor drains separately and `handle_line` never sees; we surface the
 //!   best text the JSON frame carries.)
-//! - anything else → forwarded as-is (defensive against gemini format drift;
-//!   iOS will likely drop, but we avoid silently losing the line).
+//! - anything else (unknown type, missing `type`, non-JSON) → DROPPED with a
+//!   debug breadcrumb. gemini frames are never iOS-wire-compatible (we always
+//!   transform), so forwarding a raw line renders user-facing junk (`[X]`); the
+//!   log preserves drift observability without spamming the chat.
 //!
 //! Retries / throttling / error stacks arrive on STDERR (not stdout JSON) and
 //! are drained by the Supervisor — `handle_line` only ever sees stdout JSON
@@ -94,10 +96,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::adapter::{
-    claude_assistant_text_envelope, claude_tool_use_envelope, file_nonempty,
+    claude_assistant_text_envelope, claude_tool_use_envelope, extract_json_type, file_nonempty,
     first_message_capabilities_preamble, parse_json_obj, probe_with_blocking_auth, shell_escape,
-    AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, ImportProgress, LastTokensDedup,
-    TurnContext, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_GEMINI,
+    worktree_cwd_prefix, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, ImportProgress,
+    LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_GEMINI,
 };
 use crate::adapters::import_shared::{
     basename_or, collapse_title, emit_chat, is_synthetic_wrapper, mint_project_id,
@@ -208,9 +210,9 @@ impl AgentAdapter for GeminiAdapter {
 
     fn prepare_command(&mut self, ctx: &TurnContext<'_>) -> Result<String> {
         let mut cmd = String::new();
-        if let Some(pp) = ctx.project_path {
-            cmd.push_str(&format!("cd {} && ", shell_escape(pp)));
-        }
+        // cwd (+ spawner-side worktree create/cd) — gemini sets cwd only via this
+        // leading `cd`, no separate cwd flag, so the shared prefix is a pure drop-in.
+        cmd.push_str(&worktree_cwd_prefix(ctx));
 
         // Prompt is piped via stdin (prompts can be multi-MB with attachments;
         // never inline via `-p` argv). Piped non-TTY stdin triggers gemini's
@@ -266,9 +268,6 @@ impl AgentAdapter for GeminiAdapter {
             cmd.push_str(&format!(" -m {}", shell_escape(model)));
         }
 
-        // TODO(gemini): worktree=true is ignored for v1, same as codex.
-        let _ = ctx.worktree;
-
         Ok(cmd)
     }
 
@@ -280,8 +279,9 @@ impl AgentAdapter for GeminiAdapter {
     }
 
     /// No system-prompt injection point (no `--append-system-prompt` on
-    /// gemini-cli 0.44.1), so capabilities ride the first user message; worktree
-    /// ignored. See [`first_message_capabilities_preamble`].
+    /// gemini-cli 0.44.1), so capabilities ride the first user message. (Worktree
+    /// cwd is handled in `prepare_command` via the shared `worktree_cwd_prefix`,
+    /// not here.) See [`first_message_capabilities_preamble`].
     fn prompt_file_preamble(&self, ctx: &TurnContext<'_>) -> Option<String> {
         first_message_capabilities_preamble(ctx)
     }
@@ -289,21 +289,60 @@ impl AgentAdapter for GeminiAdapter {
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
         let mut out: SmallVec<[AgentEvent; 2]> = SmallVec::new();
 
-        // Oversize-frame guard. Forward verbatim above the cap so a single big
-        // tool_result/message line doesn't churn the heap on a full
-        // `serde_json::Value` parse. Mirrors codex/claude `handle_line`.
+        // Oversize-frame fast-path. gemini frames are NEVER iOS-wire-compatible
+        // (we always transform via normalize_tool_use / claude_assistant_text_envelope
+        // / normalize_result_*), so forwarding a raw gemini line verbatim is wrong —
+        // iOS renders an unknown `{"type":"X"}` as literal `[X]`. The ONLY reason the
+        // size cap exists is to skip a full `serde_json::Value` parse (heap churn) on
+        // a multi-MB line. So classify CHEAPLY via `extract_json_type` (no parse) and
+        // branch — every RENDERABLE oversize type falls through to the normal parse +
+        // match arm below (we accept the one-time heap blip for correctness), while
+        // lifecycle/unclassifiable frames DROP (raw gemini JSON is never renderable).
         if line.len() > MAX_STREAM_FRAME_BYTES {
-            out.push(AgentEvent::Frame(line));
-            return out;
+            match extract_json_type(&line) {
+                // `result` is the TERMINAL frame and it's body-derived: the error
+                // path needs `error.message` (rendered as its own assistant bubble)
+                // and the success path needs `usage` tokens — and BOTH must run
+                // `flush_pending_text()` first. Dropping it here is exactly what made
+                // the user see "Agent interrupted" instead of `[result: error]` (the
+                // `result` arm never ran → no `AgentEvent::Result`). So fall through
+                // to the normal `"result"` arm; accept the one-time heap parse.
+                Some("result") => {}
+                // `message` (assistant text delta) and `tool_use` (huge params) are
+                // both body-derived content that must still render. Fall through to
+                // the normal parse + arm; same correctness-over-heap-blip tradeoff.
+                Some("message") | Some("tool_use") => {}
+                // Lifecycle / special (init, tool_result) + any unknown type → DROP.
+                // Forwarding raw gemini JSON is strictly worse than dropping (iOS
+                // can't render it). init is a tiny session header (realistically
+                // never oversize) and tool_result only fires a prune cue, so neither
+                // loses renderable content by being dropped here.
+                Some(other) => {
+                    debug!(ty = %other, "gemini oversize lifecycle frame dropped");
+                    return out;
+                }
+                // Couldn't classify (no `"type"` near the start, escaped value, …).
+                // Drop: raw gemini JSON is never renderable, so a forward would only
+                // surface garbage. Safe fallback.
+                None => {
+                    debug!("gemini oversize frame without classifiable type dropped");
+                    return out;
+                }
+            }
         }
 
         let Some(obj) = parse_json_obj(&line) else {
-            // Non-JSON line: forward as-is (matches codex's permissive path).
-            out.push(AgentEvent::Frame(line));
+            // Non-JSON line: DROP. gemini stdout is pure JSONL; a non-JSON line is
+            // stray noise and forwarding it raw is wire-incompatible (gemini frames
+            // are never iOS-renderable — we always transform). Real failures arrive
+            // on stderr. Breadcrumb preserves observability. (Matches codex.)
+            debug!("gemini non-json stdout line dropped");
             return out;
         };
         let Some(ty) = obj.get("type").and_then(|v| v.as_str()) else {
-            out.push(AgentEvent::Frame(line));
+            // Object without a `type` — can't transform it, so DROP (raw forward
+            // would only surface garbage on iOS).
+            debug!("gemini json line without type dropped");
             return out;
         };
 
@@ -440,10 +479,12 @@ impl AgentAdapter for GeminiAdapter {
                 }
             }
             other => {
-                // Defensive forward — gemini format drift shouldn't silently
-                // drop content. Matches codex's unknown-passthrough.
-                debug!("gemini unknown frame type, forwarding: {}", other);
-                out.push(AgentEvent::Frame(line));
+                // Unknown type (gemini format drift or a lifecycle event we don't
+                // transform) → DROP. Forwarding raw gemini JSON is wire-incompatible:
+                // iOS renders an unknown `{"type":"X"}` as the literal `[X]`. The
+                // breadcrumb gives drift observability without spamming the chat.
+                // (Matches codex.)
+                debug!(ty = %other, "gemini unknown frame type dropped");
             }
         }
 
@@ -1284,21 +1325,13 @@ fn gemini_tool_call_matches(
     tool_name: &str,
     needle: &str,
 ) -> bool {
-    if !crate::prune::tool_name_matches(name, tool_name, claude_to_gemini_tool_names) {
-        return false;
-    }
-    // Skip the agent's own in-flight prune-context call — see
-    // `crate::prune::value_is_prune_context_call`.
-    if args.is_some_and(crate::prune::value_is_prune_context_call) {
-        return false;
-    }
-    if needle.is_empty() {
-        return crate::prune::args_value_is_empty(args);
-    }
-    match args {
-        Some(a) => crate::prune::value_glob_match(a, needle),
-        None => false,
-    }
+    crate::prune::value_args_tool_call_matches(
+        name,
+        args,
+        tool_name,
+        needle,
+        claude_to_gemini_tool_names,
+    )
 }
 
 /// Read-only depth-first walk calling `visit` once per JSON object node in
@@ -1648,6 +1681,82 @@ mod tests {
         model: Option<&'a str>,
     ) -> TurnContext<'a> {
         TurnContext::for_test(prompt_file, agent_session_id, is_sandboxed, model)
+    }
+
+    // `for_test` hard-codes chat_id="0000...0" → chat8 "00000000".
+    const WT_CHAT8: &str = "00000000";
+
+    #[test]
+    fn prepare_command_worktree_first_turn_creates_and_cds() {
+        let mut a = GeminiAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let c = TurnContext {
+            worktree: true,
+            ..ctx(&prompt_file, None, false, None)
+        };
+        let cmd = a.prepare_command(&c).unwrap();
+        let wt = crate::zucchini_spawner_dir()
+            .join("worktrees")
+            .join(WT_CHAT8);
+        let wt_esc = shell_escape(&wt.to_string_lossy());
+        assert!(
+            cmd.contains(&format!(
+                "git -C '/tmp/proj' worktree add {wt_esc} -b zc-{WT_CHAT8} && "
+            )),
+            "first turn emits worktree add: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("cd {wt_esc} && ")),
+            "cd's into the worktree: {cmd}"
+        );
+        assert!(
+            !cmd.contains("cd '/tmp/proj' && "),
+            "worktree mode does not cd into the bare project: {cmd}"
+        );
+    }
+
+    #[test]
+    fn prepare_command_worktree_resume_cds_without_creating() {
+        let mut a = GeminiAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let c = TurnContext {
+            worktree: true,
+            ..ctx(
+                &prompt_file,
+                Some("11111111-2222-3333-4444-555555555555"),
+                false,
+                None,
+            )
+        };
+        let cmd = a.prepare_command(&c).unwrap();
+        let wt = crate::zucchini_spawner_dir()
+            .join("worktrees")
+            .join(WT_CHAT8);
+        let wt_esc = shell_escape(&wt.to_string_lossy());
+        assert!(
+            !cmd.contains("worktree add"),
+            "resume must NOT recreate the worktree: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("cd {wt_esc} && ")),
+            "resume cd's into the recomputed worktree path: {cmd}"
+        );
+    }
+
+    #[test]
+    fn prepare_command_no_worktree_cds_into_project_unchanged() {
+        let mut a = GeminiAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let c = ctx(&prompt_file, None, false, None);
+        let cmd = a.prepare_command(&c).unwrap();
+        assert!(
+            cmd.contains("cd '/tmp/proj' && "),
+            "no-worktree cd's into the project: {cmd}"
+        );
+        assert!(
+            !cmd.contains("worktree add"),
+            "no-worktree never creates a worktree: {cmd}"
+        );
     }
 
     #[test]
@@ -2113,6 +2222,76 @@ mod tests {
     }
 
     #[test]
+    fn oversize_result_error_still_emits_error_bubble_frame_and_result_marker() {
+        // An oversize `result` error frame (its error.message can be huge) must
+        // NOT be dropped or raw-forwarded: it falls through to the normal `result`
+        // arm so iOS still gets the error bubble + `[result: error]` terminator +
+        // the Result marker. Dropping it was the "Agent interrupted" bug.
+        let mut a = GeminiAdapter::new();
+        // Pad error.message past the cap; keep "type":"result" first so
+        // extract_json_type classifies it before the parse.
+        let pad = "x".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        let line = format!(
+            r#"{{"type":"result","status":"error","error":{{"type":"quota","message":"{pad}"}},"stats":{{"total_tokens":0}}}}"#
+        );
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        let events = run(&mut a, &line);
+        assert_eq!(events.len(), 3);
+
+        // 1) assistant text bubble carrying the (huge) error message.
+        let bubble = frame_value(&events[0]);
+        assert_eq!(bubble["type"], "assistant");
+        assert_eq!(bubble["message"]["content"][0]["text"], pad);
+
+        // 2) error result envelope = the `[result: error]` terminator on iOS.
+        let v = frame_value(&events[1]);
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["subtype"], "error");
+        assert_eq!(v["is_error"], true);
+
+        // 3) Result marker (latches Done.has_result — no spurious interrupt).
+        assert_eq!(events[2], "Result");
+    }
+
+    #[test]
+    fn oversize_result_success_emits_success_frame_and_result_marker() {
+        // An oversize `result` success frame likewise falls through so tokens are
+        // harvested and the `[result: success]` terminator + Result are emitted.
+        let mut a = GeminiAdapter::new();
+        // Pad a stats sub-object past the cap; "type":"result" stays first.
+        let pad = "9".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        let line = format!(
+            r#"{{"type":"result","status":"success","stats":{{"input_tokens":1234,"tool_calls":0}},"junk":"{pad}"}}"#
+        );
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        let events = run(&mut a, &line);
+        // ContextTokens(1234) + success result Frame + Result = 3 events.
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], "ContextTokens(1234)");
+        let v = frame_value(&events[1]);
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["subtype"], "success");
+        assert_eq!(events[2], "Result");
+    }
+
+    #[test]
+    fn oversize_lifecycle_frame_is_dropped_not_forwarded() {
+        // An oversize lifecycle/special frame (init here) emits NOTHING — it must
+        // be dropped, never raw-forwarded (raw gemini JSON renders as literal
+        // `[init]` on iOS).
+        let mut a = GeminiAdapter::new();
+        let pad = "z".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        let line = format!(
+            r#"{{"type":"init","session_id":"11111111-2222-3333-4444-555555555555","junk":"{pad}"}}"#
+        );
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        assert!(
+            run(&mut a, &line).is_empty(),
+            "oversize lifecycle frame must be dropped, not forwarded"
+        );
+    }
+
+    #[test]
     fn repeated_result_success_dedups_context_tokens() {
         let mut a = GeminiAdapter::new();
         // input_tokens 1234, no tool calls → ContextTokens(1234); re-emitting the
@@ -2129,20 +2308,37 @@ mod tests {
     }
 
     #[test]
-    fn unknown_frame_type_passed_through() {
+    fn unknown_frame_type_dropped() {
+        // gemini format drift / lifecycle we don't transform → DROP (raw forward
+        // would render literal `[X]` junk on iOS). Breadcrumb keeps observability.
         let mut a = GeminiAdapter::new();
         let line = r#"{"type":"some.future.event","payload":{"k":"v"}}"#;
         let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
-        assert!(events[0].starts_with("Frame("));
+        assert!(
+            events.is_empty(),
+            "unknown frame must drop, got: {events:?}"
+        );
     }
 
     #[test]
-    fn non_json_line_kept_as_frame() {
+    fn non_json_line_dropped() {
+        // gemini stdout is pure JSONL; a non-JSON line is stray noise → DROP.
         let mut a = GeminiAdapter::new();
         let events = run(&mut a, "non-json-line");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0], "Frame(non-json-line)");
+        assert!(
+            events.is_empty(),
+            "non-json line must drop, got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn json_object_without_type_dropped() {
+        let mut a = GeminiAdapter::new();
+        let events = run(&mut a, r#"{"payload":{"k":"v"}}"#);
+        assert!(
+            events.is_empty(),
+            "typeless object must drop, got: {events:?}"
+        );
     }
 
     #[test]

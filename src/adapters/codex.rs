@@ -26,8 +26,10 @@
 //!  - `turn.completed`     → Frame (result envelope) + Result (context tokens are
 //!    sourced post-turn from the rollout, not this frame)
 //!  - `turn.failed`        → Frame (error result envelope) + Result
-//!  - anything else        → forwarded as-is (defensive against codex format
-//!    drift; iOS will likely drop, but we avoid silently losing the line)
+//!  - anything else (unknown type, missing `type`, non-JSON) → DROPPED with a
+//!    debug breadcrumb. codex frames are never iOS-wire-compatible (we always
+//!    transform), so forwarding a raw line renders user-facing junk (`[X]`);
+//!    the log preserves drift observability without spamming the chat.
 //!
 //! Codex's actual wire format observed via `codex exec --json` on
 //! codex-cli 0.133.0: each turn starts with `thread.started` carrying a
@@ -62,10 +64,10 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::adapter::{
-    claude_assistant_text_envelope, claude_tool_use_envelope, file_nonempty,
-    first_message_capabilities_preamble, parse_json_obj, probe_with_blocking_auth, shell_escape,
-    AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, ImportProgress, TurnContext,
-    MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_CODEX,
+    claude_assistant_text_envelope, claude_tool_use_envelope, effective_cwd, extract_json_type,
+    file_nonempty, first_message_capabilities_preamble, parse_json_obj, probe_with_blocking_auth,
+    shell_escape, worktree_cwd_prefix, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind,
+    ImportProgress, TurnContext, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_CODEX,
 };
 use crate::writer::WriteEvent;
 
@@ -162,9 +164,14 @@ impl AgentAdapter for CodexAdapter {
 
     fn prepare_command(&mut self, ctx: &TurnContext<'_>) -> Result<String> {
         let mut cmd = String::new();
-        if let Some(pp) = ctx.project_path {
-            cmd.push_str(&format!("cd {} && ", shell_escape(pp)));
-        }
+        // cwd (+ spawner-side worktree create/cd). Codex passes cwd TWICE: this
+        // leading `cd` AND a `-C <cwd>` flag on the first turn. `run_cwd` is the
+        // resolved dir (worktree under worktree mode, else project) shared with
+        // both `-C` sites below so the shell cwd and the flag can never disagree.
+        // The prefix's `git worktree add` runs first in the same `&&` chain, so
+        // the worktree dir exists by the time `-C <worktree>` is evaluated.
+        cmd.push_str(&worktree_cwd_prefix(ctx));
+        let run_cwd: Option<String> = effective_cwd(ctx);
         // Subcommand selection. First turn uses `codex exec`; follow-up turns
         // use `codex exec resume <thread_id>`. `--json --skip-git-repo-check`
         // work on both. Flag availability differs across the two:
@@ -197,25 +204,23 @@ impl AgentAdapter for CodexAdapter {
             cmd.push_str(" -c approval_policy=never");
             if !is_resume {
                 cmd.push_str(" -s read-only");
-                if let Some(pp) = ctx.project_path {
-                    cmd.push_str(&format!(" -C {}", shell_escape(pp)));
+                if let Some(cwd) = &run_cwd {
+                    cmd.push_str(&format!(" -C {}", shell_escape(cwd)));
                 }
             }
         } else {
             cmd.push_str(" --dangerously-bypass-approvals-and-sandbox");
             if !is_resume {
-                if let Some(pp) = ctx.project_path {
-                    cmd.push_str(&format!(" -C {}", shell_escape(pp)));
+                if let Some(cwd) = &run_cwd {
+                    cmd.push_str(&format!(" -C {}", shell_escape(cwd)));
                 }
             }
         }
 
-        // TODO(codex): worktree=true is ignored for v1. Codex has no
-        // first-class worktree flag; a follow-up pass will either `git
-        // worktree add` upstream of this and pass `-C <worktree>` in
-        // place of `project_path`, or refuse the toggle with a clearer
-        // signal back to the UI. Today we just spawn in the project root.
-        let _ = ctx.worktree;
+        // Worktree cwd is handled via the shared `worktree_cwd_prefix` (leading
+        // `cd` + first-turn `git worktree add`) and `effective_cwd` (the `-C`
+        // flag above), so both the shell cwd and codex's authoritative `-C` root
+        // point at the worktree dir under worktree mode.
 
         // Codex has no system-prompt injection point (no `--append-system-prompt`;
         // `AGENTS.md` would clobber/persist the user's, `-c instructions=` would
@@ -277,29 +282,67 @@ impl AgentAdapter for CodexAdapter {
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
         let mut out: SmallVec<[AgentEvent; 2]> = SmallVec::new();
 
-        // Oversize-frame guard. `serde_json::from_str` on a multi-MB line
-        // allocates a tree of `Map<String, Value>` nodes; the per-item
-        // dispatch below needs the parsed tree, so without this guard a
-        // single big shell output (command_execution often embeds full
-        // stdout) can churn the heap by megabytes. For lines past the cap
-        // we forward verbatim as a Frame — iOS will likely fail to render
-        // it cleanly, but at least the content reaches the chat instead
-        // of disappearing. Mirrors the pattern in `claude.rs::handle_line`.
+        // Oversize-frame fast-path. `serde_json::from_str` on a multi-MB line
+        // allocates a tree of `Map<String, Value>` nodes; the per-item dispatch
+        // below needs the parsed tree, so a single big shell output
+        // (command_execution often embeds full stdout) can churn the heap by
+        // megabytes. But codex frames are NEVER iOS-wire-compatible (we always
+        // transform them), so forwarding a raw codex line verbatim is wrong —
+        // iOS renders an unknown `{"type":"X"}` as the literal `[X]`. So
+        // classify CHEAPLY via `extract_json_type` (no full parse) and branch
+        // on whether the body is needed:
         if line.len() > MAX_STREAM_FRAME_BYTES {
-            out.push(AgentEvent::Frame(line));
-            return out;
+            match extract_json_type(&line) {
+                // BODY-INDEPENDENT terminal: the success envelope is a fixed
+                // shape, so emit it WITHOUT parsing the multi-MB line and
+                // return early (nothing downstream needs the body). Same output
+                // as the normal `"turn.completed"` arm. Dropping it here is what
+                // would make the user see "Agent interrupted".
+                Some("turn.completed") => {
+                    push_turn_completed_terminal(&mut out);
+                    return out;
+                }
+                // BODY-DERIVED terminal: `turn.failed` pulls `error.message`
+                // from the body, and an oversize error message is realistic. A
+                // terminal frame that MUST render its body is worth the one-time
+                // full-parse heap blip — DON'T early-return; fall through to the
+                // normal `"turn.failed"` arm so it still emits a correct
+                // `[result: error]` + Result.
+                Some("turn.failed") => {}
+                // BODY-DERIVED content: `item.completed` embedding full stdout is
+                // the COMMON oversize case and MUST render; `item.started` too.
+                // Correctness beats the heap blip — fall through to full parse.
+                Some("item.started") | Some("item.completed") => {}
+                // Lifecycle (thread.started/turn.started — realistically never
+                // oversize) + any unknown type → DROP. Forwarding raw codex JSON
+                // is strictly worse than dropping (iOS can't render it).
+                Some(other) => {
+                    debug!(ty = %other, "codex oversize lifecycle frame dropped");
+                    return out;
+                }
+                // Couldn't classify (no `"type"` near the start, escaped value,
+                // …). Drop: raw codex JSON is never renderable, so a forward
+                // would only surface garbage. Safe fallback.
+                None => {
+                    debug!("codex oversize frame without classifiable type dropped");
+                    return out;
+                }
+            }
         }
 
         let Some(obj) = parse_json_obj(&line) else {
-            // Non-JSON line: forward as-is so spawner-side noise (or a
-            // codex pre-banner) still surfaces. Mirrors claude's
-            // permissive non-JSON branch.
-            out.push(AgentEvent::Frame(line));
+            // Non-JSON line: DROP. codex stdout is pure JSONL, so a non-JSON line
+            // is stray noise; forwarding it raw is wire-incompatible (codex frames
+            // are never iOS-renderable — unlike claude, which is pass-through).
+            // Real startup/auth failures arrive on stderr (stderr_failure_message),
+            // not here. Breadcrumb preserves observability.
+            debug!("codex non-json stdout line dropped");
             return out;
         };
         let Some(ty) = obj.get("type").and_then(|v| v.as_str()) else {
-            // Object without a `type` — defensive forward.
-            out.push(AgentEvent::Frame(line));
+            // Object without a `type` — can't transform it, so DROP (raw forward
+            // would only surface garbage on iOS).
+            debug!("codex json line without type dropped");
             return out;
         };
 
@@ -372,15 +415,10 @@ impl AgentAdapter for CodexAdapter {
                 // gauge is sourced post-turn from the rollout instead — see
                 // `read_rollout_last_context_tokens` / `post_turn_context_tokens`.
                 //
-                // Emit claude-shape result envelope so iOS's describer
-                // renders the `[result: success]` line.
-                out.push(AgentEvent::Frame(normalize_turn_completed_frame()));
-                // Emit Result on every turn.completed; the supervisor
-                // latches it (so AgentResponse::Done.has_result is set
-                // once and only once).
-                out.push(AgentEvent::Result {
-                    origin_is_task: false,
-                });
+                // Emit claude-shape result envelope + Result marker. Same fixed
+                // (body-independent) output as the oversize fast-path above, so
+                // both go through the single helper.
+                push_turn_completed_terminal(&mut out);
             }
             "turn.failed" => {
                 // Codex emits a terminal failure frame instead of a claude
@@ -393,12 +431,12 @@ impl AgentAdapter for CodexAdapter {
                 });
             }
             other => {
-                // Defensive forward — codex format drift shouldn't silently
-                // drop content. iOS will fall through to its "unknown
-                // frame" branch (rendered as raw text), which is the right
-                // failure mode while we observe the drift.
-                debug!("codex unknown frame type, forwarding: {}", other);
-                out.push(AgentEvent::Frame(line));
+                // Unknown type (codex format drift or a lifecycle event we don't
+                // transform) → DROP. Forwarding raw codex JSON is wire-incompatible:
+                // iOS renders an unknown `{"type":"X"}` as the literal `[X]`, which
+                // is user-facing junk, not a useful "observe the drift" signal. The
+                // breadcrumb gives us the observability without spamming the chat.
+                debug!(ty = %other, "codex unknown frame type dropped");
             }
         }
 
@@ -637,6 +675,19 @@ fn normalize_item_completed(obj: &Value) -> Vec<String> {
     }
     // Tool items: same renderers as the started path; deduped by id at the call site.
     normalize_item_started(obj)
+}
+
+/// Terminal output for a codex `turn.completed`: the claude-shape success
+/// `result` envelope (so iOS renders `[result: success]`) + the `Result` marker
+/// (so the supervisor latches `Done.has_result` once and only once).
+/// Body-independent — emitted from BOTH the normal `"turn.completed"` arm and
+/// the oversize fast-path, so this is the single source (repo rule: never
+/// copy-paste the result-frame block).
+fn push_turn_completed_terminal(out: &mut SmallVec<[AgentEvent; 2]>) {
+    out.push(AgentEvent::Frame(normalize_turn_completed_frame()));
+    out.push(AgentEvent::Result {
+        origin_is_task: false,
+    });
 }
 
 /// Builds the claude-shape result envelope emitted on `turn.completed`. We
@@ -1761,6 +1812,102 @@ mod tests {
     // `first_message_preamble_first_turn_then_resume` (codex/gemini/hermes all
     // delegate to `first_message_capabilities_preamble`), not re-asserted here.
 
+    // `for_test` hard-codes chat_id="0000...0" → chat8 "00000000".
+    const WT_CHAT8: &str = "00000000";
+
+    fn worktree_path_esc() -> String {
+        let wt = crate::zucchini_spawner_dir()
+            .join("worktrees")
+            .join(WT_CHAT8);
+        shell_escape(&wt.to_string_lossy())
+    }
+
+    #[test]
+    fn prepare_command_worktree_first_turn_creates_cds_and_C_points_at_worktree() {
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let wt_esc = worktree_path_esc();
+        // BOTH branches (sandboxed read-only + non-sandboxed bypass) emit `-C` on
+        // the first turn — assert each points at the WORKTREE, not the project.
+        for sandboxed in [true, false] {
+            let mut a = CodexAdapter::new();
+            let c = TurnContext {
+                worktree: true,
+                ..ctx(&prompt_file, None, sandboxed, None)
+            };
+            let cmd = a.prepare_command(&c).unwrap();
+            assert!(
+                cmd.contains(&format!(
+                    "git -C '/tmp/proj' worktree add {wt_esc} -b zc-{WT_CHAT8} && "
+                )),
+                "first turn emits worktree add (sandboxed={sandboxed}): {cmd}"
+            );
+            assert!(
+                cmd.contains(&format!("cd {wt_esc} && ")),
+                "cd's into the worktree (sandboxed={sandboxed}): {cmd}"
+            );
+            // codex's own `-C` (after `codex exec`) — distinct from the `git -C
+            // '/tmp/proj'` in the worktree-add prefix.
+            let codex_part = cmd.split("codex exec").nth(1).unwrap();
+            assert!(
+                codex_part.contains(&format!(" -C {wt_esc}")),
+                "codex -C points at the worktree (sandboxed={sandboxed}): {cmd}"
+            );
+            assert!(
+                !codex_part.contains(" -C '/tmp/proj'"),
+                "codex -C must NOT point at the project (sandboxed={sandboxed}): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_command_worktree_resume_cds_no_create_no_C() {
+        let mut a = CodexAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let wt_esc = worktree_path_esc();
+        let c = TurnContext {
+            worktree: true,
+            ..ctx(
+                &prompt_file,
+                Some("11111111-2222-3333-4444-555555555555"),
+                false,
+                None,
+            )
+        };
+        let cmd = a.prepare_command(&c).unwrap();
+        assert!(
+            !cmd.contains("worktree add"),
+            "resume must NOT recreate the worktree: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("cd {wt_esc} && ")),
+            "resume cd's into the recomputed worktree path: {cmd}"
+        );
+        assert!(
+            !cmd.contains(" -C "),
+            "resume passes no -C (locked at session creation): {cmd}"
+        );
+    }
+
+    #[test]
+    fn prepare_command_no_worktree_unchanged() {
+        let mut a = CodexAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        let c = ctx(&prompt_file, None, false, None);
+        let cmd = a.prepare_command(&c).unwrap();
+        assert!(
+            cmd.contains("cd '/tmp/proj' && "),
+            "no-worktree cd's into the project: {cmd}"
+        );
+        assert!(
+            cmd.contains(" -C '/tmp/proj'"),
+            "no-worktree -C points at the project: {cmd}"
+        );
+        assert!(
+            !cmd.contains("worktree add"),
+            "no-worktree never creates a worktree: {cmd}"
+        );
+    }
+
     #[test]
     fn time_line_injected_on_resume_turn() {
         // Capability block is first-message-only, but the volatile time line must
@@ -1810,6 +1957,67 @@ mod tests {
             events,
             vec!["SessionIdHarvested(0192f00d-7ce0-7e9a-8d6f-abcdef012345)"]
         );
+    }
+
+    #[test]
+    fn oversize_turn_completed_still_emits_result_and_marker() {
+        // A >64KB turn.completed must bypass the (now removed) raw-forward and
+        // STILL produce the terminal result — else `has_result` stays false and
+        // the user sees "Agent interrupted". The success envelope is fixed/
+        // body-independent, so this is handled without a full parse.
+        let mut a = CodexAdapter::new();
+        let pad = "x".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        // "type" first so `extract_json_type` sees it early on the huge line.
+        let line = format!(r#"{{"type":"turn.completed","pad":"{pad}"}}"#);
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        let events = run(&mut a, &line);
+        // Identical to a small turn.completed: result frame + Result marker.
+        assert_eq!(events.len(), 2, "got: {:?}", events);
+        let v = frame_value(&events[0]);
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["subtype"], "success");
+        assert_eq!(v["is_error"], false);
+        assert_eq!(events[1], "Result");
+    }
+
+    #[test]
+    fn oversize_turn_failed_falls_through_and_emits_error_result() {
+        // A >64KB turn.failed is body-derived (error.message) and a terminal:
+        // it must fall through to the full-parse arm and still emit a
+        // `[result: error]` Frame + Result (no "Agent interrupted").
+        let mut a = CodexAdapter::new();
+        let pad = "z".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        let line =
+            format!(r#"{{"type":"turn.failed","error":{{"message":"boom"}},"pad":"{pad}"}}"#);
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        let events = run(&mut a, &line);
+        assert_eq!(events.len(), 2, "got: {:?}", events);
+        let v = frame_value(&events[0]);
+        assert_eq!(v["type"], "result");
+        assert_eq!(v["subtype"], "error");
+        assert_eq!(v["is_error"], true);
+        assert_eq!(v["error"]["message"], "boom");
+        assert_eq!(events[1], "Result");
+    }
+
+    #[test]
+    fn oversize_lifecycle_frame_dropped_not_forwarded() {
+        // A >64KB lifecycle / unknown frame must DROP — never forward raw codex
+        // JSON (iOS would render it as the literal `[X]`).
+        let mut a = CodexAdapter::new();
+        let pad = "y".repeat(MAX_STREAM_FRAME_BYTES + 1024);
+        for ty in ["turn.started", "thread.started", "some.unknown.type"] {
+            let line = format!(r#"{{"type":"{ty}","pad":"{pad}"}}"#);
+            assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+            assert!(
+                run(&mut a, &line).is_empty(),
+                "oversize {ty} must be dropped, not forwarded"
+            );
+        }
+        // Unclassifiable oversize line (no leading "type") → also dropped.
+        let line = format!(r#"{{"pad":"{pad}"}}"#);
+        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
+        assert!(run(&mut a, &line).is_empty());
     }
 
     #[test]
@@ -2239,27 +2447,41 @@ mod tests {
     }
 
     #[test]
-    fn unknown_frame_type_passed_through_as_frame() {
-        // Defensive against codex format drift — a future frame type we
-        // don't know about still reaches the chat (iOS will likely render
-        // it as raw text via the unknown-frame branch). Matches claude's
-        // permissive behavior for non-stream-event frames.
+    fn unknown_frame_type_dropped() {
+        // codex format drift / a lifecycle type we don't transform → DROP.
+        // Forwarding raw codex JSON is wire-incompatible (iOS renders an unknown
+        // `{"type":"X"}` as the literal `[X]` junk); the debug breadcrumb keeps
+        // observability without spamming the chat.
         let mut a = CodexAdapter::new();
         let line = r#"{"type":"some.future.event","payload":{"k":"v"}}"#;
         let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
-        assert!(events[0].starts_with("Frame("));
+        assert!(
+            events.is_empty(),
+            "unknown frame must drop, got: {events:?}"
+        );
     }
 
     #[test]
-    fn non_json_line_kept_as_frame() {
-        // A spawner stderr-merged line (shouldn't happen — stderr is buffered
-        // separately — but the line loop still gets bytes from stdout). Lines
-        // that don't start with `{` skip every JSON branch and are kept.
+    fn non_json_line_dropped() {
+        // codex stdout is pure JSONL; a non-JSON line is stray noise and is
+        // DROPPED (forwarding it raw is wire-incompatible). Real failures arrive
+        // on stderr, handled separately.
         let mut a = CodexAdapter::new();
         let events = run(&mut a, "non-json-line");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0], "Frame(non-json-line)");
+        assert!(
+            events.is_empty(),
+            "non-json line must drop, got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn json_object_without_type_dropped() {
+        let mut a = CodexAdapter::new();
+        let events = run(&mut a, r#"{"payload":{"k":"v"}}"#);
+        assert!(
+            events.is_empty(),
+            "typeless object must drop, got: {events:?}"
+        );
     }
 
     #[test]
