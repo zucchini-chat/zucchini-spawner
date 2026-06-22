@@ -57,6 +57,11 @@ pub enum WriteEvent {
     ChatRunning {
         chat_id: String,
         agent_running: bool,
+        /// Wire-only hint (not a `chats` column), meaningful only on a busy→idle
+        /// flip: tells the backend to skip the "Agent finished" push because the
+        /// user killed the turn with `/stop`. Interrupt-then-send leaves this
+        /// false — its push is suppressed by the immediate respawn instead.
+        stopped_by_user: bool,
     },
     ContextTokens {
         chat_id: String,
@@ -154,6 +159,15 @@ impl WriteEvent {
         WriteEvent::ChatRunning {
             chat_id,
             agent_running,
+            stopped_by_user: false,
+        }
+    }
+
+    pub fn chat_stopped_by_user(chat_id: String) -> Self {
+        WriteEvent::ChatRunning {
+            chat_id,
+            agent_running: false,
+            stopped_by_user: true,
         }
     }
 }
@@ -256,11 +270,14 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
         WriteEvent::ChatRunning {
             chat_id,
             agent_running,
-        } => chats_patch(
-            chat_id,
-            "ChatRunning",
-            serde_json::json!({ "agent_running": agent_running }),
-        )?,
+            stopped_by_user,
+        } => {
+            let mut data = serde_json::json!({ "agent_running": agent_running });
+            if *stopped_by_user {
+                data["stopped_by_user"] = serde_json::Value::Bool(true);
+            }
+            chats_patch(chat_id, "ChatRunning", data)?
+        }
         WriteEvent::ContextTokens { chat_id, tokens } => chats_patch(
             chat_id,
             "ContextTokens",

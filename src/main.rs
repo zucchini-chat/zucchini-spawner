@@ -743,7 +743,9 @@ async fn handle_message_put(
                 info!(chat_id = %chat_id, "stop: tearing down resident session (kills armed monitors)");
                 publish_interrupted(write_tx, &chat_id, user_id).await;
                 supervisor.abort_agent(&chat_id).await;
-                send_run_state(write_tx, chat_id.clone(), false).await;
+                let _ = write_tx
+                    .send(WriteEvent::chat_stopped_by_user(chat_id.clone()))
+                    .await;
             }
             return;
         }
@@ -770,7 +772,7 @@ async fn handle_message_put(
         }
         if is_stop {
             let _ = write_tx
-                .send(WriteEvent::chat_running(chat_id.clone(), false))
+                .send(WriteEvent::chat_stopped_by_user(chat_id.clone()))
                 .await;
             return;
         }
@@ -3148,6 +3150,8 @@ mod tests {
             WriteEvent::ChatRunning {
                 chat_id: cid,
                 agent_running: false,
+                // Process died without a result — not a /stop, push still fires.
+                stopped_by_user: false,
             } => {
                 assert_eq!(cid, &chat_id);
             }
@@ -3175,6 +3179,7 @@ mod tests {
             WriteEvent::ChatRunning {
                 chat_id: cid,
                 agent_running: false,
+                stopped_by_user: false,
             } => {
                 assert_eq!(cid, &chat_id);
             }
