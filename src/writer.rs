@@ -102,6 +102,10 @@ pub enum WriteEvent {
         user_id: Uuid,
         title: String,
         created_at: DateTime<Utc>,
+        /// The producing adapter's kind; encoded as its `wire_name` so the
+        /// backend stores the right `agent_kind` instead of defaulting to
+        /// claude on the Machine import path.
+        agent_kind: AgentKind,
     },
     /// Importer-only.
     PutProject {
@@ -353,6 +357,7 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
             user_id,
             title,
             created_at,
+            agent_kind,
         } => {
             let k = resolve_key_or_warn(keys, user_id, id, "chat")?;
             // Importer contract: chat id IS the claude session id (migration
@@ -371,6 +376,7 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
                     "worktree": false,
                     "created_at": created_at.to_rfc3339(),
                     "agent_session_id": id.to_string(),
+                    "agent_kind": agent_kind.descriptor().wire_name,
                 })),
             }
         }

@@ -19,7 +19,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::adapter::ImportProgress;
+use crate::adapter::{AgentKind, ImportProgress};
 use crate::envelope::MessageEnvelope;
 
 // "zucchiniprojects" — fixed so re-imports converge on the same project ids
@@ -110,6 +110,11 @@ pub(crate) struct ImportedChat {
     pub(crate) project_id: Uuid,
     pub(crate) title: String,
     pub(crate) created_at: DateTime<Utc>,
+    /// The adapter that produced this transcript. Carried to the backend so
+    /// the imported `chats` row stores the right `agent_kind` and the next
+    /// live continuation spawns the correct CLI (not always claude). Each
+    /// importer stamps `DESCRIPTOR.kind`.
+    pub(crate) agent_kind: AgentKind,
     pub(crate) messages: Vec<ImportedMessage>,
 }
 
@@ -136,6 +141,7 @@ pub(crate) async fn emit_chat(
             user_id,
             title: chat.title,
             created_at: chat.created_at,
+            agent_kind: chat.agent_kind,
         })
         .await;
 

@@ -896,6 +896,7 @@ pub(crate) async fn import(
                     project_id,
                     title: session.title,
                     created_at: session.created_at,
+                    agent_kind: DESCRIPTOR.kind,
                     messages: session.messages,
                 },
             )

@@ -1946,6 +1946,7 @@ async fn import_composer(
             project_id,
             title,
             created_at: chat_created_at,
+            agent_kind: DESCRIPTOR.kind,
             messages,
         },
     )

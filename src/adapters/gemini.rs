@@ -1100,6 +1100,7 @@ async fn import_session(
             project_id,
             title: chat_title,
             created_at: chat_created_at,
+            agent_kind: DESCRIPTOR.kind,
             messages,
         },
     )
