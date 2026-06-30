@@ -9,23 +9,20 @@
 //!
 //! Each `spawn_agent` call constructs a fresh adapter, hands it to the spawned
 //! task, and discards it when the turn ends.
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex as StdMutex,
 };
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::adapter::{AgentEvent, AgentKind, TurnContext};
 use crate::envelope::{EnvelopeAttachment, MessageEnvelope};
+use crate::sys;
 
 /// Per-chat pending-attachments registry: the agent-side `attach-file` flow
 /// writes `EnvelopeAttachment`s through these unbounded senders, and the
@@ -711,7 +708,7 @@ fn default_spawn_fn(
                 .unwrap_or_default()
                 .as_nanos()
         );
-        let prompt_file = PathBuf::from(format!("/tmp/zucchini-prompt-{}.txt", unique));
+        let prompt_file = std::env::temp_dir().join(format!("zucchini-prompt-{}.txt", unique));
 
         let ctx = TurnContext {
             chat_id: &topic_clone,
@@ -758,19 +755,18 @@ fn default_spawn_fn(
             }
         };
 
-        let user_shell = crate::shell::user_login_shell();
-        info!(shell = %user_shell, kind = ?kind, "spawning agent via login shell");
+        info!(shell = %crate::shell::user_login_shell(), kind = ?kind, "spawning agent via login shell");
 
-        let mut cmd = Command::new(&user_shell);
-        cmd.args(["-lic", &cmd_string])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .process_group(0); // new process group so we can kill shell + agent together
-                               // Adapter prompts reference both vars to invoke
-                               // `zucchini-spawner attach-file` / `schedule-message`. Exported on
-                               // the spawn (not via shell rc) so a stale PATH can't pick the wrong
-                               // binary — `current_exe()` is whatever launchd/systemd runs, which
-                               // is also what the RPC handler listens on.
+        let mut cmd = sys::login_shell_command(&cmd_string);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // New process group so we can tear down shell + agent together.
+        sys::configure_new_process_group(&mut cmd);
+        // Adapter prompts reference both vars to invoke
+        // `zucchini-spawner attach-file` / `schedule-message`. Exported on
+        // the spawn (not via shell rc) so a stale PATH can't pick the wrong
+        // binary — `current_exe()` is whatever launchd/systemd runs, which
+        // is also what the RPC handler listens on.
         cmd.env("ZUCCHINI_CHAT_ID", &topic_clone);
         if let Ok(exe) = std::env::current_exe() {
             cmd.env("ZUCCHINI_SPAWNER_BIN", exe);
@@ -781,6 +777,17 @@ fn default_spawn_fn(
             Ok(child) => child,
             Err(e) => {
                 error!("failed to spawn agent: {}", e);
+                let _ = tokio::fs::remove_file(&prompt_file).await;
+                fail_agent(&tx, &topic_clone, format!("failed to spawn agent: {}", e)).await;
+                return;
+            }
+        };
+
+        let group = match sys::ProcessGroup::adopt(&child) {
+            Ok(g) => g,
+            Err(e) => {
+                error!("failed to adopt agent process group: {}", e);
+                let _ = child.kill().await;
                 let _ = tokio::fs::remove_file(&prompt_file).await;
                 fail_agent(&tx, &topic_clone, format!("failed to spawn agent: {}", e)).await;
                 return;
@@ -815,8 +822,9 @@ fn default_spawn_fn(
             loop {
                 tokio::select! {
                     _ = token_clone.cancelled() => {
-                        warn!(topic = %topic_clone, "agent cancelled, sending SIGTERM to process group");
-                        terminate_agent_process_group(&mut child, Some(prompt_file.as_path()), &topic_clone).await;
+                        warn!(topic = %topic_clone, "agent cancelled, tearing down process group");
+                        group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
+                        let _ = tokio::fs::remove_file(&prompt_file).await;
                         // Don't send Done — caller publishes INTERRUPTED_RESULT and has
                         // already removed our entry from the map.
                         return;
@@ -827,7 +835,7 @@ fn default_spawn_fn(
                             topic: topic_clone.clone(),
                             content: format!("Error: agent failed to start — no output within {:?}. Check shell configuration (~/.zshrc / ~/.bashrc).", AGENT_STARTUP_TIMEOUT),
                         }).await;
-                        kill_agent_process_group(&mut child).await;
+                        group.kill(&mut child).await;
                         break;
                     }
                     line_result = lines.next_line() => {
@@ -915,13 +923,9 @@ fn default_spawn_fn(
             // Mid-send cancellation: same cleanup as the outer cancel arm
             // (SIGTERM → 5s wait → SIGKILL → wait → remove prompt file → return; no Done).
             if cancelled_mid_send {
-                warn!(topic = %topic_clone, "agent cancelled mid-emit, sending SIGTERM to process group");
-                terminate_agent_process_group(
-                    &mut child,
-                    Some(prompt_file.as_path()),
-                    &topic_clone,
-                )
-                .await;
+                warn!(topic = %topic_clone, "agent cancelled mid-emit, tearing down process group");
+                group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
+                let _ = tokio::fs::remove_file(&prompt_file).await;
                 return;
             }
         }
@@ -1069,14 +1073,12 @@ fn default_resident_spawn_fn(
             }
         };
 
-        let user_shell = crate::shell::user_login_shell();
-        info!(shell = %user_shell, "spawning resident agent via login shell");
-        let mut cmd = Command::new(&user_shell);
-        cmd.args(["-lic", &cmd_string])
-            .stdin(std::process::Stdio::piped())
+        info!(shell = %crate::shell::user_login_shell(), "spawning resident agent via login shell");
+        let mut cmd = sys::login_shell_command(&cmd_string);
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .process_group(0);
+            .stderr(std::process::Stdio::piped());
+        sys::configure_new_process_group(&mut cmd);
         cmd.env("ZUCCHINI_CHAT_ID", &topic);
         if let Ok(exe) = std::env::current_exe() {
             cmd.env("ZUCCHINI_SPAWNER_BIN", exe);
@@ -1085,6 +1087,19 @@ fn default_resident_spawn_fn(
             Ok(c) => c,
             Err(e) => {
                 error!("failed to spawn resident agent: {}", e);
+                fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
+                return;
+            }
+        };
+
+        // Capture the group right after spawn and hold it for the resident's
+        // whole lifetime — the resident `child` lives across turns in this same
+        // task scope, so `group` (same scope) outlives it by construction.
+        let group = match sys::ProcessGroup::adopt(&child) {
+            Ok(g) => g,
+            Err(e) => {
+                error!("failed to adopt resident agent process group: {}", e);
+                let _ = child.kill().await;
                 fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
                 return;
             }
@@ -1144,9 +1159,9 @@ fn default_resident_spawn_fn(
             'read: loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        warn!(topic = %topic, "resident session cancelled, SIGTERM process group");
+                        warn!(topic = %topic, "resident session cancelled, tearing down process group");
                         cancelled = true;
-                        terminate_agent_process_group(&mut child, None, &topic).await;
+                        group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
                         break 'read;
                     }
                     _ = tokio::time::sleep_until(startup_deadline), if !agent_started.load(Ordering::Relaxed) => {
@@ -1155,7 +1170,7 @@ fn default_resident_spawn_fn(
                             topic: topic.clone(),
                             content: format!("Error: agent failed to start — no output within {:?}. Check shell configuration (~/.zshrc / ~/.bashrc).", AGENT_STARTUP_TIMEOUT),
                         }).await;
-                        kill_agent_process_group(&mut child).await;
+                        group.kill(&mut child).await;
                         break 'read;
                     }
                     line_result = lines.next_line() => {
@@ -1308,57 +1323,11 @@ async fn await_agent_exit(handle: tokio::task::JoinHandle<()>, topic: &str) {
 }
 
 /// Wait this long after SIGTERM before escalating to SIGKILL. Same value used
-/// by the outer-cancel and mid-send-cancel arms.
+/// by the outer-cancel and mid-send-cancel arms. The `sys::ProcessGroup`
+/// teardown applies it (unix: SIGTERM grace before SIGKILL; Windows: there is
+/// no SIGTERM, so the grace is spent waiting for the child to exit on stdin-EOF
+/// before `TerminateJobObject`).
 const AGENT_SIGTERM_GRACE: Duration = Duration::from_secs(5);
-
-/// Graceful kill: SIGTERM the whole process group → wait up to
-/// `AGENT_SIGTERM_GRACE` → SIGKILL if still alive → wait → remove the prompt
-/// file (one-shot only — resident sessions pass `None`, having no prompt temp
-/// file). Used by the one-shot outer-cancel + mid-send-cancel arms and by the
-/// resident cancel teardown (knob-change / prune / idle-teardown / shutdown).
-///
-/// `process_group(0)` on spawn means `child.id()` IS the PGID, so a single
-/// `killpg` reaches both the login shell and the agent process underneath it.
-/// If `child.id()` is `None` (process already reaped) we fall back to
-/// `child.kill()` which is a no-op in that case but keeps the API consistent.
-async fn terminate_agent_process_group(
-    child: &mut tokio::process::Child,
-    prompt_file: Option<&std::path::Path>,
-    topic: &str,
-) {
-    if let Some(pid) = child.id() {
-        let pgid = Pid::from_raw(pid as i32);
-        let _ = signal::killpg(pgid, Signal::SIGTERM);
-        match tokio::time::timeout(AGENT_SIGTERM_GRACE, child.wait()).await {
-            Ok(_) => info!(topic = %topic, "agent exited after SIGTERM"),
-            Err(_) => {
-                warn!(topic = %topic, "agent did not exit in {:?}, sending SIGKILL to process group", AGENT_SIGTERM_GRACE);
-                let _ = signal::killpg(pgid, Signal::SIGKILL);
-                let _ = child.wait().await;
-            }
-        }
-    } else {
-        let _ = child.kill().await;
-    }
-    if let Some(prompt_file) = prompt_file {
-        let _ = tokio::fs::remove_file(prompt_file).await;
-    }
-}
-
-/// Fast-path kill: SIGKILL the process group immediately, no grace period.
-/// Used only by the startup-deadline arm — if the agent has produced no output
-/// in `AGENT_STARTUP_TIMEOUT` it's almost certainly hung on shell-rc init
-/// rather than actively doing work, so SIGTERM grace is wasted wait. Caller
-/// is responsible for removing the prompt file afterwards (the post-loop
-/// cleanup path already does).
-async fn kill_agent_process_group(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        let pgid = Pid::from_raw(pid as i32);
-        let _ = signal::killpg(pgid, Signal::SIGKILL);
-    } else {
-        let _ = child.kill().await;
-    }
-}
 
 /// How many trailing stderr lines we keep to surface as a failure diagnostic
 /// when the process dies without a clean result.

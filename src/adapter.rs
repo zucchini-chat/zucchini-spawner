@@ -178,9 +178,7 @@ impl AgentKind {
     pub fn cli_home(self) -> Option<PathBuf> {
         // `$HOME/.<subdir>` fallback shared by all three.
         fn home_subdir(subdir: &str) -> Option<PathBuf> {
-            std::env::var_os("HOME")
-                .filter(|h| !h.is_empty())
-                .map(|h| PathBuf::from(h).join(subdir))
+            crate::home_dir_opt().map(|h| h.join(subdir))
         }
         // The CLI's relocation env var when set non-empty.
         fn env_dir(var: &str) -> Option<PathBuf> {

@@ -87,16 +87,20 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::adapter::parse_json_obj;
 use crate::state::SharedMirror;
+use crate::sys;
 use crate::writer::WriteEvent;
+
+/// Read/write halves of one connected IPC stream after `tokio::io::split`.
+/// Platform-neutral: unix wraps a `UnixStream`, windows (step 6) a named pipe.
+type IpcReadHalf = ReadHalf<sys::IpcStream>;
+type IpcWriteHalf = WriteHalf<sys::IpcStream>;
 
 /// Bounded outbound queue per connection. Each per-connection writer task
 /// drains this and writes to the socket. Bounded because a stuck client
@@ -180,28 +184,11 @@ pub fn start(
         None => default_socket_path(),
     };
 
-    // Best-effort: remove a leftover socket file from a prior unclean
-    // shutdown so `bind` doesn't fail with EADDRINUSE. Ignored if absent.
-    if socket_path.exists() {
-        if let Err(e) = std::fs::remove_file(&socket_path) {
-            warn!(error = %e, path = %socket_path.display(), "stale hermes socket file remove failed");
-        }
-    }
-
-    let listener = UnixListener::bind(&socket_path)
+    // Stale-socket cleanup (EADDRINUSE guard) + chmod 0600 (only the spawner
+    // UID may connect) both live inside `sys::IpcListener::bind`, shared with
+    // the control socket.
+    let listener = sys::IpcListener::bind(&socket_path)
         .with_context(|| format!("bind hermes socket at {}", socket_path.display()))?;
-    // chmod 0600 on the socket file so only the spawner UID can connect.
-    // Best-effort: failure means the parent dir's 0700 inheritance is our
-    // only auth signal (still strong on a single-user host).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) =
-            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
-        {
-            warn!(error = %e, path = %socket_path.display(), "chmod 0600 hermes socket failed");
-        }
-    }
     info!(path = %socket_path.display(), "hermes socket server listening");
 
     let cancel = CancellationToken::new();
@@ -244,7 +231,7 @@ pub fn start(
 /// Accept loop. On every accept, spawn a per-connection task that reads the
 /// first frame to decide the role, then drives the role's read+write loops.
 async fn run_accept_loop(
-    listener: UnixListener,
+    listener: sys::IpcListener,
     router: Arc<Mutex<RouterState>>,
     write_tx: mpsc::Sender<WriteEvent>,
     mirror: SharedMirror,
@@ -258,7 +245,7 @@ async fn run_accept_loop(
             }
             res = listener.accept() => {
                 match res {
-                    Ok((stream, _addr)) => {
+                    Ok(stream) => {
                         let router = router.clone();
                         let write_tx = write_tx.clone();
                         let mirror = mirror.clone();
@@ -283,13 +270,13 @@ async fn run_accept_loop(
 /// Per-connection task. Reads the first frame, decides the role, runs the
 /// role's loops.
 async fn handle_connection(
-    stream: UnixStream,
+    stream: sys::IpcStream,
     router: Arc<Mutex<RouterState>>,
     write_tx: mpsc::Sender<WriteEvent>,
     mirror: SharedMirror,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
     // Read the first frame to decide the role.
@@ -348,8 +335,8 @@ async fn handle_connection(
 /// the new plugin re-establishes (acceptable — the plugin's reconnect
 /// path is slow and bounded by the backoff in adapter.py).
 async fn run_plugin_connection(
-    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    write_half: tokio::net::unix::OwnedWriteHalf,
+    mut reader: BufReader<IpcReadHalf>,
+    write_half: IpcWriteHalf,
     router: Arc<Mutex<RouterState>>,
     write_tx: mpsc::Sender<WriteEvent>,
     mirror: SharedMirror,
@@ -475,8 +462,8 @@ async fn run_plugin_connection(
 /// `stop` frames; reverse-direction envelopes from the plugin land in our
 /// outbound queue via the router.
 async fn run_trampoline_connection(
-    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    write_half: tokio::net::unix::OwnedWriteHalf,
+    mut reader: BufReader<IpcReadHalf>,
+    write_half: IpcWriteHalf,
     router: Arc<Mutex<RouterState>>,
     cancel: CancellationToken,
     chat_id: String,
@@ -547,7 +534,7 @@ async fn run_trampoline_connection(
 /// Drains a per-connection outbound queue onto the socket. One write +
 /// flush per envelope so live streaming stays responsive.
 async fn connection_writer(
-    mut write_half: tokio::net::unix::OwnedWriteHalf,
+    mut write_half: IpcWriteHalf,
     mut out_rx: mpsc::Receiver<String>,
     cancel: CancellationToken,
 ) {
@@ -770,18 +757,14 @@ async fn start_gateway_child(socket_path: &Path) -> Result<tokio::process::Child
     // Run under the user's login shell so the plugin discovers hermes via
     // PATH the same way an interactive `hermes` invocation would. Same
     // convention as the agent supervisor (`agent.rs::default_spawn_fn`).
-    let user_shell = crate::shell::user_login_shell();
-    let mut cmd = Command::new(&user_shell);
-    // `-lic` (login + interactive + command) — MUST match `agent.rs`'s
-    // `default_spawn_fn` and `shell.rs`'s `binary_on_path` probe verbatim.
-    // The `-i` is load-bearing, not cosmetic: many installers (hermes's own
-    // `~/.local/bin`, asdf, mise) extend PATH only in `.zshrc`, which a
-    // non-interactive login shell does NOT source. Drop the `-i` and the
-    // probe still finds hermes (it uses `-lic`) while this launch can't —
-    // `hermes gateway run` exits 127 and crash-loops, exactly the
-    // installed-but-unspawnable skew `shell.rs` warns about.
-    cmd.args(["-lic", "hermes gateway run"])
-        .env("ZUCCHINI_SPAWNER_SOCK", socket_path)
+    // Same login-shell seam as the agent supervisor and the `binary_on_path`
+    // probe, so hermes resolves via PATH identically. The seam's `-lic` `-i` is
+    // load-bearing: many installers (hermes's own `~/.local/bin`, asdf, mise)
+    // extend PATH only in `.zshrc`, which a non-interactive login shell does NOT
+    // source — drop it and the probe still finds hermes while this launch can't
+    // (`hermes gateway run` exits 127 and crash-loops).
+    let mut cmd = crate::sys::login_shell_command("hermes gateway run");
+    cmd.env("ZUCCHINI_SPAWNER_SOCK", socket_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     cmd.spawn()

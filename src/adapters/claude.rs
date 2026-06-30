@@ -694,7 +694,7 @@ fn probe_boxed() -> futures::future::BoxFuture<'static, (bool, bool)> {
 /// `~/.claude/.credentials.json` on Linux). Fallback covers older / non-Keychain
 /// installs.
 fn is_authenticated() -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::home_dir_opt() else {
         return false;
     };
 
@@ -878,12 +878,7 @@ pub(crate) async fn import(
 }
 
 fn claude_projects_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        std::path::PathBuf::from(home)
-            .join(".claude")
-            .join("projects"),
-    )
+    Some(crate::home_dir_opt()?.join(".claude").join("projects"))
 }
 
 /// Reverse the dirname encoding claude-code uses for cwd (every `/` replaced

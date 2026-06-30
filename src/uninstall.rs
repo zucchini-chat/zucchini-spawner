@@ -8,13 +8,18 @@
 use std::process::{Command, Stdio};
 use tracing::{info, warn};
 
+#[cfg(unix)]
 const UNINSTALL_SCRIPT: &str = include_str!("../uninstall.sh");
+#[cfg(target_os = "windows")]
+const UNINSTALL_SCRIPT_PS1: &str = include_str!("../uninstall.ps1");
 
 pub fn spawn_detached_cleanup() {
     #[cfg(target_os = "linux")]
     spawn_linux();
     #[cfg(target_os = "macos")]
     spawn_macos();
+    #[cfg(target_os = "windows")]
+    spawn_windows();
 }
 
 #[cfg(target_os = "linux")]
@@ -114,6 +119,59 @@ fn spawn_macos() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+
+    match cmd.spawn() {
+        Ok(child) => info!(pid = child.id(), "spawned detached self-uninstall"),
+        Err(e) => warn!(error = %e, "failed to spawn self-uninstall script"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_windows() {
+    // Stage the .ps1 under the install dir (mirrors the linux "body off argv"
+    // staging) and run it with `powershell -File`, detached. The cleanup runs
+    // in its own process tree — `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`
+    // severs it from ours — so it survives once we exit; the script deletes the
+    // logon Scheduled Task (which is what would otherwise respawn us) and then
+    // the install dir.
+    //
+    // UNTESTED on a real Windows box. Known caveat: the script removes `bin/`,
+    // but Windows won't unlink our own running .exe, so `Remove-Item
+    // -ErrorAction SilentlyContinue` leaves it behind — acceptable, since the
+    // Scheduled Task is already gone so nothing respawns, and an orphan exe in
+    // an otherwise-emptied dir is harmless (the dir is reported "Cleaned …" not
+    // "Removed …"). A perfect wipe would need a self-deleting trampoline; not
+    // worth the complexity for the rare self-uninstall path.
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let staged_path = crate::zucchini_spawner_dir().join("uninstall.ps1");
+    if let Err(e) = std::fs::write(&staged_path, UNINSTALL_SCRIPT_PS1) {
+        warn!(error = %e, path = %staged_path.display(), "failed to stage uninstall script");
+        return;
+    }
+    let Some(staged_path_str) = staged_path.to_str() else {
+        warn!(path = %staged_path.display(), "uninstall script path is not valid utf-8");
+        return;
+    };
+
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        staged_path_str,
+    ])
+    .env("REMOVE_KEY", "1")
+    .env("SILENT", "1")
+    .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
 
     match cmd.spawn() {
         Ok(child) => info!(pid = child.id(), "spawned detached self-uninstall"),

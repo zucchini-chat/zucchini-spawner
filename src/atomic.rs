@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use tracing::warn;
 
 /// Caller is responsible for creating the parent dir.

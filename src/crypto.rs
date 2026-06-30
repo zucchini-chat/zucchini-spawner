@@ -189,15 +189,11 @@ fn try_migrate_legacy_key(user_id: &Uuid, per_user: &Path) -> Result<bool> {
     if !legacy.exists() {
         return Ok(false);
     }
-    // chmod before rename so a chmod failure leaves the file at the legacy
-    // path for the next call to retry — chmodding after the rename would
-    // strand it at its legacy mode if the next entry short-circuits.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 on legacy key {}", legacy.display()))?;
-    }
+    // Harden before rename so a failure leaves the file at the legacy path for
+    // the next call to retry — hardening after the rename would strand it at
+    // its legacy mode if the next entry short-circuits.
+    crate::sys::harden_file(&legacy)
+        .with_context(|| format!("harden legacy key {}", legacy.display()))?;
     // Atomic rename within the same filesystem — no half-state.
     fs::rename(&legacy, per_user).with_context(|| {
         format!(

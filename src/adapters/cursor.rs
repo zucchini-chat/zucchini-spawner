@@ -40,7 +40,6 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{json, Value};
 use smallvec::SmallVec;
-use tokio::process::Command;
 use tracing::{debug, warn};
 
 use crate::adapter::{
@@ -161,8 +160,8 @@ impl AgentAdapter for CursorAdapter {
                 .project_path
                 .map(|pp| pp.trim_end_matches('/').rsplit('/').next().unwrap_or(pp))
                 .unwrap_or("project");
-            let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-            let worktree_abs = format!("{home}/.cursor/worktrees/{repo}/{wt_name}");
+            let home = crate::home_dir();
+            let worktree_abs = format!("{}/.cursor/worktrees/{repo}/{wt_name}", home.display());
             WorktreeInstructions {
                 worktree_abs,
                 parent_repo: ctx.project_path.unwrap_or(repo).to_string(),
@@ -772,8 +771,7 @@ fn probe_boxed() -> futures::future::BoxFuture<'static, (bool, bool)> {
 /// mode emits a distinctive `warn!` to leave a breadcrumb in the spawner
 /// log when cursor's schema drifts.
 async fn is_authenticated() -> bool {
-    let run = Command::new(crate::shell::user_login_shell())
-        .args(["-lic", "cursor-agent status --format json"])
+    let run = crate::sys::login_shell_command("cursor-agent status --format json")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1610,7 +1608,7 @@ pub(crate) async fn import(
 }
 
 fn cursor_state_db_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::home_dir_opt();
     // Empty XDG_CONFIG_HOME → treat as unset (VS Code / Cursor follow XDG spec
     // which says empty values fall back to defaults).
     let xdg = std::env::var_os("XDG_CONFIG_HOME")

@@ -49,10 +49,10 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 
 use crate::adapter::parse_json_obj;
+use crate::sys;
 
 /// REQUIRED env var. The spawner always sets this in the trampoline's child
 /// env. Missing → programmer error (the spawn path forgot to wire it), we
@@ -194,10 +194,10 @@ async fn run_inner(args: HermesTurnArgs) -> Result<()> {
         .context("ZUCCHINI_SPAWNER_SOCK env var missing (spawner must set this on every spawn)")?;
     debug!(sock_path = %sock_path.display(), "hermes-turn connecting");
 
-    let stream = UnixStream::connect(&sock_path)
+    let stream = sys::ipc_connect(&sock_path)
         .await
         .with_context(|| format!("connect spawner socket at {}", sock_path.display()))?;
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
     // Build and send the turn frame per the wire-format spec at the top of
@@ -222,11 +222,11 @@ async fn run_inner(args: HermesTurnArgs) -> Result<()> {
         .context("write turn frame")?;
     write_half.flush().await.context("flush turn frame")?;
 
-    // SIGINT handler — the supervisor's `terminate_agent_process_group`
-    // sends SIGTERM (5s grace before SIGKILL) on cancel; SIGINT is the
-    // graceful interrupt path. We register early so a fast user-stop
+    // Shutdown-signal handler — the supervisor's process-group teardown
+    // sends SIGTERM (5s grace before SIGKILL) on cancel; the OS interrupt
+    // path is the graceful stop. We register early so a fast user-stop
     // between connect and the read loop is still caught.
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    let mut shutdown = sys::ShutdownSignal::new().ok();
 
     // Frame stream pump. One stdout write per inbound envelope, BufWriter so
     // the per-envelope write+flush cost stays low while still surfacing
@@ -242,14 +242,14 @@ async fn run_inner(args: HermesTurnArgs) -> Result<()> {
         tokio::pin!(read_fut);
         tokio::pin!(timeout);
 
-        // We can't `select!` directly over `sigint` when it's `None` (no
+        // We can't `select!` directly over `shutdown` when it's `None` (no
         // handler registered) so branch on the option. The signal-arm
         // forwards a stop frame ONCE and keeps draining.
-        let result = if let Some(sig) = sigint.as_mut() {
+        let result = if let Some(sig) = shutdown.as_mut() {
             tokio::select! {
                 biased;
                 _ = sig.recv(), if !stop_sent => {
-                    info!("hermes-turn: SIGINT, forwarding stop frame");
+                    info!("hermes-turn: shutdown signal, forwarding stop frame");
                     let stop = json!({"type":"stop","chat_id":chat_id}).to_string() + "\n";
                     if let Err(e) = write_half.write_all(stop.as_bytes()).await {
                         warn!(error = %e, "hermes-turn: stop frame write failed");
@@ -392,10 +392,7 @@ fn resolve_sock_path() -> Result<PathBuf> {
         Ok(p)
     } else {
         // Relative is unexpected but cheaply supported — anchor under $HOME.
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        Ok(home.join(p))
+        Ok(crate::home_dir().join(p))
     }
 }
 

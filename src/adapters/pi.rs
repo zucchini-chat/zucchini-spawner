@@ -128,7 +128,6 @@
 //! imported and live rows render identically. See `import`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -516,7 +515,7 @@ fn probe_boxed() -> futures::future::BoxFuture<'static, (bool, bool)> {
 
 fn is_authenticated() -> bool {
     // On-disk credential store written by pi's `/login` / `--api-key`.
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::home_dir_opt() {
         if file_nonempty(&home.join(".pi").join("agent").join("auth.json")) {
             return true;
         }
@@ -622,9 +621,8 @@ pub(crate) async fn import(
 }
 
 fn pi_sessions_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
     Some(
-        std::path::PathBuf::from(home)
+        crate::home_dir_opt()?
             .join(".pi")
             .join("agent")
             .join("sessions"),

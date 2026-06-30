@@ -25,7 +25,6 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info, warn};
 
 use crate::agent::PendingAttachments;
@@ -34,6 +33,7 @@ use crate::crypto::KeyStore;
 use crate::envelope::EnvelopeAttachment;
 use crate::prune::{PendingPrunes, PruneRequest};
 use crate::state::SharedMirror;
+use crate::sys;
 use crate::writer::TokenFetcher;
 
 /// Where the daemon binds and the CLI connects. Lives under the same
@@ -193,38 +193,21 @@ pub struct ControlState {
     pub pending_prunes: PendingPrunes,
 }
 
-/// Bind the listener and spawn the accept loop. Unlinks a stale socket from
-/// a previous run before bind so a crash that left the inode behind doesn't
+/// Bind the listener and spawn the accept loop. Stale-socket cleanup + the
+/// 0600 inode hardening live inside `sys::IpcListener::bind` (shared with the
+/// hermes socket server), so a crash that left the inode behind doesn't
 /// permanently break the RPC path (the bind would otherwise fail with
 /// EADDRINUSE on every restart).
 pub async fn start(state: ControlState) -> Result<()> {
     let path = control_socket_path();
-    if path.exists() {
-        // Best-effort: a *different* spawner process listening on the same
-        // path would survive this remove since UDS bind replaces the inode
-        // anyway, but the second `bind` below would then fail with EADDRINUSE
-        // — surfaces as a startup error rather than silently fighting over
-        // the socket.
-        if let Err(e) = std::fs::remove_file(&path) {
-            warn!(error = %e, path = %path.display(), "failed to remove stale control socket");
-        }
-    }
-    let listener = UnixListener::bind(&path)
+    let listener = sys::IpcListener::bind(&path)
         .with_context(|| format!("bind control socket {}", path.display()))?;
-    // 0o600 on the socket inode itself — the parent dir is already 0o700,
-    // but explicit perms on the node defend against a future umask change
-    // or a `chmod` that loosens the dir.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
     info!(path = %path.display(), "control socket listening");
 
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((stream, _addr)) => {
+                Ok(stream) => {
                     let st = state.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_conn(stream, st).await {
@@ -245,8 +228,8 @@ pub async fn start(state: ControlState) -> Result<()> {
     Ok(())
 }
 
-async fn handle_conn(stream: UnixStream, state: ControlState) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+async fn handle_conn(stream: sys::IpcStream, state: ControlState) -> Result<()> {
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     let n = reader
@@ -734,13 +717,13 @@ async fn schedule_message(
 /// daemon-side `ok=false` errors. Shared by every CLI subcommand.
 async fn send_control_request(req: &ControlRequest) -> Result<ControlResponse> {
     let sock = control_socket_path();
-    let stream = UnixStream::connect(&sock).await.with_context(|| {
+    let stream = sys::ipc_connect(&sock).await.with_context(|| {
         format!(
             "connect to {} — is zucchini-spawner running?",
             sock.display()
         )
     })?;
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut payload = serde_json::to_string(req).expect("serialize control request");
     payload.push('\n');
     write_half

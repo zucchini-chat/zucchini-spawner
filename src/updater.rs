@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, trace, warn};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -52,6 +52,7 @@ fn platform_suffix() -> Result<String, String> {
     let platform_os = match os {
         "macos" => "darwin",
         "linux" => "linux",
+        "windows" => "windows",
         other => return Err(format!("unsupported os: {other}")),
     };
     // install.sh names darwin arm64 as "arm64"; linux keeps "aarch64".
@@ -89,7 +90,10 @@ pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
     let suffix = platform_suffix()?;
     let binary_name = format!("zucchini-spawner-{suffix}");
     let url = format!("{}/{binary_name}", base_url());
-    let tmp_path = "/tmp/zucchini-spawner-new";
+    let tmp_path_buf = std::env::temp_dir().join("zucchini-spawner-new");
+    let tmp_path = tmp_path_buf
+        .to_str()
+        .ok_or_else(|| "temp dir path is not valid UTF-8".to_string())?;
 
     info!(url = %url, "downloading new spawner binary");
 
@@ -102,35 +106,38 @@ pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
         return Err("curl download failed".to_string());
     }
 
-    let status = tokio::process::Command::new("chmod")
-        .args(["+x", tmp_path])
-        .status()
-        .await
-        .map_err(|e| format!("chmod failed: {e}"))?;
-    if !status.success() {
-        return Err("chmod failed".to_string());
-    }
-
-    #[cfg(target_os = "macos")]
-    if let Err(e) = tokio::process::Command::new("xattr")
-        .args(["-c", tmp_path])
-        .status()
-        .await
+    // Post-download prep is unix-only: Windows binaries need no execute bit and
+    // carry no `com.apple.quarantine` xattr.
+    #[cfg(unix)]
     {
-        warn!("xattr clear failed: {e}");
+        let status = tokio::process::Command::new("chmod")
+            .args(["+x", tmp_path])
+            .status()
+            .await
+            .map_err(|e| format!("chmod failed: {e}"))?;
+        if !status.success() {
+            return Err("chmod failed".to_string());
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Err(e) = tokio::process::Command::new("xattr")
+            .args(["-c", tmp_path])
+            .status()
+            .await
+        {
+            warn!("xattr clear failed: {e}");
+        }
     }
 
     let current_exe =
         std::env::current_exe().map_err(|e| format!("cannot find current exe: {e}"))?;
 
-    let status = tokio::process::Command::new("mv")
-        .args(["-f", tmp_path, current_exe.to_str().unwrap()])
-        .status()
-        .await
-        .map_err(|e| format!("mv failed: {e}"))?;
-    if !status.success() {
-        return Err("mv replace failed".to_string());
-    }
+    // Replace the running binary. Unix renames the inode in place; Windows can't
+    // overwrite a live .exe, so the windows seam renames the live exe aside to
+    // `<exe>.old` first (swept on next start). Either way the supervisor
+    // (launchd / systemd / the logon Scheduled Task) respawns from the new file.
+    crate::sys::replace_running_exe(&tmp_path_buf, &current_exe)
+        .map_err(|e| format!("replace running exe failed: {e}"))?;
 
     if let Err(e) = std::fs::write(applied_version_path(), remote_version) {
         warn!("failed to persist applied version: {e}");
@@ -164,7 +171,7 @@ pub async fn run_update_loop(update_tx: mpsc::Sender<String>) {
                     let _ = update_tx.send(remote.clone()).await;
                     last = remote;
                 } else {
-                    debug!(current = %last, "version is up to date");
+                    trace!(current = %last, "version is up to date");
                 }
             }
             None => {

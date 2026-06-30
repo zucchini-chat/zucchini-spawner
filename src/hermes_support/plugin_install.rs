@@ -41,10 +41,10 @@ const PLUGIN_FILES: &[(&str, &str)] = &[
 /// `~/.hermes/plugins/zucchini/` — hermes' plugin discovery scans
 /// `~/.hermes/plugins/`, one subdir per plugin.
 fn plugin_install_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".hermes").join("plugins").join("zucchini")
+    crate::home_dir()
+        .join(".hermes")
+        .join("plugins")
+        .join("zucchini")
 }
 
 /// Idempotent install / self-heal. Safe to call multiple times. Logs at

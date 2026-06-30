@@ -31,8 +31,6 @@
 //! (full bypass on the plugin side); sandboxed invitees get no `--yolo` and
 //! the plugin's default approval policy auto-denies tools in headless mode.
 
-use std::path::PathBuf;
-
 use anyhow::Result;
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
@@ -317,7 +315,7 @@ fn probe_boxed() -> futures::future::BoxFuture<'static, (bool, bool)> {
 }
 
 fn is_authenticated() -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::home_dir_opt() else {
         return false;
     };
     file_nonempty(&home.join(".hermes").join("auth.json"))

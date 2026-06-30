@@ -83,7 +83,6 @@
 //! adapter and the importer feed one map). See the section above `import()`.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -713,7 +712,7 @@ fn is_authenticated() -> bool {
     {
         return true;
     }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::home_dir_opt() else {
         return false;
     };
     let creds = home.join(".gemini").join("oauth_creds.json");
@@ -890,8 +889,7 @@ pub(crate) async fn import(
 }
 
 fn gemini_tmp_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".gemini").join("tmp"))
+    Some(crate::home_dir_opt()?.join(".gemini").join("tmp"))
 }
 
 /// Reads `~/.gemini/projects.json` (`{ "projects": { "<absPath>": "<short>" } }`)
@@ -900,7 +898,7 @@ fn gemini_tmp_dir() -> Option<std::path::PathBuf> {
 /// skipped (logged) rather than failing the whole import.
 fn load_projects_map() -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+    let Some(home) = crate::home_dir_opt() else {
         return map;
     };
     let path = home.join(".gemini").join("projects.json");

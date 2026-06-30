@@ -13,6 +13,7 @@ mod powersync;
 mod prune;
 mod shell;
 mod state;
+mod sys;
 mod uninstall;
 mod updater;
 mod writer;
@@ -70,11 +71,22 @@ fn init_logging() {
         .init();
 }
 
+/// The user's home directory, or `None` when it can't be determined. Wraps
+/// `dirs::home_dir()` (reads `$HOME` when set non-empty, else the OS default) so
+/// every spawner-side `$HOME` read is cross-platform and goes through one place.
+/// Use this where an absent home is a meaningful skip signal.
+pub(crate) fn home_dir_opt() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+/// The user's home directory, falling back to `"."` when it can't be determined.
+/// Use this where a path must always be produced (the historical fallback).
+pub(crate) fn home_dir() -> PathBuf {
+    home_dir_opt().unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub(crate) fn zucchini_spawner_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".zucchini-spawner")
+    home_dir().join(".zucchini-spawner")
 }
 
 /// Force 0o700 on the spawner dir so `key_<uuid>` filenames don't leak to
@@ -83,15 +95,9 @@ pub(crate) fn zucchini_spawner_dir() -> PathBuf {
 /// failure is logged but not fatal (matches the existing
 /// "failed to ensure spawner dir exists" pattern).
 pub(crate) fn ensure_spawner_dir_private(dir: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-            warn!(error = %e, path = %dir.display(), "failed to chmod 0700 on spawner dir");
-        }
+    if let Err(e) = sys::harden_dir(dir) {
+        warn!(error = %e, path = %dir.display(), "failed to harden spawner dir permissions");
     }
-    #[cfg(not(unix))]
-    let _ = dir;
 }
 
 /// Prod vs dev auth mode. Prod needs both MACHINE_ID and SPAWNER_TOKEN — one without
@@ -1996,47 +2002,26 @@ async fn run_uninstall(
     uninstall::spawn_detached_cleanup();
 }
 
-/// Hold an exclusive `flock` on the pidfile `~/.zucchini-spawner/spawner.pid`
-/// for the
-/// daemon's whole lifetime so only ONE spawner can run against this runtime
-/// dir. A second daemon — a stray `zucchini-spawner … | head` probe that fell
-/// through to boot, a leftover dev `cargo run`, a double start — would join the
-/// same PowerSync stream and spawn a *duplicate* agent for every user message,
-/// so the chat shows two responses and two `[result]`s (the bug this guards).
+/// Hold an exclusive single-instance lock on the pidfile
+/// `~/.zucchini-spawner/spawner.pid` for the daemon's whole lifetime so only
+/// ONE spawner can run against this runtime dir. A second daemon — a stray
+/// `zucchini-spawner … | head` probe that fell through to boot, a leftover dev
+/// `cargo run`, a double start — would join the same PowerSync stream and spawn
+/// a *duplicate* agent for every user message, so the chat shows two responses
+/// and two `[result]`s (the bug this guards).
 ///
-/// `flock` is crash-safe: the kernel releases it when the holder exits, so
-/// there's no stale-lock recovery. The lock fd is `O_CLOEXEC` (Rust std default)
-/// so spawned agents don't inherit it and pin the lock past the daemon's death.
-///
-/// On contention this prints the running pid and exits. On any I/O failure
-/// taking the lock it logs and continues unlocked (best-effort — never wedge
-/// the service over a lock we couldn't acquire). The returned handle MUST be
-/// kept alive by the caller; dropping it unlocks.
-fn acquire_single_instance_lock() -> Option<std::fs::File> {
-    use std::io::Write;
-    use std::os::unix::io::AsRawFd;
-
+/// The platform mechanics live in `sys::acquire_single_instance_lock` (unix:
+/// crash-safe `flock`, released by the kernel on exit; lock fd is `O_CLOEXEC`
+/// so spawned agents don't inherit it). On contention this prints the running
+/// pid and exits. On any I/O failure taking the lock it logs and continues
+/// unlocked (best-effort — never wedge the service over a lock we couldn't
+/// acquire). The returned handle MUST be kept alive by the caller; dropping it
+/// unlocks.
+fn acquire_single_instance_lock() -> Option<sys::InstanceLock> {
     let path = zucchini_spawner_dir().join("spawner.pid");
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        // Never truncate on open: a contender that opens the file but fails the
-        // flock below must not erase the holder's recorded pid. We clear+rewrite
-        // it via `set_len` only after we actually hold the lock.
-        .truncate(false)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(error = %e, path = %path.display(), "could not open single-instance lock; continuing unlocked");
-            return None;
-        }
-    };
-
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+    match sys::acquire_single_instance_lock(&path) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
             let pid = existing.trim();
             let pid = if pid.is_empty() { "unknown" } else { pid };
@@ -2046,14 +2031,11 @@ fn acquire_single_instance_lock() -> Option<std::fs::File> {
             error!(pid = %pid, "another spawner instance already holds the lock; exiting");
             std::process::exit(0);
         }
-        warn!(error = %err, "flock on single-instance lock failed; continuing unlocked");
-        return None;
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "could not take single-instance lock; continuing unlocked");
+            None
+        }
     }
-
-    // Lock held — record our pid so a future contender can name us.
-    let _ = file.set_len(0);
-    let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
-    Some(file)
 }
 
 #[tokio::main]
@@ -2141,6 +2123,11 @@ async fn main() {
 
     init_logging();
     info!("zucchini-spawner starting");
+
+    // Clean up the `<exe>.old` a prior self-update parked aside (Windows can't
+    // overwrite a live .exe, so the updater renames it out of the way and we
+    // unlink it here once it's no longer mapped). No-op on unix.
+    sys::sweep_stale_exe();
 
     // Single-instance guard. MUST stay bound for the whole daemon lifetime —
     // dropping the handle releases the lock. A second daemon would otherwise
@@ -2367,10 +2354,7 @@ async fn main() {
     // reused. Aborting an already-finished JoinHandle is a no-op.
     let mut import_task: Option<tokio::task::JoinHandle<()>> = None;
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to register SIGTERM handler");
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .expect("failed to register SIGINT handler");
+    let mut shutdown = sys::ShutdownSignal::new().expect("failed to register OS shutdown handler");
 
     // Latched on the FIRST CheckpointComplete: by then `mirror.members`
     // reflects everything by_machine had to send, so we can safely sweep
@@ -2392,13 +2376,8 @@ async fn main() {
 
     'main_loop: loop {
         tokio::select! {
-            _ = sigterm.recv() => {
-                info!("received SIGTERM, shutting down");
-                supervisor.shutdown_all().await;
-                break;
-            }
-            _ = sigint.recv() => {
-                info!("received SIGINT, shutting down");
+            _ = shutdown.recv() => {
+                info!("received OS shutdown signal, shutting down");
                 supervisor.shutdown_all().await;
                 break;
             }

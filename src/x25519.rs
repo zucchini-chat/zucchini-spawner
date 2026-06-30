@@ -80,11 +80,11 @@ fn persist_secret(secret: &SecretKey) -> Result<()> {
     atomic_write_private(&final_path, encoded.as_bytes())
         .with_context(|| format!("write x25519 secret {}", final_path.display()))?;
 
-    #[cfg(not(unix))]
-    tracing::warn!(
-        path = %final_path.display(),
-        "x25519 secret written without 0600 perms (non-unix target)"
-    );
+    // `atomic_write_private` already creates owner-only on unix; this re-affirms
+    // the restriction through the platform seam (a no-op on unix, and the future
+    // ACL hook on Windows where the create-time path can't set it).
+    crate::sys::harden_file(&final_path)
+        .with_context(|| format!("harden x25519 secret {}", final_path.display()))?;
 
     Ok(())
 }

@@ -750,7 +750,7 @@ fn probe_boxed() -> futures::future::BoxFuture<'static, (bool, bool)> {
 /// which is acceptable for v1 (the actual spawn will surface an auth error
 /// frame if the file is stale).
 fn is_authenticated() -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::home_dir_opt() else {
         return false;
     };
     let auth = home.join(".codex").join("auth.json");
@@ -910,8 +910,7 @@ pub(crate) async fn import(
 
 /// `~/.codex/sessions`, or `None` when HOME is unset.
 fn codex_sessions_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".codex").join("sessions"))
+    Some(crate::home_dir_opt()?.join(".codex").join("sessions"))
 }
 
 /// Recursively collect `rollout-*.jsonl` files under `dir` into `out`. Codex
