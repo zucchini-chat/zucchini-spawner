@@ -462,6 +462,7 @@ async fn run(
     pending_counter: Arc<AtomicUsize>,
 ) {
     let http = reqwest::Client::builder()
+        .user_agent(crate::useragent::user_agent())
         .pool_idle_timeout(Duration::from_secs(60))
         .timeout(Duration::from_secs(20))
         .build()
@@ -556,17 +557,20 @@ async fn send_batch(
     ops: &[BatchOp],
 ) -> Result<(), anyhow::Error> {
     let token = fetch_token().await?;
-    let resp = http
-        .post(url)
-        .bearer_auth(token)
-        .json(&BatchReq { ops })
-        .send()
-        .await?;
+    let resp = crate::net::send_reporting(
+        "POST",
+        url,
+        http.post(url)
+            .bearer_auth(token)
+            .json(&BatchReq { ops })
+            .send(),
+    )
+    .await?;
     let status = resp.status();
     if status.is_success() {
         return Ok(());
     }
-    let body = resp.text().await.unwrap_or_default();
+    let body = crate::net::capture_response_failure("POST", url, resp).await;
     if status.is_client_error() {
         // 4xx means the server rejected the batch for a reason that won't fix itself
         // (bad data, missing chat, forbidden sender). Dropping is worse than retrying —

@@ -40,6 +40,7 @@ pub struct AuthClient {
 impl AuthClient {
     pub fn new(api_base_url: &str, spawner_token: String) -> Self {
         let http = reqwest::Client::builder()
+            .user_agent(crate::useragent::user_agent())
             .timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client");
@@ -66,22 +67,27 @@ impl AuthClient {
             }
         }
 
-        let resp = self
-            .http
-            .post(&self.endpoint)
-            .bearer_auth(&self.spawner_token)
-            .send()
-            .await
-            .context("POST /auth/token")?;
+        let resp = crate::net::send_reporting(
+            "POST",
+            &self.endpoint,
+            self.http
+                .post(&self.endpoint)
+                .bearer_auth(&self.spawner_token)
+                .send(),
+        )
+        .await
+        .context("POST /auth/token")?;
         let status = resp.status();
         if status == StatusCode::GONE {
-            // Drop cached JWT so a concurrent fetcher doesn't reuse an orphaned token.
+            // 410 is a normal revocation signal, not a fault — don't report it to
+            // Sentry (the self-uninstall path handles it). Drop the cached JWT so
+            // a concurrent fetcher doesn't reuse an orphaned token.
             *guard = None;
             self.revoked.cancel();
             return Err(anyhow!("/auth/token 410 Gone — spawner revoked"));
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::net::capture_response_failure("POST", &self.endpoint, resp).await;
             return Err(anyhow!("/auth/token {}: {}", status, body));
         }
         let parsed: TokenRes = resp.json().await.context("parse TokenRes")?;

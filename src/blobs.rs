@@ -96,18 +96,21 @@ pub async fn mint_url(
         "{}/api/blobs/upload-url",
         api_base_url.trim_end_matches('/')
     );
-    let resp = http
-        .post(&endpoint)
-        .bearer_auth(&token)
-        .json(&UploadUrlReq {
-            size: ciphertext_size,
-        })
-        .send()
-        .await
-        .context("POST /api/blobs/upload-url")?;
+    let resp = crate::net::send_reporting(
+        "POST",
+        &endpoint,
+        http.post(&endpoint)
+            .bearer_auth(&token)
+            .json(&UploadUrlReq {
+                size: ciphertext_size,
+            })
+            .send(),
+    )
+    .await
+    .context("POST /api/blobs/upload-url")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::net::capture_response_failure("POST", &endpoint, resp).await;
         return Err(anyhow!("/api/blobs/upload-url {}: {}", status, body));
     }
     let presigned: UploadUrlRes = resp.json().await.context("parse UploadUrlRes")?;
@@ -136,16 +139,19 @@ pub async fn put_ciphertext(
     ciphertext: Vec<u8>,
 ) -> Result<()> {
     let ciphertext_size = ciphertext.len() as i64;
-    let put = http
-        .put(presigned_url)
-        .header("content-length", ciphertext_size.to_string())
-        .body(ciphertext)
-        .send()
-        .await
-        .context("PUT presigned R2 url")?;
+    let put = crate::net::send_reporting(
+        "PUT",
+        presigned_url,
+        http.put(presigned_url)
+            .header("content-length", ciphertext_size.to_string())
+            .body(ciphertext)
+            .send(),
+    )
+    .await
+    .context("PUT presigned R2 url")?;
     let put_status = put.status();
     if !put_status.is_success() {
-        let body = put.text().await.unwrap_or_default();
+        let body = crate::net::capture_response_failure("PUT", presigned_url, put).await;
         return Err(anyhow!("R2 PUT {}: {}", put_status, body));
     }
     Ok(())
@@ -159,6 +165,7 @@ pub struct DownloadedAttachment {
 impl BlobDownloader {
     pub fn new(api_base_url: &str, fetch_token: TokenFetcher) -> Self {
         let http = reqwest::Client::builder()
+            .user_agent(crate::useragent::user_agent())
             .timeout(Duration::from_secs(60))
             .build()
             .expect("reqwest client");
@@ -207,30 +214,33 @@ impl BlobDownloader {
 
     async fn download_one(&self, blob_key: &Uuid, dest: &Path, key: &KUser) -> Result<()> {
         let token = (self.fetch_token)().await?;
-        let resp = self
-            .http
-            .post(&self.download_url_endpoint)
-            .bearer_auth(&token)
-            .json(&DownloadUrlReq { blob_key })
-            .send()
-            .await
-            .context("POST /api/blobs/download-url")?;
+        let resp = crate::net::send_reporting(
+            "POST",
+            &self.download_url_endpoint,
+            self.http
+                .post(&self.download_url_endpoint)
+                .bearer_auth(&token)
+                .json(&DownloadUrlReq { blob_key })
+                .send(),
+        )
+        .await
+        .context("POST /api/blobs/download-url")?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body =
+                crate::net::capture_response_failure("POST", &self.download_url_endpoint, resp)
+                    .await;
             return Err(anyhow!("/api/blobs/download-url {}: {}", status, body));
         }
         let presigned: DownloadUrlRes = resp.json().await.context("parse DownloadUrlRes")?;
 
-        let blob = self
-            .http
-            .get(&presigned.url)
-            .send()
-            .await
-            .context("GET presigned R2 url")?;
+        let blob =
+            crate::net::send_reporting("GET", &presigned.url, self.http.get(&presigned.url).send())
+                .await
+                .context("GET presigned R2 url")?;
         let blob_status = blob.status();
         if !blob_status.is_success() {
-            let body = blob.text().await.unwrap_or_default();
+            let body = crate::net::capture_response_failure("GET", &presigned.url, blob).await;
             return Err(anyhow!("R2 GET {}: {}", blob_status, body));
         }
         let ciphertext = blob.bytes().await.context("read R2 body")?;

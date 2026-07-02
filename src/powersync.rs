@@ -197,6 +197,7 @@ struct BucketRequest {
 
 async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
     let http = reqwest::Client::builder()
+        .user_agent(crate::useragent::user_agent())
         .pool_idle_timeout(Duration::from_secs(60))
         .tcp_keepalive(TCP_KEEPALIVE)
         .build()
@@ -285,17 +286,30 @@ async fn connect_and_stream(
     let url = format!("{}/sync/stream", config.base_url.trim_end_matches('/'));
     debug!(%url, buckets = body.buckets.len(), "opening sync stream");
 
-    let resp = http
+    // A transport error or 410 during revocation is expected teardown, not a
+    // fault — the run loop already suppresses those, so skip Sentry to avoid the
+    // same spam.
+    let report = !config.revoked.is_cancelled();
+
+    let req = http
         .post(&url)
         .header("Authorization", format!("Token {}", token))
         .header("Accept", "application/x-ndjson")
         .json(&body)
-        .send()
-        .await?;
+        .send();
+    let resp = if report {
+        crate::net::send_reporting("POST", &url, req).await?
+    } else {
+        req.await?
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = if report {
+            crate::net::capture_response_failure("POST", &url, resp).await
+        } else {
+            resp.text().await.unwrap_or_default()
+        };
         anyhow::bail!("sync stream HTTP {}: {}", status, text);
     }
 

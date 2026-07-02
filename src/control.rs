@@ -693,17 +693,21 @@ async fn schedule_message(
     let token = (state.fetch_token)()
         .await
         .context("fetch JWT for /api/writes")?;
-    let resp = state
-        .http
-        .post(&url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({ "ops": [op] }))
-        .send()
-        .await
-        .context("POST /api/writes (schedule_message)")?;
+    let resp = crate::net::send_reporting(
+        "POST",
+        &url,
+        state
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "ops": [op] }))
+            .send(),
+    )
+    .await
+    .context("POST /api/writes (schedule_message)")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::net::capture_response_failure("POST", &url, resp).await;
         return Err(anyhow!("POST /api/writes {}: {}", status, body));
     }
     info!(chat_id, %id, deliver_at = ?deliver_at, "scheduled message via /api/writes");

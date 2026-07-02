@@ -8,6 +8,7 @@ mod control;
 mod crypto;
 mod envelope;
 mod hermes_support;
+mod net;
 mod power;
 mod powersync;
 mod prune;
@@ -16,6 +17,7 @@ mod state;
 mod sys;
 mod uninstall;
 mod updater;
+mod useragent;
 mod writer;
 mod x25519;
 
@@ -2333,6 +2335,7 @@ async fn main() {
         let (api_base_url, api_token) = base_and_token(prod.as_ref(), DEV_API_BASE_URL);
         let control_state = control::ControlState {
             http: reqwest::Client::builder()
+                .user_agent(crate::useragent::user_agent())
                 .timeout(Duration::from_secs(60))
                 .build()
                 .expect("control http client"),
