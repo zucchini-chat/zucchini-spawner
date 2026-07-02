@@ -19,7 +19,7 @@ use tracing::debug;
 use crate::adapter::{
     agent_capabilities_instructions, current_time_in_tz_line, file_nonempty,
     probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind,
-    LastTokensDedup, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
+    LastTokensDedup, NativeSpawn, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
     PRUNE_CONTEXT_INSTRUCTION,
 };
 
@@ -110,18 +110,43 @@ fn extract_tool_result_id(line: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
-/// Append every claude flag AFTER the base invocation (`cat … | claude` for
-/// one-shot, bare `claude` for resident) to `cmd`. Shared by `prepare_command`
-/// and `prepare_session_command` so the flag set (session-id resume, worktree
-/// containment, `--append-system-prompt`, `--print --verbose
+/// First sentence of the one-shot `--append-system-prompt` block. One-shot
+/// `--print` is print-and-exit: the process dies at its first `result`, so any
+/// background subagent it armed is abandoned. Steer the agent away from
+/// `run_in_background:true`. (The resident session uses `RESIDENT_SYS_LEADIN`.)
+const ONESHOT_SYS_LEADIN: &str =
+    "You are spawned via a harness, no background subagents will wake you when finished, use subagents with `run_in_background: false` only.";
+
+/// First sentence of the resident `--append-system-prompt` block. The whole
+/// point of the resident model is that background tasks/monitors run to
+/// completion and stream their results back, so it drops the one-shot lead-in.
+const RESIDENT_SYS_LEADIN: &str =
+    "You are running in a resident session; background tasks and monitors you arm will run to completion and stream their results back.";
+
+/// One token of the claude invocation. `Lit` is emitted verbatim (unquoted in
+/// the shell string) — the constant flags/values that need no escaping. `Val`
+/// is a dynamic value: shell-escaped in the POSIX string, one argv element
+/// natively. Splitting them lets the POSIX renderer reproduce the exact
+/// historical string (constant flags stay unquoted) while the native renderer
+/// yields clean argv — one source of truth for the flag list.
+enum ClaudeArg {
+    Lit(&'static str),
+    Val(String),
+}
+
+/// Build the ordered claude flag tokens AFTER the base invocation (`cat … |
+/// claude` for one-shot, bare `claude` for resident). Shared by the POSIX
+/// string path (`prepare_command`/`prepare_session_command` via
+/// `push_posix_flags`) and the Windows-native argv path (`prepare_native`/
+/// `prepare_session_native` via `flags_to_argv`) so the flag set (session-id
+/// resume, worktree containment, `--append-system-prompt`, `--print --verbose
 /// --output-format stream-json`, sandbox, model, the prune `--settings` hook)
 /// can't drift between the two paths. `sys_leadin` is the first sentence of the
 /// `--append-system-prompt` block (the only intentional difference); `resident`
 /// adds `--input-format stream-json` before `--output-format` so claude reads
 /// turns from the held-open stdin.
 #[allow(clippy::too_many_arguments)]
-fn append_claude_flags(
-    cmd: &mut String,
+fn claude_flag_args(
     sys_leadin: &str,
     chat_id: &str,
     project_path: Option<&str>,
@@ -131,7 +156,9 @@ fn append_claude_flags(
     model: Option<&str>,
     user_timezone: Option<&str>,
     resident: bool,
-) {
+) -> Vec<ClaudeArg> {
+    let mut args: Vec<ClaudeArg> = Vec::new();
+
     // First turn / fresh session: pass no session flag — claude generates a
     // session id and emits it in the `system/init` stdout frame, which we
     // harvest and persist to `chats.agent_session_id`. Subsequent (re)starts
@@ -139,7 +166,8 @@ fn append_claude_flags(
     // `agent_session_id = id::text`, so existing chats keep using the same id
     // claude already knows about.
     if let Some(sid) = agent_session_id {
-        cmd.push_str(&format!(" --resume {}", shell_escape(sid)));
+        args.push(ClaudeArg::Lit("--resume"));
+        args.push(ClaudeArg::Val(sid.to_string()));
     }
 
     let mut sys = String::from(sys_leadin);
@@ -150,7 +178,8 @@ fn append_claude_flags(
     if worktree {
         // Use the chat_id prefix so the worktree directory name stays short.
         let worktree_name: String = chat_id.chars().take(8).collect();
-        cmd.push_str(&format!(" --worktree {}", shell_escape(&worktree_name)));
+        args.push(ClaudeArg::Lit("--worktree"));
+        args.push(ClaudeArg::Val(worktree_name.clone()));
         if let Some(pp) = project_path {
             let worktree_abs = format!(
                 "{}/.claude/worktrees/{}",
@@ -172,19 +201,24 @@ fn append_claude_flags(
     ));
     sys.push_str("\n\n");
     sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
-    cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
+    args.push(ClaudeArg::Lit("--append-system-prompt"));
+    args.push(ClaudeArg::Val(sys));
     // Resident: read user/control turns from the held-open stdin pipe.
     if resident {
-        cmd.push_str(" --input-format stream-json");
+        args.push(ClaudeArg::Lit("--input-format"));
+        args.push(ClaudeArg::Lit("stream-json"));
     }
-    cmd.push_str(
-        " --print --verbose --output-format stream-json --disallowedTools AskUserQuestion",
-    );
+    args.push(ClaudeArg::Lit("--print"));
+    args.push(ClaudeArg::Lit("--verbose"));
+    args.push(ClaudeArg::Lit("--output-format"));
+    args.push(ClaudeArg::Lit("stream-json"));
+    args.push(ClaudeArg::Lit("--disallowedTools"));
+    args.push(ClaudeArg::Lit("AskUserQuestion"));
     // Sender's `machine_users.is_sandboxed`. Non-sandboxed = bypass permission
     // gating; sandboxed = claude's default permission mode auto-denies tools
     // in `--print`, which is the actual sandboxing mechanism.
     if !is_sandboxed {
-        cmd.push_str(" --dangerously-skip-permissions");
+        args.push(ClaudeArg::Lit("--dangerously-skip-permissions"));
     }
     // Verbatim pass-through of `chats.model` (migration 0035). Empty / blank
     // values are already filtered to `None` at the construction site in
@@ -193,7 +227,8 @@ fn append_claude_flags(
     // prints a clean error if it doesn't recognize it, and the closed set drifts
     // per-release.
     if let Some(model) = model {
-        cmd.push_str(&format!(" --model {}", shell_escape(model)));
+        args.push(ClaudeArg::Lit("--model"));
+        args.push(ClaudeArg::Val(model.to_string()));
     }
     // Register a `PostToolUse` hook that nudges the agent to prune large tool
     // outputs once they're no longer needed (selective forgetting). The hook
@@ -221,10 +256,34 @@ fn append_claude_flags(
             }]
         }
     });
-    cmd.push_str(&format!(
-        " --settings {}",
-        shell_escape(&settings.to_string())
-    ));
+    args.push(ClaudeArg::Lit("--settings"));
+    args.push(ClaudeArg::Val(settings.to_string()));
+
+    args
+}
+
+/// Render the flag tokens into the historical POSIX shell string: a leading
+/// space before each token, `Lit` verbatim (unquoted), `Val` single-quoted via
+/// `shell_escape`. Byte-identical to the pre-refactor `append_claude_flags`.
+fn push_posix_flags(cmd: &mut String, args: &[ClaudeArg]) {
+    for a in args {
+        cmd.push(' ');
+        match a {
+            ClaudeArg::Lit(s) => cmd.push_str(s),
+            ClaudeArg::Val(s) => cmd.push_str(&shell_escape(s)),
+        }
+    }
+}
+
+/// Render the flag tokens into clean argv (one OS arg per token, no escaping)
+/// for the Windows-native shell-free spawn.
+fn flags_to_argv(args: Vec<ClaudeArg>) -> Vec<String> {
+    args.into_iter()
+        .map(|a| match a {
+            ClaudeArg::Lit(s) => s.to_string(),
+            ClaudeArg::Val(s) => s,
+        })
+        .collect()
 }
 
 impl AgentAdapter for ClaudeAdapter {
@@ -242,15 +301,7 @@ impl AgentAdapter for ClaudeAdapter {
             "cat {} | claude",
             shell_escape(&ctx.prompt_file.to_string_lossy())
         ));
-        // One-shot `--print` is print-and-exit: the process dies at its first
-        // `result`, so any background subagent it armed is abandoned. Steer the
-        // agent away from `run_in_background:true`. (The resident session uses a
-        // DIFFERENT lead-in — see `RESIDENT_SYS_LEADIN` — because background
-        // tasks work there.)
-        const ONESHOT_SYS_LEADIN: &str =
-            "You are spawned via a harness, no background subagents will wake you when finished, use subagents with `run_in_background: false` only.";
-        append_claude_flags(
-            &mut claude_cmd,
+        let args = claude_flag_args(
             ONESHOT_SYS_LEADIN,
             ctx.chat_id,
             ctx.project_path,
@@ -261,7 +312,28 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.user_timezone,
             /* resident = */ false,
         );
+        push_posix_flags(&mut claude_cmd, &args);
         Ok(claude_cmd)
+    }
+
+    fn prepare_native(&mut self, ctx: &TurnContext<'_>) -> Option<NativeSpawn> {
+        let args = claude_flag_args(
+            ONESHOT_SYS_LEADIN,
+            ctx.chat_id,
+            ctx.project_path,
+            ctx.worktree,
+            ctx.agent_session_id,
+            ctx.is_sandboxed,
+            ctx.model,
+            ctx.user_timezone,
+            false,
+        );
+        Some(NativeSpawn {
+            program: "claude".to_string(),
+            args: flags_to_argv(args),
+            cwd: ctx.project_path.map(std::path::PathBuf::from),
+            prompt_stdin_file: Some(ctx.prompt_file.to_path_buf()),
+        })
     }
 
     /// The current-local-time line is folded into the per-turn system prompt
@@ -285,16 +357,10 @@ impl AgentAdapter for ClaudeAdapter {
         }
         // Resident: NO prompt piping — turns arrive as `encode_user_turn` stdin
         // frames over the held-open pipe. Just spawn bare `claude`; the
-        // `--input-format stream-json` flag (added by `append_claude_flags` with
+        // `--input-format stream-json` flag (added by `claude_flag_args` with
         // `resident=true`) tells it to read user/control frames from stdin.
         claude_cmd.push_str("claude");
-        // The whole point of the resident model is that background tasks/monitors
-        // run to completion and stream their results back, so DROP the one-shot
-        // "no background subagents" lead-in.
-        const RESIDENT_SYS_LEADIN: &str =
-            "You are running in a resident session; background tasks and monitors you arm will run to completion and stream their results back.";
-        append_claude_flags(
-            &mut claude_cmd,
+        let args = claude_flag_args(
             RESIDENT_SYS_LEADIN,
             ctx.chat_id,
             ctx.project_path,
@@ -305,7 +371,31 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.user_timezone,
             /* resident = */ true,
         );
+        push_posix_flags(&mut claude_cmd, &args);
         Ok(claude_cmd)
+    }
+
+    fn prepare_session_native(
+        &mut self,
+        ctx: &crate::adapter::SessionContext<'_>,
+    ) -> Option<NativeSpawn> {
+        let args = claude_flag_args(
+            RESIDENT_SYS_LEADIN,
+            ctx.chat_id,
+            ctx.project_path,
+            ctx.worktree,
+            ctx.agent_session_id,
+            ctx.is_sandboxed,
+            ctx.model,
+            ctx.user_timezone,
+            true,
+        );
+        Some(NativeSpawn {
+            program: "claude".to_string(),
+            args: flags_to_argv(args),
+            cwd: ctx.project_path.map(std::path::PathBuf::from),
+            prompt_stdin_file: None,
+        })
     }
 
     fn encode_user_turn(&self, text: &str) -> String {
@@ -2034,6 +2124,75 @@ mod tests {
         assert!(cmd.contains("--settings"), "got: {}", cmd);
         assert!(cmd.contains("prune-reminder-hook"), "got: {}", cmd);
         assert!(cmd.contains("PostToolUse"), "got: {}", cmd);
+    }
+
+    #[test]
+    fn prepare_native_yields_shell_free_recipe() {
+        use crate::adapter::TurnContext;
+        use std::path::PathBuf;
+        let mut a = ClaudeAdapter::new();
+        let prompt_file = PathBuf::from("/tmp/p.txt");
+        // for_test sets project_path = Some("/tmp/proj").
+        let ctx = TurnContext::for_test(&prompt_file, Some("sid-9"), false, None);
+        let spawn = a
+            .prepare_native(&ctx)
+            .expect("claude offers a native recipe");
+        assert_eq!(spawn.program, "claude");
+        assert_eq!(spawn.cwd, Some(PathBuf::from("/tmp/proj")));
+        assert_eq!(spawn.prompt_stdin_file, Some(prompt_file.clone()));
+        // Flags land as clean argv (one OS arg per token, no quoting).
+        assert!(
+            spawn.args.iter().any(|a| a == "--print"),
+            "{:?}",
+            spawn.args
+        );
+        assert!(
+            spawn.args.iter().any(|a| a == "--append-system-prompt"),
+            "{:?}",
+            spawn.args
+        );
+        // --resume is immediately followed by the bare session id.
+        let ri = spawn
+            .args
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("resume flag present");
+        assert_eq!(spawn.args[ri + 1], "sid-9");
+        // The native argv must carry the SAME flag set the POSIX string does:
+        // every native arg appears (verbatim or single-quoted) in the shell cmd.
+        let cmd = a.prepare_command(&ctx).unwrap();
+        for arg in &spawn.args {
+            assert!(
+                cmd.contains(arg.as_str()) || cmd.contains(&shell_escape(arg)),
+                "posix cmd missing native arg {arg:?}: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_session_native_holds_stdin_open() {
+        use crate::adapter::SessionContext;
+        let mut a = ClaudeAdapter::new();
+        let ctx = SessionContext {
+            chat_id: "abcdef012345-6789",
+            project_path: Some("/tmp/proj"),
+            worktree: false,
+            agent_session_id: Some("sid-9"),
+            is_sandboxed: false,
+            model: Some("opus"),
+            user_timezone: Some("Asia/Bangkok"),
+        };
+        let spawn = a
+            .prepare_session_native(&ctx)
+            .expect("claude offers a resident native recipe");
+        assert_eq!(spawn.program, "claude");
+        // Resident holds stdin open for frames — no prompt file.
+        assert!(spawn.prompt_stdin_file.is_none());
+        assert!(
+            spawn.args.iter().any(|a| a == "--input-format"),
+            "{:?}",
+            spawn.args
+        );
     }
 
     mod prune {

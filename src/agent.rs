@@ -745,19 +745,37 @@ fn default_spawn_fn(
             return;
         }
 
-        let cmd_string = match adapter.prepare_command(&ctx) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("adapter prepare_command failed: {}", e);
-                let _ = tokio::fs::remove_file(&prompt_file).await;
-                fail_agent(&tx, &topic_clone, format!("agent prepare failed: {}", e)).await;
-                return;
-            }
+        // Windows: launch the agent natively (no bash) when the adapter offers a
+        // shell-free recipe. Unix keeps the login-shell path (byte-identical).
+        let native = if cfg!(windows) {
+            adapter.prepare_native(&ctx)
+        } else {
+            None
         };
-
-        info!(shell = %crate::shell::user_login_shell(), kind = ?kind, "spawning agent via login shell");
-
-        let mut cmd = sys::login_shell_command(&cmd_string);
+        let mut cmd = if let Some(spawn) = native {
+            info!(program = %spawn.program, kind = ?kind, "spawning agent natively (no shell)");
+            match crate::shell::native_command(&spawn) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("failed to build native agent command: {}", e);
+                    let _ = tokio::fs::remove_file(&prompt_file).await;
+                    fail_agent(&tx, &topic_clone, format!("failed to spawn agent: {}", e)).await;
+                    return;
+                }
+            }
+        } else {
+            let cmd_string = match adapter.prepare_command(&ctx) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("adapter prepare_command failed: {}", e);
+                    let _ = tokio::fs::remove_file(&prompt_file).await;
+                    fail_agent(&tx, &topic_clone, format!("agent prepare failed: {}", e)).await;
+                    return;
+                }
+            };
+            info!(shell = %crate::shell::user_login_shell(), kind = ?kind, "spawning agent via login shell");
+            sys::login_shell_command(&cmd_string)
+        };
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         // New process group so we can tear down shell + agent together.
@@ -1064,17 +1082,33 @@ fn default_resident_spawn_fn(
             model: model.as_deref(),
             user_timezone: user_timezone.as_deref(),
         };
-        let cmd_string = match adapter.prepare_session_command(&ctx) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("adapter prepare_session_command failed: {}", e);
-                fail_agent(&tx, &topic, format!("agent prepare failed: {}", e)).await;
-                return;
-            }
+        let native = if cfg!(windows) {
+            adapter.prepare_session_native(&ctx)
+        } else {
+            None
         };
-
-        info!(shell = %crate::shell::user_login_shell(), "spawning resident agent via login shell");
-        let mut cmd = sys::login_shell_command(&cmd_string);
+        let mut cmd = if let Some(spawn) = native {
+            info!(program = %spawn.program, "spawning resident agent natively (no shell)");
+            match crate::shell::native_command(&spawn) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("failed to build native resident command: {}", e);
+                    fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
+                    return;
+                }
+            }
+        } else {
+            let cmd_string = match adapter.prepare_session_command(&ctx) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("adapter prepare_session_command failed: {}", e);
+                    fail_agent(&tx, &topic, format!("agent prepare failed: {}", e)).await;
+                    return;
+                }
+            };
+            info!(shell = %crate::shell::user_login_shell(), "spawning resident agent via login shell");
+            sys::login_shell_command(&cmd_string)
+        };
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());

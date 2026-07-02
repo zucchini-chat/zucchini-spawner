@@ -300,6 +300,23 @@ pub struct SessionContext<'a> {
     pub user_timezone: Option<&'a str>,
 }
 
+/// A shell-free spawn recipe for an adapter that can launch its CLI directly
+/// (no `bash -lic` wrapper). Used on Windows so a Git-Bash/WSL install isn't
+/// required; unix keeps the login-shell path. `program` is resolved on PATH by
+/// the spawn site (`shell::native_command`).
+pub struct NativeSpawn {
+    /// Bare program name to resolve on PATH (e.g. "claude").
+    pub program: String,
+    /// Argv AFTER the program, unescaped — each element is one OS arg.
+    pub args: Vec<String>,
+    /// Working directory for the child, or None to inherit.
+    pub cwd: Option<std::path::PathBuf>,
+    /// One-shot only: file whose contents feed the child's stdin (the native
+    /// replacement for `cat <file> | claude`). None ⇒ caller wires stdin
+    /// (resident pipes frames).
+    pub prompt_stdin_file: Option<std::path::PathBuf>,
+}
+
 /// Per-line normalized events the adapter forwards to Supervisor's response
 /// channel. `Frame(s)` lands verbatim in `messages.body`; the other variants
 /// are side-channel events written to `chats` columns.
@@ -407,6 +424,19 @@ pub trait AgentAdapter: Send + Sync {
     /// one-shot adapters never set that.
     fn prepare_session_command(&mut self, _ctx: &SessionContext<'_>) -> Result<String> {
         unreachable!("prepare_session_command called on a one-shot adapter")
+    }
+
+    /// One-shot: a shell-free spawn recipe for Windows-native launch (no bash).
+    /// `None` (default) ⇒ the Supervisor uses the `prepare_command` login-shell
+    /// path. Only claude overrides this today.
+    fn prepare_native(&mut self, _ctx: &TurnContext<'_>) -> Option<NativeSpawn> {
+        None
+    }
+
+    /// Resident twin of [`Self::prepare_native`] (stdin held open for frames, so
+    /// `prompt_stdin_file` is None). `None` (default) ⇒ login-shell path.
+    fn prepare_session_native(&mut self, _ctx: &SessionContext<'_>) -> Option<NativeSpawn> {
+        None
     }
 
     /// Resident: serialize one user turn as a newline-terminated stdin frame.

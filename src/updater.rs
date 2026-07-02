@@ -65,21 +65,36 @@ fn platform_suffix() -> Result<String, String> {
     Ok(format!("{platform_os}-{platform_arch}"))
 }
 
-// `curl -f` makes any non-2xx exit non-zero so a failed fetch yields None,
-// never an empty/garbage version that would look like a change. Using curl
-// rather than reqwest so the same code path handles both `https://` and
-// `file://` (reqwest doesn't speak file URLs).
+/// Fetch a URL's body bytes. Handles both `https://` (via the `reqwest` client
+/// we already link — no external `curl` needed, so no `curl.exe`-on-PATH
+/// dependency on Windows) and `file://` (the dev hot-reload loop; reqwest
+/// doesn't speak file URLs). Non-2xx is an error, so a failed fetch never
+/// surfaces an empty/garbage body that would look like a valid version change.
+async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    // `file://` is the author's dev-update loop only (macOS); strip the scheme
+    // to a plain path. Prod always takes the reqwest branch below.
+    if let Some(path) = url.strip_prefix("file://") {
+        return tokio::fs::read(path)
+            .await
+            .map_err(|e| format!("read {path}: {e}"));
+    }
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("request {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("fetch {url} returned HTTP {status}"));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("read body of {url}: {e}"))
+}
+
 async fn check_version() -> Option<String> {
     let url = format!("{}/{}", base_url(), VERSION_FILENAME);
-    let output = tokio::process::Command::new("curl")
-        .args(["-sf", &url])
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let version = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    let bytes = fetch_bytes(&url).await.ok()?;
+    let version = String::from_utf8(bytes).ok()?.trim().to_string();
     if version.is_empty() {
         return None;
     }
@@ -97,14 +112,10 @@ pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
 
     info!(url = %url, "downloading new spawner binary");
 
-    let status = tokio::process::Command::new("curl")
-        .args(["-f", "-o", tmp_path, &url])
-        .status()
+    let bytes = fetch_bytes(&url).await?;
+    tokio::fs::write(&tmp_path_buf, &bytes)
         .await
-        .map_err(|e| format!("curl failed: {e}"))?;
-    if !status.success() {
-        return Err("curl download failed".to_string());
-    }
+        .map_err(|e| format!("write {tmp_path}: {e}"))?;
 
     // Post-download prep is unix-only: Windows binaries need no execute bit and
     // carry no `com.apple.quarantine` xattr.

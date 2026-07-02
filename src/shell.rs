@@ -2,6 +2,7 @@ use std::process::Stdio;
 
 use tracing::warn;
 
+use crate::adapter::NativeSpawn;
 use crate::sys;
 
 /// The login-shell program (`$USER_SHELL`/`/bin/sh` on unix, a resolved bash on
@@ -30,4 +31,30 @@ pub async fn binary_on_path(binary: &str) -> bool {
             false
         }
     }
+}
+
+/// Build a shell-free child command from a [`NativeSpawn`]: resolve `program`
+/// on PATH (via the `which` crate — respects PATHEXT on Windows so `claude.exe`
+/// is found), set argv + cwd, and, for a one-shot carrying a `prompt_stdin_file`,
+/// open that file as the child's stdin (the native replacement for
+/// `cat <file> | claude`). The caller still sets stdout/stderr + process-group
+/// config + env. Errs (NotFound) if the program isn't on PATH, so the failure is
+/// explicit rather than a cryptic "program not found".
+pub fn native_command(spawn: &NativeSpawn) -> std::io::Result<tokio::process::Command> {
+    let program = which::which(&spawn.program).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("`{}` not found on PATH: {e}", spawn.program),
+        )
+    })?;
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(&spawn.args);
+    if let Some(cwd) = &spawn.cwd {
+        cmd.current_dir(cwd);
+    }
+    if let Some(file) = &spawn.prompt_stdin_file {
+        let f = std::fs::File::open(file)?;
+        cmd.stdin(Stdio::from(f));
+    }
+    Ok(cmd)
 }
