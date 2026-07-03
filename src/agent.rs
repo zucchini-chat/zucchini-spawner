@@ -52,6 +52,36 @@ pub type LiveSessions = Arc<StdMutex<HashMap<String, Arc<StdMutex<SessionState>>
 const AGENT_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// True once ANY agent on this machine produced its first output line
+/// (in-memory, since spawner start). Gates the silent-startup retry below:
+/// with no success history, startup silence is almost certainly deterministic
+/// (broken shell init, missing CLI) and a retry only doubles the user's wait.
+static ANY_AGENT_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// One automatic respawn after a SILENT startup timeout — the transient-stall
+/// signature (host overload / memory pressure; SPAWNER-13): the process hung
+/// past the deadline (we had to kill it), emitted zero stderr, and agents are
+/// known to start on this machine. Anything else fails immediately: captured
+/// stderr means a real diagnostic is about to be surfaced, no success history
+/// means environmental breakage, and the single-attempt cap keeps a
+/// deterministic hang from looping. Only sound BEFORE the first output frame —
+/// a started agent may have side effects, so mid-turn deaths are never retried.
+fn startup_retry_allowed(attempt: u32, stderr_seen: &AtomicBool) -> bool {
+    attempt == 0
+        && !stderr_seen.load(Ordering::Relaxed)
+        && ANY_AGENT_STARTED.load(Ordering::Relaxed)
+}
+
+fn startup_timeout_message(timeout: Duration, retried: bool) -> String {
+    if retried {
+        format!("Error: agent failed to start — no output within {timeout:?}, even after an automatic retry. The machine may be overloaded; try sending the message again.")
+    } else if ANY_AGENT_STARTED.load(Ordering::Relaxed) {
+        format!("Error: agent failed to start — no output within {timeout:?}.")
+    } else {
+        format!("Error: agent failed to start — no output within {timeout:?}. Check shell configuration (~/.zshrc / ~/.bashrc).")
+    }
+}
+
 /// Frame-derived obligations for ONE resident session, updated by the reader
 /// task as `AgentEvent`s arrive and read by the Supervisor to answer
 /// `is_running`. Only `running` crosses the wire (the boolean
@@ -789,164 +819,181 @@ fn default_spawn_fn(
         if let Ok(exe) = std::env::current_exe() {
             cmd.env("ZUCCHINI_SPAWNER_BIN", exe);
         }
-        let result = cmd.spawn();
+        // One automatic respawn is allowed after a silent startup timeout (see
+        // `startup_retry_allowed`); the retry attempt gets a doubled deadline.
+        let mut attempt: u32 = 0;
+        let (mut child, agent_started, stderr_handle, has_result) = 'spawn: loop {
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    error!("failed to spawn agent: {}", e);
+                    let _ = tokio::fs::remove_file(&prompt_file).await;
+                    fail_agent(&tx, &topic_clone, format!("failed to spawn agent: {}", e)).await;
+                    return;
+                }
+            };
 
-        let mut child = match result {
-            Ok(child) => child,
-            Err(e) => {
-                error!("failed to spawn agent: {}", e);
-                let _ = tokio::fs::remove_file(&prompt_file).await;
-                fail_agent(&tx, &topic_clone, format!("failed to spawn agent: {}", e)).await;
-                return;
-            }
-        };
+            let group = match sys::ProcessGroup::adopt(&child) {
+                Ok(g) => g,
+                Err(e) => {
+                    error!("failed to adopt agent process group: {}", e);
+                    let _ = child.kill().await;
+                    let _ = tokio::fs::remove_file(&prompt_file).await;
+                    fail_agent(&tx, &topic_clone, format!("failed to spawn agent: {}", e)).await;
+                    return;
+                }
+            };
 
-        let group = match sys::ProcessGroup::adopt(&child) {
-            Ok(g) => g,
-            Err(e) => {
-                error!("failed to adopt agent process group: {}", e);
-                let _ = child.kill().await;
-                let _ = tokio::fs::remove_file(&prompt_file).await;
-                fail_agent(&tx, &topic_clone, format!("failed to spawn agent: {}", e)).await;
-                return;
-            }
-        };
+            // Shared flag: flipped to true once we receive the first stdout line from the agent.
+            // The stderr task uses this to decide whether to buffer (startup noise) or warn (runtime).
+            let agent_started = Arc::new(AtomicBool::new(false));
+            let stderr_seen = Arc::new(AtomicBool::new(false));
 
-        // Shared flag: flipped to true once we receive the first stdout line from the agent.
-        // The stderr task uses this to decide whether to buffer (startup noise) or warn (runtime).
-        let agent_started = Arc::new(AtomicBool::new(false));
-        let agent_started_stderr = agent_started.clone();
+            // Read stderr in a separate task (see `spawn_stderr_reader`): buffer
+            // startup lines silently, keep a rolling tail, warn-log the rest. The
+            // capture is surfaced to the user only on a failed exit.
+            let stderr_handle = child.stderr.take().map(|stderr| {
+                spawn_stderr_reader(
+                    stderr,
+                    agent_started.clone(),
+                    stderr_seen.clone(),
+                    topic_clone.clone(),
+                )
+            });
 
-        // Read stderr in a separate task (see `spawn_stderr_reader`): buffer
-        // startup lines silently, keep a rolling tail, warn-log the rest. The
-        // capture is surfaced to the user only on a failed exit.
-        let stderr_handle = child
-            .stderr
-            .take()
-            .map(|stderr| spawn_stderr_reader(stderr, agent_started_stderr, topic_clone.clone()));
+            let mut has_result = false;
 
-        let mut has_result = false;
+            if let Some(stdout) = child.stdout.take() {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                let startup_timeout = AGENT_STARTUP_TIMEOUT * (attempt + 1);
+                let startup_deadline = tokio::time::Instant::now() + startup_timeout;
 
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            let startup_deadline = tokio::time::Instant::now() + AGENT_STARTUP_TIMEOUT;
+                // `cancelled` is set by the inner per-send select when the outer
+                // cancellation token fires mid-emit (slow writer back-pressures the mpsc
+                // and a chatty turn can emit multiple events per line); we break out and
+                // run the same SIGTERM/SIGKILL cleanup as the outer cancel arm.
+                let mut cancelled_mid_send = false;
+                loop {
+                    tokio::select! {
+                        _ = token_clone.cancelled() => {
+                            warn!(topic = %topic_clone, "agent cancelled, tearing down process group");
+                            group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
+                            let _ = tokio::fs::remove_file(&prompt_file).await;
+                            // Don't send Done — caller publishes INTERRUPTED_RESULT and has
+                            // already removed our entry from the map.
+                            return;
+                        }
+                        _ = tokio::time::sleep_until(startup_deadline), if !agent_started.load(Ordering::Relaxed) => {
+                            group.kill(&mut child).await;
+                            if startup_retry_allowed(attempt, &stderr_seen) {
+                                warn!(topic = %topic_clone, "agent produced no output within {:?}, retrying once", startup_timeout);
+                                let _ = child.wait().await;
+                                attempt += 1;
+                                continue 'spawn;
+                            }
+                            error!(topic = %topic_clone, "agent produced no output within {:?}, killing", startup_timeout);
+                            let _ = tx.send(AgentResponse::Line {
+                                topic: topic_clone.clone(),
+                                content: startup_timeout_message(startup_timeout, attempt > 0),
+                            }).await;
+                            break;
+                        }
+                        line_result = lines.next_line() => {
+                            match line_result {
+                                Ok(Some(line)) => {
+                                    // First stdout line means the agent is alive — silences any
+                                    // later stderr buffering and stops the startup watchdog.
+                                    agent_started.store(true, Ordering::Relaxed);
+                                    ANY_AGENT_STARTED.store(true, Ordering::Relaxed);
 
-            // `cancelled` is set by the inner per-send select when the outer
-            // cancellation token fires mid-emit (slow writer back-pressures the mpsc
-            // and a chatty turn can emit multiple events per line); we break out and
-            // run the same SIGTERM/SIGKILL cleanup as the outer cancel arm.
-            let mut cancelled_mid_send = false;
-            loop {
-                tokio::select! {
-                    _ = token_clone.cancelled() => {
-                        warn!(topic = %topic_clone, "agent cancelled, tearing down process group");
-                        group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
-                        let _ = tokio::fs::remove_file(&prompt_file).await;
-                        // Don't send Done — caller publishes INTERRUPTED_RESULT and has
-                        // already removed our entry from the map.
-                        return;
-                    }
-                    _ = tokio::time::sleep_until(startup_deadline), if !agent_started.load(Ordering::Relaxed) => {
-                        error!(topic = %topic_clone, "agent produced no output within {:?}, killing", AGENT_STARTUP_TIMEOUT);
-                        let _ = tx.send(AgentResponse::Line {
-                            topic: topic_clone.clone(),
-                            content: format!("Error: agent failed to start — no output within {:?}. Check shell configuration (~/.zshrc / ~/.bashrc).", AGENT_STARTUP_TIMEOUT),
-                        }).await;
-                        group.kill(&mut child).await;
-                        break;
-                    }
-                    line_result = lines.next_line() => {
-                        match line_result {
-                            Ok(Some(line)) => {
-                                // First stdout line means the agent is alive — silences any
-                                // later stderr buffering and stops the startup watchdog.
-                                agent_started.store(true, Ordering::Relaxed);
-
-                                let events = adapter.handle_line(line);
-                                let mut channel_closed = false;
-                                for ev in events {
-                                    // Result is a supervisor-only signal — set the latch and
-                                    // emit nothing on the wire. Every other event maps 1:1 to
-                                    // an AgentResponse via `into_response`.
-                                    let Some(resp) = ev.into_response(&topic_clone, &mut has_result) else {
-                                        continue;
-                                    };
-                                    // Compute a follow-up attachment row BEFORE forwarding the
-                                    // original — `attach_followup_for` peeks at the response
-                                    // shape and drains the mailbox only when the line is an
-                                    // assistant text frame with queued attachments. Held
-                                    // over the original send so cancellation between the two
-                                    // emits drops both cleanly.
-                                    let followup = if let AgentResponse::Line { topic, content } = &resp {
-                                        attach_followup_for(topic, content, &mut attach_rx)
-                                    } else {
-                                        None
-                                    };
-                                    // Nested select so a mid-loop cancellation (Stop
-                                    // tapped while the bounded mpsc is full) is observed
-                                    // immediately instead of waiting for the writer to
-                                    // drain. `biased` keeps cancel polled first.
-                                    tokio::select! {
-                                        biased;
-                                        _ = token_clone.cancelled() => {
-                                            cancelled_mid_send = true;
-                                            break;
-                                        }
-                                        send_res = tx.send(resp) => {
-                                            if send_res.is_err() {
-                                                channel_closed = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    // Emit the attachment row immediately after the text frame
-                                    // so iOS renders the paperclip pill bubble right below the
-                                    // assistant text. Same cancellation contract as above.
-                                    if let Some(followup) = followup {
+                                    let events = adapter.handle_line(line);
+                                    let mut channel_closed = false;
+                                    for ev in events {
+                                        // Result is a supervisor-only signal — set the latch and
+                                        // emit nothing on the wire. Every other event maps 1:1 to
+                                        // an AgentResponse via `into_response`.
+                                        let Some(resp) = ev.into_response(&topic_clone, &mut has_result) else {
+                                            continue;
+                                        };
+                                        // Compute a follow-up attachment row BEFORE forwarding the
+                                        // original — `attach_followup_for` peeks at the response
+                                        // shape and drains the mailbox only when the line is an
+                                        // assistant text frame with queued attachments. Held
+                                        // over the original send so cancellation between the two
+                                        // emits drops both cleanly.
+                                        let followup = if let AgentResponse::Line { topic, content } = &resp {
+                                            attach_followup_for(topic, content, &mut attach_rx)
+                                        } else {
+                                            None
+                                        };
+                                        // Nested select so a mid-loop cancellation (Stop
+                                        // tapped while the bounded mpsc is full) is observed
+                                        // immediately instead of waiting for the writer to
+                                        // drain. `biased` keeps cancel polled first.
                                         tokio::select! {
                                             biased;
                                             _ = token_clone.cancelled() => {
                                                 cancelled_mid_send = true;
                                                 break;
                                             }
-                                            send_res = tx.send(followup) => {
+                                            send_res = tx.send(resp) => {
                                                 if send_res.is_err() {
                                                     channel_closed = true;
                                                     break;
                                                 }
                                             }
                                         }
+                                        // Emit the attachment row immediately after the text frame
+                                        // so iOS renders the paperclip pill bubble right below the
+                                        // assistant text. Same cancellation contract as above.
+                                        if let Some(followup) = followup {
+                                            tokio::select! {
+                                                biased;
+                                                _ = token_clone.cancelled() => {
+                                                    cancelled_mid_send = true;
+                                                    break;
+                                                }
+                                                send_res = tx.send(followup) => {
+                                                    if send_res.is_err() {
+                                                        channel_closed = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if cancelled_mid_send {
+                                        break;
+                                    }
+                                    if channel_closed {
+                                        warn!(topic = %topic_clone, "response channel closed, killing agent");
+                                        let _ = child.kill().await;
+                                        break;
                                     }
                                 }
-                                if cancelled_mid_send {
+                                Ok(None) => break,
+                                Err(e) => {
+                                    error!(topic = %topic_clone, "error reading stdout: {}", e);
                                     break;
                                 }
-                                if channel_closed {
-                                    warn!(topic = %topic_clone, "response channel closed, killing agent");
-                                    let _ = child.kill().await;
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                error!(topic = %topic_clone, "error reading stdout: {}", e);
-                                break;
                             }
                         }
                     }
                 }
+
+                // Mid-send cancellation: same cleanup as the outer cancel arm
+                // (SIGTERM → 5s wait → SIGKILL → wait → remove prompt file → return; no Done).
+                if cancelled_mid_send {
+                    warn!(topic = %topic_clone, "agent cancelled mid-emit, tearing down process group");
+                    group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
+                    let _ = tokio::fs::remove_file(&prompt_file).await;
+                    return;
+                }
             }
 
-            // Mid-send cancellation: same cleanup as the outer cancel arm
-            // (SIGTERM → 5s wait → SIGKILL → wait → remove prompt file → return; no Done).
-            if cancelled_mid_send {
-                warn!(topic = %topic_clone, "agent cancelled mid-emit, tearing down process group");
-                group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
-                let _ = tokio::fs::remove_file(&prompt_file).await;
-                return;
-            }
-        }
+            break 'spawn (child, agent_started, stderr_handle, has_result);
+        };
 
         // Surface stderr as the failure reason when the process never started,
         // or when it died mid-turn without a `result` (e.g. cursor printing
@@ -1015,7 +1062,7 @@ fn default_resident_spawn_fn(
     cancel: CancellationToken,
     pending: PendingAttachments,
 ) -> ResidentHandles {
-    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<StdinMsg>();
+    let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinMsg>();
     // Default (idle) FSM. The first user turn is queued below, but `turn_in_flight`
     // is set by `spawn_resident` (the single setter) synchronously before the
     // session entry is stored, so a RunState/`is_running` read can't observe a
@@ -1117,176 +1164,198 @@ fn default_resident_spawn_fn(
         if let Ok(exe) = std::env::current_exe() {
             cmd.env("ZUCCHINI_SPAWNER_BIN", exe);
         }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                error!("failed to spawn resident agent: {}", e);
-                fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
-                return;
-            }
-        };
-
-        // Capture the group right after spawn and hold it for the resident's
-        // whole lifetime — the resident `child` lives across turns in this same
-        // task scope, so `group` (same scope) outlives it by construction.
-        let group = match sys::ProcessGroup::adopt(&child) {
-            Ok(g) => g,
-            Err(e) => {
-                error!("failed to adopt resident agent process group: {}", e);
-                let _ = child.kill().await;
-                fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
-                return;
-            }
-        };
-
-        // Writer task: owns ChildStdin, the single writer of stdin frames. Queue
-        // the FIRST user turn (with the first-turn suffix when this is a brand-new
-        // session — no resume id) before draining the mpsc so the turn is sent the
-        // instant the process is up.
+        // Writer input: the first user turn (with the first-turn suffix when this
+        // is a brand-new session — no resume id), queued the instant the process
+        // is up. Computed once — a startup-timeout retry re-sends the same frame.
         let first_turn = agent_session_id.is_none();
         let first_text = first_turn_text(adapter.as_ref(), prompt, first_turn);
         let first_frame = adapter.encode_user_turn(&first_text);
-        let writer_handle = child.stdin.take().map(|mut stdin| {
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                if stdin.write_all(first_frame.as_bytes()).await.is_err()
-                    || stdin.flush().await.is_err()
-                {
+        // The mpsc receiver goes to the FIRST attempt's writer; a retry writer
+        // holds stdin open until aborted instead (see `spawn_stdin_writer`).
+        let mut stdin_rx = Some(stdin_rx);
+
+        // One automatic respawn is allowed after a silent startup timeout (see
+        // `startup_retry_allowed`); the retry attempt gets a doubled deadline.
+        let mut attempt: u32 = 0;
+        let (mut child, agent_started, stderr_handle, writer_handle, cancelled) = 'spawn: loop {
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("failed to spawn resident agent: {}", e);
+                    fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
                     return;
                 }
-                // With no warm reuse the only message is `Shutdown` — wait for it
-                // (or the channel dropping). Either way fall through to drop stdin.
-                let _ = stdin_rx.recv().await;
-                // Dropping `stdin` here closes the pipe; claude ignores stdin EOF
-                // (stays alive — see plan §8), so teardown is the SIGTERM below.
-            })
-        });
+            };
 
-        let agent_started = Arc::new(AtomicBool::new(false));
-        let agent_started_stderr = agent_started.clone();
-        let stderr_handle = child
-            .stderr
-            .take()
-            .map(|stderr| spawn_stderr_reader(stderr, agent_started_stderr, topic.clone()));
+            // Capture the group right after spawn and hold it for the resident's
+            // whole lifetime — the resident `child` lives across turns in this same
+            // task scope, so `group` (same scope) outlives it by construction.
+            let group = match sys::ProcessGroup::adopt(&child) {
+                Ok(g) => g,
+                Err(e) => {
+                    error!("failed to adopt resident agent process group: {}", e);
+                    let _ = child.kill().await;
+                    fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
+                    return;
+                }
+            };
 
-        // Last `running` value emitted, so we dedup identical transitions. The
-        // internal "waiting" sub-state (armed background task, no turn in flight)
-        // is NOT distinguished on the wire — `running` stays true across it — so
-        // a Thinking↔Waiting flip emits nothing; only the busy↔idle edge does.
-        let mut last_emitted: Option<bool> = None;
-        // True when the exit was a DELIBERATE `cancel` teardown (knob-change
-        // respawn, prune-respawn, idle-teardown, shutdown). A deliberate teardown
-        // emits NO `Done` — the caller (`abort_agent`) has already removed the
-        // map entry and owns the post-state, exactly like the one-shot cancel
-        // arm. Emitting a `Done` here would (a) post a spurious
-        // INTERRUPTED_RESULT and (b) race a respawn: the stale `Done`, processed
-        // after `spawn_agent` re-inserted a fresh session, would `remove` it.
-        // Only a SPONTANEOUS exit (EOF / read error / startup timeout) emits a
-        // `Done` so the crash-recovery path can clear columns + publish
-        // INTERRUPTED_RESULT when it died mid-turn.
-        let mut cancelled = false;
+            // Writer task: owns ChildStdin, the single writer of stdin frames (see
+            // `spawn_stdin_writer`).
+            let writer_handle = child
+                .stdin
+                .take()
+                .map(|stdin| spawn_stdin_writer(stdin, first_frame.clone(), stdin_rx.take()));
 
-        if let Some(stdout) = child.stdout.take() {
-            let bufreader = BufReader::new(stdout);
-            let mut lines = bufreader.lines();
-            let startup_deadline = tokio::time::Instant::now() + AGENT_STARTUP_TIMEOUT;
-            'read: loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        warn!(topic = %topic, "resident session cancelled, tearing down process group");
-                        cancelled = true;
-                        group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
-                        break 'read;
-                    }
-                    _ = tokio::time::sleep_until(startup_deadline), if !agent_started.load(Ordering::Relaxed) => {
-                        error!(topic = %topic, "resident agent produced no output within {:?}, killing", AGENT_STARTUP_TIMEOUT);
-                        let _ = tx.send(AgentResponse::Line {
-                            topic: topic.clone(),
-                            content: format!("Error: agent failed to start — no output within {:?}. Check shell configuration (~/.zshrc / ~/.bashrc).", AGENT_STARTUP_TIMEOUT),
-                        }).await;
-                        group.kill(&mut child).await;
-                        break 'read;
-                    }
-                    line_result = lines.next_line() => {
-                        match line_result {
-                            Ok(Some(line)) => {
-                                agent_started.store(true, Ordering::Relaxed);
-                                let events = adapter.handle_line(line);
-                                for ev in events {
-                                    // Reduce the FSM and read back the resulting
-                                    // `running` in one lock — the `match` below only
-                                    // forwards frames and never mutates state, so
-                                    // this value is final for the event. (The FSM
-                                    // still tracks the waiting sub-state internally
-                                    // via `SessionState`; it just doesn't cross the
-                                    // wire.)
-                                    let is_result = matches!(&ev, AgentEvent::Result { .. });
-                                    let running = {
-                                        let mut st = state_for_reader.lock().expect("SessionState mutex");
-                                        reduce(&mut st, &ev);
-                                        let r = st.running();
-                                        // [DIAG tasktrace] TEMPORARY — log every
-                                        // state-bearing event with the resulting FSM
-                                        // so we can see why live_tasks never empties.
-                                        match &ev {
-                                            AgentEvent::TaskStarted(id) => tracing::info!(diag = "tasktrace", topic = %topic, %id, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce TaskStarted"),
-                                            AgentEvent::TaskFinished(id) => tracing::info!(diag = "tasktrace", topic = %topic, %id, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce TaskFinished"),
-                                            AgentEvent::Result { origin_is_task } => tracing::info!(diag = "tasktrace", topic = %topic, origin_is_task, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce Result"),
-                                            _ => {}
-                                        }
-                                        r
-                                    };
-                                    match ev {
-                                        AgentEvent::Frame(content) => {
-                                            let resp = AgentResponse::Line { topic: topic.clone(), content };
-                                            let followup = if let AgentResponse::Line { topic: t, content: c } = &resp {
-                                                attach_followup_for(t, c, &mut attach_rx)
-                                            } else { None };
-                                            if tx.send(resp).await.is_err() { break 'read; }
-                                            if let Some(f) = followup {
-                                                if tx.send(f).await.is_err() { break 'read; }
+            let agent_started = Arc::new(AtomicBool::new(false));
+            let stderr_seen = Arc::new(AtomicBool::new(false));
+            let stderr_handle = child.stderr.take().map(|stderr| {
+                spawn_stderr_reader(
+                    stderr,
+                    agent_started.clone(),
+                    stderr_seen.clone(),
+                    topic.clone(),
+                )
+            });
+
+            // Last `running` value emitted, so we dedup identical transitions. The
+            // internal "waiting" sub-state (armed background task, no turn in flight)
+            // is NOT distinguished on the wire — `running` stays true across it — so
+            // a Thinking↔Waiting flip emits nothing; only the busy↔idle edge does.
+            let mut last_emitted: Option<bool> = None;
+            // True when the exit was a DELIBERATE `cancel` teardown (knob-change
+            // respawn, prune-respawn, idle-teardown, shutdown). A deliberate teardown
+            // emits NO `Done` — the caller (`abort_agent`) has already removed the
+            // map entry and owns the post-state, exactly like the one-shot cancel
+            // arm. Emitting a `Done` here would (a) post a spurious
+            // INTERRUPTED_RESULT and (b) race a respawn: the stale `Done`, processed
+            // after `spawn_agent` re-inserted a fresh session, would `remove` it.
+            // Only a SPONTANEOUS exit (EOF / read error / startup timeout) emits a
+            // `Done` so the crash-recovery path can clear columns + publish
+            // INTERRUPTED_RESULT when it died mid-turn.
+            let mut cancelled = false;
+
+            if let Some(stdout) = child.stdout.take() {
+                let bufreader = BufReader::new(stdout);
+                let mut lines = bufreader.lines();
+                let startup_timeout = AGENT_STARTUP_TIMEOUT * (attempt + 1);
+                let startup_deadline = tokio::time::Instant::now() + startup_timeout;
+                'read: loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            warn!(topic = %topic, "resident session cancelled, tearing down process group");
+                            cancelled = true;
+                            group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
+                            break 'read;
+                        }
+                        _ = tokio::time::sleep_until(startup_deadline), if !agent_started.load(Ordering::Relaxed) => {
+                            group.kill(&mut child).await;
+                            if startup_retry_allowed(attempt, &stderr_seen) {
+                                warn!(topic = %topic, "resident agent produced no output within {:?}, retrying once", startup_timeout);
+                                if let Some(wh) = &writer_handle {
+                                    wh.abort();
+                                }
+                                let _ = child.wait().await;
+                                attempt += 1;
+                                continue 'spawn;
+                            }
+                            error!(topic = %topic, "resident agent produced no output within {:?}, killing", startup_timeout);
+                            let _ = tx.send(AgentResponse::Line {
+                                topic: topic.clone(),
+                                content: startup_timeout_message(startup_timeout, attempt > 0),
+                            }).await;
+                            break 'read;
+                        }
+                        line_result = lines.next_line() => {
+                            match line_result {
+                                Ok(Some(line)) => {
+                                    agent_started.store(true, Ordering::Relaxed);
+                                    ANY_AGENT_STARTED.store(true, Ordering::Relaxed);
+                                    let events = adapter.handle_line(line);
+                                    for ev in events {
+                                        // Reduce the FSM and read back the resulting
+                                        // `running` in one lock — the `match` below only
+                                        // forwards frames and never mutates state, so
+                                        // this value is final for the event. (The FSM
+                                        // still tracks the waiting sub-state internally
+                                        // via `SessionState`; it just doesn't cross the
+                                        // wire.)
+                                        let is_result = matches!(&ev, AgentEvent::Result { .. });
+                                        let running = {
+                                            let mut st = state_for_reader.lock().expect("SessionState mutex");
+                                            reduce(&mut st, &ev);
+                                            let r = st.running();
+                                            // [DIAG tasktrace] TEMPORARY — log every
+                                            // state-bearing event with the resulting FSM
+                                            // so we can see why live_tasks never empties.
+                                            match &ev {
+                                                AgentEvent::TaskStarted(id) => tracing::info!(diag = "tasktrace", topic = %topic, %id, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce TaskStarted"),
+                                                AgentEvent::TaskFinished(id) => tracing::info!(diag = "tasktrace", topic = %topic, %id, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce TaskFinished"),
+                                                AgentEvent::Result { origin_is_task } => tracing::info!(diag = "tasktrace", topic = %topic, origin_is_task, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce Result"),
+                                                _ => {}
                                             }
+                                            r
+                                        };
+                                        match ev {
+                                            AgentEvent::Frame(content) => {
+                                                let resp = AgentResponse::Line { topic: topic.clone(), content };
+                                                let followup = if let AgentResponse::Line { topic: t, content: c } = &resp {
+                                                    attach_followup_for(t, c, &mut attach_rx)
+                                                } else { None };
+                                                if tx.send(resp).await.is_err() { break 'read; }
+                                                if let Some(f) = followup {
+                                                    if tx.send(f).await.is_err() { break 'read; }
+                                                }
+                                            }
+                                            AgentEvent::ContextTokens(tokens) => {
+                                                if tx.send(AgentResponse::ContextTokens { topic: topic.clone(), tokens }).await.is_err() { break 'read; }
+                                            }
+                                            AgentEvent::CompactBoundary(post_tokens) => {
+                                                if tx.send(AgentResponse::CompactBoundary { topic: topic.clone(), post_tokens }).await.is_err() { break 'read; }
+                                            }
+                                            AgentEvent::SessionIdHarvested(session_id) => {
+                                                if tx.send(AgentResponse::SessionIdHarvested { topic: topic.clone(), session_id }).await.is_err() { break 'read; }
+                                            }
+                                            AgentEvent::ToolResult => {
+                                                if tx.send(AgentResponse::ToolResult { topic: topic.clone() }).await.is_err() { break 'read; }
+                                            }
+                                            // Run-state-bearing events (Result/TaskStarted/
+                                            // TaskFinished) already updated the FSM via
+                                            // `reduce`; the RunState recompute below emits a
+                                            // transition if `running` changed.
+                                            AgentEvent::Result { .. }
+                                            | AgentEvent::TaskStarted(_)
+                                            | AgentEvent::TaskFinished(_) => {}
                                         }
-                                        AgentEvent::ContextTokens(tokens) => {
-                                            if tx.send(AgentResponse::ContextTokens { topic: topic.clone(), tokens }).await.is_err() { break 'read; }
+                                        // Emit the idle (`running=false`) edge ONLY on a `Result` frame — a real
+                                        // turn boundary. A bare `TaskFinished` that empties `live_tasks` also drops
+                                        // `running` to false, but a claude-self-initiated continuation turn is about
+                                        // to run (and will end with its own `Result`), so suppressing the edge here
+                                        // defers it to that turn's end. Busy (`running=true`) edges always emit.
+                                        if last_emitted != Some(running) && (running || is_result) {
+                                            last_emitted = Some(running);
+                                            // [DIAG tasktrace] TEMPORARY — the busy↔idle edge that writes agent_running.
+                                            tracing::info!(diag = "tasktrace", topic = %topic, running, "RunState transition -> chat_running");
+                                            if tx.send(AgentResponse::RunState { topic: topic.clone(), running }).await.is_err() { break 'read; }
                                         }
-                                        AgentEvent::CompactBoundary(post_tokens) => {
-                                            if tx.send(AgentResponse::CompactBoundary { topic: topic.clone(), post_tokens }).await.is_err() { break 'read; }
-                                        }
-                                        AgentEvent::SessionIdHarvested(session_id) => {
-                                            if tx.send(AgentResponse::SessionIdHarvested { topic: topic.clone(), session_id }).await.is_err() { break 'read; }
-                                        }
-                                        AgentEvent::ToolResult => {
-                                            if tx.send(AgentResponse::ToolResult { topic: topic.clone() }).await.is_err() { break 'read; }
-                                        }
-                                        // Run-state-bearing events (Result/TaskStarted/
-                                        // TaskFinished) already updated the FSM via
-                                        // `reduce`; the RunState recompute below emits a
-                                        // transition if `running` changed.
-                                        AgentEvent::Result { .. }
-                                        | AgentEvent::TaskStarted(_)
-                                        | AgentEvent::TaskFinished(_) => {}
-                                    }
-                                    // Emit the idle (`running=false`) edge ONLY on a `Result` frame — a real
-                                    // turn boundary. A bare `TaskFinished` that empties `live_tasks` also drops
-                                    // `running` to false, but a claude-self-initiated continuation turn is about
-                                    // to run (and will end with its own `Result`), so suppressing the edge here
-                                    // defers it to that turn's end. Busy (`running=true`) edges always emit.
-                                    if last_emitted != Some(running) && (running || is_result) {
-                                        last_emitted = Some(running);
-                                        // [DIAG tasktrace] TEMPORARY — the busy↔idle edge that writes agent_running.
-                                        tracing::info!(diag = "tasktrace", topic = %topic, running, "RunState transition -> chat_running");
-                                        if tx.send(AgentResponse::RunState { topic: topic.clone(), running }).await.is_err() { break 'read; }
                                     }
                                 }
+                                Ok(None) => { break 'read; }
+                                Err(e) => { error!(topic = %topic, "error reading resident stdout: {}", e); break 'read; }
                             }
-                            Ok(None) => { break 'read; }
-                            Err(e) => { error!(topic = %topic, "error reading resident stdout: {}", e); break 'read; }
                         }
                     }
                 }
             }
-        }
+
+            break 'spawn (
+                child,
+                agent_started,
+                stderr_handle,
+                writer_handle,
+                cancelled,
+            );
+        };
 
         // Surface stderr on a failed exit (same contract as the one-shot path).
         // A deliberate teardown (`cancelled`) or an exit while fully idle is a
@@ -1380,12 +1449,40 @@ struct CapturedStderr {
     tail: VecDeque<String>,
 }
 
+/// Spawn the resident stdin writer task: write the first user turn, then hold
+/// stdin open. With the mpsc receiver (first spawn attempt) it waits for
+/// `Shutdown` / sender drop; without it (a startup-timeout retry — the receiver
+/// went to the first attempt's writer, now aborted) it parks until the reader
+/// aborts it on exit. Either way dropping `stdin` merely closes the pipe;
+/// claude ignores stdin EOF (stays alive — see plan §8), so real teardown is
+/// the SIGTERM, and losing the `Shutdown` nudge on the retry path is harmless
+/// (`abort_agent` cancels the session token right after sending it).
+fn spawn_stdin_writer(
+    mut stdin: tokio::process::ChildStdin,
+    first_frame: String,
+    stdin_rx: Option<mpsc::UnboundedReceiver<StdinMsg>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        if stdin.write_all(first_frame.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+            return;
+        }
+        match stdin_rx {
+            Some(mut rx) => {
+                let _ = rx.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    })
+}
+
 /// Spawn the stderr reader task. Buffers startup lines silently (capped), keeps
 /// a rolling tail of the last `STDERR_TAIL_LINES` lines, and `warn!`-logs every
 /// post-startup line. Shared by the one-shot and resident spawn paths.
 fn spawn_stderr_reader(
     stderr: tokio::process::ChildStderr,
     agent_started: Arc<AtomicBool>,
+    stderr_seen: Arc<AtomicBool>,
     topic: String,
 ) -> tokio::task::JoinHandle<CapturedStderr> {
     tokio::spawn(async move {
@@ -1394,6 +1491,7 @@ fn spawn_stderr_reader(
         let mut startup: Vec<String> = Vec::new();
         let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
         while let Ok(Some(line)) = lines.next_line().await {
+            stderr_seen.store(true, Ordering::Relaxed);
             if agent_started.load(Ordering::Relaxed) {
                 warn!(topic = %topic, "agent stderr: {}", line);
             } else if startup.len() < 200 {
