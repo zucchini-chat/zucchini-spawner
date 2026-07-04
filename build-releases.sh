@@ -27,22 +27,29 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "$OUTPUT_DIR"
-# Wipe any stragglers from prior runs (esp. --native leftovers) so the scp glob
-# in deploy.sh never ships a mix of fresh + stale arch binaries.
-rm -f "${OUTPUT_DIR}"/zucchini-spawner-*
+# Wipe stragglers from prior runs (esp. --native leftovers) so the scp glob in
+# deploy.sh never ships a mix of fresh + stale arch binaries — but PRESERVE a
+# hand-supplied zucchini-spawner-windows-x86_64. Windows is built + Authenticode-
+# signed on a Windows box and copied in here; this script never rebuilds it (see
+# build_target's windows branch), so the wipe must not delete it.
+find "${OUTPUT_DIR}" -maxdepth 1 -type f -name 'zucchini-spawner-*' \
+  ! -name 'zucchini-spawner-windows-x86_64' -delete
 
 NATIVE_TARGET="aarch64-apple-darwin"
 
 # install.sh / install.ps1 name darwin arm64 as "arm64", linux keeps "aarch64",
 # windows is "windows-x86_64" (see updater.rs::platform_suffix).
 #
-# Windows (x86_64-pc-windows-msvc) cross-compiles from this macOS/Linux box only
-# with an MSVC-compatible toolchain that `cross` does NOT provide out of the box.
-# Build it from a Windows CI runner, or cross with `cargo-xwin`
-# (`cargo install cargo-xwin`; downloads the MSVC CRT + Windows SDK headers):
-#   cargo xwin build --release --target x86_64-pc-windows-msvc
-# This script's generic else-branch uses `cross`, which will fail for the
-# windows target — see build_target's windows special-case below.
+# Windows (x86_64-pc-windows-msvc) is NOT built here. It's built AND Authenticode-
+# signed on a Windows machine (the signing cert lives there — signing must happen
+# on that box anyway), then copied into
+#   releases/zucchini-spawner-windows-x86_64
+# before this script runs. build_target's windows branch only VERIFIES it's
+# present (warns, does not fail, if missing) and the wipe above preserves it, so
+# this Mac/Linux run builds darwin + linux and ships the Windows binary alongside
+# them untouched. On the Windows box, ONE script does build + sign + stage (+
+# optional scp to this Mac): zucchini-spawner/build-windows.ps1 (signing via
+# Azure Trusted Signing, sign-windows.ps1).
 ALL_TARGETS="
 aarch64-apple-darwin:zucchini-spawner-darwin-arm64
 x86_64-apple-darwin:zucchini-spawner-darwin-x86_64
@@ -55,13 +62,21 @@ build_target() {
   local rust_target="$1"
   local output_name="$2"
 
-  echo "Building ${output_name} (${rust_target})..."
-
-  # Windows MSVC artifact carries a .exe extension; the others don't.
-  local artifact="zucchini-spawner"
+  # Windows is not built on this box — it's built + Authenticode-signed on a
+  # Windows machine and hand-copied into releases/ (see the ALL_TARGETS note).
+  # Verify it's present; warn (don't fail) if not, so a Mac-only run still ships
+  # darwin + linux. The wipe above already preserved any existing copy.
   if [[ "$rust_target" == *"-windows-"* ]]; then
-    artifact="zucchini-spawner.exe"
+    if [[ -f "${OUTPUT_DIR}/${output_name}" ]]; then
+      echo "Using prebuilt ${output_name} (built + signed on Windows)"
+    else
+      echo "WARNING: ${OUTPUT_DIR}/${output_name} not found — Windows binary will NOT ship." >&2
+      echo "         Build + Authenticode-sign it on a Windows box, copy it there, then re-run." >&2
+    fi
+    return 0
   fi
+
+  echo "Building ${output_name} (${rust_target})..."
 
   if [[ "$rust_target" == *"-apple-darwin" ]]; then
     if ! rustup target list --installed 2>/dev/null | grep -q "^${rust_target}$"; then
@@ -69,18 +84,6 @@ build_target() {
       rustup target add "$rust_target" >/dev/null
     fi
     cargo build --release --target "$rust_target" --manifest-path "${SCRIPT_DIR}/Cargo.toml" --quiet
-  elif [[ "$rust_target" == *"-windows-msvc" ]]; then
-    # MSVC target: `cross` can't build it. Use cargo-xwin, which bundles the
-    # MSVC CRT + Windows SDK so it cross-links from macOS/Linux. On a Windows
-    # CI runner `cargo build --target x86_64-pc-windows-msvc` works directly —
-    # swap this branch for that there.
-    if ! command -v cargo-xwin >/dev/null; then
-      echo "ERROR: 'cargo-xwin' not found (needed for the windows MSVC target)." >&2
-      echo "  Install with: cargo install cargo-xwin" >&2
-      echo "  Or run this on a Windows CI runner with the native MSVC toolchain." >&2
-      exit 1
-    fi
-    cargo xwin build --release --target "$rust_target" --manifest-path "${SCRIPT_DIR}/Cargo.toml" --quiet
   else
     if ! command -v cross >/dev/null; then
       echo "ERROR: 'cross' not found. Install with:" >&2
@@ -90,13 +93,8 @@ build_target() {
     cross build --release --target "$rust_target" --manifest-path "${SCRIPT_DIR}/Cargo.toml" --quiet
   fi
 
-  cp "${SCRIPT_DIR}/target/${rust_target}/release/${artifact}" "${OUTPUT_DIR}/${output_name}"
+  cp "${SCRIPT_DIR}/target/${rust_target}/release/zucchini-spawner" "${OUTPUT_DIR}/${output_name}"
   echo "  -> ${OUTPUT_DIR}/${output_name}"
-
-  # TODO(windows): Authenticode-sign the .exe (signtool / osslsigncode) with the
-  # code-signing cert before publishing, so SmartScreen doesn't flag the
-  # download. The macOS codesign step below is the analogue; Windows signing is
-  # NOT implemented here.
 }
 
 for entry in $ALL_TARGETS; do
