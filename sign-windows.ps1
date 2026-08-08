@@ -25,8 +25,10 @@
 
   Until the three ENDPOINT/ACCOUNT/PROFILE vars are set, signing is SKIPPED with
   a warning so local builds still succeed — the binaries are just unsigned
-  (SmartScreen shows "unknown publisher"). Azure Trusted Signing is provisioned
-  but not yet ready as of Jul 2026.
+  (SmartScreen shows "unknown publisher"). Azure Trusted Signing is LIVE as of
+  Aug 2026 (account hayakutech / profile zucchini / endpoint neu; the vars are
+  persisted in this box's user env). NOTE the signing dlib is .NET-hosted, so the
+  box needs the .NET 8 runtime — without it signtool exits 3 with no output.
 
   Keep in lockstep with the twin copy native-qt/sign-windows.ps1 — two copies
   exist because this zucchini-spawner/ tree is published to a standalone public

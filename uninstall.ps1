@@ -31,10 +31,16 @@ function Info($msg) {
 # ---------- stop + remove the scheduled task ----------
 
 Info "Removing scheduled task ${ServiceName}..."
-# `Stop-ScheduledTask` is best-effort: the running instance is THIS process'
-# parent when invoked from the self-uninstall path, so it may already be gone.
-& schtasks.exe /End /TN $ServiceName *> $null
-& schtasks.exe /Delete /TN $ServiceName /F *> $null
+# Use the ScheduledTasks cmdlets, NOT schtasks.exe: the task may not exist (e.g.
+# a prior install that failed at Register-ScheduledTask), and `schtasks /End` on
+# a missing task writes to stderr + exits non-zero, which under
+# `$ErrorActionPreference='Stop'` (set above) becomes a TERMINATING error that
+# aborts the uninstall before it deletes the install dir — `*> $null` hides the
+# output but not the throw. `-ErrorAction SilentlyContinue` truly no-ops when the
+# task is absent. Stop is best-effort (the running instance may be this process'
+# parent on the self-uninstall path); Unregister does the actual removal.
+Stop-ScheduledTask       -TaskName $ServiceName -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName $ServiceName -Confirm:$false -ErrorAction SilentlyContinue
 
 # ---------- remove install dir ----------
 

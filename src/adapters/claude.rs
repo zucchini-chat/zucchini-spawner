@@ -1017,8 +1017,9 @@ pub(crate) async fn import(
         // Worktree sessions are tied to a transient checkout the user usually
         // cleans up; they'd land under a project the user never created.
         // Cleaner to skip them than to roll them up under the parent repo
-        // and re-import their messages on every future import.
-        if decoded.contains("/.claude/worktrees/") {
+        // and re-import their messages on every future import. The decoded
+        // path is host-native, so match both separators (Windows uses `\`).
+        if decoded.contains("/.claude/worktrees/") || decoded.contains("\\.claude\\worktrees\\") {
             info!(dir = %dir_name, "skipping worktree session transcripts");
             continue;
         }
@@ -1089,26 +1090,42 @@ fn claude_projects_dir() -> Option<std::path::PathBuf> {
     Some(crate::home_dir_opt()?.join(".claude").join("projects"))
 }
 
-/// Reverse the dirname encoding claude-code uses for cwd (every `/` replaced
-/// with `-`). Naive `replace('-', "/")` is lossy on segments that contain a
-/// literal `-` (e.g. `/Users/me/projects/berkshire-hathaway` round-trips to
-/// `/Users/me/projects/berkshire/hathaway`). We disambiguate by walking the
-/// real filesystem: at each step pick the longest prefix of remaining
-/// segments that resolves to an existing directory.
+/// Reverse the dirname encoding claude-code uses for cwd (every path separator
+/// replaced with `-`). Naive `replace('-', "/")` is lossy on segments that
+/// contain a literal `-` (e.g. `/Users/me/projects/berkshire-hathaway`
+/// round-trips to `/Users/me/projects/berkshire/hathaway`). We disambiguate by
+/// walking the real filesystem: at each step pick the longest prefix of
+/// remaining segments that resolves to an existing directory.
+///
+/// Two host encodings are handled, chosen by the shape of the name:
+///   - Unix:    `/Users/me/proj`   → `-Users-me-proj`   (leading `/` → leading `-`)
+///   - Windows: `C:\Users\me\proj` → `C--Users-me-proj` (the drive `:` and every
+///              `\` both map to `-`, so the `C:\` prefix becomes `C--`)
+/// The greedy longest-prefix walk is identical for both; only the root and the
+/// list of segments differ.
 ///
 /// Returns `None` when no walk reaches the leaf — usually because the project
 /// was deleted or moved after the transcript was written. Caller skips those.
 fn decode_project_dir(name: &str) -> Option<String> {
     let parts: Vec<&str> = name.split('-').collect();
-    // Encoded form starts with the leading '/', so the first split yields "".
-    if parts.first() != Some(&"") {
+
+    let (mut current, segments): (std::path::PathBuf, &[&str]) = if parts.first() == Some(&"") {
+        // Unix: the split before the leading '/' yields an empty first element.
+        (std::path::PathBuf::from("/"), &parts[1..])
+    } else if parts.len() >= 2
+        && parts[1].is_empty()
+        && parts[0].len() == 1
+        && parts[0].as_bytes()[0].is_ascii_alphabetic()
+    {
+        // Windows: `C`, `` (from the doubled dash of `:\`), then the segments.
+        (std::path::PathBuf::from(format!("{}:\\", parts[0])), &parts[2..])
+    } else {
         return None;
-    }
-    let segments = &parts[1..];
+    };
+
     if segments.is_empty() {
         return None;
     }
-    let mut current = std::path::PathBuf::from("/");
     let mut i = 0;
     while i < segments.len() {
         let mut matched: Option<usize> = None;
@@ -2137,6 +2154,44 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0], "ContextTokens(15)");
         assert!(events[1].starts_with("Frame("));
+    }
+
+    #[test]
+    fn decode_project_dir_roundtrips_real_dir_with_dashes() {
+        // Build a real directory tree, derive the exact name claude-code would
+        // encode for its cwd (every path separator + a Windows drive colon →
+        // '-'), and assert decode walks back to the original absolute path.
+        // The `berkshire-hathaway` component pins the greedy longest-prefix
+        // handling of a literal '-' inside a segment. Cross-platform by
+        // construction: the encoding is derived from the real host path, so
+        // this drives the Unix `/` root on Unix and the `C:\` drive root on
+        // Windows — the exact case that made every Windows import a silent
+        // no-op before the drive-aware branch.
+        let base = std::env::temp_dir().join(format!("zucc-decode-{}", std::process::id()));
+        let leaf = base.join("berkshire-hathaway").join("sub");
+        std::fs::create_dir_all(&leaf).unwrap();
+
+        let leaf_str = leaf.to_str().unwrap();
+        let encoded: String = leaf_str
+            .chars()
+            .map(|c| if c == '/' || c == '\\' || c == ':' { '-' } else { c })
+            .collect();
+
+        let decoded = decode_project_dir(&encoded).expect("decode should resolve a real dir");
+        assert_eq!(std::path::PathBuf::from(&decoded), leaf);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn decode_project_dir_rejects_unresolvable() {
+        // A drive-shaped name whose segments don't resolve on disk returns
+        // None (caller skips it), and a bare non-encoded name is rejected too.
+        assert_eq!(
+            decode_project_dir("Z--nope-does-not-exist-anywhere-42"),
+            None
+        );
+        assert_eq!(decode_project_dir("plainname"), None);
     }
 
     #[test]

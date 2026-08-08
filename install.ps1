@@ -31,6 +31,15 @@ $ErrorActionPreference = 'Stop'
 # and as `systemctl --user` WITHOUT loginctl linger.
 # ---------------------------------------------------------------------------
 
+# The whole body is wrapped in a function so this script is safe to run via
+# `irm … | iex` (the canonical web flow, and exactly what the app's Add-Machine
+# → Windows one-liner generates). `iex` evaluates the downloaded text as an
+# expression, where a TOP-LEVEL `param()` block is a parse error ("The name
+# 'param' is not recognized…") — so `param()` must live inside a function. The
+# call at the bottom uses `@args`, which forwards `-Code`/`-Key` for the direct
+# `.\install.ps1 -Code … -Key …` path and is empty on the `irm | iex` path (→
+# the env-var defaults). Keep the function's closing brace + the call last.
+function Invoke-ZucchiniSpawnerInstall {
 param(
   [string]$Code = $env:ZUCCHINI_CODE,
   [string]$Key  = $env:ZUCCHINI_KEY
@@ -78,14 +87,22 @@ $binaryName = "zucchini-spawner-windows-$platformArch"
 
 # ---------- remove a previous install (idempotent re-run) ----------
 
-& schtasks.exe /End /TN $ServiceName *> $null
-& schtasks.exe /Delete /TN $ServiceName /F *> $null
+# Use the ScheduledTasks cmdlets, NOT schtasks.exe: on a FRESH install the task
+# doesn't exist, and `schtasks /End` on a missing task writes to stderr + exits
+# non-zero, which under `$ErrorActionPreference='Stop'` (set above) becomes a
+# TERMINATING error that aborts the whole install — `*> $null` suppresses the
+# output but not the exit-code-driven throw. `-ErrorAction SilentlyContinue` on a
+# real cmdlet truly no-ops when the task is absent (idempotent re-run).
+Stop-ScheduledTask       -TaskName $ServiceName -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName $ServiceName -Confirm:$false -ErrorAction SilentlyContinue
 
 # ---------- exchange enrollment code for spawner token ----------
 
 Write-Host 'Enrolling machine...'
+# `os` lets clients tailor OS-specific UI for this machine (e.g. a Windows
+# drive-path project placeholder). Older backends ignore the extra field.
 $response = Invoke-RestMethod -Method Post -Uri "$BaseUrl/auth/spawner/complete" `
-  -ContentType 'application/json' -Body (@{ code = $Code } | ConvertTo-Json -Compress)
+  -ContentType 'application/json' -Body (@{ code = $Code; os = 'windows' } | ConvertTo-Json -Compress)
 
 $machineId    = $response.machine_id
 $userId       = $response.user_id
@@ -157,8 +174,14 @@ Write-Host 'Registering logon Scheduled Task...'
 $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
   -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcherPath`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# RunLevel MUST stay Limited (the default) — this is an unelevated per-user
+# logon agent (the launchd LaunchAgent / `systemctl --user` analogue). Asking
+# for `-RunLevel Highest` makes Register-ScheduledTask require an elevated
+# (admin) shell to even register the task — a non-admin PowerShell gets
+# "Access denied" (HRESULT 0x80070005). The spawner needs the interactive user
+# context, not elevation, so Limited is both correct and installable unelevated.
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
-  -LogonType Interactive -RunLevel Highest
+  -LogonType Interactive
 # Settings tuned to the launchd KeepAlive / systemd Restart=always intent:
 # restart on failure, never auto-expire, allow start on battery.
 $settings = New-ScheduledTaskSettingsSet `
@@ -180,3 +203,8 @@ Write-Host "  Stop:  schtasks /End /TN $ServiceName"
 Write-Host "  Start: schtasks /Run /TN $ServiceName"
 Write-Host ''
 Write-Host 'Done. The spawner is running and connected.'
+}
+
+# `@args` forwards `-Code`/`-Key` on the `.\install.ps1 …` path; empty (→ env
+# defaults) on `irm | iex`. See the wrapping note by the function definition.
+Invoke-ZucchiniSpawnerInstall @args

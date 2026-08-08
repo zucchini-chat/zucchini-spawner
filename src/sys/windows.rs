@@ -28,8 +28,9 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, TokenUser, ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
@@ -390,10 +391,18 @@ impl Drop for LocalAllocAcl {
 /// by [`LocalAllocAcl`]). Shared by [`harden_file`]/[`harden_dir`] so the
 /// owner-only intent is expressed once.
 ///
+/// `inheritance` is the ACE's `grfInheritance`: `NO_INHERITANCE` for a leaf
+/// secret file, `SUB_CONTAINERS_AND_OBJECTS_INHERIT` for a directory (see
+/// [`apply_owner_only_dacl`] for why a protected dir DACL MUST carry an
+/// inheritable ACE).
+///
 /// `token_buf` is the caller-owned backing storage for the `TOKEN_USER` the SID
 /// points into; it must outlive every use of the returned ACL (the ACE holds the
 /// SID pointer, which points into `token_buf`).
-fn build_owner_only_dacl(token_buf: &mut Vec<u8>) -> io::Result<LocalAllocAcl> {
+fn build_owner_only_dacl(
+    token_buf: &mut Vec<u8>,
+    inheritance: ACE_FLAGS,
+) -> io::Result<LocalAllocAcl> {
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: FFI. `GetCurrentProcess` returns a pseudo-handle that needs no
     // close; we open it for `TOKEN_QUERY` only.
@@ -431,7 +440,7 @@ fn build_owner_only_dacl(token_buf: &mut Vec<u8>) -> io::Result<LocalAllocAcl> {
     let explicit = EXPLICIT_ACCESS_W {
         grfAccessPermissions: GENERIC_ALL,
         grfAccessMode: SET_ACCESS,
-        grfInheritance: NO_INHERITANCE,
+        grfInheritance: inheritance,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
@@ -452,15 +461,24 @@ fn build_owner_only_dacl(token_buf: &mut Vec<u8>) -> io::Result<LocalAllocAcl> {
 }
 
 /// Apply a **protected** owner-only DACL to `path`. `PROTECTED_DACL_*` is the
-/// load-bearing flag: it disables ACL inheritance so the parent dir's
-/// (potentially permissive) ACEs don't merge back in — the protected DACL is the
-/// whole story, granting only the current user. This is the Windows realization
-/// of the unix `chmod 0600`/`0700` intent (a directory ACL works identically;
-/// child inheritance is exactly what the protected flag turns off), so
-/// `harden_file`/`harden_dir` share this one body.
-fn apply_owner_only_dacl(path: &Path) -> io::Result<()> {
+/// load-bearing flag: it disables inheritance *into* this object so the parent
+/// dir's (potentially permissive) ACEs don't merge back in — the protected DACL
+/// is the whole story, granting only the current user. This is the Windows
+/// realization of the unix `chmod 0600`/`0700` intent, so `harden_file`/
+/// `harden_dir` share this one body.
+///
+/// `inheritance` is the ACE's `grfInheritance` and it is NOT cosmetic on a
+/// directory: a *protected* DACL re-propagates to existing children, and if its
+/// sole ACE is `NO_INHERITANCE` that propagation strips the children's inherited
+/// ACEs and leaves them with **empty DACLs** (access denied to everyone,
+/// including the owner) — which bricked the install dir's `run.ps1`/`bin\`exe so
+/// the logon task couldn't start the spawner. So `harden_dir` MUST pass
+/// `SUB_CONTAINERS_AND_OBJECTS_INHERIT` (the owner grant then covers the dir and
+/// is inherited by every child and subdir, and re-hardening repairs a
+/// previously-emptied child); a leaf file passes `NO_INHERITANCE`.
+fn apply_owner_only_dacl(path: &Path, inheritance: ACE_FLAGS) -> io::Result<()> {
     let mut token_buf: Vec<u8> = Vec::new();
-    let dacl = build_owner_only_dacl(&mut token_buf)?;
+    let dacl = build_owner_only_dacl(&mut token_buf, inheritance)?;
 
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
@@ -496,14 +514,19 @@ impl Drop for TokenHandle {
 }
 
 /// Restrict a secret file to the current user only (the `chmod 0600` analogue).
+/// A leaf file needs no inheritable ACE, so it passes `NO_INHERITANCE`.
 pub fn harden_file(path: &Path) -> io::Result<()> {
-    apply_owner_only_dacl(path)
+    apply_owner_only_dacl(path, NO_INHERITANCE)
 }
 
 /// Restrict a directory to the current user only (the `chmod 0700` analogue) so
-/// its filenames don't leak to other local users.
+/// its filenames don't leak to other local users. Passes
+/// `SUB_CONTAINERS_AND_OBJECTS_INHERIT` (not `NO_INHERITANCE`) so the owner grant
+/// applies to the dir AND is inherited by every child file/subdir — without an
+/// inheritable ACE a protected dir DACL empties its children's DACLs (see
+/// [`apply_owner_only_dacl`]).
 pub fn harden_dir(path: &Path) -> io::Result<()> {
-    apply_owner_only_dacl(path)
+    apply_owner_only_dacl(path, SUB_CONTAINERS_AND_OBJECTS_INHERIT)
 }
 
 // ---------------------------------------------------------------------------
@@ -731,5 +754,37 @@ impl AsyncWrite for IpcStream {
             PipeEnd::Server(s) => Pin::new(s).poll_shutdown(cx),
             PipeEnd::Client(c) => Pin::new(c).poll_shutdown(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the empty-DACL brick: with the old `NO_INHERITANCE`
+    /// directory ACE, hardening the install dir left children with empty DACLs
+    /// (access denied to the owner). A file created *after* hardening must
+    /// inherit the owner-Full ACE and stay readable.
+    #[test]
+    fn harden_dir_leaves_new_children_readable() {
+        use std::io::{Read, Write};
+
+        let dir = std::env::temp_dir().join(format!("zucchini-harden-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let result = (|| -> io::Result<()> {
+            harden_dir(&dir)?;
+
+            let file = dir.join("child.txt");
+            std::fs::File::create(&file)?.write_all(b"zucchini")?;
+
+            let mut buf = Vec::new();
+            std::fs::File::open(&file)?.read_to_end(&mut buf)?;
+            assert_eq!(buf, b"zucchini");
+            Ok(())
+        })();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        result.expect("hardened dir must leave new children readable");
     }
 }
