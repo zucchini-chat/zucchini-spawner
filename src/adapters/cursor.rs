@@ -44,8 +44,8 @@ use tracing::{debug, warn};
 
 use crate::adapter::{
     agent_capabilities_instructions, claude_assistant_envelope, claude_tool_use_envelope,
-    current_time_in_tz_line, extract_json_type, parse_json_obj, shell_escape, AdapterDescriptor,
-    AgentAdapter, AgentEvent, AgentKind, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
+    extract_json_type, parse_json_obj, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent,
+    AgentKind, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
     PRUNE_CONTEXT_INSTRUCTION,
 };
 
@@ -168,24 +168,21 @@ impl AgentAdapter for CursorAdapter {
             }
         });
         // cursor-agent has no `--append-system-prompt` (or any other system /
-        // prompt-prefix flag — confirmed against `cursor-agent --help` 2026.05).
-        // a short preamble before the user's prompt body. `agent_capabilities_instructions`
-        // bundles the attach-file how-to, schedule-message, worktree containment,
-        // and the per-turn time line; we then append the prune-context standing
-        // order (cursor's selective-forgetting nudge — its reads run through
-        // `Read`, so the claude-shape `PRUNE_CONTEXT_INSTRUCTION` is the right
-        // variant, NOT the codex/gemini tool-name variants). The whole preamble
-        // rides every turn (not just the first, unlike codex/gemini's
-        // `first_turn_prompt_suffix`); cursor's `--resume` reconstructs history
-        // from the local store and drops our user-echo frame, so the preamble
-        // never persists and must be re-sent — hence `first_turn_prompt_suffix`
-        // stays `None` and the per-turn time line lives here too.
+        // prompt-prefix flag — confirmed against `cursor-agent --help` 2026.05), so
+        // the capabilities ride a short preamble before the user's prompt body.
+        // `agent_capabilities_instructions` bundles the attach-file how-to,
+        // schedule-message and worktree containment; we then append the
+        // prune-context standing order (cursor's selective-forgetting nudge — its
+        // reads run through `Read`, so the claude-shape `PRUNE_CONTEXT_INSTRUCTION`
+        // is the right variant, NOT the codex/gemini tool-name variants). The whole
+        // preamble rides every turn (not just the first, unlike codex/gemini's
+        // `first_turn_prompt_suffix`); cursor's `--resume` reconstructs history from
+        // the local store and drops our user-echo frame, so the preamble never
+        // persists and must be re-sent — hence `first_turn_prompt_suffix` stays
+        // `None`.
         let preamble = format!(
             "{}\n\n{}\n\n---\n\n",
-            agent_capabilities_instructions(
-                worktree_info.as_ref(),
-                current_time_in_tz_line(ctx.user_timezone).as_deref(),
-            ),
+            agent_capabilities_instructions(worktree_info.as_ref()),
             PRUNE_CONTEXT_INSTRUCTION
         );
         cmd.push_str(&format!(
@@ -244,13 +241,6 @@ impl AgentAdapter for CursorAdapter {
             // entirely — anything user-facing is cross-file from here.
         }
         Ok(cmd)
-    }
-
-    /// The current-local-time line is folded into the per-turn stdin preamble
-    /// (`agent_capabilities_instructions` in `prepare_command`), so suppress the
-    /// prompt-file prepend to avoid injecting it twice.
-    fn prompt_file_time_line(&self, _ctx: &TurnContext<'_>) -> Option<String> {
-        None
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {

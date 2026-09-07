@@ -1911,8 +1911,8 @@ mod tests {
     #[test]
     fn time_line_injected_on_resume_turn() {
         // Capability block is first-message-only, but the volatile time line must
-        // still land on a resumed turn (default `prompt_file_time_line` fires every
-        // turn regardless of session id).
+        // still land on a resumed turn (default `turn_time_line` fires every turn
+        // regardless of session id).
         let a = CodexAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
         // Resumed turn (Some session id) WITH a known tz.
@@ -1930,7 +1930,7 @@ mod tests {
             "resume still omits the once-only capability block"
         );
         let time_line = a
-            .prompt_file_time_line(&c)
+            .turn_time_line(c.user_timezone)
             .expect("time line present on resume turn when tz known");
         assert!(
             time_line.contains("America/Los_Angeles"),
@@ -1942,7 +1942,7 @@ mod tests {
             ..c
         };
         assert!(
-            a.prompt_file_time_line(&c_no_tz).is_none(),
+            a.turn_time_line(c_no_tz.user_timezone).is_none(),
             "no tz → no time line"
         );
     }

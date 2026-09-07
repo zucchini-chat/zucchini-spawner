@@ -293,10 +293,9 @@ pub struct SessionContext<'a> {
     pub is_sandboxed: bool,
     /// See `TurnContext::model`.
     pub model: Option<&'a str>,
-    /// See `TurnContext::user_timezone`. Folded into the resident session's
-    /// per-(re)spawn `--append-system-prompt` time line; refreshed on every
-    /// teardown + respawn (the resident process can't get a fresh time line
-    /// mid-session, so it's only as current as the last spawn).
+    /// See `TurnContext::user_timezone`. Read once per stdin turn to build that
+    /// turn's time line ([`AgentAdapter::turn_time_line`]) — never folded into the
+    /// session's system prompt, so every turn's time is current.
     pub user_timezone: Option<&'a str>,
 }
 
@@ -398,15 +397,20 @@ pub trait AgentAdapter: Send + Sync {
         None
     }
 
-    /// VOLATILE current-local-time line ([`current_time_in_tz_line`]) prepended
-    /// to the prompt-file plaintext EVERY turn (never the persisted row). Split
+    /// VOLATILE current-local-time line ([`current_time_in_tz_line`]) prepended to
+    /// the USER TURN every turn — the prompt-file plaintext on the one-shot path,
+    /// the stdin turn text on the resident path (never the persisted row). Split
     /// from [`Self::prompt_file_preamble`] (first-message-only) because the time
-    /// must be fresh each turn. Default returns it (correct for prepend-path
-    /// codex/gemini/hermes); claude/cursor fold it into their per-turn capability
-    /// block instead and override to `None` to avoid double-injection. `None` when
-    /// no tz is known.
-    fn prompt_file_time_line(&self, ctx: &TurnContext<'_>) -> Option<String> {
-        current_time_in_tz_line(ctx.user_timezone)
+    /// must be fresh each turn.
+    ///
+    /// It must ride the message, never a system prompt: the system block heads the
+    /// cacheable prefix, so a fresh timestamp there invalidates the whole
+    /// conversation's cache on every respawn. Appended as the newest message it
+    /// invalidates nothing.
+    ///
+    /// `None` when no tz is known.
+    fn turn_time_line(&self, user_timezone: Option<&str>) -> Option<String> {
+        current_time_in_tz_line(user_timezone)
     }
 
     /// Resident adapters (claude) run ONE process across many turns with stdin
@@ -658,37 +662,28 @@ pub fn worktree_instructions(worktree_abs: &str, parent_repo: &str) -> String {
 /// `--append-system-prompt`, cursor's stdin preamble, and the first-message
 /// prepend (codex/gemini/hermes, no system-prompt injection point). `worktree`
 /// is `Some` only when the turn runs in a worktree the agent must stay inside;
-/// `None` omits the rule. `time_line` rides along for claude/cursor (rebuilt
-/// fresh every turn). codex/gemini/hermes pass `None` here and inject the time
-/// line separately every turn (`agent.rs` `prompt_file_time_line`), since this
-/// static block reaches them only on turn 1.
-pub fn agent_capabilities_instructions(
-    worktree: Option<&WorktreeInstructions>,
-    time_line: Option<&str>,
-) -> String {
+/// `None` omits the rule. The volatile time line is NOT part of this block — see
+/// [`AgentAdapter::turn_time_line`].
+pub fn agent_capabilities_instructions(worktree: Option<&WorktreeInstructions>) -> String {
     let mut out = format!("{ATTACH_FILE_INSTRUCTION}\n\n{SCHEDULE_MESSAGE_INSTRUCTION}");
     if let Some(wt) = worktree {
         out.push_str("\n\n");
         out.push_str(&worktree_instructions(&wt.worktree_abs, &wt.parent_repo));
-    }
-    if let Some(line) = time_line {
-        out.push_str("\n\n");
-        out.push_str(line);
     }
     out
 }
 
 /// Shared `prompt_file_preamble` body for the prepend-path adapters
 /// (codex/gemini/hermes): no system-prompt injection point, worktree ignored,
-/// time line carried separately via `prompt_file_time_line`. Emits the static
+/// time line carried separately via `turn_time_line`. Emits the static
 /// capability block on the FIRST turn only (`agent_session_id.is_none()`), `None`
 /// on resume. Centralized so the first-turn gate can't drift between the three.
-/// `worktree`/`time_line` are both `None` here on purpose.
+/// `worktree` is `None` here on purpose.
 pub fn first_message_capabilities_preamble(ctx: &TurnContext<'_>) -> Option<String> {
     if ctx.agent_session_id.is_some() {
         return None;
     }
-    Some(agent_capabilities_instructions(None, None))
+    Some(agent_capabilities_instructions(None))
 }
 
 /// Already-resolved absolute worktree path + parent repo for
@@ -1131,19 +1126,6 @@ mod tests {
         // Unparseable IANA id → no line (no tz hint, not a bogus offset).
         assert!(current_time_in_tz_line(Some("Not/AZone")).is_none());
         assert!(current_time_in_tz_line(Some("")).is_none());
-    }
-
-    #[test]
-    fn capabilities_block_appends_time_line_when_present() {
-        // Time line lands when passed, absent otherwise.
-        let with = agent_capabilities_instructions(None, Some("CLOCK-MARKER"));
-        assert!(with.contains("CLOCK-MARKER"), "time line appended: {with}");
-        assert!(with.contains("attach-file"), "static block still present");
-        let without = agent_capabilities_instructions(None, None);
-        assert!(
-            !without.contains("CLOCK-MARKER"),
-            "no time line when None: {without}"
-        );
     }
 
     #[test]

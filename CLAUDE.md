@@ -24,6 +24,14 @@ The resident `claude` process lives only while a foreground turn **or** an in-pr
 
 **Running a Monitor / background task is perfectly fine** — it just keeps the resident warm until it completes. The only interaction to know about is with `prune-context`: applying a prune hard-restarts the resident (abort → rewrite jsonl → respawn-with-`--resume`), and the in-process task/Monitor runtime is **not** restored by `--resume`, so a prune would kill anything in flight. Therefore `prune-context` **REFUSES** when the session has live tasks (`live_tasks` non-empty) and tells the agent to wait or pass `--force`. The check reads a shared `live_sessions` directory (`agent.rs` `LiveSessions` — the same `SessionState` Arcs the reader mutates) at RPC time so the error reaches the agent synchronously (exit 1). A forced prune (or a same-instant race) names the terminated tasks in the respawn prompt so the kill is never silent.
 
+## Prompt-cache discipline: nothing volatile in the system prompt
+
+**Anything we inject per-spawn must ride the user turn, never the system prompt.** Every new message respawns the agent, and the system block sits at the head of the cacheable prefix — one changing byte there invalidates the cache for the entire conversation, which is then re-written at the 1.25x cache-write rate instead of read at 0.1x. On a long chat that costs roughly an order of magnitude of usage, growing with length.
+
+The one volatile per-turn injection is the current-local-time line, and it has a single source: `AgentAdapter::turn_time_line`, overridden by no adapter and consumed by **both** lifecycle paths through `agent.rs`'s shared `turn_text` — `spawn_agent`'s prompt file (one-shot) and `resident_turn_text`'s stdin frame (resident). `agent_capabilities_instructions` takes no time line, so a system prompt can't carry one.
+
+Guarded by `claude::tests::session_system_prompt_is_stable_across_respawns`. Before adding anything to a system prompt, ask whether it is identical on the next respawn — timestamps, counters, run ids and pids are not.
+
 ## Silent-startup retry
 
 A spawn (one-shot or resident) that produces ZERO stdout+stderr within `AGENT_STARTUP_TIMEOUT` (30s) is killed and retried once with a doubled deadline — but only when some agent has already started successfully since spawner boot (`ANY_AGENT_STARTED`) and no stderr was captured (`startup_retry_allowed`, `agent.rs`). That combination is the transient-stall signature (host overload/memory pressure — SPAWNER-13); anything else fails immediately: captured stderr is surfaced as the diagnostic, and first-ever-spawn silence gets the shell-config hint. The retry is only sound BEFORE the first output frame — a started agent may have side effects, so mid-turn deaths are never retried. Deterministic hangs cost one extra 60s attempt, never a loop.

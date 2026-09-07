@@ -17,10 +17,9 @@ use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::adapter::{
-    agent_capabilities_instructions, current_time_in_tz_line, file_nonempty,
-    probe_with_blocking_auth, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind,
-    LastTokensDedup, NativeSpawn, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
-    PRUNE_CONTEXT_INSTRUCTION,
+    agent_capabilities_instructions, file_nonempty, probe_with_blocking_auth, shell_escape,
+    AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, LastTokensDedup, NativeSpawn,
+    TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -154,7 +153,6 @@ fn claude_flag_args(
     agent_session_id: Option<&str>,
     is_sandboxed: bool,
     model: Option<&str>,
-    user_timezone: Option<&str>,
     resident: bool,
 ) -> Vec<ClaudeArg> {
     let mut args: Vec<ClaudeArg> = Vec::new();
@@ -193,12 +191,8 @@ fn claude_flag_args(
         }
     }
     sys.push_str("\n\n");
-    // Fold the per-turn time line into this fresh-every-turn block (hence the
-    // `prompt_file_time_line` override returns `None`); prune nudge appended after.
-    sys.push_str(&agent_capabilities_instructions(
-        worktree_info.as_ref(),
-        current_time_in_tz_line(user_timezone).as_deref(),
-    ));
+    // Must stay byte-stable across respawns — see `AgentAdapter::turn_time_line`.
+    sys.push_str(&agent_capabilities_instructions(worktree_info.as_ref()));
     sys.push_str("\n\n");
     sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
     args.push(ClaudeArg::Lit("--append-system-prompt"));
@@ -309,7 +303,6 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.agent_session_id,
             ctx.is_sandboxed,
             ctx.model,
-            ctx.user_timezone,
             /* resident = */ false,
         );
         push_posix_flags(&mut claude_cmd, &args);
@@ -325,7 +318,6 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.agent_session_id,
             ctx.is_sandboxed,
             ctx.model,
-            ctx.user_timezone,
             false,
         );
         Some(NativeSpawn {
@@ -334,13 +326,6 @@ impl AgentAdapter for ClaudeAdapter {
             cwd: ctx.project_path.map(std::path::PathBuf::from),
             prompt_stdin_file: Some(ctx.prompt_file.to_path_buf()),
         })
-    }
-
-    /// The current-local-time line is folded into the per-turn system prompt
-    /// (`agent_capabilities_instructions` in `append_claude_flags`), so suppress
-    /// the prompt-file prepend to avoid injecting it twice.
-    fn prompt_file_time_line(&self, _ctx: &TurnContext<'_>) -> Option<String> {
-        None
     }
 
     fn is_resident(&self) -> bool {
@@ -368,7 +353,6 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.agent_session_id,
             ctx.is_sandboxed,
             ctx.model,
-            ctx.user_timezone,
             /* resident = */ true,
         );
         push_posix_flags(&mut claude_cmd, &args);
@@ -387,7 +371,6 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.agent_session_id,
             ctx.is_sandboxed,
             ctx.model,
-            ctx.user_timezone,
             true,
         );
         Some(NativeSpawn {
@@ -1578,6 +1561,20 @@ mod tests {
         crate::adapter::stringify_events(adapter.handle_line(line.to_string()))
     }
 
+    /// Minimal resident `SessionContext` (mirrors `TurnContext::for_test`). Vary
+    /// a field via struct-update: `SessionContext { worktree: true, ..session_ctx() }`.
+    fn session_ctx() -> crate::adapter::SessionContext<'static> {
+        crate::adapter::SessionContext {
+            chat_id: "abcdef012345-6789",
+            project_path: Some("/tmp/proj"),
+            worktree: false,
+            agent_session_id: Some("sid-9"),
+            is_sandboxed: false,
+            model: Some("opus"),
+            user_timezone: Some("Asia/Bangkok"),
+        }
+    }
+
     #[test]
     fn init_frame_harvests_session_id_and_drops_frame() {
         let mut a = ClaudeAdapter::new();
@@ -1644,17 +1641,8 @@ mod tests {
 
     #[test]
     fn prepare_session_command_drops_prompt_pipe_and_adds_input_format() {
-        use crate::adapter::SessionContext;
         let mut a = ClaudeAdapter::new();
-        let ctx = SessionContext {
-            chat_id: "abcdef012345-6789",
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: Some("sid-9"),
-            is_sandboxed: false,
-            model: Some("opus"),
-            user_timezone: Some("Asia/Bangkok"),
-        };
+        let ctx = session_ctx();
         let cmd = a.prepare_session_command(&ctx).unwrap();
         // No prompt-file piping in the resident path.
         assert!(
@@ -1671,6 +1659,27 @@ mod tests {
         assert!(cmd.contains("prune-reminder-hook"), "got: {cmd}");
         // cd prefix retained.
         assert!(cmd.starts_with("cd '/tmp/proj' && claude"), "got: {cmd}");
+    }
+
+    /// Must stay byte-stable across respawns — see `AgentAdapter::turn_time_line`.
+    #[test]
+    fn session_system_prompt_is_stable_across_respawns() {
+        // `ctx.user_timezone` is set, yet neither the tz nor the time-line text
+        // may reach the command — that's what keeps the prefix stable, while the
+        // two-spawn equality only catches a same-second rebuild.
+        let ctx = session_ctx();
+        assert!(ctx.user_timezone.is_some());
+        let first = ClaudeAdapter::new().prepare_session_command(&ctx).unwrap();
+        let second = ClaudeAdapter::new().prepare_session_command(&ctx).unwrap();
+        assert!(
+            !first.contains("current local time"),
+            "no time line in the system prompt: {first}"
+        );
+        assert!(
+            !first.contains("Asia/Bangkok"),
+            "no timezone in the system prompt: {first}"
+        );
+        assert_eq!(first, second, "respawn must reproduce the same command");
     }
 
     #[test]
@@ -2171,17 +2180,8 @@ mod tests {
 
     #[test]
     fn prepare_session_native_holds_stdin_open() {
-        use crate::adapter::SessionContext;
         let mut a = ClaudeAdapter::new();
-        let ctx = SessionContext {
-            chat_id: "abcdef012345-6789",
-            project_path: Some("/tmp/proj"),
-            worktree: false,
-            agent_session_id: Some("sid-9"),
-            is_sandboxed: false,
-            model: Some("opus"),
-            user_timezone: Some("Asia/Bangkok"),
-        };
+        let ctx = session_ctx();
         let spawn = a
             .prepare_session_native(&ctx)
             .expect("claude offers a resident native recipe");

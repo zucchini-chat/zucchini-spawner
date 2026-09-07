@@ -157,18 +157,72 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
     }
 }
 
-/// First-turn user text: on the first turn of a brand-new session, append the
-/// adapter's `first_turn_prompt_suffix` (after a horizontal rule); later turns
-/// (and adapters with no suffix, e.g. claude) send the prompt verbatim. Used by
-/// `default_resident_spawn_fn` to build the first stdin frame.
-fn first_turn_text(
+const TURN_PART_SEPARATOR: &str = "\n\n---\n\n";
+
+/// User-turn text shared by both lifecycles: `time_line`, then `preamble`, then
+/// the prompt with `first_turn_suffix` appended after a horizontal rule. Absent
+/// parts are skipped.
+fn turn_text(
+    prompt: String,
+    first_turn_suffix: Option<&str>,
+    time_line: Option<String>,
+    preamble: Option<String>,
+) -> String {
+    let body = match first_turn_suffix {
+        Some(suffix) => format!("{prompt}\n\n---\n{suffix}"),
+        None => prompt,
+    };
+    let mut parts: Vec<String> = Vec::new();
+    parts.extend(time_line);
+    parts.extend(preamble);
+    parts.push(body);
+    parts.join(TURN_PART_SEPARATOR)
+}
+
+/// Resident stdin turn text, built by `default_resident_spawn_fn` for the first
+/// frame. `first_turn` == brand-new session (no resume id). The time line rides
+/// the turn rather than the system prompt — see `AgentAdapter::turn_time_line`.
+fn resident_turn_text(
     adapter: &dyn crate::adapter::AgentAdapter,
     prompt: String,
     first_turn: bool,
+    user_timezone: Option<&str>,
 ) -> String {
-    match adapter.first_turn_prompt_suffix() {
-        Some(suffix) if first_turn => format!("{prompt}\n\n---\n{suffix}"),
-        _ => prompt,
+    turn_text(
+        prompt,
+        first_turn
+            .then(|| adapter.first_turn_prompt_suffix())
+            .flatten(),
+        adapter.turn_time_line(user_timezone),
+        None,
+    )
+}
+
+#[cfg(test)]
+mod resident_turn_text_tests {
+    use super::*;
+    use crate::adapter::AgentKind;
+
+    #[test]
+    fn time_line_prefixes_the_resident_turn() {
+        let adapter = AgentKind::Claude.make_adapter();
+        let time_line = adapter
+            .turn_time_line(Some("Asia/Bangkok"))
+            .expect("known tz yields a line");
+        let text = resident_turn_text(
+            adapter.as_ref(),
+            "hello".to_string(),
+            false,
+            Some("Asia/Bangkok"),
+        );
+        assert_eq!(text, format!("{time_line}{TURN_PART_SEPARATOR}hello"));
+    }
+
+    #[test]
+    fn unknown_timezone_sends_the_prompt_verbatim() {
+        let adapter = AgentKind::Claude.make_adapter();
+        let text = resident_turn_text(adapter.as_ref(), "hello".to_string(), false, None);
+        assert_eq!(text, "hello");
     }
 }
 
@@ -718,17 +772,6 @@ fn default_spawn_fn(
             "spawning agent"
         );
 
-        // First turn only (`agent_session_id.is_none()`): append the adapter's
-        // prompt suffix after the user's text. See `first_turn_prompt_suffix`.
-        let prompt = if agent_session_id.is_none() {
-            match adapter.first_turn_prompt_suffix() {
-                Some(suffix) => format!("{prompt}\n\n---\n{suffix}"),
-                None => prompt,
-            }
-        } else {
-            prompt
-        };
-
         // Write prompt to a temp file so it never touches the shell command string
         let unique = format!(
             "{}-{}",
@@ -751,19 +794,18 @@ fn default_spawn_fn(
             user_timezone: user_timezone.as_deref(),
         };
 
-        // Prepend the adapter's prompt-file prefixes (contracts on
-        // `AgentAdapter::prompt_file_time_line` / `prompt_file_preamble`) ONLY into
-        // the plaintext temp file, never the synced/persisted `messages` row.
-        // Injection order: volatile time line, once-only preamble, then the message.
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(time_line) = adapter.prompt_file_time_line(&ctx) {
-            parts.push(time_line);
-        }
-        if let Some(preamble) = adapter.prompt_file_preamble(&ctx) {
-            parts.push(preamble);
-        }
-        parts.push(prompt);
-        let prompt_to_write = parts.join("\n\n---\n\n");
+        // The adapter's prefixes (contracts on `AgentAdapter::turn_time_line` /
+        // `prompt_file_preamble`) and the first-turn suffix land ONLY in the
+        // plaintext temp file, never in the synced/persisted `messages` row.
+        let prompt_to_write = turn_text(
+            prompt,
+            ctx.agent_session_id
+                .is_none()
+                .then(|| adapter.first_turn_prompt_suffix())
+                .flatten(),
+            adapter.turn_time_line(ctx.user_timezone),
+            adapter.prompt_file_preamble(&ctx),
+        );
         if let Err(e) = tokio::fs::write(&prompt_file, &prompt_to_write).await {
             error!("failed to write prompt file: {}", e);
             fail_agent(
@@ -1168,7 +1210,8 @@ fn default_resident_spawn_fn(
         // is a brand-new session — no resume id), queued the instant the process
         // is up. Computed once — a startup-timeout retry re-sends the same frame.
         let first_turn = agent_session_id.is_none();
-        let first_text = first_turn_text(adapter.as_ref(), prompt, first_turn);
+        let first_text =
+            resident_turn_text(adapter.as_ref(), prompt, first_turn, ctx.user_timezone);
         let first_frame = adapter.encode_user_turn(&first_text);
         // The mpsc receiver goes to the FIRST attempt's writer; a retry writer
         // holds stdin open until aborted instead (see `spawn_stdin_writer`).

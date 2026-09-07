@@ -43,10 +43,10 @@
 //!   `chats.agent_session_id` on resume.
 //! - pi HAS `--append-system-prompt` (unlike gemini), so capabilities ride a
 //!   real system prompt every turn (claude-style) rather than the first-message
-//!   prepend path. `prompt_file_preamble` already defaults to `None` (so the
-//!   capability block isn't double-injected); we additionally override
-//!   `prompt_file_time_line` to `None` (its default returns the time line) so the
-//!   time isn't prepended on top of the system-prompt path either.
+//!   prepend path; `prompt_file_preamble` stays at its `None` default so the
+//!   capability block isn't double-injected. The per-turn time line is separate:
+//!   it rides the prompt file via the default `turn_time_line`, never the
+//!   system prompt.
 //!
 //! Frame mapping (pi `--mode json` → claude-shape), observed empirically:
 //!
@@ -141,10 +141,9 @@ use uuid::Uuid;
 
 use crate::adapter::{
     agent_capabilities_instructions, claude_assistant_text_envelope, claude_tool_use_envelope,
-    current_time_in_tz_line, extract_json_type, file_nonempty, parse_json_obj,
-    probe_with_blocking_auth, shell_escape, worktree_cwd_prefix, AdapterDescriptor, AgentAdapter,
-    AgentEvent, AgentKind, ImportProgress, LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES,
-    PRUNE_CONTEXT_INSTRUCTION,
+    extract_json_type, file_nonempty, parse_json_obj, probe_with_blocking_auth, shell_escape,
+    worktree_cwd_prefix, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, ImportProgress,
+    LastTokensDedup, TurnContext, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION,
 };
 use crate::adapters::import_shared::{
     basename_or, collapse_title, emit_chat, is_synthetic_wrapper, mint_project_id,
@@ -265,34 +264,23 @@ impl AgentAdapter for PiAdapter {
         }
 
         // Capabilities ride `--append-system-prompt` every turn (claude-style):
-        // attach-file + schedule-message + the fresh per-turn time line, then the
-        // standing prune-context nudge. The first
-        // `agent_capabilities_instructions` arg is the worktree-containment block
-        // and is INTENTIONALLY `None` here: when worktree mode is on, pi already
-        // runs with the worktree AS cwd (see the cwd selection above), so the
-        // "stay inside the worktree" guidance claude needs (its `--worktree`
-        // doesn't make cwd obvious) is unnecessary for pi. The CLAUDE-shape
+        // attach-file + schedule-message, then the standing prune-context nudge.
+        // Must stay byte-stable across respawns — see
+        // `AgentAdapter::turn_time_line`. The worktree-containment block is
+        // INTENTIONALLY `None` here: when worktree mode is on, pi already runs
+        // with the worktree AS cwd (see the cwd selection above), so the "stay
+        // inside the worktree" guidance claude needs (its `--worktree` doesn't
+        // make cwd obvious) is unnecessary for pi. The CLAUDE-shape
         // `PRUNE_CONTEXT_INSTRUCTION` is correct here: pi maps its tool names to
         // claude names on the wire AND the prune CLI takes claude-shape
         // `--tool-name`, so the Read/Bash examples match what the user types — the
         // nudge is appended after, exactly like claude.
-        let mut sys = agent_capabilities_instructions(
-            None,
-            current_time_in_tz_line(ctx.user_timezone).as_deref(),
-        );
+        let mut sys = agent_capabilities_instructions(None);
         sys.push_str("\n\n");
         sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
         cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
 
         Ok(cmd)
-    }
-
-    /// Capabilities go via `--append-system-prompt` (built in `prepare_command`),
-    /// not the first-message prepend path. `prompt_file_preamble` already defaults
-    /// to `None`; override the time line to `None` too (its default prepends the
-    /// current-time line) so nothing rides the prompt-file prepend path.
-    fn prompt_file_time_line(&self, _ctx: &TurnContext<'_>) -> Option<String> {
-        None
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
