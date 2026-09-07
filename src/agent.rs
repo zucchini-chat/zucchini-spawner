@@ -159,61 +159,74 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
 
 const TURN_PART_SEPARATOR: &str = "\n\n---\n\n";
 
-/// User-turn text shared by both lifecycles: `time_line`, then `preamble`, then
-/// the prompt with `first_turn_suffix` appended after a horizontal rule. Absent
-/// parts are skipped.
+/// An expanding CLI (`AgentAdapter::expands_slash_commands`) runs a slash
+/// command only when the turn STARTS with it, so such a turn ships verbatim —
+/// whole prompt, no time line, preamble or first-turn suffix (an expanding CLI
+/// swallows a trailing suffix as the command's arguments). Only the first token
+/// of the first line is inspected: `/compact`, `/plugin:cmd args` and `/tmp`
+/// match; `/Users/...` does not, its `/` disqualifying the name. A turn carrying
+/// attachments never matches — `blobs::build_prompt` puts the file list first —
+/// which mirrors the `attachments.is_empty()` gate on `/stop` in `main.rs`.
+fn is_slash_command(prompt: &str) -> bool {
+    // Claude matches on `value.trim().startsWith("/")`, so leading blanks must
+    // not defeat us either.
+    let first_line = prompt.trim_start().lines().next().unwrap_or("");
+    let Some(rest) = first_line.strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split(char::is_whitespace).next().unwrap_or("");
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+}
+
+/// User-turn text shared by both lifecycles: the time line, then `preamble`,
+/// then the prompt with the adapter's first-turn suffix appended after a
+/// horizontal rule. Absent parts are skipped. `first_turn` == brand-new session
+/// (no resume id). The time line rides the turn rather than the system prompt —
+/// see `AgentAdapter::turn_time_line`.
 fn turn_text(
+    adapter: &dyn crate::adapter::AgentAdapter,
     prompt: String,
-    first_turn_suffix: Option<&str>,
-    time_line: Option<String>,
+    first_turn: bool,
+    user_timezone: Option<&str>,
     preamble: Option<String>,
 ) -> String {
-    let body = match first_turn_suffix {
+    if adapter.expands_slash_commands() && is_slash_command(&prompt) {
+        return prompt;
+    }
+    let suffix = first_turn
+        .then(|| adapter.first_turn_prompt_suffix())
+        .flatten();
+    let body = match suffix {
         Some(suffix) => format!("{prompt}\n\n---\n{suffix}"),
         None => prompt,
     };
     let mut parts: Vec<String> = Vec::new();
-    parts.extend(time_line);
+    parts.extend(adapter.turn_time_line(user_timezone));
     parts.extend(preamble);
     parts.push(body);
     parts.join(TURN_PART_SEPARATOR)
 }
 
-/// Resident stdin turn text, built by `default_resident_spawn_fn` for the first
-/// frame. `first_turn` == brand-new session (no resume id). The time line rides
-/// the turn rather than the system prompt — see `AgentAdapter::turn_time_line`.
-fn resident_turn_text(
-    adapter: &dyn crate::adapter::AgentAdapter,
-    prompt: String,
-    first_turn: bool,
-    user_timezone: Option<&str>,
-) -> String {
-    turn_text(
-        prompt,
-        first_turn
-            .then(|| adapter.first_turn_prompt_suffix())
-            .flatten(),
-        adapter.turn_time_line(user_timezone),
-        None,
-    )
-}
-
 #[cfg(test)]
-mod resident_turn_text_tests {
+mod turn_text_tests {
     use super::*;
     use crate::adapter::AgentKind;
 
     #[test]
-    fn time_line_prefixes_the_resident_turn() {
+    fn time_line_prefixes_the_turn() {
         let adapter = AgentKind::Claude.make_adapter();
         let time_line = adapter
             .turn_time_line(Some("Asia/Bangkok"))
             .expect("known tz yields a line");
-        let text = resident_turn_text(
+        let text = turn_text(
             adapter.as_ref(),
             "hello".to_string(),
             false,
             Some("Asia/Bangkok"),
+            None,
         );
         assert_eq!(text, format!("{time_line}{TURN_PART_SEPARATOR}hello"));
     }
@@ -221,8 +234,51 @@ mod resident_turn_text_tests {
     #[test]
     fn unknown_timezone_sends_the_prompt_verbatim() {
         let adapter = AgentKind::Claude.make_adapter();
-        let text = resident_turn_text(adapter.as_ref(), "hello".to_string(), false, None);
+        let text = turn_text(adapter.as_ref(), "hello".to_string(), false, None, None);
         assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn slash_command_turns_are_verbatim_so_the_cli_expands_them() {
+        let adapter = AgentKind::Claude.make_adapter();
+        for prompt in ["/compact", "/compact keep the plan", "/plugin:cmd"] {
+            let text = turn_text(
+                adapter.as_ref(),
+                prompt.to_string(),
+                true,
+                Some("Asia/Bangkok"),
+                Some("PREAMBLE".to_string()),
+            );
+            assert_eq!(text, prompt);
+        }
+    }
+
+    /// The verbatim path would cost a non-expanding adapter its one-per-chat
+    /// capabilities preamble (and codex's prune suffix) for no slash expansion
+    /// at all — this is the only call shape where those parts are ever `Some`.
+    #[test]
+    fn a_slash_command_keeps_every_part_for_a_non_expanding_adapter() {
+        let adapter = AgentKind::Codex.make_adapter();
+        let suffix = adapter
+            .first_turn_prompt_suffix()
+            .expect("codex sets a first-turn suffix");
+        let text = turn_text(
+            adapter.as_ref(),
+            "/init".to_string(),
+            true,
+            Some("Asia/Bangkok"),
+            Some("PREAMBLE".to_string()),
+        );
+        assert!(text.contains("PREAMBLE"), "{text}");
+        assert!(text.contains(suffix), "{text}");
+        assert!(text.contains("current local time"), "{text}");
+    }
+
+    #[test]
+    fn slash_command_matching_edges() {
+        assert!(is_slash_command(" /compact"));
+        assert!(!is_slash_command("/Users/ivan/notes.txt what is this?"));
+        assert!(!is_slash_command("/ compact"));
     }
 }
 
@@ -798,12 +854,10 @@ fn default_spawn_fn(
         // `prompt_file_preamble`) and the first-turn suffix land ONLY in the
         // plaintext temp file, never in the synced/persisted `messages` row.
         let prompt_to_write = turn_text(
+            adapter.as_ref(),
             prompt,
-            ctx.agent_session_id
-                .is_none()
-                .then(|| adapter.first_turn_prompt_suffix())
-                .flatten(),
-            adapter.turn_time_line(ctx.user_timezone),
+            ctx.agent_session_id.is_none(),
+            ctx.user_timezone,
             adapter.prompt_file_preamble(&ctx),
         );
         if let Err(e) = tokio::fs::write(&prompt_file, &prompt_to_write).await {
@@ -1210,8 +1264,13 @@ fn default_resident_spawn_fn(
         // is a brand-new session — no resume id), queued the instant the process
         // is up. Computed once — a startup-timeout retry re-sends the same frame.
         let first_turn = agent_session_id.is_none();
-        let first_text =
-            resident_turn_text(adapter.as_ref(), prompt, first_turn, ctx.user_timezone);
+        let first_text = turn_text(
+            adapter.as_ref(),
+            prompt,
+            first_turn,
+            ctx.user_timezone,
+            None,
+        );
         let first_frame = adapter.encode_user_turn(&first_text);
         // The mpsc receiver goes to the FIRST attempt's writer; a retry writer
         // holds stdin open until aborted instead (see `spawn_stdin_writer`).

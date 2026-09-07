@@ -30,6 +30,8 @@ The resident `claude` process lives only while a foreground turn **or** an in-pr
 
 The one volatile per-turn injection is the current-local-time line, and it has a single source: `AgentAdapter::turn_time_line`, overridden by no adapter and consumed by **both** lifecycle paths through `agent.rs`'s shared `turn_text` — `spawn_agent`'s prompt file (one-shot) and `resident_turn_text`'s stdin frame (resident). `agent_capabilities_instructions` takes no time line, so a system prompt can't carry one.
 
+One exception rides along in `turn_text`: for an adapter that sets `expands_slash_commands` (claude only), a turn starting with a slash command (`/compact`, `/clear`, …) ships **verbatim** — no time line, preamble or first-turn suffix — because the CLI expands a slash command only when the turn starts with it, and anything prepended turns it into plain text the model answers instead of running. The gate matters: for the other adapters the same bypass would drop the once-per-chat capabilities preamble (`first_message_capabilities_preamble` is first-turn-only) and never be repaid with an expansion.
+
 Guarded by `claude::tests::session_system_prompt_is_stable_across_respawns`. Before adding anything to a system prompt, ask whether it is identical on the next respawn — timestamps, counters, run ids and pids are not.
 
 ## Silent-startup retry

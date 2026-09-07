@@ -485,6 +485,17 @@ pub trait AgentAdapter: Send + Sync {
         None
     }
 
+    /// Whether the CLI expands a leading `/command` in a non-interactive turn.
+    /// Only then may `agent.rs::turn_text` ship such a turn verbatim; every
+    /// other adapter would drop its time line, preamble and first-turn suffix
+    /// for nothing. Gemini expands too, but its capabilities preamble is
+    /// emitted ONCE per chat (`first_message_capabilities_preamble`), so a
+    /// `/cmd` first message would cost that chat attach-file/schedule-message/
+    /// prune for good — a bad trade, so it stays `false`.
+    fn expands_slash_commands(&self) -> bool {
+        false
+    }
+
     /// Called once after the agent process for a turn has fully exited (so any
     /// on-disk transcript is closed and flushed), just before the Supervisor
     /// emits `Done`. Lets an adapter publish a corrected context-token reading
@@ -631,15 +642,26 @@ pub const SCHEDULE_MESSAGE_INSTRUCTION: &str =
 /// absent or unknown — the caller omits the line (`SCHEDULE_MESSAGE_INSTRUCTION`
 /// still works, just no tz hint). MUST be recomputed every turn (embeds `Utc::now()`).
 pub fn current_time_in_tz_line(iana_tz: Option<&str>) -> Option<String> {
+    time_in_tz_line_at(chrono::Utc::now(), iana_tz)
+}
+
+/// The instant is a parameter so tests can pin the whole line against a fixed
+/// one — a live clock can't tell a zone-local weekday from a UTC one.
+fn time_in_tz_line_at(
+    now_utc: chrono::DateTime<chrono::Utc>,
+    iana_tz: Option<&str>,
+) -> Option<String> {
     let tz = iana_tz?.parse::<chrono_tz::Tz>().ok()?;
-    let now = chrono::Utc::now().with_timezone(&tz);
+    let now = now_utc.with_timezone(&tz);
     // Naive wall-clock (no `±HH:MM`/`Z`) — exactly what `schedule-message --at`
     // wants echoed back; an offset here only invites wrong offset math. The
-    // `(timezone: …)` suffix carries zone identity; the spawner does the
-    // offset/DST in `normalize_deliver_at`.
+    // parenthetical carries zone identity plus the weekday (agents derive
+    // day-of-week from a date unreliably); the spawner does the offset/DST in
+    // `normalize_deliver_at`.
     Some(format!(
-        "The user's current local time is {} (timezone: {}).",
+        "The user's current local time is {} ({}, timezone: {}).",
         now.format("%Y-%m-%dT%H:%M:%S"),
+        now.format("%A"),
         tz.name(),
     ))
 }
@@ -1101,21 +1123,14 @@ mod tests {
 
     #[test]
     fn current_time_line_known_tz_is_naive_wall_clock() {
-        // Known IANA id → line names the zone + carries a NAIVE wall-clock (no
-        // offset), the shape the agent echoes to `schedule-message --at`.
-        let line = current_time_in_tz_line(Some("America/Los_Angeles"))
-            .expect("known IANA id yields a line");
-        assert!(
-            line.contains("America/Los_Angeles"),
-            "line names the timezone: {line}"
-        );
-        // No signed `±HH:MM` offset and no `Z` — the timestamp is bare local time.
-        assert!(
-            !line.contains("+00:00")
-                && !line.contains("-08:00")
-                && !line.contains("-07:00")
-                && !line.contains('Z'),
-            "line must carry no UTC offset: {line}"
+        // An instant whose UTC and zone-local dates straddle midnight, so the
+        // line can only match if the date AND the weekday come from the
+        // tz-converted value. Naive wall clock: no `±HH:MM`, no `Z`.
+        use chrono::TimeZone;
+        let instant = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 3, 0, 0).unwrap();
+        assert_eq!(
+            time_in_tz_line_at(instant, Some("America/Los_Angeles")).expect("known IANA id"),
+            "The user's current local time is 2025-12-31T19:00:00 (Wednesday, timezone: America/Los_Angeles)."
         );
     }
 

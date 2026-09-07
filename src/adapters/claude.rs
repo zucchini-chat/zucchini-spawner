@@ -332,6 +332,10 @@ impl AgentAdapter for ClaudeAdapter {
         true
     }
 
+    fn expands_slash_commands(&self) -> bool {
+        true
+    }
+
     fn prepare_session_command(
         &mut self,
         ctx: &crate::adapter::SessionContext<'_>,
@@ -2231,9 +2235,7 @@ mod tests {
         fn prunes_skill_ack_and_expansion_body() {
             let big = "MODEL claude-opus-4-8 ".repeat(50);
             let f = write_jsonl(&[
-                &format!(
-                    r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"sk1","name":"Skill","input":{{"skill":"claude-api","args":""}}}}]}},"uuid":"a1"}}"#
-                ),
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"sk1","name":"Skill","input":{"skill":"claude-api","args":""}}]},"uuid":"a1"}"#,
                 r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"sk1","content":"Running claude-api skill"}]},"uuid":"u1"}"#,
                 &format!(
                     r#"{{"type":"user","isMeta":true,"sourceToolUseID":"sk1","message":{{"content":[{{"type":"text","text":"{big}"}}]}},"uuid":"u2"}}"#

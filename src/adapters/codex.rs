@@ -1823,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_command_worktree_first_turn_creates_cds_and_C_points_at_worktree() {
+    fn prepare_command_worktree_first_turn_creates_cds_and_dash_c_points_at_worktree() {
         let prompt_file = PathBuf::from("/tmp/p.txt");
         let wt_esc = worktree_path_esc();
         // BOTH branches (sandboxed read-only + non-sandboxed bypass) emit `-C` on
@@ -1860,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_command_worktree_resume_cds_no_create_no_C() {
+    fn prepare_command_worktree_resume_cds_no_create_no_dash_c() {
         let mut a = CodexAdapter::new();
         let prompt_file = PathBuf::from("/tmp/p.txt");
         let wt_esc = worktree_path_esc();
