@@ -197,10 +197,12 @@ fn claude_flag_args(
     sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
     args.push(ClaudeArg::Lit("--append-system-prompt"));
     args.push(ClaudeArg::Val(sys));
-    // Resident: read user/control turns from the held-open stdin pipe.
+    // Resident: read user/control turns from the held-open stdin pipe, and echo
+    // each one back when consumed (`UserTurnConsumed` drives the session FSM).
     if resident {
         args.push(ClaudeArg::Lit("--input-format"));
         args.push(ClaudeArg::Lit("stream-json"));
+        args.push(ClaudeArg::Lit("--replay-user-messages"));
     }
     args.push(ClaudeArg::Lit("--print"));
     args.push(ClaudeArg::Lit("--verbose"));
@@ -385,12 +387,13 @@ impl AgentAdapter for ClaudeAdapter {
         })
     }
 
-    fn encode_user_turn(&self, text: &str) -> String {
+    fn encode_user_turn(&self, uuid: &str, text: &str) -> String {
         // Build via serde so the user's text (quotes / newlines / control chars)
         // is encoded safely — never string concat. Newline-terminated: claude's
         // stream-json input is newline-delimited frames.
         let frame = serde_json::json!({
             "type": "user",
+            "uuid": uuid,
             "message": {
                 "role": "user",
                 "content": [{ "type": "text", "text": text }],
@@ -525,6 +528,14 @@ impl AgentAdapter for ClaudeAdapter {
                 }
                 skip = true;
             } else if line.contains("\"type\":\"user\"") {
+                // `--replay-user-messages` echo of a stdin frame we wrote: claude
+                // has consumed that turn. Never rendered — the user's own message
+                // row already exists.
+                if line.contains("\"isReplay\":true") {
+                    if let Some(uuid) = parse_replay_uuid(&line) {
+                        out.push(AgentEvent::UserTurnConsumed(uuid));
+                    }
+                }
                 // User frames are never rendered — but a `tool_result` user frame
                 // is claude's signal that it has PERSISTED a finished tool call's
                 // result. Emit a content-free `ToolResult` cue (still skipping the
@@ -553,6 +564,8 @@ impl AgentAdapter for ClaudeAdapter {
                 skip = true;
             } else if line.contains("\"type\":\"stream_event\"")
                 || line.contains("\"type\":\"rate_limit_event\"")
+                // Queue bookkeeping emitted only under `--replay-user-messages`.
+                || line.contains("\"type\":\"command_lifecycle\"")
                 || (line.contains("\"type\":\"assistant\"")
                     && !line.contains("\"type\":\"text\"")
                     && !line.contains("\"type\":\"tool_use\""))
@@ -602,6 +615,14 @@ impl AgentAdapter for ClaudeAdapter {
 
         out
     }
+}
+
+fn parse_replay_uuid(line: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Replay {
+        uuid: String,
+    }
+    serde_json::from_str::<Replay>(line).ok().map(|r| r.uuid)
 }
 
 /// Cumulative for the current turn — caller overwrites `chats.context_tokens`
@@ -1575,7 +1596,6 @@ mod tests {
             agent_session_id: Some("sid-9"),
             is_sandboxed: false,
             model: Some("opus"),
-            user_timezone: Some("Asia/Bangkok"),
         }
     }
 
@@ -1585,6 +1605,25 @@ mod tests {
         let line = r#"{"type":"system","subtype":"init","session_id":"abc-123","model":"sonnet"}"#;
         let events = run(&mut a, line);
         assert_eq!(events, vec!["SessionIdHarvested(abc-123)"]);
+    }
+
+    /// Real claude 2.1.265 shape (tmp/claude_stdin_probe.py): the echo carries
+    /// the uuid we stamped and must not become a message row.
+    #[test]
+    fn replay_echo_emits_user_turn_consumed_and_drops_frame() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Also, reply with BANANA."}]},"session_id":"s1","parent_tool_use_id":null,"uuid":"11111111-2222-3333-4444-555555555555","timestamp":"2026-09-10T10:00:00.000Z","isReplay":true}"#;
+        assert_eq!(
+            run(&mut a, line),
+            vec!["UserTurnConsumed(11111111-2222-3333-4444-555555555555)"]
+        );
+    }
+
+    #[test]
+    fn command_lifecycle_frame_is_dropped() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"command_lifecycle","command_uuid":"01a08b19-5a10-7bf2-a142-2dd72f212045","state":"queued","uuid":"20832165-4c87-43cf-b694-bb2c0b58bce5","session_id":"s1"}"#;
+        assert!(run(&mut a, line).is_empty());
     }
 
     #[test]
@@ -1631,10 +1670,11 @@ mod tests {
     #[test]
     fn encode_user_turn_is_valid_json_with_trailing_newline() {
         let a = ClaudeAdapter::new();
-        let frame = a.encode_user_turn("hello \"world\"\nwith newline");
+        let frame = a.encode_user_turn("u-1", "hello \"world\"\nwith newline");
         assert!(frame.ends_with('\n'), "frame must be newline-terminated");
         let v: serde_json::Value = serde_json::from_str(frame.trim_end()).unwrap();
         assert_eq!(v["type"], "user");
+        assert_eq!(v["uuid"], "u-1");
         assert_eq!(v["message"]["role"], "user");
         assert_eq!(v["message"]["content"][0]["type"], "text");
         assert_eq!(
@@ -1655,6 +1695,7 @@ mod tests {
         );
         // Reads turns from stdin.
         assert!(cmd.contains("--input-format stream-json"), "got: {cmd}");
+        assert!(cmd.contains("--replay-user-messages"), "got: {cmd}");
         assert!(cmd.contains("--output-format stream-json"), "got: {cmd}");
         // Resume + model + sandbox bypass + prune hook all preserved.
         assert!(cmd.contains("--resume 'sid-9'"), "got: {cmd}");
@@ -1668,20 +1709,14 @@ mod tests {
     /// Must stay byte-stable across respawns — see `AgentAdapter::turn_time_line`.
     #[test]
     fn session_system_prompt_is_stable_across_respawns() {
-        // `ctx.user_timezone` is set, yet neither the tz nor the time-line text
-        // may reach the command — that's what keeps the prefix stable, while the
-        // two-spawn equality only catches a same-second rebuild.
+        // The two-spawn equality only catches a same-second rebuild; the
+        // time-line check catches the clock itself.
         let ctx = session_ctx();
-        assert!(ctx.user_timezone.is_some());
         let first = ClaudeAdapter::new().prepare_session_command(&ctx).unwrap();
         let second = ClaudeAdapter::new().prepare_session_command(&ctx).unwrap();
         assert!(
             !first.contains("current local time"),
             "no time line in the system prompt: {first}"
-        );
-        assert!(
-            !first.contains("Asia/Bangkok"),
-            "no timezone in the system prompt: {first}"
         );
         assert_eq!(first, second, "respawn must reproduce the same command");
     }

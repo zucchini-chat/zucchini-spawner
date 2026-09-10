@@ -9,16 +9,17 @@
 //!
 //! Each `spawn_agent` call constructs a fresh adapter, hands it to the spawned
 //! task, and discards it when the turn ends.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex as StdMutex,
 };
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::adapter::{AgentEvent, AgentKind, TurnContext};
 use crate::envelope::{EnvelopeAttachment, MessageEnvelope};
@@ -86,26 +87,52 @@ fn startup_timeout_message(timeout: Duration, retried: bool) -> String {
 /// task as `AgentEvent`s arrive and read by the Supervisor to answer
 /// `is_running`. Only `running` crosses the wire (the boolean
 /// `chats.agent_running`, true the whole time the agent is busy):
-///   - `running = turn_in_flight || !live_tasks.is_empty()`
-///   - `waiting = !turn_in_flight && !live_tasks.is_empty()`
+///   - `running = turn_in_flight || !unconsumed.is_empty() || !live_tasks.is_empty()`
+///   - `waiting = running && !turn_in_flight && unconsumed.is_empty()`
 ///
-/// i.e. Thinking = turn in flight; Waiting = no turn but a background task
-/// (monitor / `run_in_background`) is still armed; Idle = neither. `running`
+/// i.e. Thinking = a turn in flight or queued; Waiting = only a background task
+/// (monitor / `run_in_background`) is still armed; Idle = none. `running`
 /// stays true across BOTH Thinking and Waiting, so the wire never distinguishes
 /// them — `waiting()` documents the FSM contract for tests only; the
 /// Thinking-vs-Waiting label is re-derived on the client.
+///
+/// A queued turn stays `unconsumed` until claude echoes it: written mid-turn it
+/// is answered by the running turn's single `result`; written after the last
+/// tool call it runs as its own turn after that `result` — which therefore
+/// can't end the busy state while the turn is still unconsumed.
 #[derive(Debug, Default, Clone)]
 pub struct SessionState {
-    /// A user turn is in flight: set when we write a user frame, cleared on the
-    /// user-turn's own `result` (origin absent — `Result{origin_is_task:false}`).
+    /// A consumed user turn is in flight: set on its `UserTurnConsumed` echo,
+    /// cleared on a user-turn `result` (origin absent — `Result{origin_is_task:false}`).
     pub turn_in_flight: bool,
     /// `task_id`s of armed background tasks (inserted on `TaskStarted`, removed
     /// on `TaskFinished`).
-    pub live_tasks: std::collections::HashSet<String>,
+    pub live_tasks: HashSet<String>,
+    /// User turns queued for stdin and not yet echoed as consumed, in order.
+    /// Registered before the write, so a racing `result` can't read Idle.
+    pub unconsumed: Vec<QueuedTurn>,
+    /// The reader left its stdout loop: the process is exiting and takes no
+    /// more turns. Set before its `Done`.
+    pub closed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedTurn {
+    pub uuid: String,
+    /// The user's prompt, re-queued by a hard restart that kills the process
+    /// before it consumed the turn.
+    pub prompt: String,
+    frame: String,
+    /// A slash command: claude expands it only as a turn of its own.
+    own_turn: bool,
 }
 
 impl SessionState {
     pub fn running(&self) -> bool {
+        self.turn_in_flight || !self.unconsumed.is_empty() || !self.live_tasks.is_empty()
+    }
+    /// Mid-turn or hosting background tasks — what a hard abort interrupts.
+    fn working(&self) -> bool {
         self.turn_in_flight || !self.live_tasks.is_empty()
     }
     /// The "Waiting" sub-state — busy with no turn in flight, only a background
@@ -114,7 +141,7 @@ impl SessionState {
     /// unit-test the FSM contract, so it's `#[cfg(test)]`.
     #[cfg(test)]
     pub fn waiting(&self) -> bool {
-        !self.turn_in_flight && !self.live_tasks.is_empty()
+        self.running() && !self.turn_in_flight && self.unconsumed.is_empty()
     }
     /// Fully Idle — safe to tear down, and the only state in which a queued prune
     /// may be applied (a respawn would otherwise kill armed monitors). Exactly the
@@ -147,6 +174,12 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
         }
         AgentEvent::TaskFinished(id) => {
             state.live_tasks.remove(id);
+        }
+        AgentEvent::UserTurnConsumed(uuid) => {
+            if let Some(i) = state.unconsumed.iter().position(|t| &t.uuid == uuid) {
+                state.unconsumed.remove(i);
+                state.turn_in_flight = true;
+            }
         }
         // Non-state-bearing events.
         AgentEvent::Frame(_)
@@ -374,7 +407,9 @@ impl AgentEvent {
             // directly to drive the Thinking/Waiting state machine (it does not
             // route through `into_response`). Kept exhaustive so a stray frame
             // can't panic the match.
-            AgentEvent::TaskStarted(_) | AgentEvent::TaskFinished(_) => {
+            AgentEvent::TaskStarted(_)
+            | AgentEvent::TaskFinished(_)
+            | AgentEvent::UserTurnConsumed(_) => {
                 return None;
             }
             AgentEvent::ToolResult => AgentResponse::ToolResult {
@@ -408,31 +443,45 @@ pub struct SpawnRequest {
     pub user_timezone: Option<String>,
 }
 
-/// A command for a resident session's single writer task. The writer owns the
-/// `ChildStdin` and writes the session's one (first) user turn directly before
-/// draining this channel; with no warm reuse there are no follow-up user
-/// frames, so the only message is `Shutdown` (flush + close on teardown).
-#[derive(Debug)]
-pub enum StdinMsg {
-    /// Flush + close: the writer task exits (drops the `ChildStdin`).
-    Shutdown,
-}
-
 /// Handles a resident spawn fn returns so the Supervisor can drive the session
 /// after it's started. The reader+writer tasks are joined into the single
 /// `reader` handle the prod impl returns (writer is spawned inside it / awaited
 /// by it); `state` is the shared FSM the reader mutates and the Supervisor
-/// reads for `is_running`.
+/// reads for `is_running` and queues turns into.
 pub struct ResidentHandles {
-    pub stdin_tx: mpsc::UnboundedSender<StdinMsg>,
+    /// Wakes the writer to write newly queued `SessionState::unconsumed` frames.
+    pub wake: Arc<Notify>,
     pub reader: tokio::task::JoinHandle<()>,
     pub state: Arc<StdMutex<SessionState>>,
 }
 
+/// Spawn-time settings baked into a resident process. Not `agent_session_id`
+/// (harvested mid-session) nor `user_timezone` (rides each turn).
+#[derive(PartialEq)]
+struct SessionKnobs {
+    agent_kind: AgentKind,
+    project_path: Option<String>,
+    worktree: bool,
+    is_sandboxed: bool,
+    model: Option<String>,
+}
+
+impl SessionKnobs {
+    fn of(req: &SpawnRequest) -> Self {
+        Self {
+            agent_kind: req.agent_kind,
+            project_path: req.project_path.clone(),
+            worktree: req.worktree,
+            is_sandboxed: req.is_sandboxed,
+            model: req.model.clone(),
+        }
+    }
+}
+
 /// A live resident session for one chat. Held in `AgentEntry::Resident`.
 pub struct ResidentSession {
-    /// Writer-task input: user frames, shutdown.
-    stdin_tx: mpsc::UnboundedSender<StdinMsg>,
+    wake: Arc<Notify>,
+    knobs: SessionKnobs,
     /// Owns the child stdout loop + child handle + writer task.
     reader: tokio::task::JoinHandle<()>,
     /// Hard kill (SIGTERM the process group) — teardown only, never /stop.
@@ -443,6 +492,32 @@ pub struct ResidentSession {
     // `SpawnRequest.agent_session_id` for `--resume`. One source of truth.
     /// FSM mutated by the reader, read by the Supervisor for `is_running`.
     state: Arc<StdMutex<SessionState>>,
+}
+
+impl ResidentSession {
+    fn queue_turn(&self, prompt: String, first_turn: bool, user_timezone: Option<&str>) {
+        let adapter = self.knobs.agent_kind.make_adapter();
+        let uuid = Uuid::now_v7().to_string();
+        let text = turn_text(
+            adapter.as_ref(),
+            prompt.clone(),
+            first_turn,
+            user_timezone,
+            None,
+        );
+        let frame = adapter.encode_user_turn(&uuid, &text);
+        self.state
+            .lock()
+            .expect("SessionState mutex")
+            .unconsumed
+            .push(QueuedTurn {
+                own_turn: adapter.expands_slash_commands() && is_slash_command(&prompt),
+                uuid,
+                prompt,
+                frame,
+            });
+        self.wake.notify_one();
+    }
 }
 
 /// Either a one-shot per-turn task (codex/gemini/cursor/hermes) or a resident
@@ -484,9 +559,8 @@ pub type SpawnFn = Arc<
 /// (real process); tests inject a recorder via `with_spawn_fns` that records the
 /// session `SpawnRequest` and returns inert handles.
 ///
-/// The `SpawnRequest.prompt` carries the turn's text — the spawn fn writes it as
-/// the first stdin frame right after the process is up. Every new message
-/// respawns a fresh `--resume` process (no warm reuse).
+/// The spawn fn only starts the process and its tasks; `spawn_resident` then
+/// queues `SpawnRequest.prompt` as the first turn into the returned `state`.
 pub type ResidentSpawnFn = Arc<
     dyn Fn(
             SpawnRequest,
@@ -588,8 +662,9 @@ impl Supervisor {
     /// and waits for the driving task to exit so the process is fully dead
     /// before any respawn on the same session. Used for interrupt-then-send /
     /// prune / idle-teardown / shutdown / /stop (all hard teardowns now — there is
-    /// no in-place interrupt).
-    pub async fn abort_agent(&mut self, topic: &str) -> bool {
+    /// no in-place interrupt). Returns the resident's turns still unconsumed
+    /// once its reader is joined (the final FSM, no racing echo).
+    pub async fn abort_agent(&mut self, topic: &str) -> Vec<QueuedTurn> {
         let removed = self.agents.remove(topic);
         self.sync_live_sessions();
         match removed {
@@ -597,19 +672,16 @@ impl Supervisor {
                 info!(topic = %topic, "aborting running agent (one-shot)");
                 cancel.cancel();
                 await_agent_exit(handle, topic).await;
-                true
+                Vec::new()
             }
             Some(AgentEntry::Resident(session)) => {
                 info!(topic = %topic, "tearing down resident session");
-                // Ask the writer to flush+close first, then hard-cancel so the
-                // reader SIGTERMs the group. Either alone suffices; doing both is
-                // belt-and-suspenders for a wedged child.
-                let _ = session.stdin_tx.send(StdinMsg::Shutdown);
+                // Closes stdin (writer) and SIGTERMs the group (reader).
                 session.cancel.cancel();
                 await_agent_exit(session.reader, topic).await;
-                true
+                std::mem::take(&mut session.state.lock().expect("SessionState mutex").unconsumed)
             }
-            None => false,
+            None => Vec::new(),
         }
     }
 
@@ -618,7 +690,15 @@ impl Supervisor {
         self.agents.is_empty()
     }
 
-    pub fn remove(&mut self, topic: &str) {
+    /// Drop the chat's entry on its `Done`. For a resident only the session
+    /// that closed, so a late `Done` from a torn-down session can't drop (and
+    /// orphan) its replacement.
+    pub fn remove_finished(&mut self, topic: &str) {
+        if let Some(AgentEntry::Resident(s)) = self.agents.get(topic) {
+            if !s.state.lock().expect("SessionState mutex").closed {
+                return;
+            }
+        }
         self.agents.remove(topic);
         self.sync_live_sessions();
     }
@@ -630,14 +710,83 @@ impl Supervisor {
     pub fn is_running(&self, topic: &str) -> bool {
         match self.agents.get(topic) {
             Some(AgentEntry::OneShot { handle, .. }) => !handle.is_finished(),
-            Some(AgentEntry::Resident(s)) => !s.reader.is_finished() && session_state(s).running(),
+            Some(AgentEntry::Resident(s)) => {
+                let st = s.state.lock().expect("SessionState mutex");
+                !s.reader.is_finished() && !st.closed && st.running()
+            }
             None => false,
         }
     }
 
-    /// Dispatch a spawn request: resident kinds (claude) always (re)spawn a
-    /// fresh `--resume` process; one-shot kinds keep the historic per-turn
-    /// spawn. Branches on the adapter's `is_resident()`.
+    /// Like `is_running`, minus turns that are only queued: whether a hard
+    /// abort would interrupt work (queued turns are re-queued, not lost).
+    pub fn is_working(&self, topic: &str) -> bool {
+        match self.agents.get(topic) {
+            Some(AgentEntry::Resident(s)) => {
+                let st = s.state.lock().expect("SessionState mutex");
+                !s.reader.is_finished() && !st.closed && st.working()
+            }
+            _ => self.is_running(topic),
+        }
+    }
+
+    /// Deliver `req` as a new user turn to the chat's live resident process via
+    /// stdin. `false` — the caller respawns instead — when there's no live
+    /// session, its spawn knobs differ, or it's a slash command while a turn
+    /// is in flight (that one interrupts, as before; a slash command queued
+    /// behind other turns is held by the writer until it can run on its own).
+    pub fn send_user_turn(&self, req: &SpawnRequest) -> bool {
+        let Some(AgentEntry::Resident(s)) = self.agents.get(&req.chat_id) else {
+            return false;
+        };
+        let (closed, in_flight) = {
+            let st = s.state.lock().expect("SessionState mutex");
+            (st.closed, st.turn_in_flight)
+        };
+        if closed || s.reader.is_finished() || s.knobs != SessionKnobs::of(req) {
+            return false;
+        }
+        if in_flight
+            && req.agent_kind.make_adapter().expands_slash_commands()
+            && is_slash_command(&req.prompt)
+        {
+            return false;
+        }
+        s.queue_turn(req.prompt.clone(), false, req.user_timezone.as_deref());
+        true
+    }
+
+    #[cfg(test)]
+    pub fn unconsumed_prompts(&self, topic: &str) -> Vec<String> {
+        match self.agents.get(topic) {
+            Some(AgentEntry::Resident(s)) => s
+                .state
+                .lock()
+                .expect("SessionState mutex")
+                .unconsumed
+                .iter()
+                .map(|t| t.prompt.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `spawn_agent(req)`, then queue each of `more` (resident only) behind its
+    /// prompt as a separate user turn.
+    pub fn spawn_agent_then(&mut self, req: SpawnRequest, more: Vec<String>) {
+        let topic = req.chat_id.clone();
+        let user_timezone = req.user_timezone.clone();
+        self.spawn_agent(req);
+        if let Some(AgentEntry::Resident(s)) = self.agents.get(&topic) {
+            for prompt in more {
+                s.queue_turn(prompt, false, user_timezone.as_deref());
+            }
+        }
+    }
+
+    /// Spawn a fresh agent process: resident kinds (claude) resume the chat's
+    /// session with `req.prompt` as the first stdin turn; one-shot kinds keep
+    /// the historic per-turn spawn. Branches on the adapter's `is_resident()`.
     pub fn spawn_agent(&mut self, req: SpawnRequest) {
         if req.agent_kind.make_adapter().is_resident() {
             self.spawn_resident(req);
@@ -660,11 +809,9 @@ impl Supervisor {
             .insert(topic, AgentEntry::OneShot { handle, cancel });
     }
 
-    /// Resident path: always (re)spawn fresh with `--resume`; no warm reuse. A
-    /// new user message never pushes a frame into an existing warm process —
-    /// every turn gets a fresh `claude --resume <agent_session_id>` process.
-    /// Drop any stale entry (finished reader, or an interrupt-then-send abort the
-    /// caller already did) then spawn fresh and insert.
+    /// Resident path: drop any stale entry (finished reader, or one the caller
+    /// already aborted), spawn a fresh process (`--resume` when the chat has a
+    /// session id) and queue `req.prompt` as its first turn.
     fn spawn_resident(&mut self, req: SpawnRequest) {
         let topic = req.chat_id.clone();
         self.agents.remove(&topic);
@@ -676,20 +823,17 @@ impl Supervisor {
             self.pending.clone(),
         );
         let session = ResidentSession {
-            stdin_tx: handles.stdin_tx,
+            wake: handles.wake,
+            knobs: SessionKnobs::of(&req),
             reader: handles.reader,
             cancel,
             state: handles.state,
         };
-        // The spawn fn queues the first user turn (from `req.prompt`) itself but
-        // returns a default (idle) FSM. Mark `turn_in_flight` here — the single
-        // set covers both the real path (so an `is_running`/RunState read between
-        // spawn and the first frame is correct) and the test-recorder path (which
-        // runs no real writer). Done synchronously before the entry is stored.
-        {
-            let mut st = session.state.lock().expect("SessionState mutex");
-            st.turn_in_flight = true;
-        }
+        session.queue_turn(
+            req.prompt,
+            req.agent_session_id.is_none(),
+            req.user_timezone.as_deref(),
+        );
         // Publish this session's FSM to the shared directory (overwriting any
         // stale entry for the chat) so the control task can read its live-task
         // count when a `prune-context` RPC arrives.
@@ -727,7 +871,6 @@ impl Supervisor {
                     joins.push((topic, handle));
                 }
                 AgentEntry::Resident(s) => {
-                    let _ = s.stdin_tx.send(StdinMsg::Shutdown);
                     s.cancel.cancel();
                     joins.push((topic, s.reader));
                 }
@@ -737,12 +880,6 @@ impl Supervisor {
             await_agent_exit(handle, &topic).await;
         }
     }
-}
-
-/// Snapshot a resident session's FSM (cloned out from under the std Mutex —
-/// hold time is one `HashSet` clone, no async work).
-fn session_state(s: &ResidentSession) -> SessionState {
-    s.state.lock().expect("SessionState mutex").clone()
 }
 
 /// Default spawn implementation — verbatim lift of the historic body of
@@ -1143,7 +1280,7 @@ fn default_spawn_fn(
 
 /// Default RESIDENT spawn implementation (claude). Spawns one `claude` process
 /// with stdin held open (`Stdio::piped()`), owns the `ChildStdin` in a single
-/// writer task fed by an mpsc of `StdinMsg`, and drives stdout in a reader task
+/// writer task (`spawn_stdin_writer`), and drives stdout in a reader task
 /// that never exits at the first `result` — it loops until stdout EOF / read
 /// error / `cancel`. The reader runs each line through `adapter.handle_line`,
 /// feeds run-state events through `reduce`, emits `RunState` on every busy↔idle
@@ -1158,26 +1295,23 @@ fn default_resident_spawn_fn(
     cancel: CancellationToken,
     pending: PendingAttachments,
 ) -> ResidentHandles {
-    let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinMsg>();
-    // Default (idle) FSM. The first user turn is queued below, but `turn_in_flight`
-    // is set by `spawn_resident` (the single setter) synchronously before the
-    // session entry is stored, so a RunState/`is_running` read can't observe a
-    // stale idle state.
+    let wake = Arc::new(Notify::new());
+    // `spawn_resident` queues the first turn right after this returns.
     let state = Arc::new(StdMutex::new(SessionState::default()));
 
     let state_for_reader = state.clone();
-    let stdin_tx_for_handles = stdin_tx.clone();
+    let wake_for_writer = wake.clone();
 
     let SpawnRequest {
         chat_id: topic,
-        prompt,
+        prompt: _,
         project_path,
         worktree,
         agent_session_id,
         agent_kind,
         is_sandboxed,
         model,
-        user_timezone,
+        user_timezone: _,
     } = req;
 
     // Register the per-chat attachment mailbox before the spawn (same rationale
@@ -1223,7 +1357,6 @@ fn default_resident_spawn_fn(
             agent_session_id: agent_session_id.as_deref(),
             is_sandboxed,
             model: model.as_deref(),
-            user_timezone: user_timezone.as_deref(),
         };
         let native = if cfg!(windows) {
             adapter.prepare_session_native(&ctx)
@@ -1236,6 +1369,7 @@ fn default_resident_spawn_fn(
                 Ok(c) => c,
                 Err(e) => {
                     error!("failed to build native resident command: {}", e);
+                    close_session(&state_for_reader);
                     fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
                     return;
                 }
@@ -1245,6 +1379,7 @@ fn default_resident_spawn_fn(
                 Ok(s) => s,
                 Err(e) => {
                     error!("adapter prepare_session_command failed: {}", e);
+                    close_session(&state_for_reader);
                     fail_agent(&tx, &topic, format!("agent prepare failed: {}", e)).await;
                     return;
                 }
@@ -1260,22 +1395,6 @@ fn default_resident_spawn_fn(
         if let Ok(exe) = std::env::current_exe() {
             cmd.env("ZUCCHINI_SPAWNER_BIN", exe);
         }
-        // Writer input: the first user turn (with the first-turn suffix when this
-        // is a brand-new session — no resume id), queued the instant the process
-        // is up. Computed once — a startup-timeout retry re-sends the same frame.
-        let first_turn = agent_session_id.is_none();
-        let first_text = turn_text(
-            adapter.as_ref(),
-            prompt,
-            first_turn,
-            ctx.user_timezone,
-            None,
-        );
-        let first_frame = adapter.encode_user_turn(&first_text);
-        // The mpsc receiver goes to the FIRST attempt's writer; a retry writer
-        // holds stdin open until aborted instead (see `spawn_stdin_writer`).
-        let mut stdin_rx = Some(stdin_rx);
-
         // One automatic respawn is allowed after a silent startup timeout (see
         // `startup_retry_allowed`); the retry attempt gets a doubled deadline.
         let mut attempt: u32 = 0;
@@ -1284,6 +1403,7 @@ fn default_resident_spawn_fn(
                 Ok(c) => c,
                 Err(e) => {
                     error!("failed to spawn resident agent: {}", e);
+                    close_session(&state_for_reader);
                     fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
                     return;
                 }
@@ -1297,6 +1417,7 @@ fn default_resident_spawn_fn(
                 Err(e) => {
                     error!("failed to adopt resident agent process group: {}", e);
                     let _ = child.kill().await;
+                    close_session(&state_for_reader);
                     fail_agent(&tx, &topic, format!("failed to spawn agent: {}", e)).await;
                     return;
                 }
@@ -1304,10 +1425,14 @@ fn default_resident_spawn_fn(
 
             // Writer task: owns ChildStdin, the single writer of stdin frames (see
             // `spawn_stdin_writer`).
-            let writer_handle = child
-                .stdin
-                .take()
-                .map(|stdin| spawn_stdin_writer(stdin, first_frame.clone(), stdin_rx.take()));
+            let writer_handle = child.stdin.take().map(|stdin| {
+                spawn_stdin_writer(
+                    stdin,
+                    state_for_reader.clone(),
+                    wake_for_writer.clone(),
+                    cancel.clone(),
+                )
+            });
 
             let agent_started = Arc::new(AtomicBool::new(false));
             let stderr_seen = Arc::new(AtomicBool::new(false));
@@ -1398,6 +1523,10 @@ fn default_resident_spawn_fn(
                                             }
                                             r
                                         };
+                                        // A slash turn held by the writer may be due now.
+                                        if is_result {
+                                            wake_for_writer.notify_one();
+                                        }
                                         match ev {
                                             AgentEvent::Frame(content) => {
                                                 let resp = AgentResponse::Line { topic: topic.clone(), content };
@@ -1427,7 +1556,8 @@ fn default_resident_spawn_fn(
                                             // transition if `running` changed.
                                             AgentEvent::Result { .. }
                                             | AgentEvent::TaskStarted(_)
-                                            | AgentEvent::TaskFinished(_) => {}
+                                            | AgentEvent::TaskFinished(_)
+                                            | AgentEvent::UserTurnConsumed(_) => {}
                                         }
                                         // Emit the idle (`running=false`) edge ONLY on a `Result` frame — a real
                                         // turn boundary. A bare `TaskFinished` that empties `live_tasks` also drops
@@ -1458,6 +1588,7 @@ fn default_resident_spawn_fn(
                 cancelled,
             );
         };
+        close_session(&state_for_reader);
 
         // Surface stderr on a failed exit (same contract as the one-shot path).
         // A deliberate teardown (`cancelled`) or an exit while fully idle is a
@@ -1514,7 +1645,7 @@ fn default_resident_spawn_fn(
     });
 
     ResidentHandles {
-        stdin_tx: stdin_tx_for_handles,
+        wake,
         reader,
         state,
     }
@@ -1551,31 +1682,55 @@ struct CapturedStderr {
     tail: VecDeque<String>,
 }
 
-/// Spawn the resident stdin writer task: write the first user turn, then hold
-/// stdin open. With the mpsc receiver (first spawn attempt) it waits for
-/// `Shutdown` / sender drop; without it (a startup-timeout retry — the receiver
-/// went to the first attempt's writer, now aborted) it parks until the reader
-/// aborts it on exit. Either way dropping `stdin` merely closes the pipe;
-/// claude ignores stdin EOF (stays alive — see plan §8), so real teardown is
-/// the SIGTERM, and losing the `Shutdown` nudge on the retry path is harmless
-/// (`abort_agent` cancels the session token right after sending it).
+/// Spawn the resident stdin writer task: write each queued
+/// `SessionState::unconsumed` frame it hasn't written yet, then sleep until
+/// `wake`. A startup-timeout retry's fresh writer re-writes them all to the new
+/// process. Exits on `cancel`, closing stdin; claude ignores stdin EOF, so real
+/// teardown is the SIGTERM.
 fn spawn_stdin_writer(
     mut stdin: tokio::process::ChildStdin,
-    first_frame: String,
-    stdin_rx: Option<mpsc::UnboundedReceiver<StdinMsg>>,
+    state: Arc<StdMutex<SessionState>>,
+    wake: Arc<Notify>,
+    cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
-        if stdin.write_all(first_frame.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
-            return;
-        }
-        match stdin_rx {
-            Some(mut rx) => {
-                let _ = rx.recv().await;
+        let mut written: HashSet<String> = HashSet::new();
+        loop {
+            let frames = frames_to_write(&state.lock().expect("SessionState mutex"), &mut written);
+            for frame in frames {
+                if stdin.write_all(frame.as_bytes()).await.is_err() || stdin.flush().await.is_err()
+                {
+                    return;
+                }
             }
-            None => std::future::pending::<()>().await,
+            tokio::select! {
+                _ = wake.notified() => {}
+                _ = cancel.cancelled() => return,
+            }
         }
     })
+}
+
+/// Unwritten frames of `st.unconsumed`, in order. A slash-command turn is held
+/// (with everything behind it) until it heads the queue with no turn in
+/// flight: written earlier, claude would inject it into the running turn as
+/// plain text at the next tool boundary.
+fn frames_to_write(st: &SessionState, written: &mut HashSet<String>) -> Vec<String> {
+    let mut frames = Vec::new();
+    for (i, t) in st.unconsumed.iter().enumerate() {
+        if t.own_turn && (i > 0 || st.turn_in_flight) {
+            break;
+        }
+        if written.insert(t.uuid.clone()) {
+            frames.push(t.frame.clone());
+        }
+    }
+    frames
+}
+
+fn close_session(state: &Arc<StdMutex<SessionState>>) {
+    state.lock().expect("SessionState mutex").closed = true;
 }
 
 /// Spawn the stderr reader task. Buffers startup lines silently (capped), keeps
@@ -1746,7 +1901,8 @@ fn attach_followup_for(
 
 #[cfg(test)]
 mod reduce_tests {
-    use super::{reduce, AgentEvent, SessionState};
+    use super::{frames_to_write, reduce, AgentEvent, QueuedTurn, SessionState};
+    use std::collections::HashSet;
 
     /// Drive a frame sequence through the pure reducer and assert the derived
     /// (running, waiting) pair after each event — the resident FSM contract.
@@ -1759,7 +1915,7 @@ mod reduce_tests {
         // user frame; here we model it explicitly).
         let mut s = SessionState {
             turn_in_flight: true,
-            live_tasks: Default::default(),
+            ..Default::default()
         };
         assert_eq!((s.running(), s.waiting()), (true, false), "Thinking");
         assert!(!s.is_idle());
@@ -1795,7 +1951,7 @@ mod reduce_tests {
     fn task_origin_result_does_not_end_user_turn() {
         let mut s = SessionState {
             turn_in_flight: true,
-            live_tasks: Default::default(),
+            ..Default::default()
         };
         s.live_tasks.insert("t1".into());
         reduce(
@@ -1830,7 +1986,7 @@ mod reduce_tests {
     fn frame_and_tokens_are_inert_for_run_state() {
         let mut s = SessionState {
             turn_in_flight: true,
-            live_tasks: Default::default(),
+            ..Default::default()
         };
         for ev in [
             AgentEvent::Frame("{}".into()),
@@ -1852,6 +2008,75 @@ mod reduce_tests {
     fn finish_of_unknown_task_is_noop() {
         let mut s = SessionState::default();
         reduce(&mut s, &AgentEvent::TaskFinished("ghost".into()));
+        assert!(s.is_idle());
+    }
+
+    fn queued(uuid: &str) -> QueuedTurn {
+        QueuedTurn {
+            uuid: uuid.into(),
+            prompt: String::new(),
+            frame: uuid.into(),
+            own_turn: false,
+        }
+    }
+
+    #[test]
+    fn a_slash_turn_is_written_only_at_the_head_with_no_turn_in_flight() {
+        let mut s = SessionState::default();
+        let slash = QueuedTurn {
+            own_turn: true,
+            ..queued("b")
+        };
+        s.unconsumed = vec![queued("a"), slash, queued("c")];
+        let mut written = HashSet::new();
+        assert_eq!(frames_to_write(&s, &mut written), vec!["a"]);
+        s.unconsumed.remove(0);
+        s.turn_in_flight = true;
+        assert!(frames_to_write(&s, &mut written).is_empty());
+        s.turn_in_flight = false;
+        assert_eq!(frames_to_write(&s, &mut written), vec!["b", "c"]);
+    }
+
+    const RESULT: AgentEvent = AgentEvent::Result {
+        origin_is_task: false,
+    };
+
+    /// Queued mid-turn: consumed at the next tool boundary and answered by the
+    /// running turn's single `result`.
+    #[test]
+    fn injected_turn_echo_then_one_result_goes_idle() {
+        let mut s = SessionState {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        s.unconsumed.push(queued("b"));
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("b".into()));
+        assert!(s.unconsumed.is_empty() && s.running());
+        reduce(&mut s, &RESULT);
+        assert!(s.is_idle());
+    }
+
+    /// Queued after the last tool call: the running turn's `result` lands while
+    /// the turn is still unconsumed, then it runs as a turn of its own.
+    #[test]
+    fn result_with_unconsumed_turn_stays_running_until_its_own_result() {
+        let mut s = SessionState {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        s.unconsumed.push(queued("b"));
+        reduce(&mut s, &RESULT);
+        assert!(s.running(), "turn b is not consumed yet");
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("b".into()));
+        assert!(s.turn_in_flight);
+        reduce(&mut s, &RESULT);
+        assert!(s.is_idle());
+    }
+
+    #[test]
+    fn echo_of_an_unknown_uuid_is_ignored() {
+        let mut s = SessionState::default();
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("ghost".into()));
         assert!(s.is_idle());
     }
 }
@@ -1910,17 +2135,13 @@ mod live_session_tests {
         let exposed: Exposed = Arc::new(StdMutex::new(HashMap::new()));
         let exp = exposed.clone();
         let resident_fn: ResidentSpawnFn = Arc::new(move |req, _tx, cancel, _pending| {
-            let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
             let state = Arc::new(StdMutex::new(SessionState::default()));
             exp.lock()
                 .unwrap()
                 .insert(req.chat_id.clone(), state.clone());
-            let reader = tokio::spawn(async move {
-                let _keep = _stdin_rx;
-                cancel.cancelled().await;
-            });
+            let reader = tokio::spawn(async move { cancel.cancelled().await });
             ResidentHandles {
-                stdin_tx,
+                wake: Arc::new(Notify::new()),
                 reader,
                 state,
             }
@@ -1951,7 +2172,112 @@ mod live_session_tests {
         let g = exposed.lock().unwrap();
         let mut st = g[chat].lock().unwrap();
         st.turn_in_flight = false;
+        st.unconsumed.clear();
         st.live_tasks.insert("t1".to_string());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_session_takes_no_turns_and_only_it_is_removed_on_done() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(claude_req("chat"));
+        sup.remove_finished("chat");
+        assert!(
+            sup.is_running("chat"),
+            "a live session survives a stale Done"
+        );
+
+        exposed.lock().unwrap()["chat"].lock().unwrap().closed = true;
+        assert!(!sup.is_running("chat"));
+        assert!(!sup.send_user_turn(&claude_req("chat")));
+        sup.remove_finished("chat");
+        assert!(sup.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abort_returns_the_turns_left_unconsumed() {
+        let (mut sup, _exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(claude_req("chat"));
+        let second = SpawnRequest {
+            prompt: "second".to_string(),
+            ..claude_req("chat")
+        };
+        assert!(sup.send_user_turn(&second));
+        let prompts: Vec<String> = sup
+            .abort_agent("chat")
+            .await
+            .into_iter()
+            .map(|t| t.prompt)
+            .collect();
+        assert_eq!(prompts, vec!["hi", "second"]);
+    }
+
+    fn set_idle(exposed: &Exposed, chat: &str) {
+        let g = exposed.lock().unwrap();
+        let mut st = g[chat].lock().unwrap();
+        st.turn_in_flight = false;
+        st.unconsumed.clear();
+    }
+
+    /// A turn for a live session with the same knobs is queued on its stdin
+    /// (uuid-stamped, time line prefixed like a respawn's) instead of respawning.
+    #[tokio::test(start_paused = true)]
+    async fn send_user_turn_queues_on_the_live_session() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(claude_req("chat"));
+        let first_state = exposed.lock().unwrap()["chat"].clone();
+
+        let next = SpawnRequest {
+            prompt: "second".to_string(),
+            agent_session_id: Some("sid-1".to_string()),
+            user_timezone: Some("Asia/Bangkok".to_string()),
+            ..claude_req("chat")
+        };
+        assert!(sup.send_user_turn(&next));
+        assert!(
+            Arc::ptr_eq(&first_state, &exposed.lock().unwrap()["chat"]),
+            "no respawn"
+        );
+        assert_eq!(sup.unconsumed_prompts("chat"), vec!["hi", "second"]);
+        let st = first_state.lock().unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&st.unconsumed[1].frame).unwrap();
+        assert_eq!(frame["uuid"], st.unconsumed[1].uuid.as_str());
+        let text = frame["message"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("current local time") && text.ends_with("second"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_user_turn_refuses_other_knobs_and_a_mid_turn_slash_command() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        assert!(!sup.send_user_turn(&claude_req("chat")), "no session");
+        sup.spawn_agent(claude_req("chat"));
+
+        let other_model = SpawnRequest {
+            model: Some("opus".to_string()),
+            ..claude_req("chat")
+        };
+        assert!(!sup.send_user_turn(&other_model));
+
+        let compact = SpawnRequest {
+            prompt: "/compact".to_string(),
+            ..claude_req("chat")
+        };
+        assert!(
+            sup.send_user_turn(&compact),
+            "queued behind the first turn; the writer holds it"
+        );
+        exposed.lock().unwrap()["chat"]
+            .lock()
+            .unwrap()
+            .turn_in_flight = true;
+        assert!(!sup.send_user_turn(&compact), "a turn is in flight");
+        set_idle(&exposed, "chat");
+        assert!(
+            sup.send_user_turn(&compact),
+            "a turn of its own gets expanded"
+        );
     }
 
     /// The shared `live_sessions` directory (read by the control task's

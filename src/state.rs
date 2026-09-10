@@ -90,6 +90,11 @@ pub struct Mirror {
     /// drain it on the backend's seed-only guard (`WHERE agents IS NULL`).
     #[serde(default)]
     pub initial_agents_seed_done: bool,
+    /// Per chat, the highest user-message seq this machine handled — the
+    /// replay guard in `handle_message_put`. Missing (pre-upgrade state.json,
+    /// or no message handled yet) falls back to the `chats.last_seq` guard.
+    #[serde(default)]
+    handled_user_seqs: HashMap<String, i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -449,6 +454,19 @@ impl Mirror {
 
     pub fn remove_chat(&mut self, id: &str) {
         self.chats.remove(id);
+        self.handled_user_seqs.remove(id);
+    }
+
+    pub fn handled_user_seq(&self, chat_id: &str) -> Option<i64> {
+        self.handled_user_seqs.get(chat_id).copied()
+    }
+
+    pub fn set_handled_user_seq(&mut self, chat_id: &str, seq: i64) {
+        let handled = self
+            .handled_user_seqs
+            .entry(chat_id.to_string())
+            .or_insert(seq);
+        *handled = (*handled).max(seq);
     }
 
     pub fn remove_project(&mut self, id: &str) {

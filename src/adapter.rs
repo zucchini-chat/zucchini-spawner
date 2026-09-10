@@ -293,10 +293,6 @@ pub struct SessionContext<'a> {
     pub is_sandboxed: bool,
     /// See `TurnContext::model`.
     pub model: Option<&'a str>,
-    /// See `TurnContext::user_timezone`. Read once per stdin turn to build that
-    /// turn's time line ([`AgentAdapter::turn_time_line`]) — never folded into the
-    /// session's system prompt, so every turn's time is current.
-    pub user_timezone: Option<&'a str>,
 }
 
 /// A shell-free spawn recipe for an adapter that can launch its CLI directly
@@ -357,6 +353,10 @@ pub enum AgentEvent {
     /// a terminal `task_notification` (completed/failed/cancelled). Carries the
     /// same `task_id`; the Supervisor removes it from `live_tasks`.
     TaskFinished(String),
+    /// Resident model only — claude consumed a user frame we wrote to stdin
+    /// (its `--replay-user-messages` echo). Carries the frame's `uuid`, which
+    /// claude preserves from our frame.
+    UserTurnConsumed(String),
     /// The agent's own `prune-context` call has PERSISTED its result. Content-free
     /// CUE the main loop uses to drive the prune restart: when the chat has a queued
     /// `PruneRequest`, the loop aborts → rewrites → respawns NOW (strictly after the
@@ -443,9 +443,10 @@ pub trait AgentAdapter: Send + Sync {
         None
     }
 
-    /// Resident: serialize one user turn as a newline-terminated stdin frame.
+    /// Resident: serialize one user turn as a newline-terminated stdin frame
+    /// stamped with `uuid` (echoed back as `UserTurnConsumed`).
     /// Default `unreachable!` (one-shot adapters pipe the prompt instead).
-    fn encode_user_turn(&self, _text: &str) -> String {
+    fn encode_user_turn(&self, _uuid: &str, _text: &str) -> String {
         unreachable!("encode_user_turn called on a one-shot adapter")
     }
 
@@ -979,6 +980,7 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             } => "Result(task)".to_string(),
             AgentEvent::TaskStarted(s) => format!("TaskStarted({})", s),
             AgentEvent::TaskFinished(s) => format!("TaskFinished({})", s),
+            AgentEvent::UserTurnConsumed(s) => format!("UserTurnConsumed({})", s),
             AgentEvent::ToolResult => "ToolResult".to_string(),
         })
         .collect()
