@@ -63,6 +63,10 @@ pub enum WriteEvent {
         /// false — its push is suppressed by the immediate respawn instead.
         stopped_by_user: bool,
     },
+    ChatAlive {
+        chat_id: String,
+        agent_alive: bool,
+    },
     ContextTokens {
         chat_id: String,
         tokens: i64,
@@ -174,6 +178,13 @@ impl WriteEvent {
             stopped_by_user: true,
         }
     }
+
+    pub fn chat_alive(chat_id: String, agent_alive: bool) -> Self {
+        WriteEvent::ChatAlive {
+            chat_id,
+            agent_alive,
+        }
+    }
 }
 
 pub struct WriterConfig {
@@ -281,6 +292,19 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
                 data["stopped_by_user"] = serde_json::Value::Bool(true);
             }
             chats_patch(chat_id, "ChatRunning", data)?
+        }
+        WriteEvent::ChatAlive {
+            chat_id,
+            agent_alive,
+        } => {
+            if !BACKEND_HAS_AGENT_ALIVE {
+                return None;
+            }
+            chats_patch(
+                chat_id,
+                "ChatAlive",
+                serde_json::json!({ "agent_alive": agent_alive }),
+            )?
         }
         WriteEvent::ContextTokens { chat_id, tokens } => chats_patch(
             chat_id,
@@ -549,6 +573,11 @@ fn backend_has_install_columns(kind: AgentKind) -> bool {
         | AgentKind::Pi => true,
     }
 }
+
+/// Same 4xx queue-poison guard as `backend_has_install_columns`: migration 0048
+/// and the `agent_alive` entry in `process_chat_patch`'s `machine_fields` are
+/// live in prod (deployed 2026-09-12), so the PATCH no longer poisons the queue.
+const BACKEND_HAS_AGENT_ALIVE: bool = true;
 
 async fn send_batch(
     http: &reqwest::Client,

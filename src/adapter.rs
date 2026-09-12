@@ -357,6 +357,18 @@ pub enum AgentEvent {
     /// (its `--replay-user-messages` echo). Carries the frame's `uuid`, which
     /// claude preserves from our frame.
     UserTurnConsumed(String),
+    /// Resident model only — claude started a turn for a cross-session
+    /// `SendMessage` from the session named `name` (its replay echo carries
+    /// `origin.kind == "peer"`). Busy like our own consumed turn.
+    PeerTurnConsumed { name: String, body: String },
+    /// Resident model only — the CLI started a turn (`command_lifecycle`
+    /// `started`) for this command uuid: one of our stdin turns, a peer's
+    /// `SendMessage`, or a self-fired one (a `CronCreate` prompt) that is
+    /// never echoed.
+    TurnStarted(String),
+    /// Resident model only — the CLI accepted our interrupt `control_request`
+    /// with this `request_id`. It precedes the interrupted turn's `result`.
+    InterruptAcked(String),
     /// The agent's own `prune-context` call has PERSISTED its result. Content-free
     /// CUE the main loop uses to drive the prune restart: when the chat has a queued
     /// `PruneRequest`, the loop aborts → rewrites → respawns NOW (strictly after the
@@ -448,6 +460,12 @@ pub trait AgentAdapter: Send + Sync {
     /// Default `unreachable!` (one-shot adapters pipe the prompt instead).
     fn encode_user_turn(&self, _uuid: &str, _text: &str) -> String {
         unreachable!("encode_user_turn called on a one-shot adapter")
+    }
+
+    /// Resident: a stdin frame asking the CLI to end its running turn while
+    /// the process lives on. `None` (default) ⇒ `/stop` hard-aborts.
+    fn encode_interrupt(&self, _request_id: &str) -> Option<String> {
+        None
     }
 
     /// Per-stdout-line processing. Stateful for the lifetime of one turn so
@@ -636,7 +654,7 @@ pub const PRUNE_CONTEXT_INSTRUCTION_GEMINI: &str = prune_context_instruction!(
 /// offset/DST math (which it gets wrong). It just echoes the digits off the
 /// per-turn current-local-time line ([`current_time_in_tz_line`]).
 pub const SCHEDULE_MESSAGE_INSTRUCTION: &str =
-    "To schedule a follow-up message to yourself in this chat for a specific future time, run the command `\"$ZUCCHINI_SPAWNER_BIN\" schedule-message --chat-id \"$ZUCCHINI_CHAT_ID\" --body \"<text>\" --at <local-datetime>`. Pass `--at` as a naive local datetime — the user's wall-clock time (e.g. \"2026-06-07T09:00:00\" for 9am), read off the current-local-time line. ALWAYS use this command for any scheduling, reminder, or self-follow-up request — it is the only mechanism that actually delivers a message back into this chat. Do NOT use your own built-in scheduling tools (the `/schedule` skill, ScheduleWakeup, cron routines, etc.); those fire in a context the user never sees here and will silently do nothing for them.";
+    "To schedule a follow-up message to yourself in this chat for a specific future time, run the command `\"$ZUCCHINI_SPAWNER_BIN\" schedule-message --chat-id \"$ZUCCHINI_CHAT_ID\" --body \"<text>\" --at <local-datetime>`. Pass `--at` as a naive local datetime — the user's wall-clock time (e.g. \"2026-06-07T09:00:00\" for 9am), read off the current-local-time line. ALWAYS use this command for any scheduling, reminder, or self-follow-up request — it is the only mechanism that reliably delivers a message back into this chat. Do NOT use your own built-in scheduling tools (the `/schedule` skill, ScheduleWakeup, CronCreate, etc.): `/schedule` runs in a context the user never sees here, and in-session timers are lost whenever this process restarts, which happens routinely (idle eviction, context pruning, updates).";
 
 /// Per-turn current-local-time line for the agent prompt, from the sender's IANA
 /// timezone (`machine_users.timezone`, migration 0040). `None` when `iana_tz` is
@@ -981,6 +999,11 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             AgentEvent::TaskStarted(s) => format!("TaskStarted({})", s),
             AgentEvent::TaskFinished(s) => format!("TaskFinished({})", s),
             AgentEvent::UserTurnConsumed(s) => format!("UserTurnConsumed({})", s),
+            AgentEvent::PeerTurnConsumed { name, body } => {
+                format!("PeerTurnConsumed({name}: {body})")
+            }
+            AgentEvent::TurnStarted(s) => format!("TurnStarted({})", s),
+            AgentEvent::InterruptAcked(s) => format!("InterruptAcked({})", s),
             AgentEvent::ToolResult => "ToolResult".to_string(),
         })
         .collect()

@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::adapter::{AgentEvent, AgentKind, TurnContext};
 use crate::envelope::{EnvelopeAttachment, MessageEnvelope};
+use crate::prune::PendingPrunes;
 use crate::sys;
 
 /// Per-chat pending-attachments registry: the agent-side `attach-file` flow
@@ -87,8 +88,9 @@ fn startup_timeout_message(timeout: Duration, retried: bool) -> String {
 /// task as `AgentEvent`s arrive and read by the Supervisor to answer
 /// `is_running`. Only `running` crosses the wire (the boolean
 /// `chats.agent_running`, true the whole time the agent is busy):
-///   - `running = turn_in_flight || !unconsumed.is_empty() || !live_tasks.is_empty()`
-///   - `waiting = running && !turn_in_flight && unconsumed.is_empty()`
+///   - `running = in_turn || !unconsumed.is_empty() || !live_tasks.is_empty()`
+///   - `waiting = running && !in_turn && unconsumed.is_empty()`
+///   - `in_turn = turn_in_flight || self_turn`
 ///
 /// i.e. Thinking = a turn in flight or queued; Waiting = only a background task
 /// (monitor / `run_in_background`) is still armed; Idle = none. `running`
@@ -102,9 +104,14 @@ fn startup_timeout_message(timeout: Duration, retried: bool) -> String {
 /// can't end the busy state while the turn is still unconsumed.
 #[derive(Debug, Default, Clone)]
 pub struct SessionState {
-    /// A consumed user turn is in flight: set on its `UserTurnConsumed` echo,
+    /// A consumed user turn is in flight: set on its `UserTurnConsumed` (or a
+    /// peer session's `PeerTurnConsumed`) echo,
     /// cleared on a user-turn `result` (origin absent — `Result{origin_is_task:false}`).
     pub turn_in_flight: bool,
+    /// The CLI started a turn that isn't one of our queued ones (a self-fired
+    /// `CronCreate` prompt is never echoed); cleared by the next `result` of
+    /// any origin, so it can't outlive a turn.
+    pub self_turn: bool,
     /// `task_id`s of armed background tasks (inserted on `TaskStarted`, removed
     /// on `TaskFinished`).
     pub live_tasks: HashSet<String>,
@@ -114,6 +121,25 @@ pub struct SessionState {
     /// The reader left its stdout loop: the process is exiting and takes no
     /// more turns. Set before its `Done`.
     pub closed: bool,
+    /// A `/stop` asked the process to end the turn in flight. Once acked, the
+    /// next `result` ends that turn and clears it; if the turn ended on its
+    /// own first, the ack clears it (the stop was a no-op).
+    pub interrupt: Option<PendingInterrupt>,
+    /// When the reader last emitted the idle edge; cleared by a busy edge.
+    /// Only a resident with one can be evicted (`warm.rs`).
+    pub idle_since: Option<tokio::time::Instant>,
+    /// The process group leader, for memory measurement.
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingInterrupt {
+    pub request_id: String,
+    frame: String,
+    /// The CLI acked it: the next `result` is the interrupted turn's.
+    acked: bool,
+    /// A `result` ended the turn before the ack: a natural end.
+    turn_ended: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -129,11 +155,15 @@ pub struct QueuedTurn {
 
 impl SessionState {
     pub fn running(&self) -> bool {
-        self.turn_in_flight || !self.unconsumed.is_empty() || !self.live_tasks.is_empty()
+        self.in_turn() || !self.unconsumed.is_empty() || !self.live_tasks.is_empty()
+    }
+    /// A turn runs: a consumed one of ours or a peer's, or a self-fired one.
+    fn in_turn(&self) -> bool {
+        self.turn_in_flight || self.self_turn
     }
     /// Mid-turn or hosting background tasks — what a hard abort interrupts.
     fn working(&self) -> bool {
-        self.turn_in_flight || !self.live_tasks.is_empty()
+        self.in_turn() || !self.live_tasks.is_empty()
     }
     /// The "Waiting" sub-state — busy with no turn in flight, only a background
     /// task / monitor still armed. NOT emitted on the wire (the client
@@ -141,13 +171,21 @@ impl SessionState {
     /// unit-test the FSM contract, so it's `#[cfg(test)]`.
     #[cfg(test)]
     pub fn waiting(&self) -> bool {
-        self.running() && !self.turn_in_flight && self.unconsumed.is_empty()
+        self.running() && !self.in_turn() && self.unconsumed.is_empty()
     }
     /// Fully Idle — safe to tear down, and the only state in which a queued prune
     /// may be applied (a respawn would otherwise kill armed monitors). Exactly the
     /// negation of `running()`.
     pub fn is_idle(&self) -> bool {
         !self.running()
+    }
+    /// The next `result` ends a `/stop`-interrupted turn.
+    fn interrupt_acked(&self) -> bool {
+        self.interrupt.as_ref().is_some_and(|i| i.acked)
+    }
+    /// Kept warm past its idle edge with nothing pending: evictable.
+    fn warm_idle_since(&self) -> Option<tokio::time::Instant> {
+        self.idle_since.filter(|_| !self.closed && self.is_idle())
     }
 }
 
@@ -158,17 +196,38 @@ impl SessionState {
 /// reader directly.
 ///
 /// `Result{origin_is_task:false}` ends the user turn; `Result{origin_is_task:
-/// true}` is a background-task wake's result and must NOT clear the turn flag.
+/// true}` is a background-task wake's result and must NOT clear the turn flag
+/// — unless it follows an acked interrupt: an interrupted turn that merged
+/// monitor ticks ends with a `task-notification` result.
 pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
     match ev {
-        AgentEvent::Result {
-            origin_is_task: false,
-        } => {
-            state.turn_in_flight = false;
+        AgentEvent::Result { origin_is_task } => {
+            if state.interrupt_acked() {
+                state.interrupt = None;
+                state.turn_in_flight = false;
+            } else if !origin_is_task {
+                state.turn_in_flight = false;
+            }
+            state.self_turn = false;
+            if !state.in_turn() {
+                if let Some(i) = &mut state.interrupt {
+                    i.turn_ended = true;
+                }
+            }
         }
-        AgentEvent::Result {
-            origin_is_task: true,
-        } => { /* background-task wake — leaves turn_in_flight unchanged */ }
+        AgentEvent::TurnStarted(uuid) => {
+            if !state.unconsumed.iter().any(|t| &t.uuid == uuid) {
+                state.self_turn = true;
+            }
+        }
+        AgentEvent::InterruptAcked(id) => {
+            if let Some(mut i) = state.interrupt.take_if(|i| &i.request_id == id) {
+                if !i.turn_ended {
+                    i.acked = true;
+                    state.interrupt = Some(i);
+                }
+            }
+        }
         AgentEvent::TaskStarted(id) => {
             state.live_tasks.insert(id.clone());
         }
@@ -181,6 +240,7 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
                 state.turn_in_flight = true;
             }
         }
+        AgentEvent::PeerTurnConsumed { .. } => state.turn_in_flight = true,
         // Non-state-bearing events.
         AgentEvent::Frame(_)
         | AgentEvent::ContextTokens(_)
@@ -188,6 +248,18 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
         | AgentEvent::SessionIdHarvested(_)
         | AgentEvent::ToolResult => {}
     }
+}
+
+/// Spawner-synthesized message row for a turn another claude session started
+/// via `SendMessage`. Older clients hide unknown system subtypes.
+fn peer_message_frame_json(name: &str, body: &str) -> String {
+    serde_json::json!({
+        "type": "system",
+        "subtype": "peer_message",
+        "name": name,
+        "body": body,
+    })
+    .to_string()
 }
 
 const TURN_PART_SEPARATOR: &str = "\n\n---\n\n";
@@ -371,6 +443,36 @@ pub enum AgentResponse {
     ToolResult {
         topic: String,
     },
+    /// RESIDENT path only — the `result` ending a `/stop`-interrupted turn
+    /// arrived (its frame is swallowed; the caller publishes ours instead).
+    /// Sent before that result's `RunState` edge. `session` identifies the
+    /// sender (`Supervisor::is_current_session`).
+    Interrupted {
+        topic: String,
+        session: Arc<StdMutex<SessionState>>,
+    },
+    /// `Supervisor::interrupt`'s deadline for the turn's `result` passed. A
+    /// no-op unless that interrupt is still pending (`interrupt_pending`).
+    InterruptTimedOut {
+        topic: String,
+        request_id: String,
+    },
+}
+
+impl AgentResponse {
+    pub fn topic(&self) -> &str {
+        match self {
+            AgentResponse::Line { topic, .. }
+            | AgentResponse::ContextTokens { topic, .. }
+            | AgentResponse::CompactBoundary { topic, .. }
+            | AgentResponse::SessionIdHarvested { topic, .. }
+            | AgentResponse::Done { topic, .. }
+            | AgentResponse::RunState { topic, .. }
+            | AgentResponse::ToolResult { topic }
+            | AgentResponse::Interrupted { topic, .. }
+            | AgentResponse::InterruptTimedOut { topic, .. } => topic,
+        }
+    }
 }
 
 impl AgentEvent {
@@ -409,7 +511,10 @@ impl AgentEvent {
             // can't panic the match.
             AgentEvent::TaskStarted(_)
             | AgentEvent::TaskFinished(_)
-            | AgentEvent::UserTurnConsumed(_) => {
+            | AgentEvent::UserTurnConsumed(_)
+            | AgentEvent::PeerTurnConsumed { .. }
+            | AgentEvent::TurnStarted(_)
+            | AgentEvent::InterruptAcked(_) => {
                 return None;
             }
             AgentEvent::ToolResult => AgentResponse::ToolResult {
@@ -584,7 +689,18 @@ pub struct Supervisor {
     /// can read a chat's live-task count (resident sessions only). Points at the
     /// same per-session `SessionState` Arcs the reader mutates.
     live_sessions: LiveSessions,
+    /// Shared with the control-socket handler, which parks `prune-context`
+    /// requests here. An aborted session never delivers their cue or `Done`,
+    /// so `abort_agent` drops its chat's entry: a stale one would respawn it.
+    pending_prunes: PendingPrunes,
+    /// Chats whose resident process we last published as alive
+    /// (`chats.agent_alive`); see `alive_changes`.
+    alive_published: HashSet<String>,
 }
+
+/// How long a `/stop` interrupt waits for the turn's `result` before the
+/// process is hard-aborted.
+const INTERRUPT_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Supervisor {
     pub fn new(response_tx: mpsc::Sender<AgentResponse>) -> Self {
@@ -619,6 +735,8 @@ impl Supervisor {
             resident_spawn_fn,
             pending: Arc::new(StdMutex::new(HashMap::new())),
             live_sessions: Arc::new(StdMutex::new(HashMap::new())),
+            pending_prunes: PendingPrunes::default(),
+            alive_published: HashSet::new(),
         }
     }
 
@@ -633,6 +751,10 @@ impl Supervisor {
     /// `prune-context` RPC can read a chat's live-task count. Cheap `Arc` clone.
     pub fn live_sessions(&self) -> LiveSessions {
         self.live_sessions.clone()
+    }
+
+    pub fn pending_prunes(&self) -> PendingPrunes {
+        self.pending_prunes.clone()
     }
 
     /// Number of background tasks / monitors live in the chat's resident session
@@ -661,13 +783,13 @@ impl Supervisor {
     /// group; resident: shutdown stdin then cancel → SIGTERM). Removes the entry
     /// and waits for the driving task to exit so the process is fully dead
     /// before any respawn on the same session. Used for interrupt-then-send /
-    /// prune / idle-teardown / shutdown / /stop (all hard teardowns now — there is
-    /// no in-place interrupt). Returns the resident's turns still unconsumed
+    /// prune / eviction / shutdown / `/kill`, and `/stop` when `interrupt`
+    /// can't be used. Returns the resident's turns still unconsumed
     /// once its reader is joined (the final FSM, no racing echo).
     pub async fn abort_agent(&mut self, topic: &str) -> Vec<QueuedTurn> {
         let removed = self.agents.remove(topic);
         self.sync_live_sessions();
-        match removed {
+        let unconsumed = match removed {
             Some(AgentEntry::OneShot { handle, cancel }) => {
                 info!(topic = %topic, "aborting running agent (one-shot)");
                 cancel.cancel();
@@ -682,12 +804,23 @@ impl Supervisor {
                 std::mem::take(&mut session.state.lock().expect("SessionState mutex").unconsumed)
             }
             None => Vec::new(),
-        }
+        };
+        self.pending_prunes.lock().await.remove(topic);
+        unconsumed
     }
 
-    /// Check if there are no tracked agents.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.agents.is_empty()
+    }
+
+    pub fn has_agent(&self, topic: &str) -> bool {
+        self.agents.contains_key(topic)
+    }
+
+    /// Some chat's agent is busy. Idle residents don't count.
+    pub fn any_running(&self) -> bool {
+        self.agents.keys().any(|topic| self.is_running(topic))
     }
 
     /// Drop the chat's entry on its `Done`. For a resident only the session
@@ -705,8 +838,8 @@ impl Supervisor {
 
     /// True when the chat has a tracked agent that hasn't finished. For a
     /// resident session this means the process is alive AND its FSM is non-Idle
-    /// (a fully-Idle resident is torn down on its idle edge, so this is rarely
-    /// observed Idle); for one-shot it's "task not finished".
+    /// (an Idle resident is kept warm and is not running); for one-shot it's
+    /// "task not finished".
     pub fn is_running(&self, topic: &str) -> bool {
         match self.agents.get(topic) {
             Some(AgentEntry::OneShot { handle, .. }) => !handle.is_finished(),
@@ -732,18 +865,20 @@ impl Supervisor {
 
     /// Deliver `req` as a new user turn to the chat's live resident process via
     /// stdin. `false` — the caller respawns instead — when there's no live
-    /// session, its spawn knobs differ, or it's a slash command while a turn
-    /// is in flight (that one interrupts, as before; a slash command queued
-    /// behind other turns is held by the writer until it can run on its own).
+    /// session, its spawn knobs differ, a `/stop` interrupt is pending (its
+    /// timeout hard-aborts and would drop the turn; the respawn re-queues it),
+    /// or it's a slash command while a turn is in flight (that one interrupts,
+    /// as before; a slash command queued behind other turns is held by the
+    /// writer until it can run on its own).
     pub fn send_user_turn(&self, req: &SpawnRequest) -> bool {
         let Some(AgentEntry::Resident(s)) = self.agents.get(&req.chat_id) else {
             return false;
         };
-        let (closed, in_flight) = {
+        let (closed, in_flight, interrupting) = {
             let st = s.state.lock().expect("SessionState mutex");
-            (st.closed, st.turn_in_flight)
+            (st.closed, st.in_turn(), st.interrupt.is_some())
         };
-        if closed || s.reader.is_finished() || s.knobs != SessionKnobs::of(req) {
+        if closed || interrupting || s.reader.is_finished() || s.knobs != SessionKnobs::of(req) {
             return false;
         }
         if in_flight
@@ -754,6 +889,145 @@ impl Supervisor {
         }
         s.queue_turn(req.prompt.clone(), false, req.user_timezone.as_deref());
         true
+    }
+
+    /// `/stop` that keeps the process: ask the live resident to end its turn
+    /// in flight. Background tasks survive. `false` — the caller hard-aborts —
+    /// when the adapter can't interrupt, no turn is in flight (only tasks or
+    /// queued turns), or turns are queued: claude runs those right after the
+    /// interrupt (`still_queued`), while `/stop` drops them. The turn's
+    /// `result` arrives as `AgentResponse::Interrupted`; without one within
+    /// `INTERRUPT_RESULT_TIMEOUT` comes `InterruptTimedOut`.
+    pub fn interrupt(&self, topic: &str) -> bool {
+        let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
+            return false;
+        };
+        let request_id = Uuid::now_v7().to_string();
+        let Some(frame) = s
+            .knobs
+            .agent_kind
+            .make_adapter()
+            .encode_interrupt(&request_id)
+        else {
+            return false;
+        };
+        {
+            let mut st = s.state.lock().expect("SessionState mutex");
+            if st.closed || s.reader.is_finished() || !st.in_turn() || !st.unconsumed.is_empty() {
+                return false;
+            }
+            if st.interrupt.as_ref().is_some_and(|i| !i.turn_ended) {
+                return true;
+            }
+            st.interrupt = Some(PendingInterrupt {
+                request_id: request_id.clone(),
+                frame,
+                acked: false,
+                turn_ended: false,
+            });
+        }
+        s.wake.notify_one();
+        let tx = self.response_tx.clone();
+        let topic = topic.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(INTERRUPT_RESULT_TIMEOUT).await;
+            let _ = tx
+                .send(AgentResponse::InterruptTimedOut { topic, request_id })
+                .await;
+        });
+        true
+    }
+
+    /// The turn interrupt `request_id` targeted in the chat's live session
+    /// still runs. An interrupt whose turn ended on its own is dropped here
+    /// if its ack never came, so it can't hold back `send_user_turn`.
+    pub fn interrupt_pending(&self, topic: &str, request_id: &str) -> bool {
+        let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
+            return false;
+        };
+        let mut st = s.state.lock().expect("SessionState mutex");
+        let Some(i) = st.interrupt.as_ref().filter(|i| i.request_id == request_id) else {
+            return false;
+        };
+        if i.turn_ended {
+            st.interrupt = None;
+            return false;
+        }
+        true
+    }
+
+    /// `session` is the chat's live resident session.
+    pub fn is_current_session(&self, topic: &str, session: &Arc<StdMutex<SessionState>>) -> bool {
+        matches!(self.agents.get(topic), Some(AgentEntry::Resident(s)) if Arc::ptr_eq(&s.state, session))
+    }
+
+    /// Residents kept warm past their idle edge with nothing pending, by topic.
+    pub fn idle_residents(&self) -> Vec<crate::warm::IdleResident> {
+        let mut idle: Vec<_> = self
+            .agents
+            .iter()
+            .filter_map(|(topic, entry)| {
+                let AgentEntry::Resident(s) = entry else {
+                    return None;
+                };
+                let st = s.state.lock().expect("SessionState mutex");
+                let idle_since = st.warm_idle_since().filter(|_| !s.reader.is_finished())?;
+                Some(crate::warm::IdleResident {
+                    topic: topic.clone(),
+                    idle_since,
+                    pid: st.pid,
+                    footprint_kb: None,
+                })
+            })
+            .collect();
+        idle.sort_by(|a, b| a.topic.cmp(&b.topic));
+        idle
+    }
+
+    /// Hard-abort an idle resident. `false` if it took a turn meanwhile: the
+    /// check and the kill share the lock the reader reduces under.
+    pub async fn evict_idle(&mut self, topic: &str) -> bool {
+        let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
+            return false;
+        };
+        {
+            let st = s.state.lock().expect("SessionState mutex");
+            if st.warm_idle_since().is_none() {
+                return false;
+            }
+            s.cancel.cancel();
+        }
+        self.abort_agent(topic).await;
+        true
+    }
+
+    /// `chats.agent_alive` edges since the last call: a chat gained or lost
+    /// its resident process. The main loop diffs once per pass, so an
+    /// abort + respawn within one pass (prune, knob change) publishes nothing.
+    pub fn alive_changes(&mut self) -> Vec<(String, bool)> {
+        let alive: HashSet<String> = self
+            .agents
+            .iter()
+            .filter(|(_, e)| matches!(e, AgentEntry::Resident(_)))
+            .map(|(topic, _)| topic.clone())
+            .collect();
+        let mut changes: Vec<(String, bool)> = alive
+            .difference(&self.alive_published)
+            .map(|topic| (topic.clone(), true))
+            .collect();
+        changes.extend(
+            self.alive_published
+                .difference(&alive)
+                .map(|topic| (topic.clone(), false)),
+        );
+        self.alive_published = alive;
+        changes
+    }
+
+    /// Drop the chat from `alive_changes` without an edge: its row is gone, or
+    /// the caller writes `agent_alive` itself.
+    pub fn forget_alive(&mut self, topic: &str) {
+        self.alive_published.remove(topic);
     }
 
     #[cfg(test)]
@@ -852,33 +1126,40 @@ impl Supervisor {
         self.sync_live_sessions();
     }
 
-    pub async fn shutdown_all(&mut self) {
+    /// Cancel every agent and hand back the tasks to join.
+    pub fn cancel_all(&mut self) -> Vec<(String, tokio::task::JoinHandle<()>)> {
         let agents: Vec<_> = self.agents.drain().collect();
         self.live_sessions
             .lock()
             .expect("LiveSessions mutex")
             .clear();
-        if agents.is_empty() {
-            return;
+        if !agents.is_empty() {
+            info!("shutting down {} running agent(s)", agents.len());
         }
-        info!("shutting down {} running agent(s)", agents.len());
-        let mut joins: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
-        for (topic, entry) in agents {
-            info!(topic = %topic, "cancelling agent");
-            match entry {
-                AgentEntry::OneShot { handle, cancel } => {
-                    cancel.cancel();
-                    joins.push((topic, handle));
+        agents
+            .into_iter()
+            .map(|(topic, entry)| {
+                info!(topic = %topic, "cancelling agent");
+                match entry {
+                    AgentEntry::OneShot { handle, cancel } => {
+                        cancel.cancel();
+                        (topic, handle)
+                    }
+                    AgentEntry::Resident(s) => {
+                        s.cancel.cancel();
+                        (topic, s.reader)
+                    }
                 }
-                AgentEntry::Resident(s) => {
-                    s.cancel.cancel();
-                    joins.push((topic, s.reader));
-                }
-            }
-        }
-        for (topic, handle) in joins {
+            })
+            .collect()
+    }
+
+    pub async fn shutdown_all(&mut self) {
+        for (topic, handle) in self.cancel_all() {
             await_agent_exit(handle, &topic).await;
         }
+        // After the joins: a dying agent's `prune-context` RPC may park late.
+        self.pending_prunes.lock().await.clear();
     }
 }
 
@@ -1339,7 +1620,8 @@ fn default_resident_spawn_fn(
             map: pending,
             chat_id: topic.clone(),
         };
-        let _power_assertion = crate::power::AgentPowerAssertion::acquire();
+        // Held only while busy, so an idle resident doesn't keep the Mac awake.
+        let mut _power_assertion: Option<crate::power::AgentPowerAssertion> = None;
         let mut adapter = agent_kind.make_adapter();
         info!(
             topic = %topic,
@@ -1398,7 +1680,7 @@ fn default_resident_spawn_fn(
         // One automatic respawn is allowed after a silent startup timeout (see
         // `startup_retry_allowed`); the retry attempt gets a doubled deadline.
         let mut attempt: u32 = 0;
-        let (mut child, agent_started, stderr_handle, writer_handle, cancelled) = 'spawn: loop {
+        let (mut child, pgid, agent_started, stderr_handle, writer_handle, cancelled) = 'spawn: loop {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
@@ -1422,6 +1704,9 @@ fn default_resident_spawn_fn(
                     return;
                 }
             };
+            let pgid = child.id().unwrap_or_default();
+            crate::orphans::record(pgid);
+            state_for_reader.lock().expect("SessionState mutex").pid = child.id();
 
             // Writer task: owns ChildStdin, the single writer of stdin frames (see
             // `spawn_stdin_writer`).
@@ -1451,7 +1736,7 @@ fn default_resident_spawn_fn(
             // a Thinking↔Waiting flip emits nothing; only the busy↔idle edge does.
             let mut last_emitted: Option<bool> = None;
             // True when the exit was a DELIBERATE `cancel` teardown (knob-change
-            // respawn, prune-respawn, idle-teardown, shutdown). A deliberate teardown
+            // respawn, prune-respawn, eviction, shutdown). A deliberate teardown
             // emits NO `Done` — the caller (`abort_agent`) has already removed the
             // map entry and owns the post-state, exactly like the one-shot cancel
             // arm. Emitting a `Done` here would (a) post a spurious
@@ -1483,6 +1768,7 @@ fn default_resident_spawn_fn(
                                     wh.abort();
                                 }
                                 let _ = child.wait().await;
+                                crate::orphans::forget(pgid);
                                 attempt += 1;
                                 continue 'spawn;
                             }
@@ -1499,6 +1785,8 @@ fn default_resident_spawn_fn(
                                     agent_started.store(true, Ordering::Relaxed);
                                     ANY_AGENT_STARTED.store(true, Ordering::Relaxed);
                                     let events = adapter.handle_line(line);
+                                    // This line is the `result` ending an interrupted turn.
+                                    let mut interrupted = false;
                                     for ev in events {
                                         // Reduce the FSM and read back the resulting
                                         // `running` in one lock — the `match` below only
@@ -1510,6 +1798,7 @@ fn default_resident_spawn_fn(
                                         let is_result = matches!(&ev, AgentEvent::Result { .. });
                                         let running = {
                                             let mut st = state_for_reader.lock().expect("SessionState mutex");
+                                            interrupted |= is_result && st.interrupt_acked();
                                             reduce(&mut st, &ev);
                                             let r = st.running();
                                             // [DIAG tasktrace] TEMPORARY — log every
@@ -1528,6 +1817,11 @@ fn default_resident_spawn_fn(
                                             wake_for_writer.notify_one();
                                         }
                                         match ev {
+                                            AgentEvent::Frame(_) if interrupted => {}
+                                            AgentEvent::Result { .. } if interrupted => {
+                                                let session = state_for_reader.clone();
+                                                if tx.send(AgentResponse::Interrupted { topic: topic.clone(), session }).await.is_err() { break 'read; }
+                                            }
                                             AgentEvent::Frame(content) => {
                                                 let resp = AgentResponse::Line { topic: topic.clone(), content };
                                                 let followup = if let AgentResponse::Line { topic: t, content: c } = &resp {
@@ -1550,6 +1844,10 @@ fn default_resident_spawn_fn(
                                             AgentEvent::ToolResult => {
                                                 if tx.send(AgentResponse::ToolResult { topic: topic.clone() }).await.is_err() { break 'read; }
                                             }
+                                            AgentEvent::PeerTurnConsumed { name, body } => {
+                                                let content = peer_message_frame_json(&name, &body);
+                                                if tx.send(AgentResponse::Line { topic: topic.clone(), content }).await.is_err() { break 'read; }
+                                            }
                                             // Run-state-bearing events (Result/TaskStarted/
                                             // TaskFinished) already updated the FSM via
                                             // `reduce`; the RunState recompute below emits a
@@ -1557,7 +1855,9 @@ fn default_resident_spawn_fn(
                                             AgentEvent::Result { .. }
                                             | AgentEvent::TaskStarted(_)
                                             | AgentEvent::TaskFinished(_)
-                                            | AgentEvent::UserTurnConsumed(_) => {}
+                                            | AgentEvent::UserTurnConsumed(_)
+                                            | AgentEvent::TurnStarted(_)
+                                            | AgentEvent::InterruptAcked(_) => {}
                                         }
                                         // Emit the idle (`running=false`) edge ONLY on a `Result` frame — a real
                                         // turn boundary. A bare `TaskFinished` that empties `live_tasks` also drops
@@ -1566,6 +1866,9 @@ fn default_resident_spawn_fn(
                                         // defers it to that turn's end. Busy (`running=true`) edges always emit.
                                         if last_emitted != Some(running) && (running || is_result) {
                                             last_emitted = Some(running);
+                                            state_for_reader.lock().expect("SessionState mutex").idle_since =
+                                                (!running).then(tokio::time::Instant::now);
+                                            _power_assertion = running.then(crate::power::AgentPowerAssertion::acquire).flatten();
                                             // [DIAG tasktrace] TEMPORARY — the busy↔idle edge that writes agent_running.
                                             tracing::info!(diag = "tasktrace", topic = %topic, running, "RunState transition -> chat_running");
                                             if tx.send(AgentResponse::RunState { topic: topic.clone(), running }).await.is_err() { break 'read; }
@@ -1582,6 +1885,7 @@ fn default_resident_spawn_fn(
 
             break 'spawn (
                 child,
+                pgid,
                 agent_started,
                 stderr_handle,
                 writer_handle,
@@ -1622,6 +1926,7 @@ fn default_resident_spawn_fn(
             Ok(status) => info!(topic = %topic, %status, "resident agent exited"),
             Err(e) => error!(topic = %topic, "error waiting for resident agent: {}", e),
         }
+        crate::orphans::forget(pgid);
 
         // Deliberate teardown ⇒ no `Done` (caller owns the post-state; see the
         // `cancelled` declaration above). SPONTANEOUS exit ⇒ emit `Done`:
@@ -1651,7 +1956,7 @@ fn default_resident_spawn_fn(
     }
 }
 
-async fn await_agent_exit(handle: tokio::task::JoinHandle<()>, topic: &str) {
+pub async fn await_agent_exit(handle: tokio::task::JoinHandle<()>, topic: &str) {
     match tokio::time::timeout(AGENT_EXIT_TIMEOUT, handle).await {
         Ok(_) => info!(topic = %topic, "agent exited"),
         Err(_) => warn!(topic = %topic, "agent did not exit in {:?}", AGENT_EXIT_TIMEOUT),
@@ -1718,8 +2023,13 @@ fn spawn_stdin_writer(
 /// plain text at the next tool boundary.
 fn frames_to_write(st: &SessionState, written: &mut HashSet<String>) -> Vec<String> {
     let mut frames = Vec::new();
+    if let Some(i) = &st.interrupt {
+        if written.insert(i.request_id.clone()) {
+            frames.push(i.frame.clone());
+        }
+    }
     for (i, t) in st.unconsumed.iter().enumerate() {
-        if t.own_turn && (i > 0 || st.turn_in_flight) {
+        if t.own_turn && (i > 0 || st.in_turn()) {
             break;
         }
         if written.insert(t.uuid.clone()) {
@@ -1901,7 +2211,10 @@ fn attach_followup_for(
 
 #[cfg(test)]
 mod reduce_tests {
-    use super::{frames_to_write, reduce, AgentEvent, QueuedTurn, SessionState};
+    use super::{
+        frames_to_write, peer_message_frame_json, reduce, AgentEvent, PendingInterrupt, QueuedTurn,
+        SessionState,
+    };
     use std::collections::HashSet;
 
     /// Drive a frame sequence through the pure reducer and assert the derived
@@ -2037,6 +2350,91 @@ mod reduce_tests {
         assert_eq!(frames_to_write(&s, &mut written), vec!["b", "c"]);
     }
 
+    fn interrupting() -> SessionState {
+        SessionState {
+            turn_in_flight: true,
+            interrupt: Some(PendingInterrupt {
+                request_id: "int-1".into(),
+                frame: "interrupt".into(),
+                acked: false,
+                turn_ended: false,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn ack(id: &str) -> AgentEvent {
+        AgentEvent::InterruptAcked(id.into())
+    }
+
+    #[test]
+    fn an_interrupt_is_written_once_ahead_of_queued_turns() {
+        let mut s = interrupting();
+        s.unconsumed = vec![queued("a")];
+        let mut written = HashSet::new();
+        assert_eq!(frames_to_write(&s, &mut written), vec!["interrupt", "a"]);
+        assert!(frames_to_write(&s, &mut written).is_empty());
+    }
+
+    /// Seen live: an interrupted turn that merged monitor ticks ends with a
+    /// `task-notification` result. Later task results stay task results.
+    #[test]
+    fn an_interrupted_turn_ends_on_a_result_of_any_origin() {
+        let task_result = AgentEvent::Result {
+            origin_is_task: true,
+        };
+        let mut s = interrupting();
+        s.live_tasks.insert("monitor".into());
+        reduce(&mut s, &ack("other"));
+        assert!(!s.interrupt_acked());
+        reduce(&mut s, &ack("int-1"));
+        assert!(s.interrupt_acked());
+        reduce(&mut s, &task_result);
+        assert!(!s.turn_in_flight && s.interrupt.is_none());
+        assert!(s.running(), "the monitor survives");
+
+        s.turn_in_flight = true;
+        reduce(&mut s, &task_result);
+        assert!(s.turn_in_flight);
+    }
+
+    /// Before the ack a monitor tick's result is not the interrupted one.
+    #[test]
+    fn a_task_result_before_the_ack_keeps_the_interrupt() {
+        let mut s = interrupting();
+        reduce(
+            &mut s,
+            &AgentEvent::Result {
+                origin_is_task: true,
+            },
+        );
+        assert!(s.turn_in_flight);
+        reduce(&mut s, &ack("int-1"));
+        assert!(s.interrupt_acked());
+    }
+
+    /// The turn's natural `result` was already in the pipe when `/stop`
+    /// arrived: it ends the turn as usual, and the ack makes the stop a no-op
+    /// even if a peer turn started in between.
+    #[test]
+    fn a_result_before_the_ack_is_a_natural_end() {
+        let mut s = interrupting();
+        reduce(&mut s, &RESULT);
+        assert!(!s.turn_in_flight && !s.interrupt_acked());
+        assert!(s.interrupt.is_some(), "stdin turns wait for the ack");
+        reduce(
+            &mut s,
+            &AgentEvent::PeerTurnConsumed {
+                name: "peer".into(),
+                body: "hi".into(),
+            },
+        );
+        reduce(&mut s, &ack("int-1"));
+        assert!(s.interrupt.is_none());
+        reduce(&mut s, &RESULT);
+        assert!(s.is_idle());
+    }
+
     const RESULT: AgentEvent = AgentEvent::Result {
         origin_is_task: false,
     };
@@ -2078,6 +2476,81 @@ mod reduce_tests {
         let mut s = SessionState::default();
         reduce(&mut s, &AgentEvent::UserTurnConsumed("ghost".into()));
         assert!(s.is_idle());
+    }
+
+    /// A `CronCreate` prompt fires on an idle resident: no echo, only a
+    /// started frame, and the result carries no origin (tmp/cron_probe.log).
+    #[test]
+    fn a_self_fired_turn_is_busy_until_its_result() {
+        let mut s = SessionState::default();
+        reduce(&mut s, &AgentEvent::TurnStarted("cron".into()));
+        assert!(s.running() && s.working());
+        reduce(&mut s, &RESULT);
+        assert!(s.is_idle());
+
+        // A monitor wake's turn ends with a task result.
+        reduce(&mut s, &AgentEvent::TurnStarted("wake".into()));
+        reduce(
+            &mut s,
+            &AgentEvent::Result {
+                origin_is_task: true,
+            },
+        );
+        assert!(s.is_idle());
+    }
+
+    /// Our own queued turn starts before its echo: it stays a queued turn.
+    #[test]
+    fn our_own_turn_starting_is_not_a_self_turn() {
+        let mut s = SessionState::default();
+        s.unconsumed.push(queued("a"));
+        reduce(&mut s, &AgentEvent::TurnStarted("a".into()));
+        assert!(!s.self_turn);
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
+        reduce(&mut s, &RESULT);
+        assert!(s.is_idle());
+    }
+
+    /// `/stop` during a self-fired turn interrupts it like one of ours.
+    #[test]
+    fn an_interrupted_self_turn_ends_on_its_result() {
+        let mut s = interrupting();
+        s.turn_in_flight = false;
+        s.self_turn = true;
+        reduce(&mut s, &ack("int-1"));
+        assert!(s.interrupt_acked());
+        reduce(&mut s, &RESULT);
+        assert!(s.is_idle() && s.interrupt.is_none());
+    }
+
+    /// A peer `SendMessage` to an idle resident: busy from its echo, idle on
+    /// the turn's `result`.
+    #[test]
+    fn peer_turn_is_busy_until_its_result() {
+        let mut s = SessionState::default();
+        let peer = AgentEvent::PeerTurnConsumed {
+            name: "zucchini-9d".into(),
+            body: "what is 6 x 7?".into(),
+        };
+        reduce(&mut s, &peer);
+        assert!(s.turn_in_flight && s.running());
+        reduce(&mut s, &RESULT);
+        assert!(s.is_idle());
+    }
+
+    #[test]
+    fn peer_message_frame_is_a_system_row() {
+        let v: serde_json::Value =
+            serde_json::from_str(&peer_message_frame_json("zucchini-9d", "hi \"there\"")).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "system",
+                "subtype": "peer_message",
+                "name": "zucchini-9d",
+                "body": "hi \"there\"",
+            })
+        );
     }
 }
 
@@ -2246,6 +2719,87 @@ mod live_session_tests {
             text.contains("current local time") && text.ends_with("second"),
             "{text}"
         );
+    }
+
+    /// Only a resident past its idle edge with nothing pending is evictable,
+    /// and a turn queued on it first saves it.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_warm_idle_resident_is_evicted() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(claude_req("chat"));
+        set_idle(&exposed, "chat");
+        assert!(sup.idle_residents().is_empty(), "no idle edge yet");
+        assert!(!sup.evict_idle("chat").await);
+
+        exposed.lock().unwrap()["chat"].lock().unwrap().idle_since =
+            Some(tokio::time::Instant::now());
+        assert_eq!(sup.idle_residents()[0].topic, "chat");
+        assert!(sup.send_user_turn(&claude_req("chat")), "warm stdin turn");
+        assert!(sup.idle_residents().is_empty());
+        assert!(!sup.evict_idle("chat").await, "busy is never evicted");
+
+        set_idle(&exposed, "chat");
+        assert!(sup.evict_idle("chat").await);
+        assert!(sup.is_empty());
+    }
+
+    /// Only a consumed turn with nothing queued behind it is interrupted in
+    /// place; the caller hard-aborts otherwise.
+    #[tokio::test(start_paused = true)]
+    async fn interrupt_needs_a_turn_in_flight_and_nothing_queued() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        assert!(!sup.interrupt("chat"), "no session");
+        sup.spawn_agent(claude_req("chat"));
+        assert!(!sup.interrupt("chat"), "first turn not consumed yet");
+
+        set_idle(&exposed, "chat");
+        exposed.lock().unwrap()["chat"]
+            .lock()
+            .unwrap()
+            .turn_in_flight = true;
+        assert!(sup.interrupt("chat"));
+        let request_id = exposed.lock().unwrap()["chat"]
+            .lock()
+            .unwrap()
+            .interrupt
+            .clone()
+            .unwrap()
+            .request_id;
+        assert!(sup.interrupt_pending("chat", &request_id));
+        assert!(sup.interrupt("chat"), "already interrupting");
+        assert!(!sup.interrupt_pending("chat", "other"));
+        assert!(
+            !sup.send_user_turn(&claude_req("chat")),
+            "a turn sent now would die with the timeout's hard abort"
+        );
+    }
+
+    /// The turn ended on its own and the ack never came: the timeout drops
+    /// the interrupt instead of killing the idle process.
+    #[tokio::test(start_paused = true)]
+    async fn a_naturally_ended_interrupt_times_out_quietly() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(claude_req("chat"));
+        set_idle(&exposed, "chat");
+        let session = exposed.lock().unwrap()["chat"].clone();
+        session.lock().unwrap().turn_in_flight = true;
+        assert!(sup.interrupt("chat"));
+        let request_id = session
+            .lock()
+            .unwrap()
+            .interrupt
+            .clone()
+            .unwrap()
+            .request_id;
+        super::reduce(
+            &mut session.lock().unwrap(),
+            &AgentEvent::Result {
+                origin_is_task: false,
+            },
+        );
+        assert!(!sup.interrupt_pending("chat", &request_id));
+        assert!(session.lock().unwrap().interrupt.is_none());
+        assert!(sup.send_user_turn(&claude_req("chat")));
     }
 
     #[tokio::test(start_paused = true)]

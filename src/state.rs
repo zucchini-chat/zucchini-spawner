@@ -3,7 +3,7 @@
 //! are transient because PowerSync only delivers ops after the saved cursor and we'd
 //! miss any chat created before the last restart otherwise.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -95,6 +95,15 @@ pub struct Mirror {
     /// or no message handled yet) falls back to the `chats.last_seq` guard.
     #[serde(default)]
     handled_user_seqs: HashMap<String, i64>,
+    /// Chats whose last-synced row had `agent_running` or `agent_alive` set.
+    /// Persisted because PowerSync resumes from the saved cursor and won't
+    /// re-stream those rows after a restart, when every such flag is stale:
+    /// no agent outlives the spawner (`orphans.rs`).
+    #[serde(default)]
+    flagged_chats: HashSet<String>,
+    /// `stale_flagged_chats_at_boot` already ran this process.
+    #[serde(skip)]
+    stale_flags_taken: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -198,6 +207,13 @@ impl Mirror {
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+
+        if crate::json_pg_bool(v.get("agent_running")) || crate::json_pg_bool(v.get("agent_alive"))
+        {
+            self.flagged_chats.insert(id.clone());
+        } else {
+            self.flagged_chats.remove(&id);
+        }
 
         self.chats.insert(
             id,
@@ -452,9 +468,28 @@ impl Mirror {
         self.projects.insert(id, path.to_string());
     }
 
+    pub fn chat_ids(&self, pred: impl Fn(&ChatState) -> bool) -> Vec<String> {
+        self.chats
+            .iter()
+            .filter(|(_, c)| pred(c))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     pub fn remove_chat(&mut self, id: &str) {
         self.chats.remove(id);
         self.handled_user_seqs.remove(id);
+        self.flagged_chats.remove(id);
+    }
+
+    /// The flagged chats on the first call per process (at boot all their
+    /// flags are stale), none after. They stay flagged until their reset rows
+    /// sync back, so a restart before the writer flushes resets them again.
+    pub fn stale_flagged_chats_at_boot(&mut self) -> Vec<String> {
+        if std::mem::replace(&mut self.stale_flags_taken, true) {
+            return Vec::new();
+        }
+        self.flagged_chats.iter().cloned().collect()
     }
 
     pub fn handled_user_seq(&self, chat_id: &str) -> Option<i64> {

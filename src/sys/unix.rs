@@ -144,6 +144,190 @@ impl ProcessGroup {
     }
 }
 
+/// Start time of process `pid` in microseconds since the epoch, or `None` if
+/// it's gone. The pid-reuse guard for the boot orphan sweep (`orphans.rs`),
+/// which is macOS-only: on Linux systemd kills the service's whole cgroup.
+#[cfg(target_os = "macos")]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// A process with this pid exists (zombies included).
+pub fn process_exists(pid: u32) -> bool {
+    signal::kill(Pid::from_raw(pid as i32), None) != Err(nix::errno::Errno::ESRCH)
+}
+
+/// SIGTERM the process group `pgid`.
+pub fn terminate_process_group(pgid: u32) {
+    let _ = signal::killpg(Pid::from_raw(pgid as i32), Signal::SIGTERM);
+}
+
+/// SIGKILL the process group `pgid`.
+pub fn kill_process_group(pgid: u32) {
+    let _ = signal::killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+}
+
+/// The process group `pgid` has a member (zombies included).
+pub fn process_group_exists(pgid: u32) -> bool {
+    signal::killpg(Pid::from_raw(pgid as i32), None) != Err(nix::errno::Errno::ESRCH)
+}
+
+// ---------------------------------------------------------------------------
+// Memory measurement (warm-keep eviction, `warm.rs`)
+// ---------------------------------------------------------------------------
+
+/// Footprint (KB) of each root's whole process tree, or `None` if `ps` fails
+/// or the OS has no footprint measure. Walks ppid links rather than the
+/// process group: Playwright's browser runs in a group of its own.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub async fn process_tree_footprint_kb(roots: &[u32]) -> Option<Vec<u64>> {
+    let out = tokio::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let rows = parse_ps(&String::from_utf8_lossy(&out.stdout));
+    let footprints = roots
+        .iter()
+        .map(|&root| {
+            tree_pids(&rows, root)
+                .into_iter()
+                .filter_map(footprint_kb)
+                .sum()
+        })
+        .collect();
+    Some(footprints)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub async fn process_tree_footprint_kb(_roots: &[u32]) -> Option<Vec<u64>> {
+    None
+}
+
+/// `(pid, ppid)` per `ps -o pid=,ppid=` line.
+fn parse_ps(out: &str) -> Vec<(u32, u32)> {
+    out.lines()
+        .filter_map(|line| {
+            let fields: Vec<u32> = line
+                .split_whitespace()
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .ok()?;
+            match fields[..] {
+                [pid, ppid] => Some((pid, ppid)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn tree_pids(rows: &[(u32, u32)], root: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        pids.push(pid);
+        stack.extend(
+            rows.iter()
+                .filter(|&&(p, ppid)| ppid == pid && p != pid)
+                .map(|&(p, _)| p),
+        );
+    }
+    pids
+}
+
+/// What killing `pid` frees: private memory, compressed pages included
+/// (Activity Monitor's "Memory"). RSS would count the shared `claude` binary
+/// once per process.
+#[cfg(target_os = "macos")]
+fn footprint_kb(pid: u32) -> Option<u64> {
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            (&mut info as *mut libc::rusage_info_v2).cast(),
+        )
+    };
+    (rc == 0).then_some(info.ri_phys_footprint / 1024)
+}
+
+/// Proportional set size: shared pages split among the processes mapping them.
+#[cfg(target_os = "linux")]
+fn footprint_kb(pid: u32) -> Option<u64> {
+    let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    let line = rollup.lines().find(|l| l.starts_with("Pss:"))?;
+    line["Pss:".len()..].split_whitespace().next()?.parse().ok()
+}
+
+/// Total RAM, and pressure at the kernel's warn level or worse (the level
+/// Activity Monitor graphs). `None` if unreadable.
+#[cfg(target_os = "macos")]
+pub fn memory() -> Option<crate::warm::Memory> {
+    const PRESSURE_WARN: i32 = 2;
+    let total_bytes: u64 = sysctl_value(c"hw.memsize")?;
+    let level: i32 = sysctl_value(c"kern.memorystatus_vm_pressure_level")?;
+    Some(crate::warm::Memory {
+        total_kb: total_bytes / 1024,
+        pressure: level >= PRESSURE_WARN,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_value<T: Default>(name: &std::ffi::CStr) -> Option<T> {
+    let mut value = T::default();
+    let mut size = std::mem::size_of::<T>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut T).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && size == std::mem::size_of::<T>()).then_some(value)
+}
+
+/// Total RAM, and pressure below 10% `MemAvailable`. `None` if unreadable.
+#[cfg(target_os = "linux")]
+pub fn memory() -> Option<crate::warm::Memory> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let field = |name: &str| -> Option<u64> {
+        let line = meminfo.lines().find(|l| l.starts_with(name))?;
+        line[name.len()..].split_whitespace().next()?.parse().ok()
+    };
+    let total_kb = field("MemTotal:")?;
+    let available_kb = field("MemAvailable:")?;
+    (total_kb > 0).then(|| crate::warm::Memory {
+        total_kb,
+        pressure: available_kb * 10 < total_kb,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn memory() -> Option<crate::warm::Memory> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Single-instance lock
 // ---------------------------------------------------------------------------
@@ -305,5 +489,28 @@ impl AsyncWrite for IpcStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ps_rows_walk_the_process_tree() {
+        let out = "    1     0\n  100     1\n  101   100\n  102   101\n  200     1\n  bogus line\n  300\n";
+        let rows = parse_ps(out);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(tree_pids(&rows, 100), vec![100, 101, 102]);
+        assert_eq!(tree_pids(&rows, 999), vec![999]);
+    }
+
+    #[tokio::test]
+    async fn measures_this_process_and_the_machine() {
+        let kb = process_tree_footprint_kb(&[std::process::id()])
+            .await
+            .unwrap();
+        assert!(kb[0] > 0);
+        assert!(memory().unwrap().total_kb > 0);
     }
 }

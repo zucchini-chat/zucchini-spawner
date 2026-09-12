@@ -273,6 +273,34 @@ impl Drop for ProcessGroup {
     }
 }
 
+/// No orphans to sweep: the kill-on-close job dies with the spawner.
+pub fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+pub fn process_exists(_pid: u32) -> bool {
+    true
+}
+
+pub fn terminate_process_group(_pgid: u32) {}
+
+pub fn kill_process_group(_pgid: u32) {}
+
+pub fn process_group_exists(_pgid: u32) -> bool {
+    false
+}
+
+// TODO(windows): per-process private bytes and `GlobalMemoryStatusEx` (extra
+// windows-sys features). Until then warm-keep eviction counts idle residents
+// and has no memory-pressure guard.
+pub async fn process_tree_footprint_kb(_roots: &[u32]) -> Option<Vec<u64>> {
+    None
+}
+
+pub fn memory() -> Option<crate::warm::Memory> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Single-instance lock — LockFileEx (step 7)
 // ---------------------------------------------------------------------------

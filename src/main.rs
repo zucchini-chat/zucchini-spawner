@@ -9,6 +9,7 @@ mod crypto;
 mod envelope;
 mod hermes_support;
 mod net;
+mod orphans;
 mod power;
 mod powersync;
 mod prune;
@@ -18,6 +19,7 @@ mod sys;
 mod uninstall;
 mod updater;
 mod useragent;
+mod warm;
 mod writer;
 mod x25519;
 
@@ -365,8 +367,20 @@ async fn handle_sync_event(
                 // Members are persisted across restarts so the sandbox-spawn
                 // gate doesn't fail open after the bucket cursor advances
                 // past historical machine_users rows.
+                let sandboxed_before = mirror.member_is_sandboxed(&user_id);
                 let state_changed =
                     apply_machine_users_put(&id, user_id, &row, x25519_secret, keys, mirror);
+                if !mirror.is_owner(user_id) {
+                    let revoked = row
+                        .get("sealed_blob")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(str::is_empty);
+                    let sandbox_flipped = sandboxed_before
+                        .is_some_and(|b| mirror.member_is_sandboxed(&user_id) != Some(b));
+                    if revoked || sandbox_flipped {
+                        abort_member_agents(user_id, revoked, mirror, supervisor, write_tx).await;
+                    }
+                }
 
                 // `agents` (migration 0035) is deliberately NOT mirrored: the
                 // spawner never needs the roster's server state (see
@@ -418,6 +432,7 @@ async fn handle_sync_event(
                 }
                 mirror.remove_member(&id);
                 revoke_local_access(&user_id, keys);
+                abort_member_agents(user_id, true, mirror, supervisor, write_tx).await;
                 SyncEventOutcome::StateChanged
             }
             _ => SyncEventOutcome::Nothing,
@@ -431,7 +446,13 @@ async fn handle_sync_event(
             for (id, row) in staging.projects.drain() {
                 match row {
                     StagedRow::Put(json) => mirror.upsert_project(id, &json),
-                    StagedRow::Remove => mirror.remove_project(&id),
+                    StagedRow::Remove => {
+                        // Its chats go with it (ON DELETE CASCADE).
+                        for chat_id in mirror.chat_ids(|c| c.project_id == id) {
+                            delete_chat(&chat_id, mirror, supervisor).await;
+                        }
+                        mirror.remove_project(&id);
+                    }
                 }
             }
 
@@ -463,8 +484,18 @@ async fn handle_sync_event(
                             }
                         }
                     }
-                    StagedRow::Remove => mirror.remove_chat(&id),
+                    StagedRow::Remove => delete_chat(&id, mirror, supervisor).await,
                 }
+            }
+
+            // Boot: clear the run flags no agent backs anymore, before any
+            // message below spawns one. Stopped-by-user: no "finished" push.
+            for chat_id in mirror.stale_flagged_chats_at_boot() {
+                info!(chat_id = %chat_id, "resetting stale agent_running/agent_alive");
+                let _ = write_tx
+                    .send(WriteEvent::chat_stopped_by_user(chat_id.clone()))
+                    .await;
+                let _ = write_tx.send(WriteEvent::chat_alive(chat_id, false)).await;
             }
 
             // 3. messages — spawn against the now-consistent mirror, arrival order
@@ -496,6 +527,12 @@ pub(crate) async fn handle_agent_response(
     write_tx: &mpsc::Sender<WriteEvent>,
     supervisor: &mut Supervisor,
 ) {
+    if is_deleted_chat(mirror, resp.topic()) {
+        if let AgentResponse::Done { topic, .. } = &resp {
+            supervisor.remove_finished(topic);
+        }
+        return;
+    }
     match resp {
         AgentResponse::Line { topic, content } => {
             send_agent_line(write_tx, mirror, &topic, content).await;
@@ -557,6 +594,67 @@ pub(crate) async fn handle_agent_response(
         // never reaches here at runtime. The arm exists only to keep the match
         // exhaustive (and stays a no-op if a future caller routes one through).
         AgentResponse::ToolResult { .. } => {}
+        // The `/stop`-interrupted turn ended. With background tasks still
+        // armed the chat stays busy until its idle edge. From a session a
+        // `/kill` or respawn already replaced, it is stale: that teardown
+        // closed the chat out.
+        AgentResponse::Interrupted { topic, session } => {
+            if !supervisor.is_current_session(&topic, &session) {
+                info!(topic = %topic, "ignoring interrupted result of a replaced session");
+                return;
+            }
+            send_agent_line(write_tx, mirror, &topic, INTERRUPTED_RESULT.to_string()).await;
+            if !supervisor.is_running(&topic) {
+                let _ = write_tx.send(WriteEvent::chat_stopped_by_user(topic)).await;
+            }
+        }
+        AgentResponse::InterruptTimedOut { topic, request_id } => {
+            if supervisor.interrupt_pending(&topic, &request_id) {
+                warn!(topic = %topic, "no result after the interrupt, tearing down the resident session");
+                if let Some(user_id) = mirror.chats.get(&topic).map(|c| c.user_id) {
+                    hard_stop(&topic, user_id, supervisor, write_tx).await;
+                }
+            }
+        }
+    }
+}
+
+/// A chat whose agent outlived its row (its responses were queued before the
+/// delete aborted it). Any write against it 4xx's the whole batch server-side,
+/// and the writer retries a 4xx forever.
+fn is_deleted_chat(mirror: &Mirror, chat_id: &str) -> bool {
+    !mirror.chats.contains_key(chat_id)
+}
+
+/// Delete `chat_id` from the mirror and kill its agent, with no writes: the
+/// row is gone server-side (see `is_deleted_chat`).
+async fn delete_chat(chat_id: &str, mirror: &mut Mirror, supervisor: &mut Supervisor) {
+    mirror.remove_chat(chat_id);
+    supervisor.abort_agent(chat_id).await;
+    supervisor.forget_alive(chat_id);
+}
+
+/// Kill a member's agents after their access changed, so a running turn can't
+/// finish under the old key or sandbox mode. A revoked member gets no writes
+/// (their key is gone and their chats may be cascaded away); after a sandbox
+/// flip, a running or queued turn is closed out as interrupted.
+async fn abort_member_agents(
+    user_id: Uuid,
+    revoked: bool,
+    mirror: &Mirror,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    for chat_id in mirror.chat_ids(|c| c.user_id == user_id) {
+        let running = supervisor.is_running(&chat_id);
+        supervisor.abort_agent(&chat_id).await;
+        if revoked {
+            supervisor.forget_alive(&chat_id);
+        } else if running {
+            info!(chat_id = %chat_id, %user_id, "sandbox flipped: aborted running agent");
+            publish_interrupted(write_tx, &chat_id, user_id).await;
+            send_run_state(write_tx, chat_id, false).await;
+        }
     }
 }
 
@@ -582,6 +680,265 @@ async fn publish_interrupted(write_tx: &mpsc::Sender<WriteEvent>, chat_id: &str,
 async fn send_run_state(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String, running: bool) {
     let _ = write_tx
         .send(WriteEvent::chat_running(chat_id, running))
+        .await;
+}
+
+/// Write `agent_alive` for every chat whose resident process appeared or went
+/// away since the last call. Once per main-loop pass (see `alive_changes`).
+async fn publish_alive_changes(supervisor: &mut Supervisor, write_tx: &mpsc::Sender<WriteEvent>) {
+    for (chat_id, alive) in supervisor.alive_changes() {
+        let _ = write_tx.send(WriteEvent::chat_alive(chat_id, alive)).await;
+    }
+}
+
+/// How often idle residents' memory is re-measured for eviction.
+const WARM_TICK: Duration = Duration::from_secs(60);
+
+/// Evict idle claude residents per `warm::choose` until none is due (one per
+/// call under memory pressure); returns when the next one would be due. Their
+/// turns already ended, so no `interrupted`
+/// frame; `agent_alive` goes false via `publish_alive_changes`.
+async fn evict_idle_residents(
+    supervisor: &mut Supervisor,
+    memory: fn() -> Option<warm::Memory>,
+) -> Option<tokio::time::Instant> {
+    loop {
+        let mut idle = supervisor.idle_residents();
+        if idle.len() < 2 {
+            return None;
+        }
+        measure_idle_footprint(&mut idle).await;
+        let eviction = match warm::choose(&idle, memory().as_ref(), tokio::time::Instant::now()) {
+            warm::Decision::Evict(e) => e,
+            warm::Decision::WaitUntil(deadline) => return Some(deadline),
+            warm::Decision::KeepAll => return None,
+        };
+        let topic = &idle[eviction.victim].topic;
+        info!(
+            topic = %topic,
+            n = idle.len(),
+            n_eff = eviction.n_eff,
+            ttl = ?eviction.ttl,
+            age = ?eviction.age,
+            pressure = eviction.pressure,
+            "evicting idle resident"
+        );
+        supervisor.evict_idle(topic).await;
+        if eviction.pressure {
+            // Memory stats lag the kill; the next tick re-checks.
+            return None;
+        }
+    }
+}
+
+async fn measure_idle_footprint(idle: &mut [warm::IdleResident]) {
+    let Some(pids) = idle.iter().map(|r| r.pid).collect::<Option<Vec<u32>>>() else {
+        return;
+    };
+    let Some(footprints) = sys::process_tree_footprint_kb(&pids).await else {
+        return;
+    };
+    for (r, kb) in idle.iter_mut().zip(footprints) {
+        r.footprint_kb = Some(kb);
+    }
+}
+
+/// Which residents are idle since when; a change re-runs eviction.
+fn idle_set(supervisor: &Supervisor) -> Vec<(String, tokio::time::Instant)> {
+    supervisor
+        .idle_residents()
+        .into_iter()
+        .map(|r| (r.topic, r.idle_since))
+        .collect()
+}
+
+/// The main loop's `response_rx` arm.
+async fn route_agent_response(
+    resp: AgentResponse,
+    pending_prunes: &prune::PendingPrunes,
+    mirror: &SharedMirror,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    match resp {
+        // This cue is the call-keyed signal that the `prune-context`
+        // call's OWN result has persisted to the transcript (the adapter
+        // emits it only for that call, never a sibling tool in the same
+        // parallel batch). Aborting → rewriting → respawning here lands
+        // the prune strictly AFTER that result (and its summary) reached
+        // disk — the resumed agent sees its own prune and won't re-run it.
+        // A no-op for any chat with nothing pending. The control task
+        // parked the `PruneRequest` in `pending_prunes` during the
+        // `prune-context` RPC, which returned before this cue could fire,
+        // so the entry is guaranteed visible here. Take the lock only long
+        // enough to lift the chat's batch out, then apply unlocked.
+        AgentResponse::ToolResult { topic } => {
+            // The `prune-context` call's own result has persisted to the
+            // transcript. Apply NOW regardless of resident-busy state:
+            // abort (SIGTERM) the agent → rewrite the jsonl → respawn-with-
+            // `--resume`, so the freed context takes effect immediately,
+            // within the SAME task — not deferred to the turn boundary
+            // (which made the prune useless to the turn that asked for it).
+            // This is a HARD RESTART of the resident session, and it has to
+            // be: a transcript rewrite only lands via respawn (a live in-
+            // memory session ignores the on-disk edit), so pruning a
+            // resident agent is necessarily kill+resume. The cue fires only
+            // AFTER the prune call's result reached disk, so the resumed
+            // transcript carries the agent's prune call + summary and it
+            // won't re-issue the now-satisfied command. A no-op for any chat
+            // with nothing pending or no agent (`take_prunes`). The control task parked the
+            // `PruneRequest` in `pending_prunes` during the `prune-context`
+            // RPC (which returned before this cue could fire), so the entry
+            // is guaranteed visible here.
+            //
+            // This restart kills any background task / Monitor armed in
+            // the resident session — their runtime is in-process, not in
+            // the transcript, so `--resume` does not re-arm them. The
+            // control task GUARDS against this: `prune_context` refuses a
+            // prune while `live_tasks` is non-empty unless the agent
+            // passed `--force`, so reaching here with live tasks means a
+            // forced prune (or a task armed in the same instant the RPC's
+            // check passed). Either way `apply_prune_group` reads the
+            // live-task count first and tells the resumed agent in the
+            // respawn prompt how many it terminated, so the kill is never
+            // silent. (Earlier this DEFERRED until Idle to spare the
+            // monitor; the immediate apply — so the freed context helps the
+            // turn that asked for it — is the behavior we kept.)
+            if let Some(reqs) = take_prunes(&topic, pending_prunes, supervisor).await {
+                apply_prune_group(&topic, reqs, mirror, supervisor, write_tx).await;
+            }
+        }
+        AgentResponse::RunState { topic, running } => {
+            handle_run_state(
+                &topic,
+                running,
+                pending_prunes,
+                mirror,
+                supervisor,
+                write_tx,
+            )
+            .await;
+        }
+        other => {
+            // A turn ending with a prune still parked means its triggering
+            // cue never arrived (the agent exited/errored mid-`prune-context`,
+            // so the call's own result was never persisted). Drop the parked
+            // request: leaving it in `pending_prunes` leaks the entry for the
+            // process lifetime and would mis-fire on a LATER turn's
+            // `prune-context` cue for this chat (applying a stale rewrite).
+            if let AgentResponse::Done { topic, .. } = &other {
+                pending_prunes.lock().await.remove(topic);
+            }
+            // Write guard scoped tightly so the control task can interleave
+            // a read between agent responses but not within one.
+            // `handle_agent_response` `.await`s on writer-channel sends and
+            // the supervisor remove path, so this MUST be `tokio::sync::RwLock`.
+            let mut g = mirror.write().await;
+            handle_agent_response(other, &mut g, write_tx, supervisor).await;
+        }
+    }
+}
+
+/// The chat's parked prunes, if its agent is still tracked. A `prune-context`
+/// RPC can park after `/kill` or shutdown cleared the entry; applying it would
+/// respawn the torn-down chat, so it is dropped instead.
+async fn take_prunes(
+    topic: &str,
+    pending_prunes: &prune::PendingPrunes,
+    supervisor: &Supervisor,
+) -> Option<Vec<prune::PruneRequest>> {
+    let reqs = pending_prunes.lock().await.remove(topic);
+    reqs.filter(|_| supervisor.has_agent(topic))
+}
+
+/// Tear every agent down while processing what their readers send meanwhile:
+/// a resident reduces a turn's `result` (so `any_running` goes false) before it
+/// forwards that line's frames and idle edge, and a reader blocked on a full
+/// `response_rx` only exits once it is consumed. With no agent tracked,
+/// `take_prunes` keeps anything routed here from respawning one.
+async fn shutdown_agents(
+    supervisor: &mut Supervisor,
+    response_rx: &mut mpsc::Receiver<AgentResponse>,
+    mirror: &SharedMirror,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    let pending_prunes = supervisor.pending_prunes();
+    let mut readers = tokio::task::JoinSet::new();
+    for (topic, handle) in supervisor.cancel_all() {
+        readers.spawn(async move { agent::await_agent_exit(handle, &topic).await });
+    }
+    loop {
+        tokio::select! {
+            Some(resp) = response_rx.recv() => {
+                route_agent_response(resp, &pending_prunes, mirror, supervisor, write_tx).await;
+            }
+            joined = readers.join_next() => {
+                if joined.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    pending_prunes.lock().await.clear();
+    while let Ok(resp) = response_rx.try_recv() {
+        route_agent_response(resp, &pending_prunes, mirror, supervisor, write_tx).await;
+    }
+    publish_alive_changes(supervisor, write_tx).await;
+}
+
+/// Stop heartbeats, tear the agents down and flush the writer, whose queue
+/// lives only in memory.
+async fn shutdown_and_flush(
+    supervisor: &mut Supervisor,
+    response_rx: &mut mpsc::Receiver<AgentResponse>,
+    mirror: &SharedMirror,
+    write_tx: &mpsc::Sender<WriteEvent>,
+    heartbeat_cancel: &CancellationToken,
+    writer: &Writer,
+) {
+    heartbeat_cancel.cancel();
+    shutdown_agents(supervisor, response_rx, mirror, write_tx).await;
+    if !wait_for_writer_idle(writer).await {
+        warn!("writer drain timed out, unsent writes are lost");
+    }
+}
+
+/// `/stop` by killing the process group, background tasks included.
+async fn hard_stop(
+    chat_id: &str,
+    user_id: Uuid,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    publish_interrupted(write_tx, chat_id, user_id).await;
+    supervisor.abort_agent(chat_id).await;
+    let _ = write_tx
+        .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
+        .await;
+}
+
+/// `/kill`: end the chat's agent process, and with it the warm session.
+async fn kill_agent(
+    chat_id: &str,
+    user_id: Uuid,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    if supervisor.is_working(chat_id) {
+        hard_stop(chat_id, user_id, supervisor, write_tx).await;
+    } else {
+        let running = supervisor.is_running(chat_id);
+        supervisor.abort_agent(chat_id).await;
+        if running {
+            let _ = write_tx
+                .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
+                .await;
+        }
+    }
+    // Written even with no process: the row may be stale.
+    supervisor.forget_alive(chat_id);
+    let _ = write_tx
+        .send(WriteEvent::chat_alive(chat_id.to_string(), false))
         .await;
 }
 
@@ -737,14 +1094,16 @@ async fn handle_message_put(
         }
     };
 
-    // Detect /stop early but defer the return: the abort+INTERRUPTED publish
+    // Detect /stop and /kill early but defer the return: the abort+INTERRUPTED publish
     // below must still run for an explicit user stop (so the chat gets the
     // "Agent interrupted" system frame), while the membership gate that
     // follows must run BEFORE any abort so an invitee with an unsynced
     // machine_users row can never trigger a stray INTERRUPTED.
-    let is_stop = envelope.attachments.is_empty() && envelope.text.trim() == "/stop";
-    if is_stop {
-        info!(chat_id = %chat_id, "stop command received");
+    let command = |name: &str| envelope.attachments.is_empty() && envelope.text.trim() == name;
+    let is_stop = command("/stop");
+    let is_kill = command("/kill");
+    if is_stop || is_kill {
+        info!(chat_id = %chat_id, text = %envelope.text.trim(), "stop command received");
     }
 
     // Sandbox gate: owners (`user_id == mirror.user_id`) are never sandboxed
@@ -779,20 +1138,25 @@ async fn handle_message_put(
     // (below); one-shot adapters (codex/gemini/cursor/hermes) spawn per turn.
     let was_running = supervisor.is_running(&chat_id);
 
+    if is_kill {
+        kill_agent(&chat_id, user_id, supervisor, write_tx).await;
+        return;
+    }
     if is_resident {
         if is_stop {
-            // RESIDENT /stop is an explicit HARD stop: SIGTERM the process
-            // group, killing claude AND any armed background tasks/monitors, so
-            // the chat returns to Idle. `abort_agent` on a resident session
-            // emits NO `Done`, so we clear the run state explicitly. The next
-            // message respawns with `--resume`.
+            // RESIDENT /stop ends the turn in flight but keeps the process
+            // and its background tasks; `Interrupted` then closes the turn
+            // out. Otherwise (tasks or queued turns only) it is a HARD stop:
+            // `abort_agent` on a resident session emits NO `Done`, so
+            // `hard_stop` clears the run state explicitly. The next message
+            // respawns with `--resume`.
             if was_running {
-                info!(chat_id = %chat_id, "stop: tearing down resident session (kills armed monitors)");
-                publish_interrupted(write_tx, &chat_id, user_id).await;
-                supervisor.abort_agent(&chat_id).await;
-                let _ = write_tx
-                    .send(WriteEvent::chat_stopped_by_user(chat_id.clone()))
-                    .await;
+                if supervisor.interrupt(&chat_id) {
+                    info!(chat_id = %chat_id, "stop: interrupting the resident's turn");
+                } else {
+                    info!(chat_id = %chat_id, "stop: tearing down resident session (kills armed monitors)");
+                    hard_stop(&chat_id, user_id, supervisor, write_tx).await;
+                }
             }
             return;
         }
@@ -894,6 +1258,9 @@ async fn handle_message_put(
                 .send(WriteEvent::chat_running(chat_id.clone(), true))
                 .await;
         }
+        // A fresh turn: anything parked is a torn-down session's (the resident
+        // path's `abort_agent` drops it too).
+        supervisor.pending_prunes().lock().await.remove(&chat_id);
         supervisor.spawn_agent(req);
     }
 }
@@ -1140,10 +1507,10 @@ fn unpersisted_prompts(turns: Vec<QueuedTurn>, transcript: &str) -> Vec<String> 
         .collect()
 }
 
-/// Main-loop handling of a resident busy↔idle edge: write `agent_running`, and
-/// on the idle edge tear the process down — idle sessions aren't kept warm; the
-/// next message respawns with `--resume`. The idle edge is emitted only on a
-/// `Result` turn-boundary frame with no live background task (see the reader's
+/// Main-loop handling of a resident busy↔idle edge: write `agent_running`. The
+/// idle process is kept warm for the next message's stdin until evicted
+/// (`evict_idle_residents`). The idle edge is emitted only on a `Result`
+/// turn-boundary frame with no live background task (see the reader's
 /// emission gate), so it means the turn ended and nothing is in flight.
 async fn handle_run_state(
     topic: &str,
@@ -1153,6 +1520,9 @@ async fn handle_run_state(
     supervisor: &mut Supervisor,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
+    if is_deleted_chat(&*mirror.read().await, topic) {
+        return;
+    }
     // Stale busy edge, e.g. queued before a /stop tore the session down.
     if running && !supervisor.is_running(topic) {
         info!(topic = %topic, "ignoring stale busy edge: no live session");
@@ -1168,16 +1538,12 @@ async fn handle_run_state(
         // `ToolResult` cue fires. If that cue never arrived for a still-parked
         // request, apply it here rather than leak the entry; the respawn emits
         // its own RunState.
-        let reqs = pending_prunes.lock().await.remove(topic);
-        if let Some(reqs) = reqs {
+        if let Some(reqs) = take_prunes(topic, pending_prunes, supervisor).await {
             apply_prune_group(topic, reqs, mirror, supervisor, write_tx).await;
             return;
         }
     }
     send_run_state(write_tx, topic.to_string(), running).await;
-    if !running {
-        supervisor.abort_agent(topic).await;
-    }
 }
 
 /// Keep this list narrower than `AgentKind::ALL`: new adapter kinds are not
@@ -1722,8 +2088,8 @@ fn spawn_heartbeat(
 
 /// Wait for in-flight writes to drain (supervisor is already empty at this
 /// point). Bounded by `UPDATE_DRAIN_TIMEOUT` so a stalled backend can't block
-/// the update forever — `writer`'s retry-with-backoff already keeps anything
-/// un-flushed in its queue, so a post-timeout restart picks it up again.
+/// the exit forever. The queue isn't persisted: writes still unsent at the
+/// timeout are lost.
 async fn wait_for_writer_idle(writer: &Writer) -> bool {
     let deadline = Instant::now() + UPDATE_DRAIN_TIMEOUT;
     while Instant::now() < deadline {
@@ -2262,6 +2628,9 @@ async fn main() {
     // message (two responses + two `[result]`s per chat). See
     // `acquire_single_instance_lock`.
     let _instance_lock = acquire_single_instance_lock();
+    if _instance_lock.is_some() {
+        orphans::sweep();
+    }
 
     let prod = load_prod_config();
     if let Some(p) = &prod {
@@ -2446,8 +2815,7 @@ async fn main() {
     // channel) so the park is visible the instant the RPC returns — the apply cue
     // on `response_rx` can't race ahead of it. Coalescing several targets from one
     // batched call onto a single `Vec` entry folds the burst into ONE respawn.
-    let pending_prunes: prune::PendingPrunes =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let pending_prunes = supervisor.pending_prunes();
 
     // Control socket for agent-side CLI subcommands (`attach-file`). Bound
     // before we start consuming sync events so a fast `attach-file` issued
@@ -2500,13 +2868,27 @@ async fn main() {
     // own `tool_result` frame. The `response_rx` `ToolResult`-cue arm drains a
     // chat's entry once the result has persisted — coalescing a batch into ONE
     // abort→rewrite→respawn.
+    // Warm-keep eviction runs when the idle set changes, at the next TTL
+    // deadline, and on a periodic tick (idle memory drifts).
+    let mut warm_tick = tokio::time::interval(WARM_TICK);
+    warm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut warm_deadline: Option<tokio::time::Instant> = None;
+    let mut warm_idle_seen = Vec::new();
+
     info!("zucchini-spawner ready, waiting for sync + agent responses");
 
     'main_loop: loop {
+        let mut warm_due = false;
         tokio::select! {
+            _ = warm_tick.tick() => {
+                warm_due = true;
+            }
+            _ = tokio::time::sleep_until(warm_deadline.unwrap_or_else(tokio::time::Instant::now)), if warm_deadline.is_some() => {
+                warm_due = true;
+            }
             _ = shutdown.recv() => {
                 info!("received OS shutdown signal, shutting down");
-                supervisor.shutdown_all().await;
+                shutdown_and_flush(&mut supervisor, &mut response_rx, &mirror, &write_tx, &heartbeat_cancel, &writer).await;
                 break;
             }
             _ = revoked_token.cancelled() => {
@@ -2655,94 +3037,36 @@ async fn main() {
                 }
             }
             Some(resp) = response_rx.recv() => {
-                match resp {
-                    // This cue is the call-keyed signal that the `prune-context`
-                    // call's OWN result has persisted to the transcript (the adapter
-                    // emits it only for that call, never a sibling tool in the same
-                    // parallel batch). Aborting → rewriting → respawning here lands
-                    // the prune strictly AFTER that result (and its summary) reached
-                    // disk — the resumed agent sees its own prune and won't re-run it.
-                    // A no-op for any chat with nothing pending. The control task
-                    // parked the `PruneRequest` in `pending_prunes` during the
-                    // `prune-context` RPC, which returned before this cue could fire,
-                    // so the entry is guaranteed visible here. Take the lock only long
-                    // enough to lift the chat's batch out, then apply unlocked.
-                    AgentResponse::ToolResult { topic } => {
-                        // The `prune-context` call's own result has persisted to the
-                        // transcript. Apply NOW regardless of resident-busy state:
-                        // abort (SIGTERM) the agent → rewrite the jsonl → respawn-with-
-                        // `--resume`, so the freed context takes effect immediately,
-                        // within the SAME task — not deferred to the turn boundary
-                        // (which made the prune useless to the turn that asked for it).
-                        // This is a HARD RESTART of the resident session, and it has to
-                        // be: a transcript rewrite only lands via respawn (a live in-
-                        // memory session ignores the on-disk edit), so pruning a
-                        // resident agent is necessarily kill+resume. The cue fires only
-                        // AFTER the prune call's result reached disk, so the resumed
-                        // transcript carries the agent's prune call + summary and it
-                        // won't re-issue the now-satisfied command. A no-op for any chat
-                        // with nothing pending. The control task parked the
-                        // `PruneRequest` in `pending_prunes` during the `prune-context`
-                        // RPC (which returned before this cue could fire), so the entry
-                        // is guaranteed visible here.
-                        //
-                        // This restart kills any background task / Monitor armed in
-                        // the resident session — their runtime is in-process, not in
-                        // the transcript, so `--resume` does not re-arm them. The
-                        // control task GUARDS against this: `prune_context` refuses a
-                        // prune while `live_tasks` is non-empty unless the agent
-                        // passed `--force`, so reaching here with live tasks means a
-                        // forced prune (or a task armed in the same instant the RPC's
-                        // check passed). Either way `apply_prune_group` reads the
-                        // live-task count first and tells the resumed agent in the
-                        // respawn prompt how many it terminated, so the kill is never
-                        // silent. (Earlier this DEFERRED until Idle to spare the
-                        // monitor; the immediate apply — so the freed context helps the
-                        // turn that asked for it — is the behavior we kept.)
-                        let reqs = pending_prunes.lock().await.remove(&topic);
-                        if let Some(reqs) = reqs {
-                            apply_prune_group(&topic, reqs, &mirror, &mut supervisor, &write_tx).await;
-                        }
-                    }
-                    AgentResponse::RunState { topic, running } => {
-                        handle_run_state(&topic, running, &pending_prunes, &mirror, &mut supervisor, &write_tx).await;
-                    }
-                    other => {
-                        // A turn ending with a prune still parked means its triggering
-                        // cue never arrived (the agent exited/errored mid-`prune-context`,
-                        // so the call's own result was never persisted). Drop the parked
-                        // request: leaving it in `pending_prunes` leaks the entry for the
-                        // process lifetime and would mis-fire on a LATER turn's
-                        // `prune-context` cue for this chat (applying a stale rewrite).
-                        if let AgentResponse::Done { topic, .. } = &other {
-                            pending_prunes.lock().await.remove(topic);
-                        }
-                        // Write guard scoped tightly so the control task can interleave
-                        // a read between agent responses but not within one.
-                        // `handle_agent_response` `.await`s on writer-channel sends and
-                        // the supervisor remove path, so this MUST be `tokio::sync::RwLock`.
-                        let mut g = mirror.write().await;
-                        handle_agent_response(other, &mut g, &write_tx, &mut supervisor).await;
-                    }
-                }
+                route_agent_response(resp, &pending_prunes, &mirror, &mut supervisor, &write_tx).await;
             }
         }
 
-        // If an update is pending and no agents are running, stop producing
-        // heartbeats, wait for the writer to drain, then swap the binary and
-        // exit — launchd/systemd will respawn the new version.
+        if warm_due || idle_set(&supervisor) != warm_idle_seen {
+            warm_deadline = evict_idle_residents(&mut supervisor, sys::memory).await;
+            warm_idle_seen = idle_set(&supervisor);
+        }
+        publish_alive_changes(&mut supervisor, &write_tx).await;
+
+        // If an update is pending and no agent is busy, stop producing
+        // heartbeats, shut down idle agents, wait for the writer to drain
+        // (including their final writes), then swap the binary and exit —
+        // launchd/systemd will respawn the new version.
         if let Some(new_version) = update_pending.as_ref() {
-            if supervisor.is_empty() {
+            if !supervisor.any_running() {
                 info!(
                     current = env!("CARGO_PKG_VERSION"),
                     new = %new_version,
                     "all agents finished, draining writer before update"
                 );
-                heartbeat_cancel.cancel();
-                let drained = wait_for_writer_idle(&writer).await;
-                if !drained {
-                    warn!("writer drain timed out, proceeding with update anyway");
-                }
+                shutdown_and_flush(
+                    &mut supervisor,
+                    &mut response_rx,
+                    &mirror,
+                    &write_tx,
+                    &heartbeat_cancel,
+                    &writer,
+                )
+                .await;
                 match updater::download_and_replace(new_version).await {
                     Ok(()) => {
                         info!("binary replaced, exiting for restart");
@@ -4528,7 +4852,9 @@ mod tests {
         write_rx: mpsc::Receiver<WriteEvent>,
         supervisor: Supervisor,
         recorded: StdArc<StdMutex<Vec<SpawnRequest>>>,
-        _resp_rx: mpsc::Receiver<AgentResponse>,
+        /// What the chat's reader sends on.
+        resp_tx: mpsc::Sender<AgentResponse>,
+        resp_rx: mpsc::Receiver<AgentResponse>,
     }
 
     impl ResidentChat {
@@ -4537,8 +4863,8 @@ mod tests {
             let mut mirror = Mirror::default();
             mirror.set_user_id(user_id);
             let (write_tx, write_rx) = mpsc::channel::<WriteEvent>(64);
-            let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
-            let (supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
+            let (resp_tx, resp_rx) = mpsc::channel::<AgentResponse>(64);
+            let (supervisor, recorded) = supervisor_with_resident_recorder(resp_tx.clone());
             Self {
                 user_id,
                 chat_id: Uuid::now_v7().to_string(),
@@ -4550,7 +4876,8 @@ mod tests {
                 write_rx,
                 supervisor,
                 recorded,
-                _resp_rx,
+                resp_tx,
+                resp_rx,
             }
         }
 
@@ -4621,6 +4948,54 @@ mod tests {
                 )
                 .await;
             }
+            publish_alive_changes(&mut self.supervisor, &self.write_tx).await;
+        }
+
+        async fn respond(&mut self, resp: AgentResponse) {
+            handle_agent_response(resp, &mut self.mirror, &self.write_tx, &mut self.supervisor)
+                .await;
+            publish_alive_changes(&mut self.supervisor, &self.write_tx).await;
+        }
+
+        /// The live session's FSM, as its reader would mutate it.
+        fn session(&self) -> StdArc<StdMutex<SessionState>> {
+            self.supervisor.live_sessions().lock().unwrap()[&self.chat_id].clone()
+        }
+
+        /// Claude acks the pending interrupt, ends the turn, and the reader
+        /// reports it.
+        async fn end_interrupted_turn(&mut self) {
+            let session = self.session();
+            let request_id = {
+                let st = session.lock().unwrap();
+                st.interrupt.clone().unwrap().request_id
+            };
+            for ev in [
+                adapter::AgentEvent::InterruptAcked(request_id),
+                adapter::AgentEvent::Result {
+                    origin_is_task: true,
+                },
+            ] {
+                crate::agent::reduce(&mut session.lock().unwrap(), &ev);
+            }
+            self.respond(AgentResponse::Interrupted {
+                topic: self.chat_id.clone(),
+                session,
+            })
+            .await;
+        }
+
+        /// The first turn was consumed and is in flight.
+        fn consume_first_turn(&self) {
+            let s = self.session();
+            let mut st = s.lock().unwrap();
+            st.unconsumed.clear();
+            st.turn_in_flight = true;
+        }
+
+        /// Moves the mirror out, for the main-loop helpers that take it shared.
+        fn shared_mirror(&mut self) -> SharedMirror {
+            Arc::new(tokio::sync::RwLock::new(std::mem::take(&mut self.mirror)))
         }
 
         fn spawned_prompts(&self) -> Vec<String> {
@@ -4647,6 +5022,123 @@ mod tests {
 
     fn is_interrupted(w: &WriteEvent) -> bool {
         matches!(w, WriteEvent::PutMessage { content, .. } if content == INTERRUPTED_RESULT)
+    }
+
+    fn remove(table: &str, id: &str) -> SyncEvent {
+        SyncEvent::Remove {
+            table: table.into(),
+            id: id.into(),
+        }
+    }
+
+    /// Makes `c.user_id` an unsandboxed invitee on someone else's machine,
+    /// with its `machine_users` row `row_id` already unsealed.
+    fn invite(c: &mut ResidentChat, row_id: &str) {
+        c.mirror.set_user_id(Uuid::now_v7());
+        c.mirror.upsert_member(row_id.into(), c.user_id, false);
+        c.mirror.record_sealed_blob(&c.user_id, "blob");
+    }
+
+    #[tokio::test]
+    async fn chat_delete_aborts_its_agent_and_drops_its_late_writes() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.writes();
+        c.window(vec![remove("chats", &c.chat_id)]).await;
+        assert!(!c.supervisor.is_running(&c.chat_id));
+
+        let mirror = c.shared_mirror();
+        let prunes = prune::PendingPrunes::default();
+        handle_run_state(
+            &c.chat_id,
+            false,
+            &prunes,
+            &mirror,
+            &mut c.supervisor,
+            &c.write_tx,
+        )
+        .await;
+        handle_agent_response(
+            AgentResponse::ContextTokens {
+                topic: c.chat_id.clone(),
+                tokens: 1,
+            },
+            &mut *mirror.write().await,
+            &c.write_tx,
+            &mut c.supervisor,
+        )
+        .await;
+        assert!(c.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_delete_aborts_its_chats_agents() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.writes();
+        c.window(vec![remove("projects", &c.project_id)]).await;
+        assert!(!c.supervisor.is_running(&c.chat_id));
+        assert!(!c.mirror.chats.contains_key(&c.chat_id));
+        assert!(c.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invitee_revoke_aborts_their_agents_without_writes() {
+        let mut c = ResidentChat::new();
+        invite(&mut c, "row-1");
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        assert!(c.supervisor.is_running(&c.chat_id));
+        c.writes();
+        c.window(vec![remove("machine_users", "row-1")]).await;
+        assert!(!c.supervisor.is_running(&c.chat_id));
+        assert!(c.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sandbox_flip_aborts_the_running_turn() {
+        let mut c = ResidentChat::new();
+        invite(&mut c, "row-1");
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.writes();
+        let flip = SyncEvent::Put {
+            table: "machine_users".into(),
+            id: "row-1".into(),
+            data: json!({
+                "user_id": c.user_id.to_string(),
+                "is_sandboxed": 1,
+                "sealed_blob": "blob",
+            })
+            .to_string(),
+        };
+        c.window(vec![flip]).await;
+        assert!(!c.supervisor.is_running(&c.chat_id));
+        let writes = c.writes();
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+        assert!(writes.iter().any(|w| matches!(
+            w,
+            WriteEvent::ChatRunning {
+                agent_running: false,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn an_idle_resident_does_not_hold_back_an_update() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        assert!(c.supervisor.any_running());
+        c.supervisor.live_sessions().lock().unwrap()[&c.chat_id]
+            .lock()
+            .unwrap()
+            .unconsumed
+            .clear();
+        assert!(!c.supervisor.any_running());
     }
 
     #[tokio::test]
@@ -4756,7 +5248,8 @@ mod tests {
     #[tokio::test]
     async fn stale_busy_edge_without_a_session_is_dropped() {
         let mut c = ResidentChat::new();
-        let mirror: SharedMirror = Arc::new(tokio::sync::RwLock::new(Mirror::default()));
+        c.window(vec![c.project(), c.chat(1, "")]).await;
+        let mirror = c.shared_mirror();
         let prunes = prune::PendingPrunes::default();
         handle_run_state(
             &c.chat_id,
@@ -4796,7 +5289,7 @@ mod tests {
         c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
             .await;
         c.writes();
-        let mirror: SharedMirror = Arc::new(tokio::sync::RwLock::new(Mirror::default()));
+        let mirror = c.shared_mirror();
         let prunes = prune::PendingPrunes::default();
 
         handle_run_state(
@@ -4828,5 +5321,544 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[tokio::test]
+    async fn idle_edge_keeps_the_resident_warm_for_the_next_turn() {
+        use crate::agent::reduce;
+        use adapter::AgentEvent;
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        let session = c.session();
+        let first = session.lock().unwrap().unconsumed[0].uuid.clone();
+        reduce(
+            &mut session.lock().unwrap(),
+            &AgentEvent::UserTurnConsumed(first),
+        );
+        reduce(
+            &mut session.lock().unwrap(),
+            &AgentEvent::Result {
+                origin_is_task: false,
+            },
+        );
+        c.writes();
+
+        let mirror = c.shared_mirror();
+        handle_run_state(
+            &c.chat_id,
+            false,
+            &prune::PendingPrunes::default(),
+            &mirror,
+            &mut c.supervisor,
+            &c.write_tx,
+        )
+        .await;
+        c.mirror = std::mem::take(&mut *mirror.write().await);
+        publish_alive_changes(&mut c.supervisor, &c.write_tx).await;
+        assert!(
+            matches!(
+                c.writes()[..],
+                [WriteEvent::ChatRunning {
+                    agent_running: false,
+                    ..
+                }]
+            ),
+            "idle, and still alive"
+        );
+
+        c.window(vec![c.chat(3, ""), c.message(2, "second")]).await;
+        assert_eq!(c.spawned_prompts(), vec!["first"], "same process");
+        assert_eq!(c.unconsumed(), vec!["second"]);
+        let second = session.lock().unwrap().unconsumed[0].uuid.clone();
+        reduce(
+            &mut session.lock().unwrap(),
+            &AgentEvent::UserTurnConsumed(second),
+        );
+        assert!(session.lock().unwrap().running());
+        reduce(
+            &mut session.lock().unwrap(),
+            &AgentEvent::Result {
+                origin_is_task: false,
+            },
+        );
+        assert!(session.lock().unwrap().is_idle());
+    }
+
+    /// Five residents: one busy past its idle edge, one with no idle edge,
+    /// three idle. Three idle get 24h, so the one idle 25h goes; then two
+    /// idle get 48h.
+    #[tokio::test(start_paused = true)]
+    async fn eviction_kills_the_oldest_idle_past_its_ttl_and_clears_its_alive_flag() {
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteEvent>(64);
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let (mut sup, _) = supervisor_with_resident_recorder(resp_tx);
+        let hour = Duration::from_secs(3600);
+        let mut since = std::collections::HashMap::new();
+        for chat in ["busy", "idle-25h", "idle-24h", "no-edge", "idle-22h"] {
+            sup.spawn_agent(SpawnRequest {
+                chat_id: chat.to_string(),
+                prompt: "hi".to_string(),
+                project_path: None,
+                worktree: false,
+                agent_session_id: None,
+                agent_kind: AgentKind::Claude,
+                is_sandboxed: false,
+                model: None,
+                user_timezone: None,
+            });
+            {
+                let state = sup.live_sessions().lock().unwrap()[chat].clone();
+                let mut st = state.lock().unwrap();
+                st.unconsumed.clear();
+                st.turn_in_flight = chat == "busy";
+                if chat != "no-edge" {
+                    st.idle_since = Some(tokio::time::Instant::now());
+                    since.insert(chat, tokio::time::Instant::now());
+                }
+            }
+            tokio::time::advance(hour).await;
+        }
+        publish_alive_changes(&mut sup, &write_tx).await;
+        tokio::time::advance(hour * 21).await;
+
+        let deadline = evict_idle_residents(&mut sup, || None).await;
+        assert_eq!(deadline, Some(since["idle-24h"] + hour * 48));
+        publish_alive_changes(&mut sup, &write_tx).await;
+        let mut alive = Vec::new();
+        while let Ok(w) = write_rx.try_recv() {
+            if let WriteEvent::ChatAlive {
+                chat_id,
+                agent_alive,
+            } = w
+            {
+                alive.push((chat_id, agent_alive));
+            }
+        }
+        assert_eq!(alive.len(), 6, "{alive:?}");
+        assert_eq!(alive[5], ("idle-25h".to_string(), false));
+        assert!(sup.is_running("busy"));
+        assert_eq!(sup.idle_residents().len(), 2);
+    }
+
+    fn alive_writes(writes: &[WriteEvent]) -> Vec<bool> {
+        writes
+            .iter()
+            .filter_map(|w| match w {
+                WriteEvent::ChatAlive { agent_alive, .. } => Some(*agent_alive),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn is_stopped_by_user(w: &WriteEvent) -> bool {
+        matches!(
+            w,
+            WriteEvent::ChatRunning {
+                agent_running: false,
+                stopped_by_user: true,
+                ..
+            }
+        )
+    }
+
+    /// A resident mid-turn, then `/stop`.
+    async fn stopped_mid_turn() -> ResidentChat {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.writes();
+        c.window(vec![c.chat(2, ""), c.message(2, "/stop")]).await;
+        c
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_the_turn_and_keeps_the_process() {
+        let mut c = stopped_mid_turn().await;
+        assert!(c.session().lock().unwrap().interrupt.is_some());
+        assert!(c.writes().is_empty(), "nothing until the turn's result");
+
+        c.end_interrupted_turn().await;
+
+        let writes = c.writes();
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
+        assert!(alive_writes(&writes).is_empty(), "process kept: {writes:?}");
+        assert_eq!(c.spawned_prompts(), vec!["first"]);
+    }
+
+    /// A message sent while the interrupt awaits its result respawns the
+    /// session with it, so the interrupt's hard-abort fallback can't drop it.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_during_a_pending_interrupt_survives_its_timeout() {
+        let mut c = stopped_mid_turn().await;
+        c.window(vec![c.chat(3, ""), c.message(3, "second")]).await;
+        assert_eq!(c.spawned_prompts(), vec!["first", "second"]);
+        let writes = c.writes();
+        assert_eq!(writes.iter().filter(|w| is_interrupted(w)).count(), 1);
+
+        let timed_out = c.resp_rx.recv().await.unwrap();
+        assert!(matches!(timed_out, AgentResponse::InterruptTimedOut { .. }));
+        c.respond(timed_out).await;
+        assert!(
+            c.supervisor.is_running(&c.chat_id),
+            "second is still queued"
+        );
+        assert_eq!(c.unconsumed(), vec!["second"]);
+        assert!(c.writes().is_empty());
+    }
+
+    /// The old session's `Interrupted` was queued before a `/kill` closed
+    /// the chat out: no second "Agent interrupted".
+    #[tokio::test]
+    async fn an_interrupted_result_from_a_killed_session_is_ignored() {
+        let mut c = stopped_mid_turn().await;
+        let old = c.session();
+        c.window(vec![c.chat(3, ""), c.message(3, "/kill")]).await;
+        assert_eq!(c.writes().iter().filter(|w| is_interrupted(w)).count(), 1);
+
+        c.respond(AgentResponse::Interrupted {
+            topic: c.chat_id.clone(),
+            session: old,
+        })
+        .await;
+        assert!(c.writes().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_hard_aborts_when_the_interrupt_gets_no_result() {
+        let mut c = stopped_mid_turn().await;
+        let timed_out = c.resp_rx.recv().await.unwrap();
+        assert!(matches!(timed_out, AgentResponse::InterruptTimedOut { .. }));
+        c.respond(timed_out).await;
+
+        assert!(!c.supervisor.is_running(&c.chat_id));
+        let writes = c.writes();
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
+        assert_eq!(alive_writes(&writes), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn stop_with_a_queued_turn_hard_aborts_dropping_it() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.window(vec![c.chat(2, ""), c.message(2, "second")]).await;
+        c.writes();
+        c.window(vec![c.chat(3, ""), c.message(3, "/stop")]).await;
+
+        assert!(!c.supervisor.is_running(&c.chat_id));
+        let writes = c.writes();
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+        assert_eq!(alive_writes(&writes), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn kill_ends_the_process_and_its_alive_flag() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        assert_eq!(alive_writes(&c.writes()), vec![true]);
+        c.window(vec![c.chat(2, ""), c.message(2, "/kill")]).await;
+
+        assert!(!c.supervisor.is_running(&c.chat_id));
+        let writes = c.writes();
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
+        assert_eq!(alive_writes(&writes), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn kill_without_a_process_only_clears_the_alive_flag() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "/kill")])
+            .await;
+        let writes = c.writes();
+        assert!(matches!(
+            writes[..],
+            [WriteEvent::ChatAlive {
+                agent_alive: false,
+                ..
+            }]
+        ));
+    }
+
+    fn park_prune(prunes: &prune::PendingPrunes, chat_id: &str) {
+        prunes.try_lock().unwrap().insert(
+            chat_id.to_string(),
+            vec![prune::PruneRequest {
+                jsonl_path: "/nonexistent.jsonl".into(),
+                agent_kind: AgentKind::Claude,
+                tool_name: "Read".into(),
+                needle: "x".into(),
+                reason: "r".into(),
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prune_cue_after_kill_does_not_resurrect_the_agent() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        let prunes = c.supervisor.pending_prunes();
+        park_prune(&prunes, &c.chat_id);
+        c.window(vec![c.chat(2, ""), c.message(2, "/kill")]).await;
+        assert!(prunes.lock().await.is_empty());
+
+        c.mirror.set_agent_session_id(&c.chat_id, "sid".into());
+        let mirror = c.shared_mirror();
+        let topic = c.chat_id.clone();
+        for resp in [
+            AgentResponse::ToolResult {
+                topic: topic.clone(),
+            },
+            AgentResponse::RunState {
+                topic,
+                running: false,
+            },
+        ] {
+            route_agent_response(resp, &prunes, &mirror, &mut c.supervisor, &c.write_tx).await;
+        }
+        assert_eq!(c.spawned_prompts(), vec!["first"]);
+        assert!(!c.supervisor.is_running(&c.chat_id));
+    }
+
+    /// The control task parks a `prune-context` RPC that raced `/kill` after
+    /// `abort_agent` cleared the table.
+    #[tokio::test]
+    async fn a_prune_parked_after_kill_does_not_resurrect_the_agent() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.window(vec![c.chat(2, ""), c.message(2, "/kill")]).await;
+
+        c.mirror.set_agent_session_id(&c.chat_id, "sid".into());
+        let prunes = c.supervisor.pending_prunes();
+        let mirror = c.shared_mirror();
+        let topic = c.chat_id.clone();
+        for resp in [
+            AgentResponse::ToolResult {
+                topic: topic.clone(),
+            },
+            AgentResponse::RunState {
+                topic: topic.clone(),
+                running: false,
+            },
+        ] {
+            park_prune(&prunes, &topic);
+            route_agent_response(resp, &prunes, &mirror, &mut c.supervisor, &c.write_tx).await;
+            assert!(prunes.lock().await.is_empty());
+        }
+        assert_eq!(c.spawned_prompts(), vec!["first"]);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_spawn_drops_a_prune_parked_after_kill() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.window(vec![c.chat(2, ""), c.message(2, "/kill")]).await;
+        let prunes = c.supervisor.pending_prunes();
+        park_prune(&prunes, &c.chat_id);
+        c.window(vec![c.chat(3, ""), c.message(3, "second")]).await;
+
+        assert_eq!(c.spawned_prompts(), vec!["first", "second"]);
+        assert!(prunes.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_routes_the_frames_of_a_reader_blocked_on_a_full_queue() {
+        let mut c = ResidentChat::new();
+        let (resp_tx, resp_rx) = mpsc::channel::<AgentResponse>(1);
+        let resident_fn: ResidentSpawnFn = StdArc::new(|req, tx, cancel, _pending| {
+            let reader = tokio::spawn(async move {
+                cancel.cancelled().await;
+                for n in 0..3 {
+                    let content = format!(r#"{{"type":"assistant","n":{n}}}"#);
+                    let topic = req.chat_id.clone();
+                    let _ = tx.send(AgentResponse::Line { topic, content }).await;
+                }
+            });
+            ResidentHandles {
+                wake: StdArc::new(tokio::sync::Notify::new()),
+                reader,
+                state: StdArc::new(StdMutex::new(SessionState::default())),
+            }
+        });
+        let one_shot: SpawnFn = StdArc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
+        c.supervisor = Supervisor::with_spawn_fns(resp_tx, one_shot, resident_fn);
+        c.resp_rx = resp_rx;
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.writes();
+
+        let mirror = c.shared_mirror();
+        shutdown_agents(&mut c.supervisor, &mut c.resp_rx, &mirror, &c.write_tx).await;
+
+        let writes = c.writes();
+        let lines = writes
+            .iter()
+            .filter(|w| matches!(w, WriteEvent::PutMessage { .. }))
+            .count();
+        assert_eq!(lines, 3, "{writes:?}");
+    }
+
+    /// The reader reduces a turn's `result` (so `any_running` goes false and
+    /// the update proceeds) before it forwards the line's frames and idle edge.
+    #[tokio::test]
+    async fn shutdown_publishes_the_final_frames_still_queued() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.writes();
+        park_prune(&c.supervisor.pending_prunes(), &c.chat_id);
+        let topic = c.chat_id.clone();
+        for resp in [
+            AgentResponse::ToolResult {
+                topic: topic.clone(),
+            },
+            AgentResponse::Line {
+                topic: topic.clone(),
+                content: r#"{"type":"result"}"#.into(),
+            },
+            AgentResponse::RunState {
+                topic,
+                running: false,
+            },
+        ] {
+            c.resp_tx.send(resp).await.unwrap();
+        }
+
+        c.mirror.set_agent_session_id(&c.chat_id, "sid".into());
+        let mirror = c.shared_mirror();
+        shutdown_agents(&mut c.supervisor, &mut c.resp_rx, &mirror, &c.write_tx).await;
+
+        assert_eq!(c.spawned_prompts(), vec!["first"], "no prune respawn");
+        let writes = c.writes();
+        assert!(
+            matches!(
+                writes[..],
+                [
+                    WriteEvent::PutMessage { .. },
+                    WriteEvent::ChatRunning {
+                        agent_running: false,
+                        ..
+                    },
+                    WriteEvent::ChatAlive {
+                        agent_alive: false,
+                        ..
+                    },
+                ]
+            ),
+            "{writes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn respawns_do_not_flicker_the_alive_flag() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        assert_eq!(alive_writes(&c.writes()), vec![true]);
+        c.window(vec![c.chat(2, "opus"), c.message(2, "second")])
+            .await;
+        assert_eq!(c.recorded.lock().unwrap().len(), 2, "respawned");
+        assert!(alive_writes(&c.writes()).is_empty());
+
+        c.respond(AgentResponse::Done {
+            topic: c.chat_id.clone(),
+            has_result: true,
+        })
+        .await;
+        assert!(
+            alive_writes(&c.writes()).is_empty(),
+            "late Done, live session"
+        );
+    }
+
+    /// The mirror as the next spawner process loads it.
+    fn restarted(mirror: &Mirror) -> Mirror {
+        let path = std::env::temp_dir().join(format!("zucchini-state-{}.json", Uuid::now_v7()));
+        mirror.save(&path).unwrap();
+        let loaded = Mirror::load(&path);
+        let _ = std::fs::remove_file(&path);
+        loaded
+    }
+
+    fn alive_reset_chats(writes: &[WriteEvent]) -> std::collections::HashSet<&str> {
+        writes
+            .iter()
+            .filter_map(|w| match w {
+                WriteEvent::ChatAlive {
+                    chat_id,
+                    agent_alive: false,
+                } => Some(chat_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn boot_resets_stale_run_flags_before_spawning() {
+        let mut c = ResidentChat::new();
+        let (project_id, user_id) = (c.project_id.clone(), c.user_id);
+        let row = |flag: i64| {
+            json!({
+                "project_id": project_id,
+                "user_id": user_id.to_string(),
+                "agent_running": flag,
+                "agent_alive": flag,
+            })
+            .to_string()
+        };
+        // Flagged before the restart: persisted, not re-streamed.
+        let persisted = Uuid::now_v7().to_string();
+        c.mirror.upsert_chat(persisted.clone(), &row(1));
+        c.mirror = restarted(&c.mirror);
+
+        let restreamed = SyncEvent::Put {
+            table: "chats".into(),
+            id: c.chat_id.clone(),
+            data: row(1),
+        };
+        c.window(vec![c.project(), restreamed, c.message(1, "first")])
+            .await;
+        let writes = c.writes();
+        assert_eq!(
+            alive_reset_chats(&writes),
+            [persisted.as_str(), c.chat_id.as_str()].into()
+        );
+        assert_eq!(writes.iter().filter(|w| is_stopped_by_user(w)).count(), 2);
+        assert_eq!(
+            alive_writes(&writes).last(),
+            Some(&true),
+            "the spawn publishes after the reset"
+        );
+
+        c.window(vec![c.chat(1, "")]).await;
+        assert!(c.writes().is_empty(), "once per boot");
+
+        // Restarted before the reset synced back: reset again.
+        c.mirror = restarted(&c.mirror);
+        c.window(vec![]).await;
+        assert_eq!(alive_reset_chats(&c.writes()), [persisted.as_str()].into());
+
+        let synced_back = SyncEvent::Put {
+            table: "chats".into(),
+            id: persisted.clone(),
+            data: row(0),
+        };
+        c.window(vec![synced_back]).await;
+        c.mirror = restarted(&c.mirror);
+        c.window(vec![]).await;
+        assert!(alive_reset_chats(&c.writes()).is_empty());
     }
 }

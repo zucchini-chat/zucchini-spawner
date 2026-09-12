@@ -208,11 +208,18 @@ fn claude_flag_args(
     args.push(ClaudeArg::Lit("--verbose"));
     args.push(ClaudeArg::Lit("--output-format"));
     args.push(ClaudeArg::Lit("stream-json"));
-    args.push(ClaudeArg::Lit("--disallowedTools"));
-    args.push(ClaudeArg::Lit("AskUserQuestion"));
     // Sender's `machine_users.is_sandboxed`. Non-sandboxed = bypass permission
     // gating; sandboxed = claude's default permission mode auto-denies tools
-    // in `--print`, which is the actual sandboxing mechanism.
+    // in `--print`, which is the actual sandboxing mechanism. The default mode
+    // still allows `SendMessage`, which would let an invitee's session drive
+    // the owner's bypass-mode sessions on this machine.
+    let disallowed_tools = if is_sandboxed {
+        "AskUserQuestion SendMessage ListAgents"
+    } else {
+        "AskUserQuestion"
+    };
+    args.push(ClaudeArg::Lit("--disallowedTools"));
+    args.push(ClaudeArg::Val(disallowed_tools.to_string()));
     if !is_sandboxed {
         args.push(ClaudeArg::Lit("--dangerously-skip-permissions"));
     }
@@ -402,6 +409,15 @@ impl AgentAdapter for ClaudeAdapter {
         format!("{}\n", frame)
     }
 
+    fn encode_interrupt(&self, request_id: &str) -> Option<String> {
+        let frame = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": { "subtype": "interrupt" },
+        });
+        Some(format!("{}\n", frame))
+    }
+
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
         let mut out: SmallVec<[AgentEvent; 2]> = SmallVec::new();
 
@@ -528,13 +544,11 @@ impl AgentAdapter for ClaudeAdapter {
                 }
                 skip = true;
             } else if line.contains("\"type\":\"user\"") {
-                // `--replay-user-messages` echo of a stdin frame we wrote: claude
-                // has consumed that turn. Never rendered — the user's own message
-                // row already exists.
+                // `--replay-user-messages` echo of a stdin frame we wrote (claude
+                // has consumed that turn; the user's own message row already
+                // exists) or of a peer session's `SendMessage`.
                 if line.contains("\"isReplay\":true") {
-                    if let Some(uuid) = parse_replay_uuid(&line) {
-                        out.push(AgentEvent::UserTurnConsumed(uuid));
-                    }
+                    out.extend(parse_replay_echo(&line));
                 }
                 // User frames are never rendered — but a `tool_result` user frame
                 // is claude's signal that it has PERSISTED a finished tool call's
@@ -562,10 +576,21 @@ impl AgentAdapter for ClaudeAdapter {
                     }
                 }
                 skip = true;
+            } else if line.contains("\"type\":\"control_response\"") {
+                // Ack of our interrupt `control_request`. An error ack is no
+                // ack: `/stop`'s timeout then hard-aborts a still-running turn.
+                if line.contains("\"subtype\":\"success\"") {
+                    out.extend(parse_control_response_id(&line).map(AgentEvent::InterruptAcked));
+                }
+                skip = true;
+            } else if line.contains("\"type\":\"command_lifecycle\"") {
+                // Queue bookkeeping emitted only under `--replay-user-messages`.
+                if line.contains("\"state\":\"started\"") {
+                    out.extend(parse_started_command_uuid(&line).map(AgentEvent::TurnStarted));
+                }
+                skip = true;
             } else if line.contains("\"type\":\"stream_event\"")
                 || line.contains("\"type\":\"rate_limit_event\"")
-                // Queue bookkeeping emitted only under `--replay-user-messages`.
-                || line.contains("\"type\":\"command_lifecycle\"")
                 || (line.contains("\"type\":\"assistant\"")
                     && !line.contains("\"type\":\"text\"")
                     && !line.contains("\"type\":\"tool_use\""))
@@ -617,12 +642,47 @@ impl AgentAdapter for ClaudeAdapter {
     }
 }
 
-fn parse_replay_uuid(line: &str) -> Option<String> {
+fn parse_started_command_uuid(line: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Lifecycle {
+        command_uuid: String,
+    }
+    serde_json::from_str::<Lifecycle>(line)
+        .ok()
+        .map(|l| l.command_uuid)
+}
+
+fn parse_control_response_id(line: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Response {
+        request_id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ControlResponse {
+        response: Response,
+    }
+    serde_json::from_str::<ControlResponse>(line)
+        .ok()
+        .map(|r| r.response.request_id)
+}
+
+fn parse_replay_echo(line: &str) -> Option<AgentEvent> {
+    // `origin` stays untyped so an unexpected shape can't cost us our own echo.
     #[derive(serde::Deserialize)]
     struct Replay {
         uuid: String,
+        #[serde(default)]
+        origin: serde_json::Value,
     }
-    serde_json::from_str::<Replay>(line).ok().map(|r| r.uuid)
+    let r = serde_json::from_str::<Replay>(line).ok()?;
+    if r.origin["kind"] != "peer" {
+        return Some(AgentEvent::UserTurnConsumed(r.uuid));
+    }
+    let field = |k: &str| r.origin[k].as_str().unwrap_or_default().to_string();
+    Some(AgentEvent::PeerTurnConsumed {
+        name: field("name"),
+        body: field("body"),
+    })
 }
 
 /// Cumulative for the current turn — caller overwrites `chats.context_tokens`
@@ -1626,6 +1686,18 @@ mod tests {
         assert!(run(&mut a, line).is_empty());
     }
 
+    /// Real claude 2.1.265 (tmp/cron_probe.log): a `CronCreate` prompt firing
+    /// on an idle resident is announced only by this frame; no replay echo.
+    #[test]
+    fn command_lifecycle_started_emits_turn_started() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"command_lifecycle","command_uuid":"b3bed1f2-4e92-48a7-8f16-f6481fb94f1a","state":"started","uuid":"420478f0-552a-444b-9cda-d65c04cbd262","session_id":"47264b88-bc6c-42b8-aef8-e69544efdf36"}"#;
+        assert_eq!(
+            run(&mut a, line),
+            vec!["TurnStarted(b3bed1f2-4e92-48a7-8f16-f6481fb94f1a)"]
+        );
+    }
+
     #[test]
     fn task_started_frame_emits_taskstarted_and_drops_frame() {
         let mut a = ClaudeAdapter::new();
@@ -1683,6 +1755,27 @@ mod tests {
         );
     }
 
+    /// Real claude 2.1.265 ack (tmp/queued_interrupt_probe.log) is not a row;
+    /// an error ack is no ack.
+    #[test]
+    fn interrupt_request_and_its_ack() {
+        let mut a = ClaudeAdapter::new();
+        let frame = a.encode_interrupt("int-1").unwrap();
+        let v: serde_json::Value = serde_json::from_str(frame.trim_end()).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "control_request",
+                "request_id": "int-1",
+                "request": { "subtype": "interrupt" },
+            })
+        );
+        let ack = r#"{"type":"control_response","response":{"subtype":"success","request_id":"int-1","response":{"still_queued":[]}}}"#;
+        assert_eq!(run(&mut a, ack), vec!["InterruptAcked(int-1)"]);
+        let error = r#"{"type":"control_response","response":{"subtype":"error","request_id":"int-1","error":"x"}}"#;
+        assert!(run(&mut a, error).is_empty());
+    }
+
     #[test]
     fn prepare_session_command_drops_prompt_pipe_and_adds_input_format() {
         let mut a = ClaudeAdapter::new();
@@ -1704,6 +1797,45 @@ mod tests {
         assert!(cmd.contains("prune-reminder-hook"), "got: {cmd}");
         // cd prefix retained.
         assert!(cmd.starts_with("cd '/tmp/proj' && claude"), "got: {cmd}");
+    }
+
+    #[test]
+    fn sandboxed_spawns_disallow_peer_messaging() {
+        let mut a = ClaudeAdapter::new();
+        let owner = a.prepare_session_command(&session_ctx()).unwrap();
+        assert!(
+            owner.contains("--disallowedTools 'AskUserQuestion' --dangerously-skip-permissions"),
+            "got: {owner}"
+        );
+        let sandboxed = crate::adapter::SessionContext {
+            is_sandboxed: true,
+            ..session_ctx()
+        };
+        let cmd = a.prepare_session_command(&sandboxed).unwrap();
+        assert!(
+            cmd.contains("--disallowedTools 'AskUserQuestion SendMessage ListAgents'"),
+            "got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--dangerously-skip-permissions"),
+            "got: {cmd}"
+        );
+        let argv = a.prepare_session_native(&sandboxed).unwrap().args;
+        let i = argv.iter().position(|s| s == "--disallowedTools").unwrap();
+        assert_eq!(argv[i + 1], "AskUserQuestion SendMessage ListAgents");
+    }
+
+    /// Real claude 2.1.265 shape (tmp/peer_probe2.log): a cross-session
+    /// `SendMessage` to this session is echoed with `origin.kind == "peer"`
+    /// and a uuid we never wrote.
+    #[test]
+    fn peer_replay_echo_emits_peer_turn_consumed() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"user","message":{"role":"user","content":"Another Claude session sent a message:\n<cross-session-message from=\"uds:/tmp/cc-socks/95696.sock\" from-name=\"zucchini-9d\" from-mode=\"bypass\">\nProbe question 2: what is 6 x 7? Reply to me via SendMessage.\n</cross-session-message>"},"session_id":"011e1e77-dbc3-44e8-b423-06b9379903f5","parent_tool_use_id":null,"uuid":"153cc7ac-438d-4e49-a41e-2ab0afbaf756","timestamp":"2026-09-10T15:28:41.059Z","isReplay":true,"isSynthetic":true,"origin":{"kind":"peer","from":"uds:/tmp/cc-socks/95696.sock","verifiedPeerPid":95696,"msg_id":"a2abd1f2-a0c3-4ff6-a3f6-8940043e28e4","name":"zucchini-9d","fromMode":"bypass","body":"Probe question 2: what is 6 x 7? Reply to me via SendMessage."}}"#;
+        assert_eq!(
+            run(&mut a, line),
+            vec!["PeerTurnConsumed(zucchini-9d: Probe question 2: what is 6 x 7? Reply to me via SendMessage.)"]
+        );
     }
 
     /// Must stay byte-stable across respawns — see `AgentAdapter::turn_time_line`.
