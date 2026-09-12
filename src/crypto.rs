@@ -129,6 +129,24 @@ impl KeyStore {
         cache.remove(user_id);
     }
 
+    /// [`get`](Self::get) without the legacy-key migration: the file is only
+    /// read where it already belongs to `user_id`. The legacy `key` file holds
+    /// the OWNER's K_user and migration is uid-blind, so the first lookup for
+    /// ANY other member claims it — and `reconcile_key_files` then deletes it
+    /// as a non-member's, losing every ciphertext on the machine. `get`'s
+    /// callers (message decrypt, writeback encrypt) run for a member whose key
+    /// is already on disk; a `chats` row's `user_id` is any member's and its
+    /// title is only a decoration, so it uses this.
+    pub fn get_existing(&self, user_id: &Uuid) -> Option<Arc<KUser>> {
+        let mut cache = self.cache.lock().expect("KeyStore mutex");
+        if let Some(entry) = cache.get(user_id) {
+            return entry.clone();
+        }
+        let key = Arc::new(KUser::load_from(&user_key_path(user_id)).ok()?);
+        cache.insert(*user_id, Some(key.clone()));
+        Some(key)
+    }
+
     pub fn get(&self, user_id: &Uuid) -> Result<Arc<KUser>> {
         // Single lock window: spawner has 1-2 uids per process lifetime and the
         // fs I/O fires at most once per uid, so brief blocking under the guard
@@ -249,6 +267,14 @@ pub fn encrypt(key: &KUser, plaintext: &[u8]) -> Vec<u8> {
 
 pub fn encrypt_field_b64(key: &KUser, plaintext: &str) -> String {
     B64.encode(encrypt(key, plaintext.as_bytes()))
+}
+
+/// Inverse of [`encrypt_field_b64`]: a single encrypted TEXT column
+/// (`chats.title`), not a message envelope. `None` on anything unreadable —
+/// wrong key, truncated value, non-UTF8 plaintext.
+pub fn decrypt_field_b64(key: &KUser, ciphertext_b64: &str) -> Option<String> {
+    let bytes = B64.decode(ciphertext_b64).ok()?;
+    String::from_utf8(decrypt_bytes(key, &bytes)?).ok()
 }
 
 /// Decrypt a `nonce‖ct‖tag` blob. Used for both message-envelope JSON

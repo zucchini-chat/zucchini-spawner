@@ -293,6 +293,12 @@ pub struct SessionContext<'a> {
     pub is_sandboxed: bool,
     /// See `TurnContext::model`.
     pub model: Option<&'a str>,
+    /// The chat's title, sanitized by `session_name::from_title`. Claude
+    /// registers it as the live process's name so another agent on the machine
+    /// can `SendMessage` this chat by title. `None` (blank title, failed
+    /// decrypt, non-claude adapter) ⇒ no flag, and the CLI picks its own
+    /// derived name.
+    pub session_name: Option<&'a str>,
 }
 
 /// A shell-free spawn recipe for an adapter that can launch its CLI directly

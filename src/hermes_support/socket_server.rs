@@ -799,6 +799,7 @@ mod tests {
                 "worktree": false,
             })
             .to_string(),
+            &crate::crypto::KeyStore::new(),
         );
         let mirror = Arc::new(tokio::sync::RwLock::new(mirror));
 
@@ -853,6 +854,7 @@ mod tests {
                 "worktree": false,
             })
             .to_string(),
+            &crate::crypto::KeyStore::new(),
         );
         let mirror = Arc::new(tokio::sync::RwLock::new(mirror));
 

@@ -88,8 +88,8 @@ fn startup_timeout_message(timeout: Duration, retried: bool) -> String {
 /// task as `AgentEvent`s arrive and read by the Supervisor to answer
 /// `is_running`. Only `running` crosses the wire (the boolean
 /// `chats.agent_running`, true the whole time the agent is busy):
-///   - `running = in_turn || !unconsumed.is_empty() || !live_tasks.is_empty()`
-///   - `waiting = running && !in_turn && unconsumed.is_empty()`
+///   - `running = in_turn || user_queued || !live_tasks.is_empty()`
+///   - `waiting = running && !in_turn && !user_queued`
 ///   - `in_turn = turn_in_flight || self_turn`
 ///
 /// i.e. Thinking = a turn in flight or queued; Waiting = only a background task
@@ -130,6 +130,13 @@ pub struct SessionState {
     pub idle_since: Option<tokio::time::Instant>,
     /// The process group leader, for memory measurement.
     pub pid: Option<u32>,
+    /// Uuids of internal `/rename` turns the spawner queued for itself and the
+    /// CLI hasn't started yet. Several can coexist: a chat renamed twice in a
+    /// row queues one per title.
+    pub(crate) internal: Vec<String>,
+    /// The internal turn the CLI started: its suppression window is open until
+    /// the next `result`. Never busy.
+    pub(crate) internal_running: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,11 +158,21 @@ pub struct QueuedTurn {
     frame: String,
     /// A slash command: claude expands it only as a turn of its own.
     own_turn: bool,
+    /// Queued by the spawner, not the user (`/rename`): invisible to
+    /// `running()` and dropped rather than re-queued by a respawn.
+    internal: bool,
 }
 
 impl SessionState {
     pub fn running(&self) -> bool {
-        self.in_turn() || !self.unconsumed.is_empty() || !self.live_tasks.is_empty()
+        self.in_turn() || self.user_queued() || !self.live_tasks.is_empty()
+    }
+    /// A turn of the USER's is queued. An internal `/rename` doesn't count: it
+    /// is the spawner's own, so it neither makes the session busy nor costs the
+    /// user their resident when `/stop` has to decide between an interrupt and
+    /// a hard abort.
+    fn user_queued(&self) -> bool {
+        self.unconsumed.iter().any(|t| !t.internal)
     }
     /// A turn runs: a consumed one of ours or a peer's, or a self-fired one.
     fn in_turn(&self) -> bool {
@@ -171,7 +188,7 @@ impl SessionState {
     /// unit-test the FSM contract, so it's `#[cfg(test)]`.
     #[cfg(test)]
     pub fn waiting(&self) -> bool {
-        self.running() && !self.in_turn() && self.unconsumed.is_empty()
+        self.running() && !self.in_turn() && !self.user_queued()
     }
     /// Fully Idle — safe to tear down, and the only state in which a queued prune
     /// may be applied (a respawn would otherwise kill armed monitors). Exactly the
@@ -186,6 +203,30 @@ impl SessionState {
     /// Kept warm past its idle edge with nothing pending: evictable.
     fn warm_idle_since(&self) -> Option<tokio::time::Instant> {
         self.idle_since.filter(|_| !self.closed && self.is_idle())
+    }
+    /// An internal turn is running: its frames are being swallowed right now.
+    pub(crate) fn internal_in_flight(&self) -> bool {
+        self.internal_running.is_some()
+    }
+    pub(crate) fn queue_internal(&mut self, uuid: String) {
+        self.internal.push(uuid);
+    }
+    /// Opens the suppression window when `uuid` is an internal turn of ours
+    /// (queued or already running); reports whether it is.
+    fn start_internal(&mut self, uuid: &str) -> bool {
+        if self.internal_running.as_deref() != Some(uuid)
+            && !self.internal.iter().any(|u| u == uuid)
+        {
+            return false;
+        }
+        self.internal.retain(|u| u != uuid);
+        self.internal_running = Some(uuid.to_string());
+        true
+    }
+    /// Fail open: anything other than the internal turn's own `result` ends
+    /// the suppression window, so real content can never be swallowed.
+    fn close_internal_window(&mut self) {
+        self.internal_running = None;
     }
 }
 
@@ -202,6 +243,7 @@ impl SessionState {
 pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
     match ev {
         AgentEvent::Result { origin_is_task } => {
+            state.close_internal_window();
             if state.interrupt_acked() {
                 state.interrupt = None;
                 state.turn_in_flight = false;
@@ -216,7 +258,9 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
             }
         }
         AgentEvent::TurnStarted(uuid) => {
-            if !state.unconsumed.iter().any(|t| &t.uuid == uuid) {
+            // The command's assistant text precedes its echo, so the window has
+            // to open here rather than on `UserTurnConsumed`.
+            if !state.start_internal(uuid) && !state.unconsumed.iter().any(|t| &t.uuid == uuid) {
                 state.self_turn = true;
             }
         }
@@ -235,12 +279,21 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
             state.live_tasks.remove(id);
         }
         AgentEvent::UserTurnConsumed(uuid) => {
+            let ours = state.start_internal(uuid);
+            if !ours {
+                state.close_internal_window();
+            }
             if let Some(i) = state.unconsumed.iter().position(|t| &t.uuid == uuid) {
                 state.unconsumed.remove(i);
-                state.turn_in_flight = true;
+                if !ours {
+                    state.turn_in_flight = true;
+                }
             }
         }
-        AgentEvent::PeerTurnConsumed { .. } => state.turn_in_flight = true,
+        AgentEvent::PeerTurnConsumed { .. } => {
+            state.close_internal_window();
+            state.turn_in_flight = true;
+        }
         // Non-state-bearing events.
         AgentEvent::Frame(_)
         | AgentEvent::ContextTokens(_)
@@ -260,6 +313,28 @@ fn peer_message_frame_json(name: &str, body: &str) -> String {
         "body": body,
     })
     .to_string()
+}
+
+/// Dropped while the internal `/rename` turn's suppression window is open: its
+/// own output writes no message row, and a local command's usage must not move
+/// the context gauge. Everything else passes — and a foreign echo or a peer
+/// turn closes the window in `reduce`, so real content is never swallowed.
+fn internal_turn_swallows(ev: &AgentEvent) -> bool {
+    matches!(ev, AgentEvent::Frame(_) | AgentEvent::ContextTokens(_))
+}
+
+/// The suppression window, latched for one stdout LINE. One line yields several
+/// events (a `result` line yields `Result` and then the result frame), the
+/// window is read before each is reduced, and the `Result` closes it — so a
+/// line that starts inside the window stays inside it to its last event.
+#[derive(Default)]
+pub(crate) struct InternalLine(bool);
+
+impl InternalLine {
+    pub(crate) fn swallows(&mut self, window_open: bool, ev: &AgentEvent) -> bool {
+        self.0 |= window_open;
+        self.0 && internal_turn_swallows(ev)
+    }
 }
 
 const TURN_PART_SEPARATOR: &str = "\n\n---\n\n";
@@ -546,6 +621,11 @@ pub struct SpawnRequest {
     /// `None`. Injects the user's current local time into the prompt each turn
     /// for `schedule-message --at`.
     pub user_timezone: Option<String>,
+    /// The chat's title sanitized by `session_name::from_title` — the name the
+    /// resident registers for peer addressing (`claude --name`). Recomputed on
+    /// every spawn, so a rename that missed the live process still lands on the
+    /// next one. `None` for a blank/undecryptable title.
+    pub session_name: Option<String>,
 }
 
 /// Handles a resident spawn fn returns so the Supervisor can drive the session
@@ -597,10 +677,32 @@ pub struct ResidentSession {
     // `SpawnRequest.agent_session_id` for `--resume`. One source of truth.
     /// FSM mutated by the reader, read by the Supervisor for `is_running`.
     state: Arc<StdMutex<SessionState>>,
+    /// The name this process was last ASKED for: `claude --name` at spawn, then
+    /// whatever an internal `/rename` turn requested. A chats row re-streams on
+    /// every writeback, so this is what keeps the rename from being re-queued
+    /// on each one.
+    asked_name: Option<String>,
 }
 
 impl ResidentSession {
     fn queue_turn(&self, prompt: String, first_turn: bool, user_timezone: Option<&str>) {
+        self.push_turn(prompt, first_turn, user_timezone, false);
+    }
+
+    /// A turn of the spawner's own (`/rename <name>`). `is_slash_command` makes
+    /// it an `own_turn`, so the writer holds it until it heads the queue with
+    /// no turn in flight and `turn_text` ships it verbatim — nothing special.
+    fn queue_internal_turn(&self, name: &str) {
+        self.push_turn(format!("/rename {name}"), false, None, true);
+    }
+
+    fn push_turn(
+        &self,
+        prompt: String,
+        first_turn: bool,
+        user_timezone: Option<&str>,
+        internal: bool,
+    ) {
         let adapter = self.knobs.agent_kind.make_adapter();
         let uuid = Uuid::now_v7().to_string();
         let text = turn_text(
@@ -611,16 +713,18 @@ impl ResidentSession {
             None,
         );
         let frame = adapter.encode_user_turn(&uuid, &text);
-        self.state
-            .lock()
-            .expect("SessionState mutex")
-            .unconsumed
-            .push(QueuedTurn {
-                own_turn: adapter.expands_slash_commands() && is_slash_command(&prompt),
-                uuid,
-                prompt,
-                frame,
-            });
+        let mut st = self.state.lock().expect("SessionState mutex");
+        if internal {
+            st.queue_internal(uuid.clone());
+        }
+        st.unconsumed.push(QueuedTurn {
+            own_turn: adapter.expands_slash_commands() && is_slash_command(&prompt),
+            internal,
+            uuid,
+            prompt,
+            frame,
+        });
+        drop(st);
         self.wake.notify_one();
     }
 }
@@ -801,7 +905,12 @@ impl Supervisor {
                 // Closes stdin (writer) and SIGTERMs the group (reader).
                 session.cancel.cancel();
                 await_agent_exit(session.reader, topic).await;
+                // An internal `/rename` is not re-queued: the respawn passes
+                // `--name` from the current title anyway.
                 std::mem::take(&mut session.state.lock().expect("SessionState mutex").unconsumed)
+                    .into_iter()
+                    .filter(|t| !t.internal)
+                    .collect()
             }
             None => Vec::new(),
         };
@@ -894,8 +1003,10 @@ impl Supervisor {
     /// `/stop` that keeps the process: ask the live resident to end its turn
     /// in flight. Background tasks survive. `false` — the caller hard-aborts —
     /// when the adapter can't interrupt, no turn is in flight (only tasks or
-    /// queued turns), or turns are queued: claude runs those right after the
-    /// interrupt (`still_queued`), while `/stop` drops them. The turn's
+    /// queued turns), or USER turns are queued: claude runs those right after
+    /// the interrupt (`still_queued`), while `/stop` drops them. An internal
+    /// `/rename` is ours and is meant to run, so it doesn't force the abort.
+    /// The turn's
     /// `result` arrives as `AgentResponse::Interrupted`; without one within
     /// `INTERRUPT_RESULT_TIMEOUT` comes `InterruptTimedOut`.
     pub fn interrupt(&self, topic: &str) -> bool {
@@ -913,7 +1024,7 @@ impl Supervisor {
         };
         {
             let mut st = s.state.lock().expect("SessionState mutex");
-            if st.closed || s.reader.is_finished() || !st.in_turn() || !st.unconsumed.is_empty() {
+            if st.closed || s.reader.is_finished() || !st.in_turn() || st.user_queued() {
                 return false;
             }
             if st.interrupt.as_ref().is_some_and(|i| !i.turn_ended) {
@@ -998,6 +1109,33 @@ impl Supervisor {
             s.cancel.cancel();
         }
         self.abort_agent(topic).await;
+        true
+    }
+
+    /// Rename the live resident to `name` (chat renamed in the app) with an
+    /// internal `/rename` turn — claude handles it locally and updates both its
+    /// session registry and the in-memory name it stamps on outbound peer
+    /// messages. No-op when the chat has no live resident or that process was
+    /// already asked for `name` (its `--name` at spawn included; a chats row
+    /// re-streams on every writeback). `name` is `None` for a title that
+    /// sanitizes to nothing: the resident keeps its current name.
+    /// Returns whether a turn was queued.
+    pub fn rename_resident(&mut self, topic: &str, name: Option<&str>) -> bool {
+        let Some(name) = name else {
+            return false;
+        };
+        let Some(AgentEntry::Resident(s)) = self.agents.get_mut(topic) else {
+            return false;
+        };
+        if s.reader.is_finished() || s.state.lock().expect("SessionState mutex").closed {
+            return false;
+        }
+        if s.asked_name.as_deref() == Some(name) {
+            return false;
+        }
+        s.asked_name = Some(name.to_string());
+        s.queue_internal_turn(name);
+        info!(chat_id = %topic, name = %name, "renaming live claude session");
         true
     }
 
@@ -1102,6 +1240,7 @@ impl Supervisor {
             reader: handles.reader,
             cancel,
             state: handles.state,
+            asked_name: req.session_name.clone(),
         };
         session.queue_turn(
             req.prompt,
@@ -1192,6 +1331,7 @@ fn default_spawn_fn(
         is_sandboxed,
         model,
         user_timezone,
+        session_name: _,
     } = req;
     let mut adapter = agent_kind.make_adapter();
 
@@ -1593,6 +1733,7 @@ fn default_resident_spawn_fn(
         is_sandboxed,
         model,
         user_timezone: _,
+        session_name,
     } = req;
 
     // Register the per-chat attachment mailbox before the spawn (same rationale
@@ -1639,6 +1780,7 @@ fn default_resident_spawn_fn(
             agent_session_id: agent_session_id.as_deref(),
             is_sandboxed,
             model: model.as_deref(),
+            session_name: session_name.as_deref(),
         };
         let native = if cfg!(windows) {
             adapter.prepare_session_native(&ctx)
@@ -1787,6 +1929,7 @@ fn default_resident_spawn_fn(
                                     let events = adapter.handle_line(line);
                                     // This line is the `result` ending an interrupted turn.
                                     let mut interrupted = false;
+                                    let mut renaming = InternalLine::default();
                                     for ev in events {
                                         // Reduce the FSM and read back the resulting
                                         // `running` in one lock — the `match` below only
@@ -1796,9 +1939,13 @@ fn default_resident_spawn_fn(
                                         // via `SessionState`; it just doesn't cross the
                                         // wire.)
                                         let is_result = matches!(&ev, AgentEvent::Result { .. });
-                                        let running = {
+                                        // Our own `/rename` turn is running: it is silent,
+                                        // so every frame it produces (and its usage) is
+                                        // dropped.
+                                        let (running, swallow) = {
                                             let mut st = state_for_reader.lock().expect("SessionState mutex");
                                             interrupted |= is_result && st.interrupt_acked();
+                                            let swallow = renaming.swallows(st.internal_in_flight(), &ev);
                                             reduce(&mut st, &ev);
                                             let r = st.running();
                                             // [DIAG tasktrace] TEMPORARY — log every
@@ -1810,13 +1957,14 @@ fn default_resident_spawn_fn(
                                                 AgentEvent::Result { origin_is_task } => tracing::info!(diag = "tasktrace", topic = %topic, origin_is_task, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce Result"),
                                                 _ => {}
                                             }
-                                            r
+                                            (r, swallow)
                                         };
                                         // A slash turn held by the writer may be due now.
                                         if is_result {
                                             wake_for_writer.notify_one();
                                         }
                                         match ev {
+                                            _ if swallow => {}
                                             AgentEvent::Frame(_) if interrupted => {}
                                             AgentEvent::Result { .. } if interrupted => {
                                                 let session = state_for_reader.clone();
@@ -2212,10 +2360,28 @@ fn attach_followup_for(
 #[cfg(test)]
 mod reduce_tests {
     use super::{
-        frames_to_write, peer_message_frame_json, reduce, AgentEvent, PendingInterrupt, QueuedTurn,
-        SessionState,
+        frames_to_write, internal_turn_swallows, peer_message_frame_json, reduce, AgentEvent,
+        PendingInterrupt, QueuedTurn, SessionState,
     };
     use std::collections::HashSet;
+
+    /// A session with the internal `/rename` turn `uuid` queued, as
+    /// `ResidentSession::queue_internal_turn` leaves it.
+    fn renaming(uuid: &str) -> SessionState {
+        let mut s = SessionState::default();
+        queue_rename(&mut s, uuid);
+        s
+    }
+
+    /// One more internal `/rename` turn queued, exactly as `push_turn` does.
+    fn queue_rename(s: &mut SessionState, uuid: &str) {
+        s.queue_internal(uuid.into());
+        s.unconsumed.push(QueuedTurn {
+            own_turn: true,
+            internal: true,
+            ..queued(uuid)
+        });
+    }
 
     /// Drive a frame sequence through the pure reducer and assert the derived
     /// (running, waiting) pair after each event — the resident FSM contract.
@@ -2330,6 +2496,7 @@ mod reduce_tests {
             prompt: String::new(),
             frame: uuid.into(),
             own_turn: false,
+            internal: false,
         }
     }
 
@@ -2538,6 +2705,125 @@ mod reduce_tests {
         assert!(s.is_idle());
     }
 
+    /// The spawner's own `/rename` turn: busy for nobody, from queue to
+    /// `result`, so it writes no `agent_running` edge (hence no push, no
+    /// scheduled-message promotion) and never touches `idle_since`. Everything
+    /// it emits is dropped — the rename leaves no message row behind.
+    #[test]
+    fn an_internal_turn_is_never_busy_and_its_frames_are_swallowed() {
+        let mut s = renaming("r1");
+        assert!(s.is_idle(), "queued");
+
+        reduce(&mut s, &AgentEvent::TurnStarted("r1".into()));
+        assert!(s.is_idle() && !s.self_turn, "started");
+        assert!(s.internal_in_flight());
+        assert!(internal_turn_swallows(&AgentEvent::Frame("{}".into())));
+        assert!(internal_turn_swallows(&AgentEvent::ContextTokens(9_000)));
+
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("r1".into()));
+        assert!(s.is_idle() && !s.turn_in_flight, "consumed");
+        assert!(s.unconsumed.is_empty());
+        assert!(s.internal_in_flight());
+
+        // The `result` LINE yields `Result` and then its own frame, so the
+        // reader latches the window here and drops both (e2e:
+        // `renaming_a_live_chat_writes_nothing_at_all`).
+        let latched = s.internal_in_flight();
+        reduce(&mut s, &RESULT);
+        assert!(latched && internal_turn_swallows(&AgentEvent::Frame("{}".into())));
+        assert!(
+            !s.internal_in_flight(),
+            "the window closes for the next line"
+        );
+        assert!(s.is_idle());
+    }
+
+    /// Fail open: anything that isn't the command's own `result` ends the
+    /// window, so a turn racing it can never have its frames swallowed.
+    #[test]
+    fn a_foreign_turn_inside_the_window_closes_it() {
+        for echo in [
+            AgentEvent::UserTurnConsumed("other".into()),
+            AgentEvent::PeerTurnConsumed {
+                name: "zucchini-9d".into(),
+                body: "hi".into(),
+            },
+        ] {
+            let mut s = renaming("r1");
+            s.unconsumed.push(queued("other"));
+            reduce(&mut s, &AgentEvent::TurnStarted("r1".into()));
+            reduce(&mut s, &echo);
+            assert!(!s.internal_in_flight(), "{echo:?}");
+            assert!(s.turn_in_flight, "{echo:?}");
+        }
+    }
+
+    /// A user turn consumed while the rename is still QUEUED is an ordinary
+    /// turn — the record it would need survives for its own echo.
+    #[test]
+    fn a_queued_internal_turn_outlives_another_turns_result() {
+        let mut s = renaming("r1");
+        s.unconsumed.insert(0, queued("a"));
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
+        assert!(s.turn_in_flight && s.running());
+        reduce(&mut s, &RESULT);
+        assert!(s.is_idle());
+        reduce(&mut s, &AgentEvent::TurnStarted("r1".into()));
+        assert!(s.internal_in_flight());
+    }
+
+    /// It is a slash command, so the writer holds it — and the turns behind
+    /// it — until it heads the queue with no turn in flight.
+    #[test]
+    fn an_internal_turn_is_held_like_any_slash_command() {
+        let mut s = renaming("r1");
+        s.unconsumed.insert(0, queued("a"));
+        s.turn_in_flight = true;
+        let mut written = HashSet::new();
+        assert_eq!(frames_to_write(&s, &mut written), vec!["a"]);
+        assert!(frames_to_write(&s, &mut written).is_empty());
+        s.unconsumed.remove(0);
+        s.turn_in_flight = false;
+        assert_eq!(frames_to_write(&s, &mut written), vec!["r1"]);
+    }
+
+    /// Renamed twice before the first `/rename` even starts: both turns stay
+    /// tracked, so the first is still invisible and still swallowed.
+    #[test]
+    fn a_rename_queued_behind_another_keeps_both_silent() {
+        let mut s = renaming("r1");
+        queue_rename(&mut s, "r2");
+
+        reduce(&mut s, &AgentEvent::TurnStarted("r1".into()));
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("r1".into()));
+        assert!(!s.turn_in_flight && !s.self_turn, "r1 is still invisible");
+        assert!(s.is_idle());
+        assert!(s.internal_in_flight(), "r1's frames are still swallowed");
+
+        reduce(&mut s, &RESULT);
+        assert!(!s.internal_in_flight());
+        reduce(&mut s, &AgentEvent::TurnStarted("r2".into()));
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("r2".into()));
+        assert!(!s.turn_in_flight && !s.self_turn, "r2 too");
+        assert!(s.internal_in_flight(), "r2's own window");
+        assert!(s.is_idle());
+    }
+
+    /// A rename queued while the previous one is mid-flight doesn't reopen or
+    /// close its window.
+    #[test]
+    fn a_rename_queued_mid_flight_leaves_the_open_window_alone() {
+        let mut s = renaming("r1");
+        reduce(&mut s, &AgentEvent::TurnStarted("r1".into()));
+        queue_rename(&mut s, "r2");
+        assert!(s.internal_in_flight(), "r1's window survives r2 queueing");
+
+        reduce(&mut s, &RESULT);
+        assert!(!s.internal_in_flight());
+        reduce(&mut s, &AgentEvent::TurnStarted("r2".into()));
+        assert!(s.internal_in_flight() && s.is_idle(), "r2 is still tracked");
+    }
+
     #[test]
     fn peer_message_frame_is_a_system_row() {
         let v: serde_json::Value =
@@ -2629,6 +2915,7 @@ mod live_session_tests {
 
     fn claude_req(chat_id: &str) -> SpawnRequest {
         SpawnRequest {
+            session_name: None,
             chat_id: chat_id.to_string(),
             prompt: "hi".to_string(),
             project_path: None,
@@ -2832,6 +3119,95 @@ mod live_session_tests {
             sup.send_user_turn(&compact),
             "a turn of its own gets expanded"
         );
+    }
+
+    /// A chats row re-streams on every writeback, so the rename is queued only
+    /// when the title actually changed what this process was last asked for —
+    /// its spawn-time `--name` included. The turn itself is invisible: it never
+    /// makes the session busy, and a respawn drops it rather than re-queuing it
+    /// (the fresh spawn passes `--name` from the current title).
+    #[tokio::test(start_paused = true)]
+    async fn renaming_queues_one_internal_turn_per_new_title() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(SpawnRequest {
+            session_name: Some("cover letters writer".to_string()),
+            ..claude_req("chat")
+        });
+        set_idle(&exposed, "chat");
+
+        assert!(
+            !sup.rename_resident("chat", Some("cover letters writer")),
+            "came up under this --name"
+        );
+        assert!(!sup.rename_resident("chat", None), "unusable title");
+        assert!(sup.rename_resident("chat", Some("my voice writer")));
+        assert!(
+            !sup.rename_resident("chat", Some("my voice writer")),
+            "the same row re-streamed"
+        );
+        assert!(sup.rename_resident("chat", Some("third name")));
+        assert!(!sup.rename_resident("other-chat", Some("x")), "no resident");
+
+        assert_eq!(
+            sup.unconsumed_prompts("chat"),
+            vec!["/rename my voice writer", "/rename third name"]
+        );
+        assert!(!sup.is_running("chat"), "no busy edge for our own turns");
+
+        // It is a slash command, so the writer holds it until it heads the
+        // queue with no turn in flight.
+        let session = exposed.lock().unwrap()["chat"].clone();
+        assert_eq!(
+            session.lock().unwrap().internal.len(),
+            2,
+            "both renames stay tracked, so neither turn is ever taken for the user's"
+        );
+        let mut written = HashSet::new();
+        {
+            let mut st = session.lock().expect("SessionState mutex");
+            st.turn_in_flight = true;
+            assert!(frames_to_write(&st, &mut written).is_empty());
+            st.turn_in_flight = false;
+            assert_eq!(frames_to_write(&st, &mut written).len(), 1, "one at a time");
+        }
+
+        let requeued: Vec<String> = sup
+            .abort_agent("chat")
+            .await
+            .into_iter()
+            .map(|t| t.prompt)
+            .collect();
+        assert!(requeued.is_empty(), "{requeued:?}");
+    }
+
+    /// A queued turn makes `/stop` a hard abort because claude would run it
+    /// right after the interrupt — but an internal `/rename` is the spawner's
+    /// own, and a chats row re-streams on every writeback, so it must not cost
+    /// the user their resident.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_rename_still_lets_stop_interrupt_in_place() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(claude_req("chat"));
+        set_idle(&exposed, "chat");
+        exposed.lock().unwrap()["chat"]
+            .lock()
+            .unwrap()
+            .turn_in_flight = true;
+
+        let second = SpawnRequest {
+            prompt: "second".to_string(),
+            ..claude_req("chat")
+        };
+        assert!(sup.send_user_turn(&second));
+        assert!(!sup.interrupt("chat"), "a user turn queued: /stop drops it");
+
+        set_idle(&exposed, "chat");
+        exposed.lock().unwrap()["chat"]
+            .lock()
+            .unwrap()
+            .turn_in_flight = true;
+        assert!(sup.rename_resident("chat", Some("my voice writer")));
+        assert!(sup.interrupt("chat"), "ours to run, not the user's to drop");
     }
 
     /// The shared `live_sessions` directory (read by the control task's

@@ -48,6 +48,13 @@ pub struct ChatState {
     /// stay `if let Some(m) = ctx.model { ... }`). Column absent → `None`,
     /// same as NULL.
     pub model: Option<String>,
+    /// `chats.title`, DECRYPTED (the column is K_machine-sealed under the chat
+    /// OWNER's key, like `messages.body`). `None` when the chat has no title or
+    /// the owner's key isn't unsealed yet — a chats row re-streams on every
+    /// writeback, so a miss heals on the next one. Never persisted: `chats` is
+    /// `#[serde(skip)]`, so no plaintext reaches state.json. Feeds
+    /// `claude --name` via `session_name::from_title`.
+    pub title: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -142,7 +149,7 @@ fn default_true() -> bool {
 }
 
 impl Mirror {
-    pub fn upsert_chat(&mut self, id: String, row_json: &str) {
+    pub fn upsert_chat(&mut self, id: String, row_json: &str, keys: &crate::crypto::KeyStore) {
         let Some(v) = parse_row_json(row_json, "chat", &id) else {
             return;
         };
@@ -225,6 +232,14 @@ impl Mirror {
                 agent_session_id: incoming_agent_session_id,
                 agent_kind,
                 model,
+                title: v
+                    .get("title")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .and_then(|ct| {
+                        let key = keys.get_existing(&user_id)?;
+                        crate::crypto::decrypt_field_b64(&key, ct)
+                    }),
             },
         );
     }

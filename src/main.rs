@@ -13,6 +13,7 @@ mod orphans;
 mod power;
 mod powersync;
 mod prune;
+mod session_name;
 mod shell;
 mod state;
 mod sys;
@@ -472,7 +473,7 @@ async fn handle_sync_event(
                             .chats
                             .get(&id)
                             .and_then(|c| c.agent_session_id.clone());
-                        mirror.upsert_chat(id.clone(), &json);
+                        mirror.upsert_chat(id.clone(), &json, keys);
                         if let Some(local) = local_session {
                             if mirror
                                 .chats
@@ -482,6 +483,14 @@ async fn handle_sync_event(
                             {
                                 mirror.set_agent_session_id(&id, local);
                             }
+                        }
+                        // Chat renamed in the app: carry the new name to the
+                        // live resident so peers keep addressing it by title.
+                        // A cold chat needs nothing - its next spawn passes
+                        // `--name` from this same title.
+                        if let Some(chat) = mirror.chats.get(&id) {
+                            let name = chat.title.as_deref().and_then(session_name::from_title);
+                            supervisor.rename_resident(&id, name.as_deref());
                         }
                     }
                     StagedRow::Remove => delete_chat(&id, mirror, supervisor).await,
@@ -1005,30 +1014,39 @@ async fn handle_message_put(
         return;
     }
 
-    let (project_id, worktree, chat_last_seq, user_id, agent_session_id, agent_kind, model) =
-        match mirror.chats.get(&chat_id) {
-            Some(c) => (
-                c.project_id.clone(),
-                c.worktree,
-                c.last_seq,
-                c.user_id,
-                c.agent_session_id.clone(),
-                c.agent_kind,
-                // `chats.model` (migration 0035) — filter empty strings to
-                // `None` HERE (not in the adapter) so adapter logic stays
-                // `if let Some(m) = ctx.model { ... }`. `state.rs::upsert_chat`
-                // already does the same filter on insert, but we re-apply
-                // defensively in case a future code path bypasses it.
-                c.model
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string),
-            ),
-            None => {
-                warn!(chat_id = %chat_id, "message arrived before chat row, skipping");
-                return;
-            }
-        };
+    let (
+        project_id,
+        worktree,
+        chat_last_seq,
+        user_id,
+        agent_session_id,
+        agent_kind,
+        model,
+        session_name,
+    ) = match mirror.chats.get(&chat_id) {
+        Some(c) => (
+            c.project_id.clone(),
+            c.worktree,
+            c.last_seq,
+            c.user_id,
+            c.agent_session_id.clone(),
+            c.agent_kind,
+            // `chats.model` (migration 0035) — filter empty strings to
+            // `None` HERE (not in the adapter) so adapter logic stays
+            // `if let Some(m) = ctx.model { ... }`. `state.rs::upsert_chat`
+            // already does the same filter on insert, but we re-apply
+            // defensively in case a future code path bypasses it.
+            c.model
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            c.title.as_deref().and_then(session_name::from_title),
+        ),
+        None => {
+            warn!(chat_id = %chat_id, "message arrived before chat row, skipping");
+            return;
+        }
+    };
 
     // Replay guard: PowerSync re-streams the bucket from op_id 0 (sync-rules
     // rename, fresh state.json), and without it every replayed user message
@@ -1214,6 +1232,7 @@ async fn handle_message_put(
         is_sandboxed,
         model,
         user_timezone,
+        session_name,
     };
 
     if is_resident {
@@ -1279,6 +1298,8 @@ struct ChatSpawnParams {
     /// Sender's IANA timezone (migration 0040), mirrored per `handle_message_put`
     /// so the prune respawn keeps injecting the current-local-time line.
     user_timezone: Option<String>,
+    /// See `SpawnRequest::session_name`.
+    session_name: Option<String>,
 }
 
 /// Resolve spawn params for `chat_id`, mirroring `handle_message_put`'s gates
@@ -1318,6 +1339,7 @@ fn resolve_chat_spawn_params(mirror: &Mirror, chat_id: &str) -> Option<ChatSpawn
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         user_timezone: mirror.member_timezone(&chat.user_id).map(str::to_string),
+        session_name: chat.title.as_deref().and_then(session_name::from_title),
     })
 }
 
@@ -1475,6 +1497,7 @@ async fn apply_prune_group(
             is_sandboxed: params.is_sandboxed,
             model: params.model,
             user_timezone: params.user_timezone,
+            session_name: params.session_name,
         },
         unconsumed,
     );
@@ -1721,12 +1744,15 @@ fn apply_machine_users_put(
         return false;
     }
     // Sealed_blob validated and persisted — only NOW is it safe to bind the
-    // new is_sandboxed value into the in-memory mirror. No
-    // `keys.forget` here: K_machine is not rotated within an active
-    // membership (see persist_user_key doc), so any cached Arc<KUser> in the
-    // KeyStore is either absent (first PUT for this user) or already the
-    // matching one (idempotent re-emit). The REMOVE branch is the sole
-    // forget point.
+    // new is_sandboxed value into the in-memory mirror. Drop any cached entry:
+    // K_machine is not rotated within an active membership (see
+    // persist_user_key doc), so a cached Arc<KUser> is already the matching
+    // one — but a NEGATIVE entry ("no key file") can have been cached in
+    // between by anything that reads keys for this user (`upsert_chat`
+    // decrypting a title, a message body), and it would outlive the key we
+    // just wrote: every later message from that user would be dropped until
+    // the spawner restarts.
+    keys.forget(&user_id);
     mirror.upsert_member(row_id.to_string(), user_id, is_sandboxed_new);
     mirror.record_sealed_blob(&user_id, sealed_b64);
     info!(%user_id, "stored K_machine from machine_users.sealed_blob");
@@ -3200,6 +3226,8 @@ mod tests {
             "agent_session_id": serde_json::Value::Null,
             "agent_kind": "claude",
             "worktree": false,
+            // Sealed like the clients write it; becomes `claude --name`.
+            "title": crypto::encrypt_field_b64(&key, "  cover letters\nwriter  "),
         })
         .to_string();
         handle_sync_event(
@@ -3291,6 +3319,8 @@ mod tests {
         assert!(!req.worktree);
         // No attachments → prompt is the raw envelope text (see blobs::build_prompt).
         assert_eq!(req.prompt, plaintext);
+        // Decrypted + sanitized chat title: the handle peers address it by.
+        assert_eq!(req.session_name.as_deref(), Some("cover letters writer"));
 
         // RESIDENT path: NO optimistic `ChatRunning(true)` PATCH at message-put
         // time (CLAUDE.md "No optimistic patches of local sync state") — the
@@ -3351,6 +3381,7 @@ mod tests {
                 "worktree": false,
             })
             .to_string(),
+            &keys,
         );
 
         // Supervisor is only needed because the `Done` arm calls
@@ -3487,6 +3518,7 @@ mod tests {
         // then clear agent_running (→ false / idle). Supervisor slot is gone.
         // Pre-register a fake handle so we can observe `supervisor.remove`.
         supervisor.spawn_agent(SpawnRequest {
+            session_name: None,
             chat_id: chat_id.clone(),
             prompt: String::new(),
             project_path: None,
@@ -4813,6 +4845,7 @@ mod tests {
         let (mut supervisor, recorded) = supervisor_with_resident_recorder(resp_tx);
 
         let mk = |prompt: &str, model: Option<&str>, sid: Option<&str>| SpawnRequest {
+            session_name: None,
             chat_id: chat_id.clone(),
             prompt: prompt.to_string(),
             project_path: Some("/tmp/p".to_string()),
@@ -4855,6 +4888,8 @@ mod tests {
         /// What the chat's reader sends on.
         resp_tx: mpsc::Sender<AgentResponse>,
         resp_rx: mpsc::Receiver<AgentResponse>,
+        /// The real claude line parser, for `reader_raw`.
+        adapter: Box<dyn adapter::AgentAdapter>,
     }
 
     impl ResidentChat {
@@ -4878,6 +4913,7 @@ mod tests {
                 recorded,
                 resp_tx,
                 resp_rx,
+                adapter: AgentKind::Claude.make_adapter(),
             }
         }
 
@@ -4904,6 +4940,22 @@ mod tests {
                     "model": model,
                 })
                 .to_string(),
+            }
+        }
+
+        /// `chat`, plus the sealed `title` the clients write — which becomes
+        /// `claude --name` and, on a change, the internal `/rename` turn.
+        fn titled_chat(&self, last_seq: i64, title: &str) -> SyncEvent {
+            let SyncEvent::Put { table, id, data } = self.chat(last_seq, "") else {
+                unreachable!("chat() is a Put")
+            };
+            let key = self.keys.get(&self.user_id).expect("seeded key");
+            let mut row: serde_json::Value = serde_json::from_str(&data).expect("chat row");
+            row["title"] = json!(crypto::encrypt_field_b64(&key, title));
+            SyncEvent::Put {
+                table,
+                id,
+                data: row.to_string(),
             }
         }
 
@@ -4983,6 +5035,47 @@ mod tests {
                 session,
             })
             .await;
+        }
+
+        /// Drive the events of ONE stdout line exactly as the resident reader
+        /// would: reduce each in order and publish what it leaves standing,
+        /// with the internal `/rename` suppression window latched for the whole
+        /// line (its `result` closes the window, but that same line's frame and
+        /// usage are still the rename's).
+        async fn reader_line(&mut self, events: Vec<adapter::AgentEvent>) {
+            let mut renaming = crate::agent::InternalLine::default();
+            for ev in events {
+                let session = self.session();
+                let swallow = {
+                    let mut st = session.lock().unwrap();
+                    let swallow = renaming.swallows(st.internal_in_flight(), &ev);
+                    crate::agent::reduce(&mut st, &ev);
+                    swallow
+                };
+                let topic = self.chat_id.clone();
+                match ev {
+                    _ if swallow => {}
+                    adapter::AgentEvent::Frame(content) => {
+                        self.respond(AgentResponse::Line { topic, content }).await
+                    }
+                    adapter::AgentEvent::ContextTokens(tokens) => {
+                        self.respond(AgentResponse::ContextTokens { topic, tokens })
+                            .await
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        /// The same, for a raw claude stdout line parsed by the real adapter —
+        /// so the events and their ORDER are the production ones.
+        async fn reader_raw(&mut self, line: &str) {
+            let events: Vec<_> = self
+                .adapter
+                .handle_line(line.to_string())
+                .into_iter()
+                .collect();
+            self.reader_line(events).await;
         }
 
         /// The first turn was consumed and is in flight.
@@ -5160,6 +5253,44 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// A chat renamed in the app while its resident is warm: the `/rename`
+    /// turn is the spawner's own and completely silent — no message row (which
+    /// would bump the chat: unread, preview, push), no `agent_running` edge (no
+    /// "finished" push, no queued-message promotion), no context-gauge move.
+    #[tokio::test]
+    async fn renaming_a_live_chat_writes_nothing_at_all() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.titled_chat(1, "cover letters"),
+            c.project(),
+            c.message(1, "first"),
+        ])
+        .await;
+        c.consume_first_turn();
+        c.reader_line(vec![adapter::AgentEvent::Result {
+            origin_is_task: false,
+        }])
+        .await;
+        c.writes();
+
+        c.window(vec![c.titled_chat(1, "my voice writer")]).await;
+        assert_eq!(c.unconsumed(), vec!["/rename my voice writer"]);
+        let uuid = c.session().lock().unwrap().unconsumed[0].uuid.clone();
+
+        for line in [
+            format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"started","session_id":"s1"}}"#),
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Session renamed to: my voice writer"}],"usage":{"input_tokens":9000,"output_tokens":1}}}"#.to_string(),
+            format!(r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"/rename my voice writer"}}]}},"session_id":"s1","uuid":"{uuid}","isReplay":true}}"#),
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#.to_string(),
+        ] {
+            c.reader_raw(&line).await;
+            assert!(!c.supervisor.is_running(&c.chat_id), "never busy");
+        }
+
+        let writes = c.writes();
+        assert!(writes.is_empty(), "the rename is silent: {writes:?}");
     }
 
     #[tokio::test]
@@ -5397,6 +5528,7 @@ mod tests {
         let mut since = std::collections::HashMap::new();
         for chat in ["busy", "idle-25h", "idle-24h", "no-edge", "idle-22h"] {
             sup.spawn_agent(SpawnRequest {
+                session_name: None,
                 chat_id: chat.to_string(),
                 prompt: "hi".to_string(),
                 project_path: None,
@@ -5554,6 +5686,58 @@ mod tests {
         let writes = c.writes();
         assert!(writes.iter().any(is_interrupted), "{writes:?}");
         assert_eq!(alive_writes(&writes), vec![false]);
+    }
+
+    /// Renaming the chat mid-turn queues the spawner's own `/rename`. `/stop`
+    /// must still be the soft interrupt it promises: the process, its armed
+    /// monitors and `agent_alive` all survive.
+    #[tokio::test]
+    async fn stop_past_a_queued_rename_keeps_the_process() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            c.titled_chat(1, "cover letters"),
+            c.message(1, "first"),
+        ])
+        .await;
+        c.consume_first_turn();
+        c.window(vec![c.titled_chat(1, "my voice writer")]).await;
+        assert_eq!(c.unconsumed(), vec!["/rename my voice writer"]);
+        c.writes();
+
+        c.window(vec![
+            c.titled_chat(2, "my voice writer"),
+            c.message(2, "/stop"),
+        ])
+        .await;
+
+        assert!(c.session().lock().unwrap().interrupt.is_some());
+        assert!(c.supervisor.is_working(&c.chat_id), "process kept");
+        let writes = c.writes();
+        assert!(
+            writes.is_empty(),
+            "nothing until the turn's result: {writes:?}"
+        );
+
+        c.end_interrupted_turn().await;
+        let writes = c.writes();
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+        assert!(alive_writes(&writes).is_empty(), "process kept: {writes:?}");
+
+        // Claude runs the rename right after the interrupt (`still_queued`) —
+        // as silently as ever.
+        let uuid = c.session().lock().unwrap().unconsumed[0].uuid.clone();
+        for line in [
+            format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"started","session_id":"s1"}}"#),
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Session renamed to: my voice writer"}],"usage":{"input_tokens":9000,"output_tokens":1}}}"#.to_string(),
+            format!(r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"/rename my voice writer"}}]}},"session_id":"s1","uuid":"{uuid}","isReplay":true}}"#),
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#.to_string(),
+        ] {
+            c.reader_raw(&line).await;
+            assert!(!c.supervisor.is_running(&c.chat_id), "never busy");
+        }
+        let writes = c.writes();
+        assert!(writes.is_empty(), "the rename is silent: {writes:?}");
     }
 
     #[tokio::test]
@@ -5821,7 +6005,8 @@ mod tests {
         };
         // Flagged before the restart: persisted, not re-streamed.
         let persisted = Uuid::now_v7().to_string();
-        c.mirror.upsert_chat(persisted.clone(), &row(1));
+        c.mirror
+            .upsert_chat(persisted.clone(), &row(1), &KeyStore::new());
         c.mirror = restarted(&c.mirror);
 
         let restreamed = SyncEvent::Put {

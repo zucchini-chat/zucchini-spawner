@@ -153,9 +153,23 @@ fn claude_flag_args(
     agent_session_id: Option<&str>,
     is_sandboxed: bool,
     model: Option<&str>,
+    session_name: Option<&str>,
     resident: bool,
 ) -> Vec<ClaudeArg> {
     let mut args: Vec<ClaudeArg> = Vec::new();
+
+    // Register the chat's title as this process's peer-addressable name
+    // (`~/.claude/sessions/<pid>.json`), so another agent on the machine can
+    // `SendMessage` it by chat title instead of re-deriving its context.
+    // Claude resolves a collision with another live session itself
+    // (`session_name_collision`) by taking a suffixed variant, so we pass the
+    // title as-is. Sanitizing is `session_name::from_title`'s job; the value is
+    // one argv element (POSIX path single-quotes it), so a title with spaces or
+    // quotes can't split into flags.
+    if let Some(name) = session_name {
+        args.push(ClaudeArg::Lit("--name"));
+        args.push(ClaudeArg::Val(name.to_string()));
+    }
 
     // First turn / fresh session: pass no session flag — claude generates a
     // session id and emits it in the `system/init` stdout frame, which we
@@ -312,6 +326,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.agent_session_id,
             ctx.is_sandboxed,
             ctx.model,
+            /* session_name = */ None,
             /* resident = */ false,
         );
         push_posix_flags(&mut claude_cmd, &args);
@@ -327,6 +342,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.agent_session_id,
             ctx.is_sandboxed,
             ctx.model,
+            /* session_name = */ None,
             false,
         );
         Some(NativeSpawn {
@@ -366,6 +382,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.agent_session_id,
             ctx.is_sandboxed,
             ctx.model,
+            ctx.session_name,
             /* resident = */ true,
         );
         push_posix_flags(&mut claude_cmd, &args);
@@ -384,6 +401,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.agent_session_id,
             ctx.is_sandboxed,
             ctx.model,
+            ctx.session_name,
             true,
         );
         Some(NativeSpawn {
@@ -1650,6 +1668,7 @@ mod tests {
     /// a field via struct-update: `SessionContext { worktree: true, ..session_ctx() }`.
     fn session_ctx() -> crate::adapter::SessionContext<'static> {
         crate::adapter::SessionContext {
+            session_name: None,
             chat_id: "abcdef012345-6789",
             project_path: Some("/tmp/proj"),
             worktree: false,
@@ -1799,6 +1818,29 @@ mod tests {
         assert!(cmd.starts_with("cd '/tmp/proj' && claude"), "got: {cmd}");
     }
 
+    /// The chat title becomes the process's peer-addressable name, on both
+    /// spawn paths — a respawn (resume, prune, knob change) renders through the
+    /// same builder, so the name can't silently revert to claude's derived one.
+    #[test]
+    fn session_name_becomes_the_claude_name_flag() {
+        let mut a = ClaudeAdapter::new();
+        let named = crate::adapter::SessionContext {
+            session_name: Some("cover letters writer"),
+            ..session_ctx()
+        };
+        let cmd = a.prepare_session_command(&named).unwrap();
+        // One argv element: a title with spaces can't split into flags.
+        assert!(cmd.contains("--name 'cover letters writer'"), "got: {cmd}");
+
+        let argv = a.prepare_session_native(&named).unwrap().args;
+        let i = argv.iter().position(|s| s == "--name").unwrap();
+        assert_eq!(argv[i + 1], "cover letters writer");
+
+        // No title (blank, or key not unsealed yet): no flag, claude derives one.
+        let unnamed = a.prepare_session_command(&session_ctx()).unwrap();
+        assert!(!unnamed.contains("--name"), "got: {unnamed}");
+    }
+
     #[test]
     fn sandboxed_spawns_disallow_peer_messaging() {
         let mut a = ClaudeAdapter::new();
@@ -1851,6 +1893,20 @@ mod tests {
             "no time line in the system prompt: {first}"
         );
         assert_eq!(first, second, "respawn must reproduce the same command");
+
+        // A rename changes the `--name` flag and NOTHING in the appended system
+        // prompt — that block heads the cacheable prefix.
+        let renamed = ClaudeAdapter::new()
+            .prepare_session_command(&crate::adapter::SessionContext {
+                session_name: Some("cover letters writer"),
+                ..session_ctx()
+            })
+            .unwrap();
+        let sys_of = |cmd: &str| {
+            let start = cmd.find("--append-system-prompt").expect("system prompt");
+            cmd[start..cmd.find("--print").expect("--print")].to_string()
+        };
+        assert_eq!(sys_of(&first), sys_of(&renamed));
     }
 
     #[test]
