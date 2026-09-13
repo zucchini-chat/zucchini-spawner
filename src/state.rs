@@ -102,7 +102,8 @@ pub struct Mirror {
     /// or no message handled yet) falls back to the `chats.last_seq` guard.
     #[serde(default)]
     handled_user_seqs: HashMap<String, i64>,
-    /// Chats whose last-synced row had `agent_running` or `agent_alive` set.
+    /// Chats whose last-synced row had `agent_running`, `agent_alive` or
+    /// `live_tasks` set.
     /// Persisted because PowerSync resumes from the saved cursor and won't
     /// re-stream those rows after a restart, when every such flag is stale:
     /// no agent outlives the spawner (`orphans.rs`).
@@ -215,7 +216,13 @@ impl Mirror {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
-        if crate::json_pg_bool(v.get("agent_running")) || crate::json_pg_bool(v.get("agent_alive"))
+        // `live_tasks` joins the flags: a teardown that missed its clear leaves a
+        // task blob on a row whose flags are already false, and nothing else
+        // would ever reset it.
+        let has_live_tasks = v.get("live_tasks").is_some_and(|t| !t.is_null());
+        if crate::json_pg_bool(v.get("agent_running"))
+            || crate::json_pg_bool(v.get("agent_alive"))
+            || has_live_tasks
         {
             self.flagged_chats.insert(id.clone());
         } else {

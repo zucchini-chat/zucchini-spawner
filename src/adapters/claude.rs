@@ -532,12 +532,12 @@ impl AgentAdapter for ClaudeAdapter {
                         out.push(AgentEvent::CompactBoundary(post_tokens));
                     }
                 } else if line.contains("\"subtype\":\"task_started\"") {
-                    // Resident model: a background task / Monitor was armed. The
-                    // `task_id` lets the Supervisor track it in `live_tasks`
-                    // (Waiting state) until its terminal `task_notification`.
-                    if let Some(id) = parse_task_id(&line) {
-                        out.push(AgentEvent::TaskStarted(id));
-                    }
+                    // Resident model: a background task / Monitor / backgrounded
+                    // subagent was armed. The `task_id` lets the Supervisor track
+                    // it in `live_tasks` (Waiting state) until its terminal
+                    // `task_notification`; the rest of the frame names it for the
+                    // client (`chats.live_tasks`).
+                    out.extend(parse_task_started(&line));
                 } else if line.contains("\"subtype\":\"task_notification\"")
                     || (line.contains("\"subtype\":\"task_updated\"")
                         && task_updated_is_terminal(&line))
@@ -771,11 +771,43 @@ fn parse_init_session_id(line: &str) -> Option<String> {
     }
 }
 
-/// Reads `task_id` from a `task_started` / `task_notification` system frame.
-/// Both carry it at the top level. Narrow Deserialize struct so serde skips the
-/// rest of the (small) frame. `None` on parse failure or a missing id — the
-/// Supervisor treats a dropped start/finish as "task never tracked", which is
-/// safe (a never-inserted task can't wedge the Waiting state).
+/// Reads a `task_started` system frame into the event the Supervisor tracks.
+/// Everything but `task_id` is optional: a frame shape drift must still arm the
+/// task (a never-inserted task wedges the Waiting state), it may just cost the
+/// client its label. Verbatim shapes in `tmp/monitor_raw.jsonl` (backgrounded
+/// Bash / Monitor: `task_type: "local_bash"`, no `subagent_type`) and
+/// `tmp/agent_task_raw.jsonl` (backgrounded subagent: `task_type:
+/// "local_agent"` + `subagent_type`).
+fn parse_task_started(line: &str) -> Option<AgentEvent> {
+    #[derive(serde::Deserialize)]
+    struct Frame {
+        task_id: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        task_type: Option<String>,
+        #[serde(default)]
+        subagent_type: Option<String>,
+    }
+    match serde_json::from_str::<Frame>(line) {
+        Ok(f) => Some(AgentEvent::TaskStarted {
+            id: f.task_id,
+            description: f.description.unwrap_or_default(),
+            task_type: f.task_type.unwrap_or_default(),
+            subagent_type: f.subagent_type.filter(|s| !s.is_empty()),
+        }),
+        Err(e) => {
+            debug!("failed to parse task_started frame: {}", e);
+            None
+        }
+    }
+}
+
+/// Reads `task_id` from a terminal `task_notification` / `task_updated` system
+/// frame. Narrow Deserialize struct so serde skips the rest of the (small)
+/// frame. `None` on parse failure or a missing id — the Supervisor treats a
+/// dropped finish as "task never tracked", which is safe (a never-inserted task
+/// can't wedge the Waiting state).
 fn parse_task_id(line: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Frame {
@@ -1724,6 +1756,52 @@ mod tests {
         assert_eq!(run(&mut a, line), vec!["TaskStarted(t-7)"]);
     }
 
+    /// The `task_started` frame carries everything the client needs to NAME the
+    /// task; the adapter must keep all of it. Verbatim shapes from
+    /// `tmp/monitor_raw.jsonl` (backgrounded Bash) and `tmp/agent_task_raw.jsonl`
+    /// (backgrounded subagent).
+    #[test]
+    fn task_started_carries_description_kind_and_subagent_type() {
+        let mut a = ClaudeAdapter::new();
+        let bash = r#"{"type":"system","subtype":"task_started","task_id":"buukg9452","tool_use_id":"tu9","description":"npm test -- --watch","task_type":"local_bash"}"#;
+        match a.handle_line(bash.to_string()).into_iter().next() {
+            Some(AgentEvent::TaskStarted {
+                id,
+                description,
+                task_type,
+                subagent_type,
+            }) => {
+                assert_eq!(id, "buukg9452");
+                assert_eq!(description, "npm test -- --watch");
+                assert_eq!(task_type, "local_bash");
+                assert_eq!(subagent_type, None);
+            }
+            other => panic!("expected TaskStarted, got {other:?}"),
+        }
+
+        let subagent = r#"{"type":"system","subtype":"task_started","task_id":"a3bc46a79","description":"count tmp files","subagent_type":"Explore","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"Count the files"}"#;
+        match a.handle_line(subagent.to_string()).into_iter().next() {
+            Some(AgentEvent::TaskStarted {
+                task_type,
+                subagent_type,
+                ..
+            }) => {
+                assert_eq!(task_type, "local_agent");
+                assert_eq!(subagent_type.as_deref(), Some("Explore"));
+            }
+            other => panic!("expected TaskStarted, got {other:?}"),
+        }
+    }
+
+    /// A frame missing everything but the id must still ARM the task — dropping
+    /// it would wedge the Waiting state forever.
+    #[test]
+    fn task_started_without_a_description_still_arms_the_task() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"system","subtype":"task_started","task_id":"t-7"}"#;
+        assert_eq!(run(&mut a, line), vec!["TaskStarted(t-7)"]);
+    }
+
     #[test]
     fn task_notification_frame_emits_taskfinished_and_drops_frame() {
         let mut a = ClaudeAdapter::new();
@@ -1965,7 +2043,7 @@ mod tests {
             r#"{"type":"system","subtype":"task_started","task_id":"bzdt1ec2n","tool_use_id":"toolu_01","description":"sleep 8 && echo BG_DONE","task_type":"local_bash","session_id":"s1"}"#,
         );
         assert!(
-            st.live_tasks.contains("bzdt1ec2n"),
+            st.has_live_task("bzdt1ec2n"),
             "task_started must register the task"
         );
 

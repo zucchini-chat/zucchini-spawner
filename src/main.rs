@@ -500,11 +500,14 @@ async fn handle_sync_event(
             // Boot: clear the run flags no agent backs anymore, before any
             // message below spawns one. Stopped-by-user: no "finished" push.
             for chat_id in mirror.stale_flagged_chats_at_boot() {
-                info!(chat_id = %chat_id, "resetting stale agent_running/agent_alive");
+                info!(chat_id = %chat_id, "resetting stale agent_running/agent_alive/live_tasks");
                 let _ = write_tx
                     .send(WriteEvent::chat_stopped_by_user(chat_id.clone()))
                     .await;
-                let _ = write_tx.send(WriteEvent::chat_alive(chat_id, false)).await;
+                let _ = write_tx
+                    .send(WriteEvent::chat_alive(chat_id.clone(), false))
+                    .await;
+                clear_live_tasks(write_tx, &chat_id).await;
             }
 
             // 3. messages — spawn against the now-consistent mirror, arrival order
@@ -584,7 +587,15 @@ pub(crate) async fn handle_agent_response(
             // armed — must clear the indicator); for one-shot it's the normal
             // busy→idle flip. A late `Done` from a torn-down resident leaves its
             // replacement and its indicator alone.
+            let had_agent = supervisor.has_agent(&topic);
             supervisor.remove_finished(&topic);
+            if had_agent && !supervisor.has_agent(&topic) {
+                // This `Done` is the one that ended the tracked process, and
+                // anything it had armed died with it. A late `Done` from a
+                // session a respawn already replaced leaves its successor's task
+                // list alone.
+                clear_live_tasks(write_tx, &topic).await;
+            }
             if !supervisor.is_running(&topic) {
                 send_run_state(write_tx, topic.clone(), false).await;
             }
@@ -616,6 +627,24 @@ pub(crate) async fn handle_agent_response(
             if !supervisor.is_running(&topic) {
                 let _ = write_tx.send(WriteEvent::chat_stopped_by_user(topic)).await;
             }
+        }
+        // What the resident has armed changed. From a session a teardown
+        // already replaced it is stale: that teardown cleared the column, and
+        // re-writing its task list would show phantom tasks on the live one.
+        AgentResponse::LiveTasks {
+            topic,
+            session,
+            tasks,
+        } => {
+            if !supervisor.is_current_session(&topic, &session) {
+                return;
+            }
+            // Enqueue writes directly to the writer while reader snapshots
+            // wait here; an older one must not overwrite the newer count.
+            if agent::live_tasks_payload(&session.lock().expect("SessionState mutex")) != tasks {
+                return;
+            }
+            send_live_tasks(write_tx, mirror, topic, tasks).await;
         }
         AgentResponse::InterruptTimedOut { topic, request_id } => {
             if supervisor.interrupt_pending(&topic, &request_id) {
@@ -656,12 +685,22 @@ async fn abort_member_agents(
 ) {
     for chat_id in mirror.chat_ids(|c| c.user_id == user_id) {
         let running = supervisor.is_running(&chat_id);
+        let torn_down = supervisor.has_agent(&chat_id);
         supervisor.abort_agent(&chat_id).await;
         if revoked {
             supervisor.forget_alive(&chat_id);
-        } else if running {
+            continue;
+        }
+        if running {
             info!(chat_id = %chat_id, %user_id, "sandbox flipped: aborted running agent");
             publish_interrupted(write_tx, &chat_id, user_id).await;
+        }
+        // Also for a WARM IDLE resident: its reader's own clear is dropped as a
+        // replaced session's, so the teardown has to write the NULL itself.
+        if torn_down {
+            clear_live_tasks(write_tx, &chat_id).await;
+        }
+        if running {
             send_run_state(write_tx, chat_id, false).await;
         }
     }
@@ -692,6 +731,35 @@ async fn send_run_state(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String, ru
         .await;
 }
 
+/// Clear `chats.live_tasks`. Armed tasks live inside the agent process, so
+/// every teardown has to write NULL — a `--resume` does not re-arm them and
+/// PowerSync won't re-stream the row, so a stale blob would show phantom tasks
+/// forever. Called from each teardown that keeps the row (a deleted chat and a
+/// revoked member get no writes at all).
+async fn clear_live_tasks(write_tx: &mpsc::Sender<WriteEvent>, chat_id: &str) {
+    let _ = write_tx
+        .send(WriteEvent::clear_live_tasks(chat_id.to_string()))
+        .await;
+}
+
+/// Write `chats.live_tasks` (the plaintext blob; the writer encrypts it under
+/// the chat owner's key). `None` clears the column.
+async fn send_live_tasks(
+    write_tx: &mpsc::Sender<WriteEvent>,
+    mirror: &Mirror,
+    chat_id: String,
+    tasks: Option<String>,
+) {
+    let user_id = mirror.chats.get(&chat_id).map(|c| c.user_id);
+    let _ = write_tx
+        .send(WriteEvent::ChatLiveTasks {
+            chat_id,
+            user_id,
+            tasks,
+        })
+        .await;
+}
+
 /// Write `agent_alive` for every chat whose resident process appeared or went
 /// away since the last call. Once per main-loop pass (see `alive_changes`).
 async fn publish_alive_changes(supervisor: &mut Supervisor, write_tx: &mpsc::Sender<WriteEvent>) {
@@ -710,6 +778,7 @@ const WARM_TICK: Duration = Duration::from_secs(60);
 async fn evict_idle_residents(
     supervisor: &mut Supervisor,
     memory: fn() -> Option<warm::Memory>,
+    write_tx: &mpsc::Sender<WriteEvent>,
 ) -> Option<tokio::time::Instant> {
     loop {
         let mut idle = supervisor.idle_residents();
@@ -732,7 +801,13 @@ async fn evict_idle_residents(
             pressure = eviction.pressure,
             "evicting idle resident"
         );
-        supervisor.evict_idle(topic).await;
+        let topic = topic.clone();
+        if supervisor.evict_idle(&topic).await {
+            // An evictable resident is idle, so its list is already empty and
+            // this is normally a no-op write — but it is the only thing standing
+            // between a missed edge and a chat pinned to phantom tasks.
+            clear_live_tasks(write_tx, &topic).await;
+        }
         if eviction.pressure {
             // Memory stats lag the kill; the next tick re-checks.
             return None;
@@ -873,7 +948,9 @@ async fn shutdown_agents(
 ) {
     let pending_prunes = supervisor.pending_prunes();
     let mut readers = tokio::task::JoinSet::new();
+    let mut torn_down = Vec::new();
     for (topic, handle) in supervisor.cancel_all() {
+        torn_down.push(topic.clone());
         readers.spawn(async move { agent::await_agent_exit(handle, &topic).await });
     }
     loop {
@@ -893,6 +970,17 @@ async fn shutdown_agents(
         route_agent_response(resp, &pending_prunes, mirror, supervisor, write_tx).await;
     }
     publish_alive_changes(supervisor, write_tx).await;
+    // These sessions were CANCELLED, not finished: `cancel_all` drained the
+    // supervisor, so a `Done` routed above no longer recognizes the chat's agent
+    // and its clear never fires (and a reader that misses `AGENT_EXIT_TIMEOUT`
+    // sends no `Done` at all). Last write of the drain, so a late edge can't
+    // re-arm the column behind it.
+    let mirror = mirror.read().await;
+    for topic in torn_down {
+        if !is_deleted_chat(&mirror, &topic) {
+            clear_live_tasks(write_tx, &topic).await;
+        }
+    }
 }
 
 /// Stop heartbeats, tear the agents down and flush the writer, whose queue
@@ -924,6 +1012,7 @@ async fn hard_stop(
     let _ = write_tx
         .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
         .await;
+    clear_live_tasks(write_tx, chat_id).await;
 }
 
 /// `/kill`: end the chat's agent process, and with it the warm session.
@@ -943,6 +1032,7 @@ async fn kill_agent(
                 .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
                 .await;
         }
+        clear_live_tasks(write_tx, chat_id).await;
     }
     // Written even with no process: the row may be stale.
     supervisor.forget_alive(chat_id);
@@ -1240,6 +1330,11 @@ async fn handle_message_put(
         // claude answers it within the running turn or right after it.
         if supervisor.send_user_turn(&req) {
             info!(chat_id = %chat_id, "queued user turn on the live resident session");
+            // The queued count is part of the pill's task list, and nothing else
+            // publishes it until the CLI echoes the turn.
+            if let Some(tasks) = supervisor.live_tasks_change(&chat_id) {
+                send_live_tasks(write_tx, mirror, chat_id.clone(), tasks).await;
+            }
             send_run_state(write_tx, chat_id, true).await;
             return;
         }
@@ -1253,9 +1348,15 @@ async fn handle_message_put(
             info!(chat_id = %chat_id, "interrupt-then-send: aborting in-flight resident turn, will respawn fresh");
             publish_interrupted(write_tx, &chat_id, user_id).await;
         }
+        let respawning = supervisor.has_agent(&chat_id);
         let aborted = supervisor.abort_agent(&chat_id).await;
         if interrupting {
             send_run_state(write_tx, chat_id.clone(), false).await;
+        }
+        if respawning {
+            // The respawn re-arms nothing (`--resume` doesn't restore in-process
+            // tasks); the fresh session republishes from empty.
+            clear_live_tasks(write_tx, &chat_id).await;
         }
         let mut turns = turns_to_requeue(aborted, agent_kind, req.agent_session_id.as_deref());
         turns.push(req.prompt.clone());
@@ -1367,12 +1468,14 @@ async fn apply_prune_group(
     // so a non-zero count here means the agent forced it (or a task armed in the
     // same instant the RPC's check passed). Surfaced in the respawn prompt so the
     // resumed agent knows the tasks are gone and can re-arm/re-run consciously.
-    let killed_tasks = supervisor.live_task_count(chat_id);
+    let killed_tasks = supervisor.live_task_labels(chat_id);
 
     // Kill the (now-idle-at-a-tool-boundary) agent before touching its transcript:
     // the rewrite needs exclusive access and the resume must re-read from disk. A
     // no-op if the turn already exited on its own.
     let aborted = supervisor.abort_agent(chat_id).await;
+    // The respawn re-arms none of them; the fresh session republishes from empty.
+    clear_live_tasks(write_tx, chat_id).await;
 
     // Rewrite the transcript via the per-adapter `prune_batch` behind `PruneOps`.
     // The whole burst for one transcript collapses into ONE read/serialize/fsync
@@ -1455,10 +1558,12 @@ async fn apply_prune_group(
     // gone and `--resume` does not bring it back, so it must re-arm/re-run any it
     // still needs (and re-check the status of anything side-effecting, e.g. a
     // deploy that was mid-flight).
-    if killed_tasks > 0 {
+    if !killed_tasks.is_empty() {
+        let count = killed_tasks.len();
+        let names = killed_tasks.join("; ");
         prompt.push_str(&format!(
-            " NOTE: this prune restarted the session and terminated {killed_tasks} \
-             background task(s)/monitor(s) that were running — they are NOT \
+            " NOTE: this prune restarted the session and terminated {count} \
+             background task(s)/monitor(s) that were running ({names}) — they are NOT \
              automatically resumed. Re-arm or re-run any you still need, and check \
              the status of anything that was making changes (e.g. a deploy/build)."
         ));
@@ -3068,7 +3173,7 @@ async fn main() {
         }
 
         if warm_due || idle_set(&supervisor) != warm_idle_seen {
-            warm_deadline = evict_idle_residents(&mut supervisor, sys::memory).await;
+            warm_deadline = evict_idle_residents(&mut supervisor, sys::memory, &write_tx).await;
             warm_idle_seen = idle_set(&supervisor);
         }
         publish_alive_changes(&mut supervisor, &write_tx).await;
@@ -3551,8 +3656,8 @@ mod tests {
         let events = drain(&mut write_rx);
         assert_eq!(
             events.len(),
-            2,
-            "INTERRUPTED line + ChatRunning(false) (idle clears the run state)"
+            3,
+            "INTERRUPTED line + cleared live_tasks + ChatRunning(false) (idle clears the run state)"
         );
         match &events[0] {
             WriteEvent::PutMessage {
@@ -3570,7 +3675,12 @@ mod tests {
                 other
             ),
         }
-        match &events[1] {
+        assert!(
+            matches!(&events[1], WriteEvent::ChatLiveTasks { tasks: None, .. }),
+            "the dead process's armed tasks are cleared: {:?}",
+            events[1]
+        );
+        match &events[2] {
             WriteEvent::ChatRunning {
                 chat_id: cid,
                 agent_running: false,
@@ -5046,11 +5156,11 @@ mod tests {
             let mut renaming = crate::agent::InternalLine::default();
             for ev in events {
                 let session = self.session();
-                let swallow = {
+                let (swallow, live_tasks) = {
                     let mut st = session.lock().unwrap();
                     let swallow = renaming.swallows(st.internal_in_flight(), &ev);
                     crate::agent::reduce(&mut st, &ev);
-                    swallow
+                    (swallow, st.observe_live_tasks())
                 };
                 let topic = self.chat_id.clone();
                 match ev {
@@ -5063,6 +5173,14 @@ mod tests {
                             .await
                     }
                     _ => {}
+                }
+                if let Some(tasks) = live_tasks {
+                    self.respond(AgentResponse::LiveTasks {
+                        topic: self.chat_id.clone(),
+                        session,
+                        tasks,
+                    })
+                    .await;
                 }
             }
         }
@@ -5220,6 +5338,53 @@ mod tests {
         )));
     }
 
+    /// The flip tears down a WARM IDLE resident too, and the clear its reader
+    /// already published is dropped as a replaced session's — so the teardown
+    /// has to write the NULL itself or the row keeps showing finished tasks.
+    #[tokio::test]
+    async fn sandbox_flip_clears_the_live_tasks_of_an_idle_resident() {
+        let mut c = ResidentChat::new();
+        invite(&mut c, "row-1");
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.reader_raw(r#"{"type":"system","subtype":"task_started","task_id":"t-7","description":"deploy","task_type":"local_bash"}"#).await;
+
+        // The task finished and the turn ended: the reader's clear is still in
+        // the response queue when the flip lands.
+        let session = c.session();
+        {
+            let mut st = session.lock().unwrap();
+            st.live_tasks.clear();
+            st.turn_in_flight = false;
+        }
+        let queued_clear = AgentResponse::LiveTasks {
+            topic: c.chat_id.clone(),
+            session,
+            tasks: None,
+        };
+        assert!(!c.supervisor.is_running(&c.chat_id), "warm idle");
+        c.writes();
+
+        c.window(vec![SyncEvent::Put {
+            table: "machine_users".into(),
+            id: "row-1".into(),
+            data: json!({
+                "user_id": c.user_id.to_string(),
+                "is_sandboxed": 1,
+                "sealed_blob": "blob",
+            })
+            .to_string(),
+        }])
+        .await;
+        c.respond(queued_clear).await;
+        assert_eq!(
+            live_task_blobs(&c.writes()),
+            vec![None],
+            "the idle teardown clears the column"
+        );
+    }
+
     #[tokio::test]
     async fn an_idle_resident_does_not_hold_back_an_update() {
         let mut c = ResidentChat::new();
@@ -5253,6 +5418,91 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// The queued count must reach the clients AT the enqueue edge: the reader
+    /// publishes only on adapter events and a queued turn produces none until
+    /// the CLI echoes it, so the pill would list a stale count until unrelated
+    /// output happened to arrive.
+    #[tokio::test]
+    async fn a_turn_queued_on_a_live_resident_publishes_its_count_at_once() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.writes();
+
+        c.window(vec![c.chat(2, ""), c.message(2, "second")]).await;
+        assert_eq!(
+            live_task_blobs(&c.writes()),
+            vec![Some(r#"{"q":1}"#.to_string())],
+            "the queued count rides the row with no adapter output"
+        );
+
+        // The change detection is shared with the reader, so the echo that
+        // consumes the turn clears the column — and nothing re-writes it.
+        let uuid = c.session().lock().unwrap().unconsumed[0].uuid.clone();
+        c.reader_raw(&format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"second"}}]}},"session_id":"s1","uuid":"{uuid}","isReplay":true}}"#
+        ))
+        .await;
+        assert_eq!(
+            live_task_blobs(&c.writes()),
+            vec![None],
+            "the echo clears the count exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_buffered_task_clear_cannot_overwrite_a_newer_queued_count() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.reader_raw(r#"{"type":"system","subtype":"task_started","task_id":"t1","description":"build","task_type":"local_bash"}"#).await;
+        assert_eq!(live_task_blobs(&c.writes()).len(), 1);
+
+        let session = c.session();
+        let tasks = {
+            let mut st = session.lock().unwrap();
+            crate::agent::reduce(&mut st, &adapter::AgentEvent::TaskFinished("t1".into()));
+            st.observe_live_tasks().expect("the finished task clears")
+        };
+        assert_eq!(tasks, None);
+        c.resp_tx
+            .send(AgentResponse::LiveTasks {
+                topic: c.chat_id.clone(),
+                session,
+                tasks,
+            })
+            .await
+            .unwrap();
+
+        // The sync checkpoint wins the select while the reader's older clear
+        // is buffered, so the enqueue publishes q=1 before main sees the clear.
+        c.window(vec![c.chat(2, ""), c.message(2, "second")]).await;
+        assert_eq!(
+            live_task_blobs(&c.writes()),
+            vec![Some(r#"{"q":1}"#.to_string())]
+        );
+        let buffered = c.resp_rx.try_recv().expect("buffered clear");
+        c.respond(buffered).await;
+        c.reader_raw(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still working"}]}}"#).await;
+        assert!(
+            live_task_blobs(&c.writes()).is_empty(),
+            "the stale clear must be rejected; shared dedup cannot repair it"
+        );
+
+        let uuid = c.session().lock().unwrap().unconsumed[0].uuid.clone();
+        c.reader_raw(
+            &json!({
+                "type": "user", "uuid": uuid, "isReplay": true,
+                "message": { "role": "user", "content": "second" }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(live_task_blobs(&c.writes()), vec![None]);
     }
 
     /// A chat renamed in the app while its resident is warm: the `/rename`
@@ -5554,19 +5804,30 @@ mod tests {
         publish_alive_changes(&mut sup, &write_tx).await;
         tokio::time::advance(hour * 21).await;
 
-        let deadline = evict_idle_residents(&mut sup, || None).await;
+        let deadline = evict_idle_residents(&mut sup, || None, &write_tx).await;
         assert_eq!(deadline, Some(since["idle-24h"] + hour * 48));
         publish_alive_changes(&mut sup, &write_tx).await;
         let mut alive = Vec::new();
+        let mut cleared = Vec::new();
         while let Ok(w) = write_rx.try_recv() {
-            if let WriteEvent::ChatAlive {
-                chat_id,
-                agent_alive,
-            } = w
-            {
-                alive.push((chat_id, agent_alive));
+            match w {
+                WriteEvent::ChatAlive {
+                    chat_id,
+                    agent_alive,
+                } => alive.push((chat_id, agent_alive)),
+                WriteEvent::ChatLiveTasks {
+                    chat_id,
+                    tasks: None,
+                    ..
+                } => cleared.push(chat_id),
+                _ => {}
             }
         }
+        assert_eq!(
+            cleared,
+            vec!["idle-25h".to_string()],
+            "the evicted process's task list is cleared with it"
+        );
         assert_eq!(alive.len(), 6, "{alive:?}");
         assert_eq!(alive[5], ("idle-25h".to_string(), false));
         assert!(sup.is_running("busy"));
@@ -5762,13 +6023,149 @@ mod tests {
         c.window(vec![c.project(), c.chat(1, ""), c.message(1, "/kill")])
             .await;
         let writes = c.writes();
-        assert!(matches!(
-            writes[..],
-            [WriteEvent::ChatAlive {
-                agent_alive: false,
-                ..
-            }]
-        ));
+        assert!(
+            matches!(
+                writes[..],
+                [
+                    WriteEvent::ChatLiveTasks { tasks: None, .. },
+                    WriteEvent::ChatAlive {
+                        agent_alive: false,
+                        ..
+                    }
+                ]
+            ),
+            "{writes:?}"
+        );
+    }
+
+    /// The blob the clients read: a real `task_started` line puts the armed task
+    /// on the chats row, an unchanged set writes nothing more, and the task
+    /// finishing clears the column.
+    #[tokio::test]
+    async fn armed_tasks_ride_the_chats_row_and_clear_when_they_finish() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.writes();
+
+        c.reader_raw(r#"{"type":"system","subtype":"task_started","task_id":"bzdt1ec2n","tool_use_id":"toolu_01","description":"sleep 8 && echo BG_DONE","task_type":"local_bash","session_id":"s1"}"#).await;
+        let blob = live_task_blobs(&c.writes());
+        assert_eq!(blob.len(), 1, "one write per change");
+        let armed = blob[0].clone().expect("the armed task rides the row");
+        assert!(
+            armed.contains("bzdt1ec2n") && armed.contains("sleep 8"),
+            "{armed}"
+        );
+        assert!(armed.contains("\"k\":\"bash\""), "{armed}");
+
+        // An ordinary assistant frame doesn't touch the set: no second write.
+        c.reader_raw(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}],"usage":{"input_tokens":10}}}"#).await;
+        assert!(
+            live_task_blobs(&c.writes()).is_empty(),
+            "an unchanged payload is not re-written"
+        );
+
+        c.reader_raw(r#"{"type":"system","subtype":"task_updated","task_id":"bzdt1ec2n","patch":{"status":"completed"}}"#).await;
+        assert_eq!(
+            live_task_blobs(&c.writes()),
+            vec![None],
+            "the last task finishing clears the column"
+        );
+    }
+
+    /// A prune hard-restarts the resident, and `--resume` re-arms nothing: the
+    /// respawn prompt NAMES what it terminated and the column is cleared.
+    #[tokio::test]
+    async fn a_prune_restart_names_the_terminated_tasks_and_clears_them() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.respond(AgentResponse::SessionIdHarvested {
+            topic: c.chat_id.clone(),
+            session_id: Uuid::now_v7().to_string(),
+        })
+        .await;
+        c.reader_raw(r#"{"type":"system","subtype":"task_started","task_id":"t-7","description":"deploy to prod","task_type":"local_bash"}"#).await;
+        c.writes();
+
+        let transcript = crate::prune::test_util::write_jsonl(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"junk.rs"}}]},"uuid":"a1","parentUuid":null}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"body"}]},"uuid":"u1","parentUuid":"a1"}"#,
+        ]);
+        let reqs = vec![prune::PruneRequest {
+            jsonl_path: transcript.path().to_path_buf(),
+            agent_kind: AgentKind::Claude,
+            tool_name: "Read".into(),
+            needle: "junk.rs".into(),
+            reason: "done with it".into(),
+        }];
+        let (chat_id, write_tx) = (c.chat_id.clone(), c.write_tx.clone());
+        let shared = c.shared_mirror();
+        apply_prune_group(&chat_id, reqs, &shared, &mut c.supervisor, &write_tx).await;
+
+        let prompt = c.recorded.lock().unwrap().last().unwrap().prompt.clone();
+        assert!(
+            prompt.contains("terminated 1 background task(s)/monitor(s)")
+                && prompt.contains("deploy to prod"),
+            "the respawn prompt must name the killed task, got: {prompt}"
+        );
+        assert_eq!(
+            live_task_blobs(&c.writes()),
+            vec![None],
+            "the restart clears the armed-task list"
+        );
+    }
+
+    /// Armed tasks die with the process, so every teardown clears the column —
+    /// here the spontaneous exit (`Done`) and a `/kill`.
+    #[tokio::test]
+    async fn teardown_clears_the_live_task_list() {
+        async fn armed() -> ResidentChat {
+            let mut c = ResidentChat::new();
+            c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+                .await;
+            c.consume_first_turn();
+            c.reader_raw(r#"{"type":"system","subtype":"task_started","task_id":"t-7","description":"deploy","task_type":"local_bash"}"#).await;
+            assert_eq!(live_task_blobs(&c.writes()).len(), 1, "armed");
+            c
+        }
+
+        // The process exited on its own with the task still armed: its reader
+        // closes the session, then sends `Done`.
+        let mut c = armed().await;
+        c.session().lock().unwrap().closed = true;
+        c.respond(AgentResponse::Done {
+            topic: c.chat_id.clone(),
+            has_result: false,
+        })
+        .await;
+        assert_eq!(
+            live_task_blobs(&c.writes()),
+            vec![None],
+            "a spontaneous exit clears the column"
+        );
+
+        // A hard abort (`/kill`) does the same.
+        let mut c = armed().await;
+        c.window(vec![c.chat(2, ""), c.message(2, "/kill")]).await;
+        assert_eq!(
+            live_task_blobs(&c.writes()),
+            vec![None],
+            "a hard abort clears the column"
+        );
+
+        // The spawner is going down (SIGTERM / update): the agents are
+        // cancelled, not finished, so no `Done` arm can clear the column.
+        let mut c = armed().await;
+        let mirror = c.shared_mirror();
+        shutdown_agents(&mut c.supervisor, &mut c.resp_rx, &mirror, &c.write_tx).await;
+        assert_eq!(
+            live_task_blobs(&c.writes()),
+            vec![None],
+            "shutdown clears the column"
+        );
     }
 
     fn park_prune(prunes: &prune::PendingPrunes, chat_id: &str) {
@@ -5940,6 +6337,7 @@ mod tests {
                         agent_alive: false,
                         ..
                     },
+                    WriteEvent::ChatLiveTasks { tasks: None, .. },
                 ]
             ),
             "{writes:?}"
@@ -5955,7 +6353,13 @@ mod tests {
         c.window(vec![c.chat(2, "opus"), c.message(2, "second")])
             .await;
         assert_eq!(c.recorded.lock().unwrap().len(), 2, "respawned");
-        assert!(alive_writes(&c.writes()).is_empty());
+        let writes = c.writes();
+        assert!(alive_writes(&writes).is_empty());
+        assert_eq!(
+            live_task_blobs(&writes),
+            vec![None],
+            "the respawn re-arms nothing, so the task list is cleared"
+        );
 
         c.respond(AgentResponse::Done {
             topic: c.chat_id.clone(),
@@ -5975,6 +6379,31 @@ mod tests {
         let loaded = Mirror::load(&path);
         let _ = std::fs::remove_file(&path);
         loaded
+    }
+
+    /// The `chats.live_tasks` payloads in arrival order (`None` = a clear).
+    fn live_task_blobs(writes: &[WriteEvent]) -> Vec<Option<String>> {
+        writes
+            .iter()
+            .filter_map(|w| match w {
+                WriteEvent::ChatLiveTasks { tasks, .. } => Some(tasks.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn live_tasks_reset_chats(writes: &[WriteEvent]) -> std::collections::HashSet<&str> {
+        writes
+            .iter()
+            .filter_map(|w| match w {
+                WriteEvent::ChatLiveTasks {
+                    chat_id,
+                    tasks: None,
+                    ..
+                } => Some(chat_id.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn alive_reset_chats(writes: &[WriteEvent]) -> std::collections::HashSet<&str> {
@@ -6021,6 +6450,11 @@ mod tests {
             alive_reset_chats(&writes),
             [persisted.as_str(), c.chat_id.as_str()].into()
         );
+        assert_eq!(
+            live_tasks_reset_chats(&writes),
+            [persisted.as_str(), c.chat_id.as_str()].into(),
+            "boot clears phantom tasks too — PowerSync won't re-stream these rows"
+        );
         assert_eq!(writes.iter().filter(|w| is_stopped_by_user(w)).count(), 2);
         assert_eq!(
             alive_writes(&writes).last(),
@@ -6045,5 +6479,29 @@ mod tests {
         c.mirror = restarted(&c.mirror);
         c.window(vec![]).await;
         assert!(alive_reset_chats(&c.writes()).is_empty());
+    }
+
+    /// A teardown that missed its clear leaves a task blob on a row whose run
+    /// flags are already false — boot recovery has to pick that up too, or the
+    /// chat shows phantom tasks forever (PowerSync never re-streams the row).
+    #[tokio::test]
+    async fn boot_resets_a_chat_left_with_tasks_but_no_run_flags() {
+        let mut c = ResidentChat::new();
+        let idle_with_tasks = json!({
+            "project_id": c.project_id,
+            "user_id": c.user_id.to_string(),
+            "agent_running": 0,
+            "agent_alive": 0,
+            "live_tasks": "cipher",
+        })
+        .to_string();
+        let chat_id = Uuid::now_v7().to_string();
+        c.mirror
+            .upsert_chat(chat_id.clone(), &idle_with_tasks, &KeyStore::new());
+        c.mirror = restarted(&c.mirror);
+
+        c.window(vec![]).await;
+        let writes = c.writes();
+        assert_eq!(live_tasks_reset_chats(&writes), [chat_id.as_str()].into());
     }
 }

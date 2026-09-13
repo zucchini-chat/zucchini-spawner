@@ -349,12 +349,26 @@ pub enum AgentEvent {
     /// adapters never produce task-driven results and always emit `false`.
     Result { origin_is_task: bool },
     /// Resident model only — a background task (a `run_in_background` Bash, a
-    /// `Monitor`) was armed and started. Carries the claude `task_id`. The
-    /// Supervisor inserts it into the session's `live_tasks` set; a non-empty
-    /// set with no in-flight turn is the "Waiting…" state. One-shot adapters
+    /// `Monitor`, a backgrounded subagent) was armed and started. The
+    /// Supervisor inserts it into the session's `live_tasks` list; a non-empty
+    /// list with no in-flight turn is the "Waiting…" state. One-shot adapters
     /// never emit this (their process exits at the first `result`, before any
     /// task can fire).
-    TaskStarted(String),
+    ///
+    /// Everything past `id` exists so the client can NAME what is armed
+    /// (`chats.live_tasks`); the FSM itself only needs the id.
+    TaskStarted {
+        /// claude's `task_id`, the key `TaskFinished` clears.
+        id: String,
+        /// claude's own one-line label for the task; empty when the frame
+        /// carried none.
+        description: String,
+        /// Raw `task_type` — `local_bash` for a backgrounded Bash/Monitor,
+        /// `local_agent` for a backgrounded subagent.
+        task_type: String,
+        /// Backgrounded subagents only, e.g. `Explore`.
+        subagent_type: Option<String>,
+    },
     /// Resident model only — a previously-`TaskStarted` background task reached
     /// a terminal `task_notification` (completed/failed/cancelled). Carries the
     /// same `task_id`; the Supervisor removes it from `live_tasks`.
@@ -1002,7 +1016,7 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             AgentEvent::Result {
                 origin_is_task: true,
             } => "Result(task)".to_string(),
-            AgentEvent::TaskStarted(s) => format!("TaskStarted({})", s),
+            AgentEvent::TaskStarted { id, .. } => format!("TaskStarted({})", id),
             AgentEvent::TaskFinished(s) => format!("TaskFinished({})", s),
             AgentEvent::UserTurnConsumed(s) => format!("UserTurnConsumed({})", s),
             AgentEvent::PeerTurnConsumed { name, body } => {

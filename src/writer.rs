@@ -67,6 +67,16 @@ pub enum WriteEvent {
         chat_id: String,
         agent_alive: bool,
     },
+    /// What the chat's resident agent has armed right now (`chats.live_tasks`),
+    /// E2E-encrypted like a message body. `tasks` is the plaintext blob from
+    /// `agent::live_tasks_payload`; `None` writes SQL NULL — the teardown
+    /// clear, since armed tasks die with the process. `user_id` picks the key
+    /// and is therefore only needed for a payload.
+    ChatLiveTasks {
+        chat_id: String,
+        user_id: Option<Uuid>,
+        tasks: Option<String>,
+    },
     ContextTokens {
         chat_id: String,
         tokens: i64,
@@ -183,6 +193,17 @@ impl WriteEvent {
         WriteEvent::ChatAlive {
             chat_id,
             agent_alive,
+        }
+    }
+
+    /// Armed tasks die with the process, so every teardown clears the column —
+    /// otherwise the chat shows phantom tasks forever. No key needed to write
+    /// NULL.
+    pub fn clear_live_tasks(chat_id: String) -> Self {
+        WriteEvent::ChatLiveTasks {
+            chat_id,
+            user_id: None,
+            tasks: None,
         }
     }
 }
@@ -305,6 +326,16 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
                 "ChatAlive",
                 serde_json::json!({ "agent_alive": agent_alive }),
             )?
+        }
+        WriteEvent::ChatLiveTasks {
+            chat_id,
+            user_id,
+            tasks,
+        } => {
+            if !BACKEND_HAS_LIVE_TASKS {
+                return None;
+            }
+            live_tasks_patch(chat_id, user_id.as_ref(), tasks.as_deref(), keys)?
         }
         WriteEvent::ContextTokens { chat_id, tokens } => chats_patch(
             chat_id,
@@ -455,6 +486,33 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
     })
 }
 
+/// `chats.live_tasks` PATCH: the blob sealed under the chat owner's key, or a
+/// literal `null` to clear the column. Split out of `encode_event` so the wire
+/// shape stays testable while `BACKEND_HAS_LIVE_TASKS` is false.
+pub(crate) fn live_tasks_patch(
+    chat_id: &str,
+    user_id: Option<&Uuid>,
+    tasks: Option<&str>,
+    keys: &KeyStore,
+) -> Option<BatchOp> {
+    let value = match tasks {
+        Some(plaintext) => {
+            let Some(user_id) = user_id else {
+                warn!(chat_id = %chat_id, "live tasks without a user, dropping");
+                return None;
+            };
+            let k = resolve_key_or_warn(keys, user_id, chat_id, "live tasks")?;
+            serde_json::Value::String(encrypt_field_b64(&k, plaintext))
+        }
+        None => serde_json::Value::Null,
+    };
+    chats_patch(
+        chat_id,
+        "ChatLiveTasks",
+        serde_json::json!({ "live_tasks": value }),
+    )
+}
+
 fn machines_patch(machine_id: Uuid, data: serde_json::Value) -> BatchOp {
     BatchOp {
         op: "PATCH",
@@ -579,6 +637,11 @@ fn backend_has_install_columns(kind: AgentKind) -> bool {
 /// live in prod (deployed 2026-09-12), so the PATCH no longer poisons the queue.
 const BACKEND_HAS_AGENT_ALIVE: bool = true;
 
+/// Same 4xx queue-poison guard, for `chats.live_tasks` (migration 0050 and the
+/// `live_tasks` entry in `process_chat_patch`'s `machine_fields`, both live in
+/// prod since 2026-09-12), so the PATCH no longer poisons the queue.
+const BACKEND_HAS_LIVE_TASKS: bool = true;
+
 async fn send_batch(
     http: &reqwest::Client,
     url: &str,
@@ -608,4 +671,52 @@ async fn send_batch(
         error!(%status, %body, "POST /api/writes rejected (client error)");
     }
     anyhow::bail!("POST /api/writes {}: {}", status, body);
+}
+
+#[cfg(test)]
+mod live_tasks_tests {
+    use super::*;
+    use crate::crypto::decrypt_field_b64;
+
+    fn keys_for(user_id: Uuid) -> KeyStore {
+        KeyStore::with_keys([(user_id, [9u8; 32])])
+    }
+
+    /// The blob is sealed under the chat owner's key, exactly like a message
+    /// body — the backend never sees what the agent is running.
+    #[test]
+    fn a_live_tasks_patch_ships_the_blob_encrypted() {
+        let user_id = Uuid::now_v7();
+        let keys = keys_for(user_id);
+        let chat_id = Uuid::now_v7().to_string();
+        let blob = r#"{"t":[{"i":"t1","d":"npm test","k":"bash","s0":1780886492000}],"q":1}"#;
+        let op = live_tasks_patch(&chat_id, Some(&user_id), Some(blob), &keys).expect("op");
+        assert_eq!((op.op, op.table), ("PATCH", "chats"));
+        let cipher = op.data.as_ref().expect("data")["live_tasks"]
+            .as_str()
+            .expect("ciphertext string");
+        let key = keys.get(&user_id).expect("seeded key");
+        assert_eq!(decrypt_field_b64(&key, cipher).as_deref(), Some(blob));
+    }
+
+    /// A teardown writes a literal SQL NULL — not `{}`, not `{"t":[]}` — and
+    /// needs no key to do it.
+    #[test]
+    fn a_cleared_live_tasks_patch_is_a_json_null() {
+        let chat_id = Uuid::now_v7().to_string();
+        let op = live_tasks_patch(&chat_id, None, None, &KeyStore::new()).expect("op");
+        assert_eq!(
+            op.data.as_ref().expect("data")["live_tasks"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// The deploy gate is open (migration 0050 + the backend allowlist are live),
+    /// so a teardown clear reaches the queue. Closing it again would silently
+    /// stop reporting live tasks, which is a feature outage, not a safety net.
+    #[test]
+    fn a_gated_open_backend_ships_the_write() {
+        let ev = WriteEvent::clear_live_tasks(Uuid::now_v7().to_string());
+        assert!(encode_event(&ev, &KeyStore::new()).is_some());
+    }
 }

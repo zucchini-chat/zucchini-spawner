@@ -344,12 +344,7 @@ async fn prune_context(
     // synchronous error here is the only way to tell the agent at the tool
     // boundary (exit 1); the perfectly-ordered signal arrives only post-exit.
     if !force {
-        let live = {
-            let dir = state.live_sessions.lock().expect("LiveSessions mutex");
-            dir.get(chat_id)
-                .map(|st| st.lock().expect("SessionState mutex").live_tasks.len())
-                .unwrap_or(0)
-        };
+        let live = crate::agent::live_task_count(&state.live_sessions, chat_id);
         if live > 0 {
             return Err(anyhow!(
                 "{live} background task(s)/monitor(s) still running in this session — \

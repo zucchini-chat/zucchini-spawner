@@ -51,6 +51,19 @@ pub type PendingAttachments =
 /// / Monitor (whose runtime is in-process and not restored by `--resume`).
 pub type LiveSessions = Arc<StdMutex<HashMap<String, Arc<StdMutex<SessionState>>>>>;
 
+/// How many background tasks / monitors the chat's resident has armed right now
+/// (0 when it has no resident). The control task's `prune-context` guard: a
+/// prune hard-restarts the agent and `--resume` does not re-arm in-process
+/// tasks, so a non-zero count refuses the prune unless it was forced.
+pub fn live_task_count(sessions: &LiveSessions, topic: &str) -> usize {
+    sessions
+        .lock()
+        .expect("LiveSessions mutex")
+        .get(topic)
+        .map(|st| st.lock().expect("SessionState mutex").live_tasks.len())
+        .unwrap_or(0)
+}
+
 const AGENT_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -112,9 +125,10 @@ pub struct SessionState {
     /// `CronCreate` prompt is never echoed); cleared by the next `result` of
     /// any origin, so it can't outlive a turn.
     pub self_turn: bool,
-    /// `task_id`s of armed background tasks (inserted on `TaskStarted`, removed
-    /// on `TaskFinished`).
-    pub live_tasks: HashSet<String>,
+    /// Armed background tasks in arm order (appended on `TaskStarted`, retained
+    /// out on `TaskFinished`). A `Vec`, not a map: it never exceeds a handful of
+    /// entries and the client renders it in arm order.
+    pub live_tasks: Vec<LiveTask>,
     /// User turns queued for stdin and not yet echoed as consumed, in order.
     /// Registered before the write, so a racing `result` can't read Idle.
     pub unconsumed: Vec<QueuedTurn>,
@@ -137,6 +151,42 @@ pub struct SessionState {
     /// The internal turn the CLI started: its suppression window is open until
     /// the next `result`. Never busy.
     pub(crate) internal_running: Option<String>,
+    /// What was last published as `chats.live_tasks`. Shared rather than local
+    /// to the reader because the Supervisor publishes the queued count at the
+    /// enqueue edge too (`live_tasks_change`) — a second dedup would let each
+    /// side re-publish what the other already wrote, or swallow a change.
+    pub(crate) published_live_tasks: LiveTasksDedup,
+}
+
+/// One armed background task, as the client lists it when the user taps the
+/// Thinking/Waiting pill (`chats.live_tasks`). Claude's `task_started` frame
+/// carries no start time, so `started_at` is stamped when the frame arrives.
+#[derive(Debug, Clone)]
+pub struct LiveTask {
+    pub id: String,
+    pub description: String,
+    pub task_type: String,
+    pub subagent_type: Option<String>,
+    /// Epoch milliseconds.
+    pub started_at: i64,
+}
+
+impl LiveTask {
+    /// What to call the task in spawner-side prose (the forced-prune note).
+    fn label(&self) -> &str {
+        if self.description.is_empty() {
+            &self.id
+        } else {
+            &self.description
+        }
+    }
+}
+
+fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
@@ -172,7 +222,17 @@ impl SessionState {
     /// user their resident when `/stop` has to decide between an interrupt and
     /// a hard abort.
     fn user_queued(&self) -> bool {
-        self.unconsumed.iter().any(|t| !t.internal)
+        self.user_queued_count() > 0
+    }
+    /// How many of the user's turns are queued — the `q` of the `live_tasks`
+    /// blob. Same predicate as `user_queued`, so an internal `/rename` is never
+    /// counted as a message the user is waiting on.
+    fn user_queued_count(&self) -> usize {
+        self.unconsumed.iter().filter(|t| !t.internal).count()
+    }
+    #[cfg(test)]
+    pub(crate) fn has_live_task(&self, id: &str) -> bool {
+        self.live_tasks.iter().any(|t| t.id == id)
     }
     /// A turn runs: a consumed one of ours or a peer's, or a self-fired one.
     fn in_turn(&self) -> bool {
@@ -228,6 +288,12 @@ impl SessionState {
     fn close_internal_window(&mut self) {
         self.internal_running = None;
     }
+    /// The `chats.live_tasks` blob to publish now, or `None` when it is
+    /// unchanged since the last publication (see `LiveTasksDedup`).
+    pub fn observe_live_tasks(&mut self) -> Option<Option<String>> {
+        let payload = live_tasks_payload(self);
+        self.published_live_tasks.observe(payload)
+    }
 }
 
 /// PURE event→state reducer — the single source of truth for the resident
@@ -272,11 +338,24 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
                 }
             }
         }
-        AgentEvent::TaskStarted(id) => {
-            state.live_tasks.insert(id.clone());
+        AgentEvent::TaskStarted {
+            id,
+            description,
+            task_type,
+            subagent_type,
+        } => {
+            if !state.live_tasks.iter().any(|t| &t.id == id) {
+                state.live_tasks.push(LiveTask {
+                    id: id.clone(),
+                    description: description.clone(),
+                    task_type: task_type.clone(),
+                    subagent_type: subagent_type.clone(),
+                    started_at: now_epoch_ms(),
+                });
+            }
         }
         AgentEvent::TaskFinished(id) => {
-            state.live_tasks.remove(id);
+            state.live_tasks.retain(|t| &t.id != id);
         }
         AgentEvent::UserTurnConsumed(uuid) => {
             let ours = state.start_internal(uuid);
@@ -300,6 +379,90 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
         | AgentEvent::CompactBoundary(_)
         | AgentEvent::SessionIdHarvested(_)
         | AgentEvent::ToolResult => {}
+    }
+}
+
+/// Ceiling on the tasks carried in the `live_tasks` blob — the OLDEST ones,
+/// which are the ones the user has been waiting on. The chats row re-streams on
+/// every writeback, so a fat blob multiplies sync traffic and `bucket_data`.
+const MAX_LIVE_TASKS: usize = 20;
+/// Claude's `description` is a one-liner; cap it anyway so a pathological one
+/// can't bloat every re-stream of the row.
+const MAX_LIVE_TASK_DESCRIPTION_CHARS: usize = 200;
+
+/// The PLAINTEXT `chats.live_tasks` blob for a session — `{"t":[…],"q":N}` —
+/// or `None` (⇒ column NULL) when nothing is armed and no user turn is queued.
+/// `t` is omitted when empty, `q` when 0; per task `i` id, `d` description,
+/// `k` kind, `a` subagent type (omitted when absent), `s0` start epoch ms.
+/// The prompts themselves never ride along: they're already in the timeline as
+/// user bubbles right above the pill.
+pub fn live_tasks_payload(state: &SessionState) -> Option<String> {
+    let queued = state.user_queued_count();
+    if state.live_tasks.is_empty() && queued == 0 {
+        return None;
+    }
+    let mut blob = serde_json::Map::new();
+    if !state.live_tasks.is_empty() {
+        let tasks: Vec<serde_json::Value> = state
+            .live_tasks
+            .iter()
+            .take(MAX_LIVE_TASKS)
+            .map(live_task_json)
+            .collect();
+        blob.insert("t".to_string(), serde_json::Value::Array(tasks));
+    }
+    if queued > 0 {
+        blob.insert("q".to_string(), serde_json::json!(queued));
+    }
+    Some(serde_json::Value::Object(blob).to_string())
+}
+
+fn live_task_json(task: &LiveTask) -> serde_json::Value {
+    let kind = match task.task_type.as_str() {
+        "local_bash" => "bash",
+        "local_agent" => "agent",
+        other => other,
+    };
+    let description: String = task
+        .description
+        .chars()
+        .take(MAX_LIVE_TASK_DESCRIPTION_CHARS)
+        .collect();
+    let mut obj = serde_json::Map::new();
+    obj.insert("i".to_string(), serde_json::json!(task.id));
+    obj.insert("d".to_string(), serde_json::json!(description));
+    obj.insert("k".to_string(), serde_json::json!(kind));
+    if let Some(subagent) = &task.subagent_type {
+        obj.insert("a".to_string(), serde_json::json!(subagent));
+    }
+    obj.insert("s0".to_string(), serde_json::json!(task.started_at));
+    serde_json::Value::Object(obj)
+}
+
+/// Change detection for `chats.live_tasks`, the same shape as
+/// `LastTokensDedup`: the blob is recomputed after every event and only a
+/// CHANGED payload is published (`Some(None)` = clear the column). The reader
+/// has to be one of the observers — a task edge publishes no frame, so a
+/// main-loop diff à la `alive_changes` would not run until the next 60s
+/// eviction pass. Lives in `SessionState` because queueing a turn changes the
+/// blob outside the reader.
+#[derive(Debug, Default, Clone)]
+pub struct LiveTasksDedup {
+    last: Option<String>,
+}
+
+impl LiveTasksDedup {
+    /// `Some(payload)` when it differs from what was last published (`Some(None)`
+    /// = clear the column), `None` when nothing changed. A fresh session starts
+    /// from NULL — the teardown that preceded it cleared the column — so an
+    /// empty payload publishes nothing until something is actually armed (an
+    /// internal `/rename` turn must write nothing at all).
+    pub fn observe(&mut self, payload: Option<String>) -> Option<Option<String>> {
+        if self.last == payload {
+            return None;
+        }
+        self.last = payload.clone();
+        Some(payload)
     }
 }
 
@@ -532,6 +695,18 @@ pub enum AgentResponse {
         topic: String,
         request_id: String,
     },
+    /// RESIDENT path only — what the session has armed changed (a task started
+    /// or finished, or a user turn was queued/consumed). `tasks` is the
+    /// plaintext blob (`live_tasks_payload`), `None` to clear the column.
+    /// Emitted by the READER, deduped on the serialized payload — see
+    /// `LiveTasksDedup`. `session` identifies the sender so a late edge from a
+    /// torn-down session can't resurrect phantom tasks on its replacement
+    /// (`Supervisor::is_current_session`).
+    LiveTasks {
+        topic: String,
+        session: Arc<StdMutex<SessionState>>,
+        tasks: Option<String>,
+    },
 }
 
 impl AgentResponse {
@@ -545,7 +720,8 @@ impl AgentResponse {
             | AgentResponse::RunState { topic, .. }
             | AgentResponse::ToolResult { topic }
             | AgentResponse::Interrupted { topic, .. }
-            | AgentResponse::InterruptTimedOut { topic, .. } => topic,
+            | AgentResponse::InterruptTimedOut { topic, .. }
+            | AgentResponse::LiveTasks { topic, .. } => topic,
         }
     }
 }
@@ -584,7 +760,7 @@ impl AgentEvent {
             // directly to drive the Thinking/Waiting state machine (it does not
             // route through `into_response`). Kept exhaustive so a stray frame
             // can't panic the match.
-            AgentEvent::TaskStarted(_)
+            AgentEvent::TaskStarted { .. }
             | AgentEvent::TaskFinished(_)
             | AgentEvent::UserTurnConsumed(_)
             | AgentEvent::PeerTurnConsumed { .. }
@@ -861,16 +1037,23 @@ impl Supervisor {
         self.pending_prunes.clone()
     }
 
-    /// Number of background tasks / monitors live in the chat's resident session
-    /// right now (0 if no resident session). Read at prune apply-time to note in
-    /// the respawn prompt how many tasks the restart terminated.
-    pub fn live_task_count(&self, topic: &str) -> usize {
+    /// The background tasks / monitors live in the chat's resident session right
+    /// now, by label (empty if no resident session). Read at prune apply-time to
+    /// NAME in the respawn prompt what the restart terminated.
+    pub fn live_task_labels(&self, topic: &str) -> Vec<String> {
         self.live_sessions
             .lock()
             .expect("LiveSessions mutex")
             .get(topic)
-            .map(|st| st.lock().expect("SessionState mutex").live_tasks.len())
-            .unwrap_or(0)
+            .map(|st| {
+                st.lock()
+                    .expect("SessionState mutex")
+                    .live_tasks
+                    .iter()
+                    .map(|t| t.label().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Drop live-sessions entries whose chat no longer has a tracked agent. Cheap
@@ -998,6 +1181,21 @@ impl Supervisor {
         }
         s.queue_turn(req.prompt.clone(), false, req.user_timezone.as_deref());
         true
+    }
+
+    /// The chat's `chats.live_tasks` blob when it changed since the last
+    /// publication, `None` when it didn't (or the chat has no resident). Called
+    /// right after `send_user_turn` so the queued count reaches the clients at
+    /// the enqueue edge — the reader publishes only on adapter events, and a
+    /// queued turn produces none until the CLI echoes it.
+    pub fn live_tasks_change(&self, topic: &str) -> Option<Option<String>> {
+        let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
+            return None;
+        };
+        s.state
+            .lock()
+            .expect("SessionState mutex")
+            .observe_live_tasks()
     }
 
     /// `/stop` that keeps the process: ask the live resident to end its turn
@@ -1942,22 +2140,23 @@ fn default_resident_spawn_fn(
                                         // Our own `/rename` turn is running: it is silent,
                                         // so every frame it produces (and its usage) is
                                         // dropped.
-                                        let (running, swallow) = {
+                                        let (running, swallow, live_tasks) = {
                                             let mut st = state_for_reader.lock().expect("SessionState mutex");
                                             interrupted |= is_result && st.interrupt_acked();
                                             let swallow = renaming.swallows(st.internal_in_flight(), &ev);
                                             reduce(&mut st, &ev);
                                             let r = st.running();
+                                            let live_tasks = st.observe_live_tasks();
                                             // [DIAG tasktrace] TEMPORARY — log every
                                             // state-bearing event with the resulting FSM
                                             // so we can see why live_tasks never empties.
                                             match &ev {
-                                                AgentEvent::TaskStarted(id) => tracing::info!(diag = "tasktrace", topic = %topic, %id, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce TaskStarted"),
+                                                AgentEvent::TaskStarted { id, .. } => tracing::info!(diag = "tasktrace", topic = %topic, %id, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce TaskStarted"),
                                                 AgentEvent::TaskFinished(id) => tracing::info!(diag = "tasktrace", topic = %topic, %id, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce TaskFinished"),
                                                 AgentEvent::Result { origin_is_task } => tracing::info!(diag = "tasktrace", topic = %topic, origin_is_task, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce Result"),
                                                 _ => {}
                                             }
-                                            (r, swallow)
+                                            (r, swallow, live_tasks)
                                         };
                                         // A slash turn held by the writer may be due now.
                                         if is_result {
@@ -2001,7 +2200,7 @@ fn default_resident_spawn_fn(
                                             // `reduce`; the RunState recompute below emits a
                                             // transition if `running` changed.
                                             AgentEvent::Result { .. }
-                                            | AgentEvent::TaskStarted(_)
+                                            | AgentEvent::TaskStarted { .. }
                                             | AgentEvent::TaskFinished(_)
                                             | AgentEvent::UserTurnConsumed(_)
                                             | AgentEvent::TurnStarted(_)
@@ -2020,6 +2219,15 @@ fn default_resident_spawn_fn(
                                             // [DIAG tasktrace] TEMPORARY — the busy↔idle edge that writes agent_running.
                                             tracing::info!(diag = "tasktrace", topic = %topic, running, "RunState transition -> chat_running");
                                             if tx.send(AgentResponse::RunState { topic: topic.clone(), running }).await.is_err() { break 'read; }
+                                        }
+                                        // What's armed changed: publish the blob (or a
+                                        // clear). Unlike the idle edge this is NOT
+                                        // deferred to a turn boundary — the point is to
+                                        // show the task list while the turn is over and
+                                        // the chat is Waiting.
+                                        if let Some(tasks) = live_tasks {
+                                            let session = state_for_reader.clone();
+                                            if tx.send(AgentResponse::LiveTasks { topic: topic.clone(), session, tasks }).await.is_err() { break 'read; }
                                         }
                                     }
                                 }
@@ -2357,10 +2565,34 @@ fn attach_followup_for(
     }
 }
 
+/// A backgrounded Bash / Monitor arming, as the claude adapter parses it.
+#[cfg(test)]
+pub(crate) fn task_started(id: &str) -> AgentEvent {
+    AgentEvent::TaskStarted {
+        id: id.into(),
+        description: format!("{id} description"),
+        task_type: "local_bash".into(),
+        subagent_type: None,
+    }
+}
+
+/// The same, already reduced into a session's list.
+#[cfg(test)]
+pub(crate) fn live_task(id: &str) -> LiveTask {
+    LiveTask {
+        id: id.into(),
+        description: format!("{id} description"),
+        task_type: "local_bash".into(),
+        subagent_type: None,
+        started_at: 1_780_886_492_000,
+    }
+}
+
 #[cfg(test)]
 mod reduce_tests {
     use super::{
-        frames_to_write, internal_turn_swallows, peer_message_frame_json, reduce, AgentEvent,
+        frames_to_write, internal_turn_swallows, live_task, live_tasks_payload,
+        peer_message_frame_json, reduce, task_started, AgentEvent, LiveTask, LiveTasksDedup,
         PendingInterrupt, QueuedTurn, SessionState,
     };
     use std::collections::HashSet;
@@ -2400,7 +2632,7 @@ mod reduce_tests {
         assert!(!s.is_idle());
 
         // A background task starts while the turn is still running.
-        reduce(&mut s, &AgentEvent::TaskStarted("t1".into()));
+        reduce(&mut s, &task_started("t1"));
         assert_eq!(
             (s.running(), s.waiting()),
             (true, false),
@@ -2432,7 +2664,7 @@ mod reduce_tests {
             turn_in_flight: true,
             ..Default::default()
         };
-        s.live_tasks.insert("t1".into());
+        s.live_tasks.push(live_task("t1"));
         reduce(
             &mut s,
             &AgentEvent::Result {
@@ -2446,18 +2678,153 @@ mod reduce_tests {
         assert_eq!((s.running(), s.waiting()), (true, false));
     }
 
-    /// Two stacked tasks: both must finish before the session goes Idle.
+    /// Two stacked tasks: both must finish before the session goes Idle, and the
+    /// list keeps them in ARM order (it is what the client renders).
     #[test]
     fn two_tasks_both_must_finish_for_idle() {
         let mut s = SessionState::default();
-        reduce(&mut s, &AgentEvent::TaskStarted("a".into()));
-        reduce(&mut s, &AgentEvent::TaskStarted("b".into()));
+        reduce(&mut s, &task_started("a"));
+        reduce(&mut s, &task_started("b"));
         // No turn in flight, tasks armed → Waiting.
         assert_eq!((s.running(), s.waiting()), (true, true));
+        assert_eq!(ids(&s), vec!["a", "b"]);
+        // A repeated `task_started` for the same id is not a second task.
+        reduce(&mut s, &task_started("a"));
+        assert_eq!(ids(&s), vec!["a", "b"]);
         reduce(&mut s, &AgentEvent::TaskFinished("a".into()));
         assert_eq!((s.running(), s.waiting()), (true, true), "b still live");
+        assert_eq!(ids(&s), vec!["b"], "only the finished one is retained out");
         reduce(&mut s, &AgentEvent::TaskFinished("b".into()));
         assert!(s.is_idle());
+    }
+
+    fn ids(s: &SessionState) -> Vec<&str> {
+        s.live_tasks.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    /// The exact plaintext blob three clients parse. Kinds map `local_bash` →
+    /// `bash` and `local_agent` → `agent`, an unknown kind rides verbatim, `a`
+    /// is present only for a subagent, and `q` is omitted when no user turn is
+    /// queued.
+    #[test]
+    fn live_tasks_blob_is_the_documented_wire_shape() {
+        let mut s = SessionState::default();
+        reduce(
+            &mut s,
+            &AgentEvent::TaskStarted {
+                id: "buukg9452".into(),
+                description: "npm test -- --watch".into(),
+                task_type: "local_bash".into(),
+                subagent_type: None,
+            },
+        );
+        reduce(
+            &mut s,
+            &AgentEvent::TaskStarted {
+                id: "a3bc46a79".into(),
+                description: "count tmp files".into(),
+                task_type: "local_agent".into(),
+                subagent_type: Some("Explore".into()),
+            },
+        );
+        reduce(
+            &mut s,
+            &AgentEvent::TaskStarted {
+                id: "weird".into(),
+                description: String::new(),
+                task_type: "local_future_kind".into(),
+                subagent_type: None,
+            },
+        );
+        let blob: serde_json::Value =
+            serde_json::from_str(&live_tasks_payload(&s).expect("armed")).expect("valid JSON");
+        assert_eq!(blob["t"][0]["i"], "buukg9452");
+        assert_eq!(blob["t"][0]["d"], "npm test -- --watch");
+        assert_eq!(blob["t"][0]["k"], "bash");
+        assert!(blob["t"][0].get("a").is_none(), "no subagent, no `a`");
+        assert!(blob["t"][0]["s0"].as_i64().unwrap() > 1_700_000_000_000);
+        assert_eq!(blob["t"][1]["k"], "agent");
+        assert_eq!(blob["t"][1]["a"], "Explore");
+        assert_eq!(
+            blob["t"][2]["k"], "local_future_kind",
+            "unknown kind rides verbatim"
+        );
+        assert_eq!(blob["t"][2]["d"], "");
+        assert!(blob.get("q").is_none(), "no queued user turn, no `q`");
+    }
+
+    /// Nothing armed and nothing queued ⇒ the column is NULL, never an empty
+    /// object: the clients read NULL as "no sheet content".
+    #[test]
+    fn an_empty_session_has_no_live_tasks_blob() {
+        assert!(live_tasks_payload(&SessionState::default()).is_none());
+    }
+
+    /// `q` counts the USER's queued turns only — an internal `/rename` is the
+    /// spawner's own and must never show up as a message the user is waiting on.
+    #[test]
+    fn q_counts_user_turns_not_internal_renames() {
+        let mut s = SessionState::default();
+        queue_rename(&mut s, "rename-1");
+        assert!(
+            live_tasks_payload(&s).is_none(),
+            "an internal turn alone is not worth a blob"
+        );
+        s.unconsumed.push(queued("user-1"));
+        s.unconsumed.push(queued("user-2"));
+        let blob: serde_json::Value =
+            serde_json::from_str(&live_tasks_payload(&s).expect("queued")).expect("valid JSON");
+        assert_eq!(blob["q"], 2);
+        assert!(blob.get("t").is_none(), "nothing armed, no `t`");
+    }
+
+    /// Caps: the OLDEST 20 tasks ride, and a pathological description is cut to
+    /// 200 chars — the chats row re-streams on every writeback.
+    #[test]
+    fn the_blob_caps_tasks_at_20_and_descriptions_at_200_chars() {
+        let mut s = SessionState::default();
+        for i in 0..25 {
+            s.live_tasks.push(LiveTask {
+                description: "x".repeat(500),
+                ..live_task(&format!("t{i}"))
+            });
+        }
+        let blob: serde_json::Value =
+            serde_json::from_str(&live_tasks_payload(&s).expect("armed")).expect("valid JSON");
+        let tasks = blob["t"].as_array().expect("array");
+        assert_eq!(tasks.len(), 20);
+        assert_eq!(tasks[0]["i"], "t0", "the oldest survive the cap");
+        assert_eq!(tasks[19]["i"], "t19");
+        assert_eq!(tasks[0]["d"].as_str().expect("string").chars().count(), 200);
+    }
+
+    /// The reader publishes only CHANGES — an unchanged payload writes nothing,
+    /// the way `LastTokensDedup` gates `ContextTokens`.
+    #[test]
+    fn live_tasks_are_published_only_when_the_payload_changes() {
+        let mut dedup = LiveTasksDedup::default();
+        let mut s = SessionState::default();
+        assert_eq!(
+            dedup.observe(live_tasks_payload(&s)),
+            None,
+            "a fresh session starts from a cleared column and publishes nothing"
+        );
+
+        reduce(&mut s, &task_started("a"));
+        let armed = dedup.observe(live_tasks_payload(&s)).expect("a change");
+        assert!(armed.expect("a blob").contains("\"a\""));
+        assert_eq!(
+            dedup.observe(live_tasks_payload(&s)),
+            None,
+            "an unrelated event does not re-write an unchanged set"
+        );
+
+        reduce(&mut s, &AgentEvent::TaskFinished("a".into()));
+        assert_eq!(
+            dedup.observe(live_tasks_payload(&s)),
+            Some(None),
+            "the last task finishing clears the column"
+        );
     }
 
     /// Non-state-bearing events leave the FSM untouched.
@@ -2551,7 +2918,7 @@ mod reduce_tests {
             origin_is_task: true,
         };
         let mut s = interrupting();
-        s.live_tasks.insert("monitor".into());
+        s.live_tasks.push(live_task("monitor"));
         reduce(&mut s, &ack("other"));
         assert!(!s.interrupt_acked());
         reduce(&mut s, &ack("int-1"));
@@ -2933,7 +3300,7 @@ mod live_session_tests {
         let mut st = g[chat].lock().unwrap();
         st.turn_in_flight = false;
         st.unconsumed.clear();
-        st.live_tasks.insert("t1".to_string());
+        st.live_tasks.push(live_task("t1"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3211,33 +3578,51 @@ mod live_session_tests {
     }
 
     /// The shared `live_sessions` directory (read by the control task's
-    /// `prune-context` guard via `live_task_count`) reflects a resident session's
-    /// live tasks while it's alive and is cleared on teardown. This is the data
-    /// source for the prune-while-task-live block, so it must track exactly.
+    /// `prune-context` guard, and by `live_task_labels`) reflects a resident
+    /// session's live tasks while it's alive and is cleared on teardown. This is
+    /// the data source for the prune-while-task-live block, so it must track
+    /// exactly — and the labels are what the forced-prune note names.
     #[tokio::test(start_paused = true)]
     async fn live_session_directory_tracks_tasks_and_clears_on_teardown() {
         let (mut sup, exposed) = supervisor_with_exposed_sessions();
         sup.spawn_agent(claude_req("deploying"));
 
         // Registered on spawn; no tasks yet.
-        assert_eq!(sup.live_task_count("deploying"), 0);
-        assert_eq!(sup.live_task_count("never-spawned"), 0);
+        assert!(sup.live_task_labels("deploying").is_empty());
+        assert!(sup.live_task_labels("never-spawned").is_empty());
 
         // A task armed in the session is visible through the shared directory.
         set_waiting(&exposed, "deploying"); // inserts live task "t1"
         assert_eq!(
-            sup.live_task_count("deploying"),
-            1,
-            "an armed task is visible to the control-side guard"
+            sup.live_task_labels("deploying"),
+            vec!["t1 description"],
+            "an armed task is visible (and named) to the control-side guard"
         );
 
         // Teardown drops the directory entry — no stale count blocks a later prune.
         sup.abort_agent("deploying").await;
-        assert_eq!(
-            sup.live_task_count("deploying"),
-            0,
+        assert!(
+            sup.live_task_labels("deploying").is_empty(),
             "teardown clears the live-sessions entry"
         );
+    }
+
+    /// The control task's `prune-context` guard reads the armed-task COUNT from
+    /// the same directory: non-zero refuses the prune (a restart would kill the
+    /// tasks), zero lets it through.
+    #[tokio::test(start_paused = true)]
+    async fn the_prune_guard_counts_a_residents_armed_tasks() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        let dir = sup.live_sessions();
+        sup.spawn_agent(claude_req("chat"));
+        assert_eq!(live_task_count(&dir, "chat"), 0, "a prune is allowed");
+        assert_eq!(live_task_count(&dir, "never-spawned"), 0);
+
+        set_waiting(&exposed, "chat"); // arms "t1"
+        assert_eq!(live_task_count(&dir, "chat"), 1, "the prune is refused");
+
+        sup.abort_agent("chat").await;
+        assert_eq!(live_task_count(&dir, "chat"), 0, "teardown unblocks it");
     }
 
     /// Respawning the same chat overwrites the directory entry with the fresh
@@ -3247,7 +3632,7 @@ mod live_session_tests {
         let (mut sup, exposed) = supervisor_with_exposed_sessions();
         sup.spawn_agent(claude_req("chat"));
         set_waiting(&exposed, "chat");
-        assert_eq!(sup.live_task_count("chat"), 1);
+        assert_eq!(sup.live_task_labels("chat").len(), 1);
 
         // A knob-changing respawn tears down + respawns; the recorder hands back a
         // fresh default state, so the directory must now read 0, not the stale 1.
@@ -3255,9 +3640,8 @@ mod live_session_tests {
         let mut req = claude_req("chat");
         req.model = Some("opus".to_string());
         sup.spawn_agent(req);
-        assert_eq!(
-            sup.live_task_count("chat"),
-            0,
+        assert!(
+            sup.live_task_labels("chat").is_empty(),
             "respawn publishes the fresh session's (empty) task set"
         );
     }
