@@ -38,3 +38,19 @@ pub use unix::*;
 mod windows;
 #[cfg(windows)]
 pub use windows::*;
+
+/// `root` and every descendant in `(pid, ppid)` rows. Walks ppid links rather
+/// than the process group / job: Playwright's browser runs in a group of its own.
+fn tree_pids(rows: &[(u32, u32)], root: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        pids.push(pid);
+        stack.extend(
+            rows.iter()
+                .filter(|&&(p, ppid)| ppid == pid && p != pid)
+                .map(|&(p, _)| p),
+        );
+    }
+    pids
+}

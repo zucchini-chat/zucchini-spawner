@@ -1,7 +1,6 @@
 //! Windows realizations of the platform seam (see `sys/mod.rs`).
 //!
-//! Bodies are stubs for now — signatures match `sys/unix.rs` exactly so later
-//! steps only fill bodies, never touch call sites. Not compiled on macOS.
+//! Signatures match `sys/unix.rs` exactly, so call sites never `#[cfg]`.
 #![cfg(windows)]
 
 use std::hash::{Hash, Hasher};
@@ -21,7 +20,8 @@ use tokio::net::windows::named_pipe::{
 use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_shutdown, CtrlBreak, CtrlC, CtrlShutdown};
 use tracing::{info, warn};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_LOCK_VIOLATION, ERROR_PIPE_BUSY, GENERIC_ALL, HANDLE,
+    CloseHandle, LocalFree, ERROR_LOCK_VIOLATION, ERROR_PIPE_BUSY, FILETIME, GENERIC_ALL, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS,
@@ -35,13 +35,21 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+use windows_sys::Win32::System::ProcessStatus::{
+    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+};
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcessToken, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, CREATE_NEW_PROCESS_GROUP,
+    CREATE_NO_WINDOW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -296,15 +304,129 @@ pub fn process_group_exists(_pgid: u32) -> bool {
     false
 }
 
-// TODO(windows): per-process private bytes and `GlobalMemoryStatusEx` (extra
-// windows-sys features). Until then warm-keep eviction counts idle residents
-// and has no memory-pressure guard.
-pub async fn process_tree_footprint_kb(_roots: &[u32]) -> Option<Vec<u64>> {
-    None
+// ---------------------------------------------------------------------------
+// Memory measurement (warm-keep eviction, `warm.rs`)
+// ---------------------------------------------------------------------------
+
+/// Footprint (KB) of each root's whole process tree, or `None` if the process
+/// snapshot fails. Same ppid walk as unix; synchronous Win32 calls, a few ms
+/// for a few hundred processes.
+pub async fn process_tree_footprint_kb(roots: &[u32]) -> Option<Vec<u64>> {
+    let rows = process_rows()?;
+    let footprints = roots
+        .iter()
+        .map(|&root| {
+            super::tree_pids(&rows, root)
+                .into_iter()
+                .filter_map(footprint_kb)
+                .sum()
+        })
+        .collect();
+    Some(footprints)
 }
 
+/// `(pid, ppid)` of every process, minus stale parent links. Windows never
+/// re-parents an orphan, so its ppid can name a newer, unrelated process that
+/// reused the dead parent's pid; a real child is never older than its parent.
+fn process_rows() -> Option<Vec<(u32, u32)>> {
+    Some(drop_stale_parents(snapshot_process_rows()?, process_creation_time))
+}
+
+fn drop_stale_parents(
+    raw: Vec<(u32, u32)>,
+    creation_time: impl Fn(u32) -> Option<u64>,
+) -> Vec<(u32, u32)> {
+    let created: std::collections::HashMap<u32, u64> = raw
+        .iter()
+        .filter_map(|&(pid, _)| Some((pid, creation_time(pid)?)))
+        .collect();
+    raw.into_iter()
+        .filter(|(pid, ppid)| match (created.get(pid), created.get(ppid)) {
+            (Some(child), Some(parent)) => child >= parent,
+            _ => false,
+        })
+        .collect()
+}
+
+fn snapshot_process_rows() -> Option<Vec<(u32, u32)>> {
+    // SAFETY: FFI. Returns `INVALID_HANDLE_VALUE` on failure, else a snapshot
+    // handle we own and close below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let _guard = OwnedHandle(snapshot);
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut rows = Vec::new();
+    // SAFETY: FFI. `entry` is a valid struct with `dwSize` set, as both calls
+    // require; `snapshot` is live for the loop.
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+    while ok != 0 {
+        rows.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        ok = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    Some(rows)
+}
+
+/// Open `pid` for limited query (enough for times and memory counters); `None`
+/// for processes we may not query, which are never our own descendants.
+fn open_for_query(pid: u32) -> Option<OwnedHandle> {
+    // SAFETY: FFI. Returns a null handle on failure, else one we own.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    (!handle.is_null()).then_some(OwnedHandle(handle))
+}
+
+fn process_creation_time(pid: u32) -> Option<u64> {
+    let process = open_for_query(pid)?;
+    let mut times: [FILETIME; 4] = unsafe { std::mem::zeroed() };
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: FFI. `process` is live; the four out-params are valid FILETIMEs.
+    let ok = unsafe { GetProcessTimes(process.0, created, exited, kernel, user) };
+    (ok != 0).then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+/// What killing `pid` frees: its private commit (`PrivateUsage`), which unlike
+/// the private working set still counts pages Windows compressed or paged out —
+/// the macOS `ri_phys_footprint` analogue. The working set would count the
+/// shared `claude`/node image once per process.
+fn footprint_kb(pid: u32) -> Option<u64> {
+    let process = open_for_query(pid)?;
+    let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    counters.cb = size;
+    // SAFETY: FFI. `process` is live; `counters` is a `_EX` struct of `size`
+    // bytes, which the API accepts in place of the base struct.
+    let ok = unsafe { K32GetProcessMemoryInfo(process.0, std::ptr::addr_of_mut!(counters).cast(), size) };
+    (ok != 0).then_some(counters.PrivateUsage as u64 / 1024)
+}
+
+/// Total RAM, and pressure below 10% available physical memory (standby +
+/// free, the `MemAvailable` analogue) or below 10% of the commit limit left —
+/// Windows fails allocations when commit runs out, however much RAM is free.
+/// `None` if unreadable.
 pub fn memory() -> Option<crate::warm::Memory> {
-    None
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: FFI. `status` is a valid struct with `dwLength` set.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 || status.ullTotalPhys == 0 {
+        return None;
+    }
+    Some(crate::warm::Memory {
+        total_kb: status.ullTotalPhys / 1024,
+        pressure: status.ullAvailPhys * 10 < status.ullTotalPhys
+            || status.ullAvailPageFile * 10 < status.ullTotalPageFile,
+    })
+}
+
+/// RAII close for a handle we opened (process, token, snapshot).
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: FFI. `self.0` is a live handle we own and close exactly once.
+        unsafe { CloseHandle(self.0) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +537,7 @@ fn build_owner_only_dacl(
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let _token_guard = TokenHandle(token);
+    let _token_guard = OwnedHandle(token);
 
     // First call sizes the buffer; second fills it once we've grown to fit.
     let mut needed: u32 = 0;
@@ -506,16 +628,6 @@ fn apply_owner_only_dacl(path: &Path, inheritance: ACE_FLAGS) -> io::Result<()> 
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
     Ok(())
-}
-
-/// RAII close for the process token handle opened in [`build_owner_only_dacl`].
-struct TokenHandle(HANDLE);
-
-impl Drop for TokenHandle {
-    fn drop(&mut self) {
-        // SAFETY: FFI. `self.0` is the token handle we opened and own.
-        unsafe { CloseHandle(self.0) };
-    }
 }
 
 /// Restrict a secret file to the current user only (the `chmod 0600` analogue).
@@ -791,5 +903,56 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         result.expect("hardened dir must leave new children readable");
+    }
+
+    #[test]
+    fn stale_parent_links_are_dropped() {
+        let created = |pid| match pid {
+            1 => Some(10),
+            2 => Some(20),
+            3 => Some(30),
+            4 => Some(5),
+            _ => None,
+        };
+        // 4 names 2 as parent but predates it: 4's real parent died and 2
+        // reused the pid. 9 has no readable creation time.
+        let rows = drop_stale_parents(vec![(1, 0), (2, 1), (3, 2), (4, 2), (9, 2)], created);
+        assert_eq!(rows, vec![(2, 1), (3, 2)]);
+    }
+
+    #[tokio::test]
+    async fn measures_this_process_and_the_machine() {
+        let kb = process_tree_footprint_kb(&[std::process::id()])
+            .await
+            .unwrap();
+        assert!(kb[0] > 0);
+        assert!(memory().unwrap().total_kb > 0);
+    }
+
+    /// A grandchild's private commit counts toward the root: `cmd` → PowerShell
+    /// holding a 400 MB array, the claude → Bash-tool → browser shape.
+    #[tokio::test]
+    async fn footprint_includes_grandchildren() {
+        const ALLOC_MB: u64 = 400;
+        let mut root = tokio::process::Command::new("cmd")
+            .args(["/C", "powershell", "-NoProfile", "-Command"])
+            .arg(format!("$a = [byte[]]::new({ALLOC_MB}MB); Start-Sleep 60"))
+            .creation_flags(SPAWN_CREATION_FLAGS)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn cmd");
+        let group = ProcessGroup::adopt(&root).expect("job");
+        let root_pid = root.id().unwrap();
+
+        let mut kb = 0;
+        for _ in 0..100 {
+            kb = process_tree_footprint_kb(&[root_pid]).await.unwrap()[0];
+            if kb > ALLOC_MB * 1024 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        group.kill(&mut root).await;
+        assert!(kb > ALLOC_MB * 1024, "tree footprint {kb} KB");
     }
 }

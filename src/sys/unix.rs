@@ -16,6 +16,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal as unix_signal, Signal as UnixSignal, SignalKind};
 use tracing::{info, warn};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use super::tree_pids;
+
 // ---------------------------------------------------------------------------
 // OS shutdown request
 // ---------------------------------------------------------------------------
@@ -238,20 +241,6 @@ fn parse_ps(out: &str) -> Vec<(u32, u32)> {
             }
         })
         .collect()
-}
-
-fn tree_pids(rows: &[(u32, u32)], root: u32) -> Vec<u32> {
-    let mut pids = Vec::new();
-    let mut stack = vec![root];
-    while let Some(pid) = stack.pop() {
-        pids.push(pid);
-        stack.extend(
-            rows.iter()
-                .filter(|&&(p, ppid)| ppid == pid && p != pid)
-                .map(|&(p, _)| p),
-        );
-    }
-    pids
 }
 
 /// What killing `pid` frees: private memory, compressed pages included
