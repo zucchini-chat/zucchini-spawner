@@ -1396,7 +1396,7 @@ fn gemini_object_is_tool_call(obj: &serde_json::Map<String, serde_json::Value>) 
 /// matched minus already-pruned" combinator (shared with claude/codex) lives in
 /// [`crate::prune::select_eligible_ids`]; here we supply the gemini-shape
 /// collectors ([`gemini_collect_matched`] / [`gemini_collect_pruned`]) — the SAME
-/// two `prune_gemini_jsonl` feeds the single-read apply driver, so the count and
+/// two `prune_batch_gemini_jsonl` feeds the single-read apply driver, so the count and
 /// apply paths can't drift. `select_eligible_ids` preserves insertion order and
 /// never reorders, so a later snapshot copy can't move the "most recent distinct
 /// call" decision.
@@ -1413,8 +1413,8 @@ fn eligible_matches(
 }
 
 /// Pass-1 matched collector shared by `eligible_matches` (the control-side count
-/// path, via [`crate::prune::select_eligible_ids`]) and `prune_gemini_jsonl` (the
-/// apply path, via [`crate::prune::rewrite_jsonl_last_only`]). Pushes matching
+/// path, via [`crate::prune::select_eligible_ids`]) and `prune_batch_gemini_jsonl` (the
+/// apply path, via [`crate::prune::rewrite_jsonl_batch_last_only`]). Pushes matching
 /// toolCall `id`s in DOCUMENT ORDER onto `matched`.
 ///
 /// `collect_matched` recurses via `walk_objects` over EVERY node, but
@@ -1448,7 +1448,7 @@ fn gemini_collect_matched(
 }
 
 /// Pass-1 already-pruned collector shared by `eligible_matches` and
-/// `prune_gemini_jsonl` (same call sites as [`gemini_collect_matched`]). Marks a
+/// `prune_batch_gemini_jsonl` (same call sites as [`gemini_collect_matched`]). Marks a
 /// call ineligible from ANY of its (possibly many) functionResponse copies whose
 /// `response.output` is already the `[pruned]` placeholder.
 fn gemini_collect_pruned(
@@ -1502,7 +1502,7 @@ fn count_gemini_matches(
 /// codex).
 fn blank_gemini_outputs(
     entry: &mut serde_json::Value,
-    pruned_ids: &std::collections::HashSet<String>,
+    pruned_ids: &crate::prune::ChosenTargets,
     outputs_blanked: &mut std::collections::HashSet<String>,
 ) -> usize {
     let mut freed = 0usize;
@@ -1510,7 +1510,7 @@ fn blank_gemini_outputs(
         let Some(id) = obj.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
             return;
         };
-        if !pruned_ids.contains(&id) {
+        if !pruned_ids.contains_key(&id) {
             return;
         }
         // (a) functionResponse copy.
@@ -1572,12 +1572,7 @@ fn count_leaked_gemini_outputs(
     leaked
 }
 
-/// Single-target gemini rewrite, LAST-ONLY: blank EVERY output copy of just the
-/// MOST RECENT eligible match. The one-round case of [`prune_batch_gemini_jsonl`]
-/// (which carries the shared blank + fail-closed leak re-scan); kept TEST-ONLY as
-/// the equivalence oracle the batch path is pinned against. Production goes through
-/// the batch fn. `PruneStats::results_blanked` is 0 or 1; `freed_bytes` sums across
-/// all copies of the one id.
+/// Single-target, summary-less [`prune_batch_gemini_jsonl`], a test shorthand.
 #[cfg(test)]
 fn prune_gemini_jsonl(
     path: &std::path::Path,
@@ -1586,14 +1581,14 @@ fn prune_gemini_jsonl(
 ) -> std::io::Result<crate::prune::PruneStats> {
     prune_batch_gemini_jsonl(
         path,
-        std::slice::from_ref(&(tool_name.into(), needle.into())),
+        &[crate::prune::PruneTarget::new(tool_name, needle, "")],
     )
 }
 
 /// Batch entry point behind `PRUNE_OPS::prune_batch`: blank the last-only target of
 /// every `(tool_name, needle)` in `targets` in ONE read/write via the shared batch
-/// driver ([`crate::prune::rewrite_jsonl_batch_last_only`]), reproducing exactly
-/// what running [`prune_gemini_jsonl`] once per target produced. Preserves gemini's
+/// driver ([`crate::prune::rewrite_jsonl_batch_last_only`]), every output copy of
+/// each picked id included. Preserves gemini's
 /// fail-closed post-scan: the blank closure captures EVERY id it actually blanked
 /// across the batch into `blanked_ids`, then — only when ≥1 was blanked — a single
 /// `count_leaked_gemini_outputs` re-scan over the driver's FINAL entries (keyed by
@@ -1609,10 +1604,9 @@ fn prune_batch_gemini_jsonl(
     let mut blanked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (stats, final_entries) = crate::prune::rewrite_jsonl_batch_last_only(
         path,
-        targets.len(),
-        |idx, entry, matched| {
-            let (tool_name, needle) = &targets[idx];
-            gemini_collect_matched(entry, tool_name, needle, matched)
+        targets,
+        |target, entry, matched| {
+            gemini_collect_matched(entry, &target.tool_name, &target.needle, matched)
         },
         gemini_collect_pruned,
         |entry, pruned_ids, outputs_blanked| {

@@ -1,7 +1,7 @@
 //! Selective context forgetting ("prune-context") — shared core.
 //!
 //! Per-dialect transcript surgery lives in each adapter module
-//! (`adapters/{claude,gemini,codex}.rs`), wired in through the [`PruneOps`]
+//! (`adapters/{claude,gemini,codex,cursor,pi}.rs`), wired in through the [`PruneOps`]
 //! table on each `AdapterDescriptor`. This module holds the dialect-agnostic
 //! pieces: [`PruneRequest`], [`PruneStats`]/[`PRUNED_PLACEHOLDER`], the
 //! empty-args predicate ([`args_value_is_empty`]), the timeline frame builder
@@ -13,14 +13,15 @@
 //! ([`crate::control`]) resolves the chat's [`PruneOps`] from its `AgentKind`,
 //! locates the transcript (`find_session`), pre-scans (`count_matches`), and —
 //! on ≥1 match — queues a [`PruneRequest`] for the main loop, then returns so the
-//! CLI prints its summary and EXITS 0. The loop does NOT abort on the RPC; it
-//! waits for claude to emit that `prune-context` call's own `tool_result` frame
+//! CLI prints a per-target report and EXITS 0. The loop does NOT abort on the RPC;
+//! it waits for claude to emit that `prune-context` call's own `tool_result` frame
 //! (the `AgentEvent::ToolResult` cue). Only then — once claude has PERSISTED the
-//! call's result (including the summary stdout) to the transcript — does the loop
-//! abort the agent, call `prune` to rewrite the transcript, and respawn with
-//! `--resume`. Sequencing the abort after the result lands is what lets the
-//! resumed agent see its own prune call + summary in context, so it doesn't
-//! re-issue the now-satisfied prune. (claude may fire one more API request with
+//! call's result to the transcript — does the loop abort the agent, call `prune`
+//! to rewrite the transcript, and respawn with `--resume`. Sequencing the abort
+//! after the result lands is what lets the resumed agent see its own completed
+//! prune call in context, so it doesn't re-issue the now-satisfied prune. The
+//! claude pruner also moves each `--summary` out of that call into the pruned tool
+//! result, leaving a marker in the command. (claude may fire one more API request with
 //! the un-pruned context before the abort arrives; the abort kills it and the
 //! respawn re-reads the rewritten transcript, so the freed context still takes
 //! effect — at the cost of that one stray request.)
@@ -44,7 +45,7 @@
 //! re-processed > the window reclaimed). The instruction (`adapter.rs`) and the
 //! reminder steer the agent toward recent outputs for this reason.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -56,7 +57,7 @@ use std::path::{Path, PathBuf};
 pub struct PruneRequest {
     pub jsonl_path: PathBuf,
     /// Which transcript dialect `jsonl_path` is in — selects the rewrite via
-    /// `AgentKind::prune_ops()` (the per-adapter [`PruneOps::prune`]).
+    /// `AgentKind::prune_ops()` (the per-adapter [`PruneOps::prune_batch`]).
     pub agent_kind: crate::adapter::AgentKind,
     /// The CLAUDE-shape tool name to prune, or `""` for the "any tool" selector
     /// (match on `needle` alone — codex omits `--tool-name`).
@@ -85,11 +86,10 @@ pub type PendingPrunes =
     std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<PruneRequest>>>>;
 
 /// Per-adapter selective-forgetting vtable. Each adapter whose CLI owns a local
-/// plaintext transcript the spawner can edit + the CLI re-reads on resume
-/// (claude, gemini, codex) exports a `pub(crate) const PRUNE_OPS: PruneOps`
-/// next to its dialect pruners and points its `AdapterDescriptor::prune` at it.
-/// Adapters with no editable local transcript (cursor, hermes) leave
-/// `AdapterDescriptor::prune` `None`.
+/// transcript the spawner can edit + the CLI re-reads on resume (claude, gemini,
+/// codex, cursor, pi) exports a `pub(crate) const PRUNE_OPS: PruneOps` next to its
+/// dialect pruners and points its `AdapterDescriptor::prune` at it. Hermes has no
+/// editable local transcript and leaves `AdapterDescriptor::prune` `None`.
 ///
 /// All three callbacks operate purely on the filesystem/JSON; the orchestration
 /// (abort → prune → respawn) lives in `main.rs` / `control.rs` and dispatches
@@ -104,27 +104,64 @@ pub struct PruneOps {
     pub find_session: fn(base: &Path, session_id: &str) -> Option<PathBuf>,
     /// Read-only pre-scan: how many ELIGIBLE tool calls match
     /// (`tool_name`, `needle`)? Eligible = matches whose paired output isn't
-    /// already `[pruned]`. `needle` is the `--args` value glob, where `""`
-    /// selects no-args calls. Run control-side before aborting — zero means we
-    /// error back to the still-alive agent (it can retry with a better needle)
-    /// instead of killing + respawning. The count also drives the CLI's "N
-    /// remain" message; the prune itself only blanks the most recent match.
+    /// already `[pruned]` (claude: and that have an output at all). `needle` is
+    /// the `--args` value glob, where `""` selects no-args calls. Run control-side
+    /// before aborting — zero means we error back to the still-alive agent (it can
+    /// retry with a better needle) instead of killing + respawning. The count also
+    /// drives the CLI's "N remain" message; the prune itself only blanks the most
+    /// recent match.
     pub count_matches: fn(&Path, &str, &str) -> io::Result<usize>,
-    /// Rewrite the transcript in place for a WHOLE coalesced burst in ONE pass:
-    /// `targets` is the list of `(tool_name, needle)` pairs from one chat's queued
-    /// `PruneRequest`s (all sharing this `jsonl_path`). Blanks the last-only target
-    /// of each, reproducing exactly what K separate single-target last-only passes
-    /// produced (see [`rewrite_jsonl_batch_last_only`]) — same blanked set, same
-    /// freed bytes — but with one read / one serialize / one fsync-pair instead of
-    /// K. Returns the SUMMED [`PruneStats`] for the burst (`results_blanked` ≤ K).
+    /// Rewrite the transcript in place for a WHOLE coalesced burst in ONE read and
+    /// write: `targets` is one [`PruneTarget`] per queued `PruneRequest` of the chat
+    /// (all sharing this `jsonl_path`). Blanks the most recent eligible match of
+    /// each target; how a target resolves when an earlier target already took its
+    /// match is the dialect's [`BatchCollision`]. Returns the [`PruneStats`] for the
+    /// burst (`results_blanked` ≤ K).
     pub prune_batch: fn(&Path, &[PruneTarget]) -> io::Result<PruneStats>,
 }
 
-/// One `(tool_name, needle)` prune target — the per-item selector a queued
-/// `PruneRequest` carries, passed in bulk to [`PruneOps::prune_batch`]. `tool_name`
-/// is the CLAUDE-shape name (`""` = any tool); `needle` is the `--args` value glob
-/// (`""` = no-args selector). Named alias so the batch `fn` signatures stay legible.
-pub type PruneTarget = (String, String);
+/// One prune target — the per-item part of a queued `PruneRequest`, passed in bulk
+/// to [`PruneOps::prune_batch`]. `tool_name` is the CLAUDE-shape name (`""` = any
+/// tool); `needle` is the `--args` value glob (`""` = no-args selector); `summary`
+/// is the request's `reason`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneTarget {
+    pub tool_name: String,
+    pub needle: String,
+    pub summary: String,
+}
+
+impl PruneTarget {
+    pub fn new(tool_name: &str, needle: &str, summary: &str) -> Self {
+        Self {
+            tool_name: tool_name.to_string(),
+            needle: needle.to_string(),
+            summary: summary.to_string(),
+        }
+    }
+
+    fn same_selector(&self, other: &Self) -> bool {
+        self.tool_name == other.tool_name && self.needle == other.needle
+    }
+}
+
+/// The tool-call ids a batch picked, each mapped to the index of the target (in
+/// the batch's `targets`) that picked it.
+pub(crate) type ChosenTargets = HashMap<String, usize>;
+
+/// How a batch target resolves when its most recent eligible match was already
+/// picked by an earlier target of the same batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchCollision {
+    /// Take the next older match — what K separate last-only passes would do.
+    FallThrough,
+    /// Skip only matches picked by a target with the same (`tool_name`, `needle`)
+    /// (the "prune two successive" case); a match picked by a different selector
+    /// makes this target a miss. For dialects that write the target's summary into
+    /// the pruned output, where an older output would get a summary not written
+    /// about it.
+    SameSelectorOnly,
+}
 
 /// Is a tool call's arguments value "empty" (the call was made with no
 /// arguments)? True for absent, JSON `null`, empty object `{}`, or empty array
@@ -190,7 +227,7 @@ pub(crate) fn value_glob_match(value: &serde_json::Value, pattern: &str) -> bool
 /// and its required `--args` flag so an unrelated command that merely mentions the
 /// word (e.g. `grep prune-context …`) is NOT excluded — being conservative here
 /// only ever LEAVES data in context, never drops the wrong thing.
-fn leaf_is_prune_context_command(leaf: &str) -> bool {
+pub(crate) fn leaf_is_prune_context_command(leaf: &str) -> bool {
     leaf.contains("prune-context") && leaf.contains("--args")
 }
 
@@ -236,8 +273,7 @@ pub(crate) fn select_eligible_ids(
     let parsed = read_parsed_lines(path)?;
     let mut matched: Vec<String> = Vec::new();
     let mut already_pruned: HashSet<String> = HashSet::new();
-    for (_, value) in parsed.iter() {
-        let Some(entry) = value else { continue };
+    for entry in parsed_entries(&parsed) {
         collect_matched(entry, &mut matched);
         collect_pruned(entry, &mut already_pruned);
     }
@@ -270,8 +306,9 @@ pub(crate) const PRUNED_PLACEHOLDER: &str = "[pruned]";
 /// keeps re-prune byte-stable so `--resume` keeps its prompt-cache prefix),
 /// `Some(freed)` when actually replaced this call. `freed` = original
 /// serialized length − replacement length − 2 JSON quotes, saturating at 0.
-/// Shared by the 3 dialect pruners so the idempotency check and freed-byte
-/// arithmetic can't drift.
+/// Shared by the non-claude dialect pruners so the idempotency check and
+/// freed-byte arithmetic can't drift (claude's prefix-aware twin lives in
+/// `adapters/claude.rs`).
 pub(crate) fn blank_string_field(
     map: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -361,12 +398,17 @@ pub(crate) fn value_args_tool_call_matches(
 /// One parsed transcript line: the original verbatim string (kept byte-for-byte
 /// for unchanged / blank / parse-failed lines) alongside its parsed JSON value
 /// (`None` for blank or parse-failed lines).
-type ParsedLine = (String, Option<serde_json::Value>);
+pub(crate) type ParsedLine = (String, Option<serde_json::Value>);
+
+/// The parsed entries of `parsed`, skipping blank and parse-failed lines.
+pub(crate) fn parsed_entries(parsed: &[ParsedLine]) -> impl Iterator<Item = &serde_json::Value> {
+    parsed.iter().filter_map(|(_, value)| value.as_ref())
+}
 
 /// Parse `path` line by line into [`ParsedLine`]s with the shared byte-stability
 /// rules: trim trailing `\r`/`\n`; blank or parse-failed lines are kept verbatim
 /// with `None` (never dropped); other lines parse via `serde_json::from_str`.
-fn read_parsed_lines(path: &Path) -> io::Result<Vec<ParsedLine>> {
+pub(crate) fn read_parsed_lines(path: &Path) -> io::Result<Vec<ParsedLine>> {
     let text = std::fs::read_to_string(path)?;
     let mut parsed: Vec<ParsedLine> = Vec::new();
     for line in text.lines() {
@@ -383,41 +425,9 @@ fn read_parsed_lines(path: &Path) -> io::Result<Vec<ParsedLine>> {
     Ok(parsed)
 }
 
-/// Single-read SINGLE-TARGET last-only prune driver — the one-round case of
-/// [`rewrite_jsonl_batch_last_only`], which it delegates to. TEST-ONLY: each
-/// adapter's test-only `prune_*_jsonl` calls it as the equivalence oracle the
-/// batch path is pinned against; production prunes go through the batch driver so a
-/// whole coalesced burst collapses to one read/write. Returns the same
-/// `(PruneStats, final_entries)` shape so a dialect's fail-closed post-scan can run
-/// on the EXACT state the driver decided.
-#[cfg(test)]
-pub(crate) fn rewrite_jsonl_last_only(
-    path: &Path,
-    collect_matched: impl FnMut(&serde_json::Value, &mut Vec<String>),
-    collect_pruned: impl FnMut(&serde_json::Value, &mut HashSet<String>),
-    blank: impl FnMut(&mut serde_json::Value, &HashSet<String>, &mut HashSet<String>) -> Option<usize>,
-) -> io::Result<(PruneStats, Vec<Option<serde_json::Value>>)> {
-    // A single-target prune is the degenerate one-round batch: one (matched
-    // collector) target, last-only over the same parsed Vec. Routing it through
-    // the batch driver keeps the two paths from drifting.
-    let mut collect_matched = collect_matched;
-    rewrite_jsonl_batch_last_only(
-        path,
-        1,
-        |_idx, entry, matched| collect_matched(entry, matched),
-        collect_pruned,
-        blank,
-    )
-}
-
 /// Single-read BATCH last-only prune driver. Reproduces, in ONE read + ONE write,
-/// the EXACT result of running [`rewrite_jsonl_last_only`] `count` times in a row,
-/// where each round targets its own `(tool_name, needle)` (selected by `idx`).
-///
-/// The old apply path looped K [`PruneOps::prune`] calls per chat, each doing a
-/// full read + parse + atomic write (which `sync_all`s the file AND its parent
-/// dir) — K reads, K serializes, K fsync-pairs on a possibly multi-MB transcript.
-/// This collapses them to one.
+/// the EXACT result of running a one-target batch once per target in a row, which
+/// would cost K reads, serializes and fsync-pairs on a possibly multi-MB transcript.
 ///
 /// Why one pass reproduces K last-only passes EXACTLY: each separate pass picks
 /// `last()` of (its matches − ids whose paired output is ALREADY `[pruned]` on
@@ -427,76 +437,94 @@ pub(crate) fn rewrite_jsonl_last_only(
 /// `chosen` set of the ids picked in earlier rounds of THIS batch — so round N's
 /// `last()` lands on the same id the on-disk pass N would have. (Two rounds with
 /// the SAME needle therefore pick two DISTINCT successive matches, exactly as two
-/// separate same-needle calls did.) After accumulating up to `count` target ids,
-/// ONE [`blank_pass`] blanks them all and writes once.
+/// separate same-needle calls did.) The claude pruner composes the same pieces
+/// ([`select_batch_last_only`] + [`blank_pass`]) with its own eligibility and
+/// [`BatchCollision::SameSelectorOnly`].
 ///
-/// `collect_matched(idx, entry, &mut Vec)` pushes the matching ids for target
-/// `idx` (`0..count`) in DOCUMENT ORDER; `collect_pruned` / `blank` are the same
-/// per-dialect closures the single-target driver takes — reused unchanged. Returns
-/// one [`PruneStats`] for the whole batch (`results_blanked` = total outputs
-/// blanked, `freed_bytes` summed) plus the post-blank `final_entries` for a
-/// dialect's fail-closed post-scan.
+/// `collect_matched(target, entry, &mut Vec)` pushes the matching ids for `target`
+/// in DOCUMENT ORDER; `collect_pruned` inserts ids whose output is already pruned;
+/// `blank` gets the picked ids. Returns one [`PruneStats`] for the whole batch
+/// (`results_blanked` = total outputs blanked, `freed_bytes` summed) plus the
+/// post-blank `final_entries` for a dialect's fail-closed post-scan.
 pub(crate) fn rewrite_jsonl_batch_last_only(
     path: &Path,
-    count: usize,
-    mut collect_matched: impl FnMut(usize, &serde_json::Value, &mut Vec<String>),
+    targets: &[PruneTarget],
+    collect_matched: impl FnMut(&PruneTarget, &serde_json::Value, &mut Vec<String>),
     mut collect_pruned: impl FnMut(&serde_json::Value, &mut HashSet<String>),
-    blank: impl FnMut(&mut serde_json::Value, &HashSet<String>, &mut HashSet<String>) -> Option<usize>,
+    mut blank: impl FnMut(&mut serde_json::Value, &ChosenTargets, &mut HashSet<String>) -> Option<usize>,
 ) -> io::Result<(PruneStats, Vec<Option<serde_json::Value>>)> {
     let parsed = read_parsed_lines(path)?;
-
-    // Ids whose paired output is ALREADY `[pruned]` on disk — excluded from every
-    // round (same as `select_eligible_ids`'s retain). Scanned once.
     let mut already_pruned: HashSet<String> = HashSet::new();
-    for (_, value) in parsed.iter() {
-        let Some(entry) = value else { continue };
+    for entry in parsed_entries(&parsed) {
         collect_pruned(entry, &mut already_pruned);
     }
-
-    // Run the pass-1 last-only selection `count` times IN MEMORY, accumulating the
-    // chosen target ids. Each round re-derives its match list, subtracts the
-    // on-disk already-pruned set AND the ids chosen in earlier rounds, and takes
-    // `last()` — reproducing what `count` successive on-disk passes would pick.
-    let mut chosen: HashSet<String> = HashSet::new();
-    for idx in 0..count {
-        let mut matched: Vec<String> = Vec::new();
-        for (_, value) in parsed.iter() {
-            let Some(entry) = value else { continue };
-            collect_matched(idx, entry, &mut matched);
-        }
-        let pick = matched
-            .into_iter()
-            .rev()
-            .find(|id| !already_pruned.contains(id) && !chosen.contains(id));
-        if let Some(id) = pick {
-            chosen.insert(id);
-        }
-        // No eligible match this round (TOCTOU, or the needle's matches were all
-        // claimed by earlier rounds) → contributes nothing, exactly as a separate
-        // pass that found 0 eligible would have blanked nothing.
-    }
-
-    blank_pass(path, parsed, &chosen, blank)
+    let chosen = select_batch_last_only(
+        &parsed,
+        targets,
+        BatchCollision::FallThrough,
+        collect_matched,
+        |id| !already_pruned.contains(id),
+    );
+    blank_pass(path, parsed, &chosen, |entry, chosen, outputs_blanked| {
+        blank(entry, chosen, outputs_blanked).map(|freed| freed as isize)
+    })
 }
 
-/// Pass 2 behind [`rewrite_jsonl_last_only`]: blank the outputs keyed by `target`,
+/// Pass 1 of the batch driver: run the last-only selection once per target IN
+/// MEMORY. Each round re-derives its match list, keeps the ids `is_eligible`
+/// accepts, and takes the most recent one not picked by an earlier round
+/// (`collision` decides whether it may fall past an earlier round's pick). A
+/// round with no pick (TOCTOU, or a miss) contributes nothing.
+pub(crate) fn select_batch_last_only(
+    parsed: &[ParsedLine],
+    targets: &[PruneTarget],
+    collision: BatchCollision,
+    mut collect_matched: impl FnMut(&PruneTarget, &serde_json::Value, &mut Vec<String>),
+    is_eligible: impl Fn(&str) -> bool,
+) -> ChosenTargets {
+    let mut chosen = ChosenTargets::new();
+    for (idx, target) in targets.iter().enumerate() {
+        let mut matched: Vec<String> = Vec::new();
+        for entry in parsed_entries(parsed) {
+            collect_matched(target, entry, &mut matched);
+        }
+        let mut pick = None;
+        for id in matched.into_iter().rev().filter(|id| is_eligible(id)) {
+            match chosen.get(&id) {
+                None => {
+                    pick = Some(id);
+                    break;
+                }
+                Some(&earlier)
+                    if collision == BatchCollision::SameSelectorOnly
+                        && !targets[earlier].same_selector(target) =>
+                {
+                    break
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(id) = pick {
+            chosen.insert(id, idx);
+        }
+    }
+    chosen
+}
+
+/// Pass 2 of the batch driver: blank the outputs picked in `chosen`,
 /// re-serializing only the lines a blank touched (everything else byte-for-byte
 /// verbatim), atomic-write the result, and assemble [`PruneStats`] + the final
-/// parsed entries. Pulled out from the driver so the selection (pass 1) and the
-/// write path (pass 2) stay separately testable.
-fn blank_pass(
+/// parsed entries. `blank` returns the bytes an entry's edit freed (negative when
+/// it grew); `freed_bytes` is their sum, floored at 0.
+pub(crate) fn blank_pass(
     path: &Path,
     parsed: Vec<ParsedLine>,
-    target: &HashSet<String>,
-    mut blank: impl FnMut(
-        &mut serde_json::Value,
-        &HashSet<String>,
-        &mut HashSet<String>,
-    ) -> Option<usize>,
+    chosen: &ChosenTargets,
+    mut blank: impl FnMut(&mut serde_json::Value, &ChosenTargets, &mut HashSet<String>) -> Option<isize>,
 ) -> io::Result<(PruneStats, Vec<Option<serde_json::Value>>)> {
     let mut out_lines: Vec<String> = Vec::with_capacity(parsed.len());
     let mut final_entries: Vec<Option<serde_json::Value>> = Vec::with_capacity(parsed.len());
-    let mut freed_bytes = 0usize;
+    let mut freed_bytes = 0isize;
     let mut outputs_blanked: HashSet<String> = HashSet::new();
     for (original, value) in parsed.into_iter() {
         let Some(mut entry) = value else {
@@ -504,7 +532,7 @@ fn blank_pass(
             final_entries.push(None);
             continue;
         };
-        match blank(&mut entry, target, &mut outputs_blanked) {
+        match blank(&mut entry, chosen, &mut outputs_blanked) {
             // Unchanged — write the original bytes back verbatim.
             None => out_lines.push(original),
             // Mutated: re-serialize even when `freed` is 0 (a tiny output shorter
@@ -529,7 +557,7 @@ fn blank_pass(
     Ok((
         PruneStats {
             results_blanked: outputs_blanked.len(),
-            freed_bytes,
+            freed_bytes: usize::try_from(freed_bytes).unwrap_or(0),
         },
         final_entries,
     ))
@@ -537,8 +565,8 @@ fn blank_pass(
 
 /// What a dialect `prune` reports back. `results_blanked` = number of tool
 /// outputs whose content we replaced (the user-facing count). `freed_bytes` =
-/// approximate transcript size removed (summed serialized length of the blanked
-/// content, minus placeholders); feeds a coarse `~Nk freed` token estimate in
+/// approximate transcript size removed (serialized length of the blanked content,
+/// minus what replaced it); feeds a coarse `~Nk freed` token estimate in
 /// the timeline frame — the precise drop shows in the context gauge on resume.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PruneStats {

@@ -1577,7 +1577,7 @@ fn codex_arguments_match(arguments: &str, needle: &str) -> bool {
 /// "ordered matched minus already-pruned" combinator (shared with claude/gemini)
 /// lives in [`crate::prune::select_eligible_ids`]; here we just supply the
 /// codex-shape per-entry collectors ([`codex_collect_matched`] /
-/// [`codex_collect_pruned`]) — the SAME two `prune_codex_jsonl` feeds the
+/// [`codex_collect_pruned`]) — the SAME two `prune_batch_codex_jsonl` feeds the
 /// single-read apply driver, so the count and apply paths can't drift. The
 /// collectors are order-independent — a rollout could record an output before its
 /// call (see `codex_prune_blanks_output_appearing_before_its_call`).
@@ -1590,8 +1590,8 @@ fn eligible_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::Resu
 }
 
 /// Pass-1 matched collector shared by `eligible_matches` (the control-side count
-/// path, via [`crate::prune::select_eligible_ids`]) and `prune_codex_jsonl` (the
-/// apply path, via [`crate::prune::rewrite_jsonl_last_only`]). Pushes the matching
+/// path, via [`crate::prune::select_eligible_ids`]) and `prune_batch_codex_jsonl` (the
+/// apply path, via [`crate::prune::rewrite_jsonl_batch_last_only`]). Pushes the matching
 /// `function_call`'s `call_id` in DOCUMENT ORDER onto `matched`. A function_call
 /// yields at most its own single call_id.
 fn codex_collect_matched(
@@ -1608,7 +1608,7 @@ fn codex_collect_matched(
 }
 
 /// Pass-1 already-pruned collector shared by `eligible_matches` and
-/// `prune_codex_jsonl` (same call sites as [`codex_collect_matched`]). Marks a
+/// `prune_batch_codex_jsonl` (same call sites as [`codex_collect_matched`]). Marks a
 /// call ineligible from a `function_call_output` whose `output` is already the
 /// `[pruned]` placeholder.
 fn codex_collect_pruned(
@@ -1668,59 +1668,35 @@ fn collect_codex_call_id_if_matches(
     }
 }
 
-/// The real codex rewrite, LAST-ONLY: blank just the MOST RECENT eligible match
-/// (its `function_call.arguments` → `"{}"` + paired `function_call_output.output`
-/// → `[pruned]`) — never deleting a line — then atomic write back. The agent
-/// reclaims more by calling again (eligibility walks newest→oldest). Empty set
-/// (TOCTOU after the control pre-check, or nothing eligible) is a safe no-op
-/// (`results_blanked` 0 → timeline frame skipped).
-///
-/// The last-only target is chosen INSIDE the single-read driver
-/// ([`crate::prune::rewrite_jsonl_last_only`]) from the SAME codex collectors
-/// `eligible_matches` feeds ([`codex_collect_matched`] / [`codex_collect_pruned`])
-/// — one transcript read does pass-1 selection + the blank pass, dropping the
-/// redundant `eligible_matches` read the old code did before the driver. The blank
-/// pass (`blank_codex_entry`) blanks exactly that call's arguments + its paired
-/// output (running per-entry, it catches an output recorded BEFORE its call — see
-/// `codex_prune_blanks_output_appearing_before_its_call`). An empty target (TOCTOU
-/// after the control pre-check, or nothing eligible) is a safe no-op: the blank
-/// pass touches nothing → `results_blanked` 0 → timeline frame skipped. Codex has
-/// no fail-closed post-scan, so the returned final entries are ignored.
-///
-/// TEST-ONLY now: the one-round case of [`prune_batch_codex_jsonl`], kept as the
-/// equivalence oracle the tests pin the batch path against. Production goes through
-/// the batch fn.
+/// Single-target, summary-less [`prune_batch_codex_jsonl`], a test shorthand.
 #[cfg(test)]
 fn prune_codex_jsonl(
     path: &Path,
     tool_name: &str,
     needle: &str,
 ) -> std::io::Result<crate::prune::PruneStats> {
-    let (stats, _final_entries) = crate::prune::rewrite_jsonl_last_only(
+    prune_batch_codex_jsonl(
         path,
-        |entry, matched| codex_collect_matched(entry, tool_name, needle, matched),
-        codex_collect_pruned,
-        blank_codex_entry,
-    )?;
-    Ok(stats)
+        &[crate::prune::PruneTarget::new(tool_name, needle, "")],
+    )
 }
 
 /// Batch entry point behind `PRUNE_OPS::prune_batch`: blank the last-only target of
 /// every `(tool_name, needle)` in `targets` in ONE read/write via the shared batch
-/// driver ([`crate::prune::rewrite_jsonl_batch_last_only`]), reproducing exactly
-/// what running [`prune_codex_jsonl`] once per target produced. Same codex
-/// collectors `prune_codex_jsonl` feeds; codex has no fail-closed post-scan, so the
-/// final entries are ignored (mirrors claude).
+/// driver ([`crate::prune::rewrite_jsonl_batch_last_only`]): `function_call.arguments`
+/// → `"{}"` and the paired `function_call_output.output` → `[pruned]`, never deleting
+/// a line. The blank runs per entry, so it also catches an output recorded BEFORE its
+/// call (`codex_prune_blanks_output_appearing_before_its_call`). Codex has no
+/// fail-closed post-scan, so the final entries are ignored.
 fn prune_batch_codex_jsonl(
     path: &Path,
     targets: &[crate::prune::PruneTarget],
 ) -> std::io::Result<crate::prune::PruneStats> {
     let (stats, _final_entries) = crate::prune::rewrite_jsonl_batch_last_only(
         path,
-        targets.len(),
-        |idx, entry, matched| {
-            let (tool_name, needle) = &targets[idx];
-            codex_collect_matched(entry, tool_name, needle, matched)
+        targets,
+        |target, entry, matched| {
+            codex_collect_matched(entry, &target.tool_name, &target.needle, matched)
         },
         codex_collect_pruned,
         blank_codex_entry,
@@ -1740,7 +1716,7 @@ fn prune_batch_codex_jsonl(
 /// was shorter than the placeholder — the caller still re-serializes).
 fn blank_codex_entry(
     entry: &mut serde_json::Value,
-    pruned_ids: &std::collections::HashSet<String>,
+    pruned_ids: &crate::prune::ChosenTargets,
     outputs_blanked: &mut std::collections::HashSet<String>,
 ) -> Option<usize> {
     if entry.get("type").and_then(|t| t.as_str()) != Some("response_item") {
@@ -1752,7 +1728,7 @@ fn blank_codex_entry(
             let matched = payload
                 .get("call_id")
                 .and_then(|v| v.as_str())
-                .map(|id| pruned_ids.contains(id))
+                .map(|id| pruned_ids.contains_key(id))
                 .unwrap_or(false);
             if !matched {
                 return None;
@@ -1763,7 +1739,9 @@ fn blank_codex_entry(
         }
         Some("function_call_output") => {
             let call_id = payload.get("call_id").and_then(|v| v.as_str());
-            let pruned = call_id.map(|id| pruned_ids.contains(id)).unwrap_or(false);
+            let pruned = call_id
+                .map(|id| pruned_ids.contains_key(id))
+                .unwrap_or(false);
             if !pruned {
                 return None;
             }

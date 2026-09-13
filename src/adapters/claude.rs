@@ -117,6 +117,11 @@ fn extract_tool_result_id(line: &str) -> Option<&str> {
 const ONESHOT_SYS_LEADIN: &str =
     "You are spawned via a harness, no background subagents will wake you when finished, use subagents with `run_in_background: false` only.";
 
+/// Claude-only addendum to `PRUNE_CONTEXT_INSTRUCTION` (shared with cursor/pi,
+/// whose pruners don't move the summary).
+const PRUNE_SUMMARY_MOVE_INSTRUCTION: &str =
+    "Each --summary is moved into the pruned tool result (the prune command keeps a marker in its place), so write it to stand on its own next to that call.";
+
 /// One token of the claude invocation. `Lit` is emitted verbatim (unquoted in
 /// the shell string) — the constant flags/values that need no escaping. `Val`
 /// is a dynamic value: shell-escaped in the POSIX string, one argv element
@@ -203,6 +208,8 @@ fn claude_flag_args(
     sys.push_str(&agent_capabilities_instructions(worktree_info.as_ref()));
     sys.push_str("\n\n");
     sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
+    sys.push(' ');
+    sys.push_str(PRUNE_SUMMARY_MOVE_INSTRUCTION);
     args.push(ClaudeArg::Lit("--append-system-prompt"));
     args.push(ClaudeArg::Val(sys));
     // Resident: read user/control turns from the held-open stdin pipe, and echo
@@ -1094,7 +1101,8 @@ fn claude_projects_dir() -> Option<std::path::PathBuf> {
 /// Two host encodings are handled, chosen by the shape of the name:
 ///   - Unix:    `/Users/me/proj`   → `-Users-me-proj`   (leading `/` → leading `-`)
 ///   - Windows: `C:\Users\me\proj` → `C--Users-me-proj` (the drive `:` and every
-///              `\` both map to `-`, so the `C:\` prefix becomes `C--`)
+///     `\` both map to `-`, so the `C:\` prefix becomes `C--`)
+///
 /// The greedy longest-prefix walk is identical for both; only the root and the
 /// list of segments differ.
 ///
@@ -1112,7 +1120,10 @@ fn decode_project_dir(name: &str) -> Option<String> {
         && parts[0].as_bytes()[0].is_ascii_alphabetic()
     {
         // Windows: `C`, `` (from the doubled dash of `:\`), then the segments.
-        (std::path::PathBuf::from(format!("{}:\\", parts[0])), &parts[2..])
+        (
+            std::path::PathBuf::from(format!("{}:\\", parts[0])),
+            &parts[2..],
+        )
     } else {
         return None;
     };
@@ -1373,13 +1384,19 @@ fn import_boxed(
 // ===========================================================================
 // Selective forgetting ("prune-context") — claude dialect. Shared contract:
 // `crate::prune`. Claude shape: a tool result lives in a `user` entry paired to
-// the assistant's `tool_use` by `tool_use_id`; a prune blanks the `tool_use`
-// `input` to `{}` and the paired `tool_result` `content` to `PRUNED_PLACEHOLDER`
-// — preserving every line + id/threading field byte-for-byte so `--resume` keeps
-// its prompt-cache prefix up to the edit. Wired in via `PRUNE_OPS` (→
-// `AdapterDescriptor::prune`). Single-pass (assistant input + paired user
-// content blank in one read pass), distinct from the shared two-pass driver
-// gemini/codex use.
+// the assistant's `tool_use` by `tool_use_id`. A prune sets the `tool_use` `input`
+// to `pruned_input` and the paired `tool_result` `content` to `[pruned] <summary>`,
+// and swaps that summary in the requesting `prune-context` command for
+// `SUMMARY_MOVED_MARKER`, so the summary sits in context once, next to the call it
+// describes. Every line + id/threading field is preserved. Wired in via
+// `PRUNE_OPS` (→ `AdapterDescriptor::prune`).
+
+use std::collections::HashMap;
+use std::ops::Range;
+
+use crate::prune::{
+    BatchCollision, ChosenTargets, ParsedLine, PruneStats, PruneTarget, PRUNED_PLACEHOLDER,
+};
 
 /// `crate::prune::PruneOps` for claude. Points the descriptor at this module's
 /// dialect pruners.
@@ -1438,41 +1455,33 @@ fn tool_use_matches(block: &serde_json::Value, tool_name: &str, needle: &str) ->
         .is_some_and(|i| crate::prune::value_glob_match(i, needle))
 }
 
-/// Eligible (matched, not already `[pruned]`) `tool_use` ids in document order.
-/// The ordered-minus-pruned combinator is the shared
-/// [`crate::prune::select_eligible_ids`]; here we supply the claude-shape
-/// collectors ([`claude_collect_matched`] / [`claude_collect_pruned`]) — the SAME
-/// two `prune_jsonl` feeds the single-read apply driver, so the count and apply
-/// paths can't drift.
-fn eligible_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::Result<Vec<String>> {
-    crate::prune::select_eligible_ids(
-        path,
-        |entry, matched| claude_collect_matched(entry, tool_name, needle, matched),
-        claude_collect_pruned,
-    )
+/// The `message.content` blocks of a transcript entry of `entry_type`
+/// (`assistant`/`user`); empty for any other entry.
+fn claude_content_blocks<'a>(
+    entry: &'a serde_json::Value,
+    entry_type: &str,
+) -> &'a [serde_json::Value] {
+    if entry.get("type").and_then(|t| t.as_str()) != Some(entry_type) {
+        return &[];
+    }
+    entry
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .map_or(&[], Vec::as_slice)
 }
 
-/// Pass-1 matched collector shared by `eligible_matches` (the control-side count
-/// path, via [`crate::prune::select_eligible_ids`]) and `prune_jsonl` (the apply
-/// path, via [`crate::prune::rewrite_jsonl_last_only`]). Walks assistant `tool_use`
-/// blocks via [`tool_use_matches`], pushing matching ids in DOCUMENT ORDER.
+/// Pass-1 matched collector shared by [`count_matches`] and
+/// [`prune_batch_jsonl`], so the count and apply paths can't drift. Walks
+/// assistant `tool_use` blocks via [`tool_use_matches`], pushing matching ids in
+/// DOCUMENT ORDER.
 fn claude_collect_matched(
     entry: &serde_json::Value,
     tool_name: &str,
     needle: &str,
     matched: &mut Vec<String>,
 ) {
-    if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-        return;
-    }
-    let Some(blocks) = entry
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    else {
-        return;
-    };
-    for block in blocks {
+    for block in claude_content_blocks(entry, "assistant") {
         if tool_use_matches(block, tool_name, needle) {
             if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
                 matched.push(id.to_string());
@@ -1489,85 +1498,309 @@ fn claude_entry_source_id(entry: &serde_json::Value) -> Option<&str> {
     entry.get("sourceToolUseID").and_then(|i| i.as_str())
 }
 
-/// Pass-1 already-pruned collector shared by `eligible_matches` and `prune_jsonl`
-/// (same call sites as [`claude_collect_matched`]). Marks a `tool_use` ineligible
-/// when either its `tool_result` content OR its expansion-body text is already
-/// `[pruned]` — the latter keeps re-prune a no-op even if the tiny ack is absent.
-fn claude_collect_pruned(
-    entry: &serde_json::Value,
-    already_pruned: &mut std::collections::HashSet<String>,
-) {
-    use crate::prune::PRUNED_PLACEHOLDER;
-    if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
-        return;
-    }
-    let Some(blocks) = entry
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    else {
-        return;
-    };
+/// Is this claude output already pruned? The bare placeholder (older transcripts)
+/// or the placeholder followed by a moved summary.
+fn is_pruned_text(text: &str) -> bool {
+    text.strip_prefix(PRUNED_PLACEHOLDER)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+}
+
+/// Does an output field still hold content to prune?
+fn holds_unpruned_output(field: Option<&serde_json::Value>) -> bool {
+    field.is_some_and(|v| !v.as_str().is_some_and(is_pruned_text))
+}
+
+/// Already-pruned collector. Marks a `tool_use` pruned when either its
+/// `tool_result` content OR its expansion-body text is — the latter keeps re-prune
+/// a no-op even if the tiny ack is absent.
+fn claude_collect_pruned(entry: &serde_json::Value, already_pruned: &mut HashSet<String>) {
     let source_id = claude_entry_source_id(entry);
-    for block in blocks {
-        match block.get("type").and_then(|t| t.as_str()) {
-            // tool_result → keyed by its own `tool_use_id`.
-            Some("tool_result") => {
-                if block.get("content").and_then(|c| c.as_str()) == Some(PRUNED_PLACEHOLDER) {
-                    if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
-                        already_pruned.insert(id.to_string());
-                    }
+    let is_pruned = |block: &serde_json::Value, key| {
+        block
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(is_pruned_text)
+    };
+    for block in claude_content_blocks(entry, "user") {
+        let pruned_id = match block.get("type").and_then(|t| t.as_str()) {
+            Some("tool_result") if is_pruned(block, "content") => {
+                block.get("tool_use_id").and_then(|i| i.as_str())
+            }
+            Some("text") if is_pruned(block, "text") => source_id,
+            _ => None,
+        };
+        if let Some(id) = pruned_id {
+            already_pruned.insert(id.to_string());
+        }
+    }
+}
+
+/// Ids a prune may still pick: the call has a `tool_result` and it isn't pruned
+/// yet. A call killed mid-tool has no result: picking it would blank nothing, and
+/// once its input is `pruned_args` that glob would match it on every later prune.
+fn claude_prunable_ids(parsed: &[ParsedLine]) -> HashSet<String> {
+    let mut answered = HashSet::new();
+    let mut pruned = HashSet::new();
+    for entry in crate::prune::parsed_entries(parsed) {
+        for block in claude_content_blocks(entry, "user") {
+            if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
+                    answered.insert(id.to_string());
                 }
             }
-            // expansion-body text → keyed by the entry's `sourceToolUseID`.
-            Some("text") => {
-                if let Some(id) = source_id {
-                    if block.get("text").and_then(|t| t.as_str()) == Some(PRUNED_PLACEHOLDER) {
-                        already_pruned.insert(id.to_string());
+        }
+        claude_collect_pruned(entry, &mut pruned);
+    }
+    answered.retain(|id| !pruned.contains(id));
+    answered
+}
+
+/// Read-only pre-scan: count eligible matches (control-side, before aborting).
+fn count_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::Result<usize> {
+    let parsed = crate::prune::read_parsed_lines(path)?;
+    let prunable = claude_prunable_ids(&parsed);
+    let mut matched = Vec::new();
+    for entry in crate::prune::parsed_entries(&parsed) {
+        claude_collect_matched(entry, tool_name, needle, &mut matched);
+    }
+    Ok(matched.iter().filter(|id| prunable.contains(*id)).count())
+}
+
+/// The `input` a pruned call keeps: its `--args` glob, so the agent can tell the
+/// pruned calls apart. The no-args selector (empty needle) keeps `{}`.
+fn pruned_input(needle: &str) -> serde_json::Value {
+    if needle.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({ "pruned_args": needle })
+    }
+}
+
+/// The `content` a pruned `tool_result` keeps: the placeholder, plus the target's
+/// summary when it moved out of the prune command.
+fn pruned_result(moved_summary: Option<&str>) -> String {
+    match moved_summary {
+        Some(s) => format!("{PRUNED_PLACEHOLDER} {s}"),
+        None => PRUNED_PLACEHOLDER.to_string(),
+    }
+}
+
+/// Left in the `prune-context` command where a moved `--summary` value was.
+const SUMMARY_MOVED_MARKER: &str = "[was here, now written into the pruned tool result]";
+
+fn is_shell_word_break(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ';' | '|' | '&')
+}
+
+/// The words of a shell `command` with their raw byte spans, quotes and backslash
+/// escapes resolved. Expansions (`$VAR`, `$(...)`) stay literal.
+fn shell_words(command: &str) -> Vec<(String, Range<usize>)> {
+    let mut words = Vec::new();
+    let mut chars = command.char_indices().peekable();
+    loop {
+        while chars.next_if(|&(_, c)| is_shell_word_break(c)).is_some() {}
+        let Some(&(start, _)) = chars.peek() else {
+            break;
+        };
+        let mut word = String::new();
+        while let Some((_, c)) = chars.next_if(|&(_, c)| !is_shell_word_break(c)) {
+            match c {
+                '\'' => word.extend(chars.by_ref().map(|(_, c)| c).take_while(|&c| c != '\'')),
+                '"' => {
+                    while let Some((_, c)) = chars.next() {
+                        match c {
+                            '"' => break,
+                            '\\' => {
+                                match chars.next_if(|&(_, c)| matches!(c, '"' | '\\' | '$' | '`')) {
+                                    Some((_, escaped)) => word.push(escaped),
+                                    None => word.push('\\'),
+                                }
+                            }
+                            _ => word.push(c),
+                        }
                     }
+                }
+                '\\' => word.extend(chars.next().map(|(_, c)| c).filter(|&c| c != '\n')),
+                _ => word.push(c),
+            }
+        }
+        let end = chars.peek().map_or(command.len(), |&(i, _)| i);
+        words.push((word, start..end));
+    }
+    words
+}
+
+/// The targets of a `prune-context` command, read from its shell words the way
+/// `parse_prune_args` reads argv, each with the raw span of its summary value.
+fn prune_command_items(command: &str) -> Vec<(PruneTarget, Range<usize>)> {
+    const VALUE_FLAGS: [&str; 5] = [
+        "--tool-name",
+        "--args",
+        "--summary",
+        "--reason",
+        "--chat-id",
+    ];
+    let words = shell_words(command);
+    let Some(subcommand) = words.iter().position(|(word, _)| word == "prune-context") else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    let mut tool_name = String::new();
+    let mut needle = None;
+    let mut it = words[subcommand + 1..].iter();
+    while let Some((word, span)) = it.next() {
+        let (flag, (value, value_span)) = match word.split_once('=') {
+            Some((flag, value)) if command[span.clone()].starts_with(&format!("{flag}=")) => (
+                flag,
+                (value.to_string(), span.start + flag.len() + 1..span.end),
+            ),
+            _ if VALUE_FLAGS.contains(&word.as_str()) => match it.next() {
+                Some(value) => (word.as_str(), value.clone()),
+                None => break,
+            },
+            _ => continue,
+        };
+        match flag {
+            "--tool-name" => tool_name = value,
+            "--args" => needle = Some(value),
+            "--summary" | "--reason" => {
+                if let Some(needle) = needle.take() {
+                    let tool_name = std::mem::take(&mut tool_name);
+                    items.push((PruneTarget::new(&tool_name, &needle, &value), value_span));
                 }
             }
             _ => {}
         }
     }
+    items
 }
 
-/// Read-only pre-scan: count eligible matches (control-side, before aborting).
-fn count_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::Result<usize> {
-    Ok(eligible_matches(path, tool_name, needle)?.len())
+/// `command` with the summary value of its first item equal to `target` replaced
+/// by [`SUMMARY_MOVED_MARKER`]. `None` when no item matches, e.g. the summary came
+/// from a shell variable.
+fn replace_summary_flag_value(command: &str, target: &PruneTarget) -> Option<String> {
+    let (_, span) = prune_command_items(command)
+        .into_iter()
+        .find(|(item, _)| item == target)?;
+    Some(format!(
+        "{}{SUMMARY_MOVED_MARKER}{}",
+        &command[..span.start],
+        &command[span.end..]
+    ))
 }
 
-/// Pass-2 helper: blank one parsed claude transcript entry in place for any
-/// `tool_use`/`tool_result` whose id ∈ `pruned_ids` (the singleton target seeded
-/// by [`prune_jsonl`]):
-///   - assistant: each `tool_use` whose `id` ∈ set → `input` blanked to `{}` (the
-///     path/command lives in the agent's summary; the args carry nothing it still
-///     needs). Does NOT count toward `results_blanked`/`freed_bytes` — only the
-///     paired output does.
-///   - user: each `tool_result` whose `tool_use_id` ∈ set → `content` blanked to
-///     the placeholder and the id recorded in `outputs_blanked` (drives the
-///     user-facing `results_blanked` count + `freed_bytes`).
+/// Moves `target`'s summary out of the first `prune-context` command leaf of
+/// `input` that carries `target`.
+fn move_summary_out_of_prune_call(input: &mut serde_json::Value, target: &PruneTarget) -> bool {
+    match input {
+        serde_json::Value::String(leaf) if crate::prune::leaf_is_prune_context_command(leaf) => {
+            match replace_summary_flag_value(leaf, target) {
+                Some(rewritten) => {
+                    *leaf = rewritten;
+                    true
+                }
+                None => false,
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .any(|v| move_summary_out_of_prune_call(v, target)),
+        serde_json::Value::Object(map) => map
+            .values_mut()
+            .any(|v| move_summary_out_of_prune_call(v, target)),
+        _ => false,
+    }
+}
+
+/// Where a batch's summaries go.
+#[derive(Default)]
+struct SummaryMoves {
+    /// Rewritten `input` of each `prune-context` call a summary moved out of, by
+    /// tool_use id.
+    prune_call_inputs: HashMap<String, serde_json::Value>,
+    /// Targets (indexes into the batch) whose summary moved. Any other picked
+    /// target's result gets the bare placeholder, so a summary never sits in
+    /// context twice.
+    moved: HashSet<usize>,
+}
+
+/// For each picked target, in batch order, move its summary out of the most
+/// recent `prune-context` call that carries the same target (tool name, args and
+/// summary). The apply cue carries no tool_use id, so the call is found by content.
+fn plan_summary_moves(
+    parsed: &[ParsedLine],
+    targets: &[PruneTarget],
+    chosen: &ChosenTargets,
+) -> SummaryMoves {
+    let prune_calls: Vec<(&str, &serde_json::Value)> = crate::prune::parsed_entries(parsed)
+        .flat_map(|entry| claude_content_blocks(entry, "assistant"))
+        .filter_map(|block| {
+            let input = block
+                .get("input")
+                .filter(|input| crate::prune::value_is_prune_context_call(input))?;
+            Some((block.get("id")?.as_str()?, input))
+        })
+        .collect();
+    let mut picked: Vec<usize> = chosen.values().copied().collect();
+    picked.sort_unstable();
+
+    let mut moves = SummaryMoves::default();
+    for idx in picked {
+        let target = &targets[idx];
+        if target.summary.is_empty() {
+            continue;
+        }
+        for &(id, input) in prune_calls.iter().rev() {
+            let mut rewritten = moves.prune_call_inputs.get(id).unwrap_or(input).clone();
+            if move_summary_out_of_prune_call(&mut rewritten, target) {
+                moves.prune_call_inputs.insert(id.to_string(), rewritten);
+                moves.moved.insert(idx);
+                break;
+            }
+        }
+    }
+    moves
+}
+
+/// Serialized bytes freed by setting `obj[key]` to `value` (negative when it grows).
+fn replace_field(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+) -> isize {
+    let new_len = value.to_string().len() as isize;
+    let old_len = obj
+        .insert(key.to_string(), value)
+        .map_or(0, |old| old.to_string().len() as isize);
+    old_len - new_len
+}
+
+/// Pass-2 helper: rewrite one parsed claude transcript entry in place:
+///   - assistant: each picked `tool_use` → `input` = [`pruned_input`]; each
+///     `prune-context` call in `moves` → its rewritten `input`.
+///   - user: each picked `tool_result` → `content` = [`pruned_result`], the id
+///     recorded in `outputs_blanked` (drives the user-facing `results_blanked`).
 ///   - user EXPANSION BODY: a Skill/command expansion's real payload rides in a
 ///     SEPARATE `user`/`isMeta` entry (a `text` block, NOT a `tool_result`) threaded
-///     by [`claude_entry_source_id`]; its `tool_result` is just a tiny ack. When that
-///     source id ∈ set we blank the text and record the SAME id in `outputs_blanked`
-///     — the set dedups it against the ack ("1 output") while `freed_bytes` picks up
-///     the body. Without this a `--tool-name Skill` prune freed ~nothing (a 570KB
-///     claude-api body once survived a prune that freed 19 bytes).
+///     by [`claude_entry_source_id`]; its `tool_result` is just a tiny ack, which
+///     gets the summary. When that source id is picked we blank the text to the bare
+///     placeholder and record the SAME id in `outputs_blanked` — the set dedups it
+///     against the ack ("1 output") while the freed bytes pick up the body. Without
+///     this a `--tool-name Skill` prune freed ~nothing (a 570KB claude-api body once
+///     survived a prune that freed 19 bytes).
 ///
 /// Cross-line by design: the tool_use lives on the assistant line, its tool_result
-/// and any expansion body on later user lines; the driver runs this per-entry, so
-/// each is blanked when its own line comes through. Returns `None` when the entry was
-/// left untouched, or `Some(freed_bytes)` when a field was blanked (`freed` may be
-/// `0` for an input-only blank or a tiny output — the driver still re-serializes).
-/// Idempotent: already-blank fields no-op so a re-prune stays byte-stable.
+/// and any expansion body on later user lines; the driver runs this per-entry.
+/// Returns `None` when the entry was left untouched, else the serialized bytes
+/// freed (negative when it grew). Already-pruned outputs are left as they are, so a
+/// re-prune stays byte-stable.
 fn blank_claude_entry(
     entry: &mut serde_json::Value,
-    pruned_ids: &std::collections::HashSet<String>,
-    outputs_blanked: &mut std::collections::HashSet<String>,
-) -> Option<usize> {
-    use crate::prune::PRUNED_PLACEHOLDER;
-
+    chosen: &ChosenTargets,
+    targets: &[PruneTarget],
+    moves: &SummaryMoves,
+    outputs_blanked: &mut HashSet<String>,
+) -> Option<isize> {
     let entry_type = entry.get("type").and_then(|t| t.as_str());
     let is_assistant = entry_type == Some("assistant");
     let is_user = entry_type == Some("user");
@@ -1580,7 +1813,7 @@ fn blank_claude_entry(
     let body_source_id = is_user
         .then(|| claude_entry_source_id(entry))
         .flatten()
-        .filter(|id| pruned_ids.contains(*id))
+        .filter(|id| chosen.contains_key(*id))
         .map(str::to_string);
 
     let blocks = entry
@@ -1588,111 +1821,88 @@ fn blank_claude_entry(
         .and_then(|m| m.get_mut("content"))
         .and_then(|c| c.as_array_mut())?;
 
-    let mut freed_total = 0usize;
+    let mut freed = 0isize;
     let mut changed = false;
     for block in blocks.iter_mut() {
-        // Expansion-body text → blank it, counting freed bytes under the source id.
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
+        let block_type = obj.get("type").and_then(|t| t.as_str());
         if let Some(source_id) = &body_source_id {
-            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                if let Some(obj) = block.as_object_mut() {
-                    if let Some(freed) =
-                        crate::prune::blank_string_field(obj, "text", PRUNED_PLACEHOLDER)
-                    {
-                        freed_total += freed;
-                        changed = true;
-                        outputs_blanked.insert(source_id.clone());
-                    }
+            if block_type == Some("text") {
+                if holds_unpruned_output(obj.get("text")) {
+                    freed += replace_field(obj, "text", PRUNED_PLACEHOLDER.into());
+                    changed = true;
+                    outputs_blanked.insert(source_id.clone());
                 }
                 continue;
             }
         }
-        let id = block
-            .get(if is_assistant { "id" } else { "tool_use_id" })
-            .and_then(|i| i.as_str())
-            .map(str::to_string);
-        let Some(id) = id.filter(|id| pruned_ids.contains(id)) else {
-            continue;
-        };
-        let Some(obj) = block.as_object_mut() else {
-            continue;
-        };
-        if is_assistant {
-            if obj.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+        if is_assistant && block_type == Some("tool_use") {
+            let Some(id) = obj.get("id").and_then(|i| i.as_str()) else {
                 continue;
-            }
-            let already_empty = matches!(
-                obj.get("input"),
-                Some(serde_json::Value::Object(m)) if m.is_empty()
-            );
-            if !already_empty {
-                obj.insert("input".into(), serde_json::json!({}));
+            };
+            let input = match (chosen.get(id), moves.prune_call_inputs.get(id)) {
+                (Some(&idx), _) => pruned_input(&targets[idx].needle),
+                (None, Some(rewritten)) => rewritten.clone(),
+                (None, None) => continue,
+            };
+            if obj.get("input") != Some(&input) {
+                freed += replace_field(obj, "input", input);
                 changed = true;
             }
-        } else {
-            if obj.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+        } else if is_user && block_type == Some("tool_result") {
+            let Some((id, &idx)) = obj
+                .get("tool_use_id")
+                .and_then(|i| i.as_str())
+                .and_then(|id| chosen.get_key_value(id))
+            else {
                 continue;
-            }
-            // `None` when already blank — keeps re-prune byte-stable. Idempotency +
-            // freed-byte arithmetic live in the shared helper.
-            if let Some(freed) =
-                crate::prune::blank_string_field(obj, "content", PRUNED_PLACEHOLDER)
-            {
-                freed_total += freed;
+            };
+            if holds_unpruned_output(obj.get("content")) {
+                let summary = moves
+                    .moved
+                    .contains(&idx)
+                    .then(|| targets[idx].summary.as_str());
+                freed += replace_field(obj, "content", pruned_result(summary).into());
                 changed = true;
-                outputs_blanked.insert(id);
+                outputs_blanked.insert(id.clone());
             }
         }
     }
 
-    changed.then_some(freed_total)
+    changed.then_some(freed)
 }
 
-/// Single-target last-only rewrite — the one-round case of [`prune_batch_jsonl`].
-/// Kept as a TEST-ONLY oracle: the batch path must be byte-identical to running
-/// this once per target, so the tests pin that equivalence. Production prunes go
-/// through `prune_batch_jsonl` (one read for the whole burst). Blanks the most
-/// recent eligible match's tool_use input + paired tool_result content; an empty
-/// target (TOCTOU / nothing eligible) is a safe no-op. Claude has no fail-closed
-/// post-scan, so the driver's returned final entries are ignored.
+/// Single-target, summary-less [`prune_batch_jsonl`], a test shorthand.
 #[cfg(test)]
-fn prune_jsonl(
-    path: &Path,
-    tool_name: &str,
-    needle: &str,
-) -> std::io::Result<crate::prune::PruneStats> {
-    let (stats, _final_entries) = crate::prune::rewrite_jsonl_last_only(
-        path,
-        |entry, matched| claude_collect_matched(entry, tool_name, needle, matched),
-        claude_collect_pruned,
-        blank_claude_entry,
-    )?;
-    Ok(stats)
+fn prune_jsonl(path: &Path, tool_name: &str, needle: &str) -> std::io::Result<PruneStats> {
+    prune_batch_jsonl(path, &[PruneTarget::new(tool_name, needle, "")])
 }
 
-/// Batch entry point behind `PRUNE_OPS::prune_batch`: blank the last-only target of
-/// EVERY `(tool_name, needle)` in `targets` in ONE read/write, reproducing exactly
-/// what running [`prune_jsonl`] once per target produced (same blanked set + freed
-/// bytes). The single-read batch driver
-/// ([`crate::prune::rewrite_jsonl_batch_last_only`]) re-derives the per-target
-/// matches from the SAME claude collectors `prune_jsonl` uses, subtracting both the
-/// on-disk `[pruned]` set and the ids already chosen earlier in the batch — so two
-/// same-needle targets pick two DISTINCT successive matches, just as two separate
-/// `prune_jsonl` calls did. Claude has no fail-closed post-scan, so the driver's
-/// final entries are ignored.
-fn prune_batch_jsonl(
-    path: &Path,
-    targets: &[crate::prune::PruneTarget],
-) -> std::io::Result<crate::prune::PruneStats> {
-    let (stats, _final_entries) = crate::prune::rewrite_jsonl_batch_last_only(
-        path,
-        targets.len(),
-        |idx, entry, matched| {
-            let (tool_name, needle) = &targets[idx];
-            claude_collect_matched(entry, tool_name, needle, matched)
+/// Batch entry point behind `PRUNE_OPS::prune_batch`, in ONE read/write: pick the
+/// most recent match of each target among [`claude_prunable_ids`] (a target whose
+/// match an earlier target with a different selector picked is a miss — its
+/// summary would land on an output it wasn't written about), move the summaries
+/// out of the prune command ([`plan_summary_moves`]), and rewrite.
+/// `freed_bytes` is the net serialized shrink of all edits, floored at 0.
+fn prune_batch_jsonl(path: &Path, targets: &[PruneTarget]) -> std::io::Result<PruneStats> {
+    let parsed = crate::prune::read_parsed_lines(path)?;
+    let prunable = claude_prunable_ids(&parsed);
+    let chosen = crate::prune::select_batch_last_only(
+        &parsed,
+        targets,
+        BatchCollision::SameSelectorOnly,
+        |target, entry, matched| {
+            claude_collect_matched(entry, &target.tool_name, &target.needle, matched)
         },
-        claude_collect_pruned,
-        blank_claude_entry,
-    )?;
+        |id| prunable.contains(id),
+    );
+    let moves = plan_summary_moves(&parsed, targets, &chosen);
+    let (stats, _final_entries) =
+        crate::prune::blank_pass(path, parsed, &chosen, |entry, chosen, outputs_blanked| {
+            blank_claude_entry(entry, chosen, targets, &moves, outputs_blanked)
+        })?;
     Ok(stats)
 }
 
@@ -2168,7 +2378,13 @@ mod tests {
         let leaf_str = leaf.to_str().unwrap();
         let encoded: String = leaf_str
             .chars()
-            .map(|c| if c == '/' || c == '\\' || c == ':' { '-' } else { c })
+            .map(|c| {
+                if c == '/' || c == '\\' || c == ':' {
+                    '-'
+                } else {
+                    c
+                }
+            })
             .collect();
 
         let decoded = decode_project_dir(&encoded).expect("decode should resolve a real dir");
@@ -2483,6 +2699,7 @@ mod tests {
         let cmd = a.prepare_command(&ctx).unwrap();
         // The standing prune-context instruction rides --append-system-prompt …
         assert!(cmd.contains("prune-context"), "got: {}", cmd);
+        assert!(cmd.contains(PRUNE_SUMMARY_MOVE_INSTRUCTION), "got: {}", cmd);
         // … and the PostToolUse reminder hook is injected via --settings.
         assert!(cmd.contains("--settings"), "got: {}", cmd);
         assert!(cmd.contains("prune-reminder-hook"), "got: {}", cmd);
@@ -2554,8 +2771,8 @@ mod tests {
         use crate::prune::test_util::{read_lines, write_jsonl};
 
         /// One assistant `tool_use` (Read junk.rs) paired to a user `tool_result`.
-        /// Pruning by (Read, junk) blanks the result content to `[pruned]` and the
-        /// tool_use input to `{}`, preserving every other field.
+        /// Pruning by (Read, junk) with no summary sets the result content to
+        /// `[pruned]` and the tool_use input to the glob, preserving every other field.
         #[test]
         fn prunes_paired_tool_use_and_result() {
             let f = write_jsonl(&[
@@ -2567,10 +2784,10 @@ mod tests {
             assert_eq!(stats.results_blanked, 1);
             assert!(stats.freed_bytes > 0);
             let lines = read_lines(f.path());
-            // tool_use input blanked to {}, threading fields intact.
+            // tool_use input keeps only the glob, threading fields intact.
             assert_eq!(
                 lines[0]["message"]["content"][0]["input"],
-                serde_json::json!({})
+                serde_json::json!({"pruned_args": "junk"})
             );
             assert_eq!(lines[0]["uuid"], "a1");
             // paired tool_result content blanked to the placeholder.
@@ -2605,7 +2822,7 @@ mod tests {
             let lines = read_lines(f.path());
             assert_eq!(
                 lines[0]["message"]["content"][0]["input"],
-                serde_json::json!({})
+                serde_json::json!({"pruned_args": "claude-api"})
             );
             assert_eq!(lines[1]["message"]["content"][0]["content"], "[pruned]");
             // The expansion body text is blanked; threading fields intact.
@@ -2724,16 +2941,16 @@ mod tests {
         fn batch_distinct_needles_blanks_all_in_one_pass() {
             let f = write_jsonl(&[
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"junk1.rs"}}]}}"#,
-                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"body one"}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"body one, long enough to free bytes"}]}}"#,
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"junk2.rs"}}]}}"#,
-                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"body two"}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"body two, long enough to free bytes"}]}}"#,
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"junk3.rs"}}]}}"#,
-                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"body three"}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"body three, long enough to free bytes"}]}}"#,
             ]);
-            let targets = vec![
-                ("Read".to_string(), "junk1.rs".to_string()),
-                ("Read".to_string(), "junk2.rs".to_string()),
-                ("Read".to_string(), "junk3.rs".to_string()),
+            let targets = [
+                PruneTarget::new("Read", "junk1.rs", ""),
+                PruneTarget::new("Read", "junk2.rs", ""),
+                PruneTarget::new("Read", "junk3.rs", ""),
             ];
             let stats = prune_batch_jsonl(f.path(), &targets).unwrap();
             assert_eq!(stats.results_blanked, 3, "all 3 distinct targets blanked");
@@ -2761,9 +2978,9 @@ mod tests {
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"junk.rs"}}]}}"#,
                 r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"body three"}]}}"#,
             ]);
-            let targets = vec![
-                ("Read".to_string(), "junk".to_string()),
-                ("Read".to_string(), "junk".to_string()),
+            let targets = [
+                PruneTarget::new("Read", "junk", ""),
+                PruneTarget::new("Read", "junk", ""),
             ];
             let stats = prune_batch_jsonl(f.path(), &targets).unwrap();
             assert_eq!(
@@ -2805,10 +3022,10 @@ mod tests {
 
             // Batch: the same three targets in one call.
             let batch = write_jsonl(lines_src);
-            let targets = vec![
-                ("Read".to_string(), "junk".to_string()),
-                ("Read".to_string(), "junk".to_string()),
-                ("Read".to_string(), "other".to_string()),
+            let targets = [
+                PruneTarget::new("Read", "junk", ""),
+                PruneTarget::new("Read", "junk", ""),
+                PruneTarget::new("Read", "other", ""),
             ];
             let batch_stats = prune_batch_jsonl(batch.path(), &targets).unwrap();
             let batch_bytes = std::fs::read_to_string(batch.path()).unwrap();
@@ -2820,6 +3037,382 @@ mod tests {
             assert_eq!(batch_stats.results_blanked, seq_stats.results_blanked);
             assert_eq!(batch_stats.freed_bytes, seq_stats.freed_bytes);
             assert_eq!(batch_stats.results_blanked, 3);
+        }
+
+        fn tool_use(id: &str, name: &str, input: serde_json::Value) -> String {
+            serde_json::json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":id,"name":name,"input":input}
+            ]}})
+            .to_string()
+        }
+
+        fn tool_result(id: &str, content: &str) -> String {
+            serde_json::json!({"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":id,"content":content}
+            ]}})
+            .to_string()
+        }
+
+        fn prune_call(id: &str, command: &str) -> [String; 2] {
+            [
+                tool_use(id, "Bash", serde_json::json!({ "command": command })),
+                tool_result(id, "queued 1 prune(s)"),
+            ]
+        }
+
+        fn write(lines: &[String]) -> crate::prune::test_util::TempJsonl {
+            write_jsonl(&lines.iter().map(String::as_str).collect::<Vec<_>>())
+        }
+
+        fn input_of(line: &serde_json::Value) -> &serde_json::Value {
+            &line["message"]["content"][0]["input"]
+        }
+
+        fn content_of(line: &serde_json::Value) -> &serde_json::Value {
+            &line["message"]["content"][0]["content"]
+        }
+
+        #[test]
+        fn summary_flag_value_is_read_as_shell_words() {
+            let m = SUMMARY_MOVED_MARKER;
+            let cases = [
+                (
+                    r#"p prune-context --tool-name Read --args "build.log" --summary "build""#,
+                    ("Read", "build.log", "build"),
+                    Some(format!(
+                        r#"p prune-context --tool-name Read --args "build.log" --summary {m}"#
+                    )),
+                ),
+                (
+                    "p prune-context --args x --summary 'kept: a b' --chat-id c",
+                    ("", "x", "kept: a b"),
+                    Some(format!(
+                        "p prune-context --args x --summary {m} --chat-id c"
+                    )),
+                ),
+                (
+                    "p prune-context --args x --summary kept && echo ok",
+                    ("", "x", "kept"),
+                    Some(format!("p prune-context --args x --summary {m} && echo ok")),
+                ),
+                (
+                    r#"p prune-context --args x --summary="kept it""#,
+                    ("", "x", "kept it"),
+                    Some(format!("p prune-context --args x --summary={m}")),
+                ),
+                (
+                    r#"p prune-context --args x --reason "kept""#,
+                    ("", "x", "kept"),
+                    Some(format!("p prune-context --args x --reason {m}")),
+                ),
+                (
+                    r#"p prune-context --args x --summary "say \"hi\"""#,
+                    ("", "x", r#"say "hi""#),
+                    Some(format!("p prune-context --args x --summary {m}")),
+                ),
+                // Only a whole flag value of the same target counts.
+                (
+                    r#"p prune-context --args "build" --summary "other""#,
+                    ("", "build", "build"),
+                    None,
+                ),
+                (
+                    r#"p prune-context --args x --summary "build passed""#,
+                    ("", "x", "build"),
+                    None,
+                ),
+                (
+                    r#"p prune-context --args y --summary "kept""#,
+                    ("", "x", "kept"),
+                    None,
+                ),
+                (
+                    r#"p prune-context --args "a --summary kept" --summary kept"#,
+                    ("", "a --summary kept", "kept"),
+                    Some(format!(
+                        r#"p prune-context --args "a --summary kept" --summary {m}"#
+                    )),
+                ),
+                (
+                    r#"p prune-context --args x --summary "$S""#,
+                    ("", "x", "kept"),
+                    None,
+                ),
+            ];
+            for (command, (tool, needle, summary), expected) in cases {
+                assert_eq!(
+                    replace_summary_flag_value(command, &PruneTarget::new(tool, needle, summary)),
+                    expected,
+                    "{command}"
+                );
+            }
+        }
+
+        /// The summary lands in the pruned result, the pruned call keeps its glob,
+        /// and the prune command keeps a marker instead of the summary.
+        #[test]
+        fn summary_moves_from_prune_command_into_result() {
+            let command = r#""$ZUCCHINI_SPAWNER_BIN" prune-context --tool-name Read --args "build.log" --summary "build""#;
+            let mut lines = vec![
+                tool_use("r1", "Read", serde_json::json!({"file_path": "build.log"})),
+                tool_result("r1", "log body"),
+            ];
+            lines.extend(prune_call("p1", command));
+            let f = write(&lines);
+
+            let stats =
+                prune_batch_jsonl(f.path(), &[PruneTarget::new("Read", "build.log", "build")])
+                    .unwrap();
+            assert_eq!(stats.results_blanked, 1);
+            let out = read_lines(f.path());
+            assert_eq!(
+                input_of(&out[0]),
+                &serde_json::json!({"pruned_args": "build.log"})
+            );
+            assert_eq!(content_of(&out[1]), "[pruned] build");
+            assert_eq!(
+                input_of(&out[2])["command"],
+                command.replace(r#""build""#, SUMMARY_MOVED_MARKER)
+            );
+            assert_eq!(content_of(&out[3]), "queued 1 prune(s)");
+        }
+
+        #[test]
+        fn empty_needle_keeps_empty_input() {
+            let mut lines = vec![
+                tool_use("l1", "LS", serde_json::json!({})),
+                tool_result("l1", "a b c"),
+            ];
+            lines.extend(prune_call(
+                "p1",
+                r#"p prune-context --tool-name LS --args "" --summary "three files""#,
+            ));
+            let f = write(&lines);
+            prune_batch_jsonl(f.path(), &[PruneTarget::new("LS", "", "three files")]).unwrap();
+            let out = read_lines(f.path());
+            assert_eq!(input_of(&out[0]), &serde_json::json!({}));
+            assert_eq!(content_of(&out[1]), "[pruned] three files");
+        }
+
+        /// Each target of a multi-target command gets its own summary, and each
+        /// flag value becomes a marker.
+        #[test]
+        fn multi_target_command_moves_each_summary() {
+            let command = r#"p prune-context --tool-name Read --args a.rs --summary "same" --tool-name Read --args b.rs --summary "same""#;
+            let mut lines = vec![
+                tool_use("a", "Read", serde_json::json!({"file_path": "a.rs"})),
+                tool_result("a", "A body"),
+                tool_use("b", "Read", serde_json::json!({"file_path": "b.rs"})),
+                tool_result("b", "B body"),
+            ];
+            lines.extend(prune_call("p1", command));
+            let f = write(&lines);
+            let targets = [
+                PruneTarget::new("Read", "a.rs", "same"),
+                PruneTarget::new("Read", "b.rs", "same"),
+            ];
+            assert_eq!(
+                prune_batch_jsonl(f.path(), &targets)
+                    .unwrap()
+                    .results_blanked,
+                2
+            );
+            let out = read_lines(f.path());
+            assert_eq!(content_of(&out[1]), "[pruned] same");
+            assert_eq!(content_of(&out[3]), "[pruned] same");
+            assert_eq!(
+                input_of(&out[4])["command"],
+                command.replace(r#""same""#, SUMMARY_MOVED_MARKER)
+            );
+        }
+
+        /// A summary the requesting command doesn't carry literally stays in it, an
+        /// older prune call with the same summary for another target is left alone,
+        /// and the result gets the bare placeholder.
+        #[test]
+        fn unfindable_summary_leaves_commands_and_bare_placeholder() {
+            let older = r#"p prune-context --tool-name Read --args b.rs --summary "kept""#;
+            let command = r#"p prune-context --tool-name Read --args a.rs --summary "$S""#;
+            let mut lines = vec![
+                tool_use("a", "Read", serde_json::json!({"file_path": "a.rs"})),
+                tool_result("a", "A body"),
+            ];
+            lines.extend(prune_call("p0", older));
+            lines.extend(prune_call("p1", command));
+            let f = write(&lines);
+            prune_batch_jsonl(f.path(), &[PruneTarget::new("Read", "a.rs", "kept")]).unwrap();
+            let out = read_lines(f.path());
+            assert_eq!(content_of(&out[1]), "[pruned]");
+            assert_eq!(input_of(&out[2])["command"], older);
+            assert_eq!(input_of(&out[4])["command"], command);
+        }
+
+        #[test]
+        fn long_summary_moves_whole() {
+            let summary = "a".repeat(4096);
+            let command =
+                format!("p prune-context --tool-name Read --args a.rs --summary {summary}");
+            let mut lines = vec![
+                tool_use("a", "Read", serde_json::json!({"file_path": "a.rs"})),
+                tool_result("a", "A body"),
+            ];
+            lines.extend(prune_call("p1", &command));
+            let f = write(&lines);
+            prune_batch_jsonl(f.path(), &[PruneTarget::new("Read", "a.rs", &summary)]).unwrap();
+            let out = read_lines(f.path());
+            assert_eq!(content_of(&out[1]), format!("[pruned] {summary}").as_str());
+        }
+
+        /// A Skill's ack gets the summary; the expansion body stays bare.
+        #[test]
+        fn skill_summary_goes_to_ack_not_body() {
+            let mut lines = vec![
+                tool_use("sk1", "Skill", serde_json::json!({"skill": "claude-api"})),
+                tool_result("sk1", "Running claude-api skill"),
+                serde_json::json!({"type":"user","isMeta":true,"sourceToolUseID":"sk1",
+                    "message":{"content":[{"type":"text","text":"big body"}]}})
+                .to_string(),
+            ];
+            lines.extend(prune_call(
+                "p1",
+                r#"p prune-context --tool-name Skill --args claude-api --summary "models listed""#,
+            ));
+            let f = write(&lines);
+            prune_batch_jsonl(
+                f.path(),
+                &[PruneTarget::new("Skill", "claude-api", "models listed")],
+            )
+            .unwrap();
+            let out = read_lines(f.path());
+            assert_eq!(content_of(&out[1]), "[pruned] models listed");
+            assert_eq!(out[2]["message"]["content"][0]["text"], "[pruned]");
+        }
+
+        /// A result already pruned with a summary (or a genuine output starting
+        /// with `[pruned] `) is not re-selected, and a repeat leaves the bytes alone.
+        #[test]
+        fn summarised_result_is_already_pruned() {
+            let mut lines = vec![
+                tool_use("a", "Read", serde_json::json!({"file_path": "a.rs"})),
+                tool_result("a", "A body"),
+            ];
+            lines.extend(prune_call(
+                "p1",
+                r#"p prune-context --tool-name Read --args a.rs --summary "kept""#,
+            ));
+            let f = write(&lines);
+            let target = [PruneTarget::new("Read", "a.rs", "kept")];
+            prune_batch_jsonl(f.path(), &target).unwrap();
+            let after_first = std::fs::read_to_string(f.path()).unwrap();
+
+            assert_eq!(count_matches(f.path(), "Read", "a.rs").unwrap(), 0);
+            assert_eq!(
+                prune_batch_jsonl(f.path(), &target).unwrap(),
+                PruneStats::default()
+            );
+            assert_eq!(std::fs::read_to_string(f.path()).unwrap(), after_first);
+
+            let genuine = write(&[
+                tool_use("g", "Read", serde_json::json!({"file_path": "g.rs"})),
+                tool_result("g", "[pruned] looks pruned"),
+            ]);
+            assert_eq!(count_matches(genuine.path(), "Read", "g.rs").unwrap(), 0);
+        }
+
+        /// A call killed mid-tool (no `tool_result`) is never picked and doesn't
+        /// hide an older answered match.
+        #[test]
+        fn unanswered_tool_use_is_never_selected() {
+            let f = write(&[
+                tool_use("old", "Read", serde_json::json!({"file_path": "junk.rs"})),
+                tool_result("old", "old body"),
+                tool_use(
+                    "killed",
+                    "Read",
+                    serde_json::json!({"file_path": "junk.rs"}),
+                ),
+            ]);
+            assert_eq!(count_matches(f.path(), "Read", "junk").unwrap(), 1);
+            assert_eq!(
+                prune_jsonl(f.path(), "Read", "junk")
+                    .unwrap()
+                    .results_blanked,
+                1
+            );
+            let out = read_lines(f.path());
+            assert_eq!(content_of(&out[1]), "[pruned]");
+            assert_eq!(
+                input_of(&out[2]),
+                &serde_json::json!({"file_path": "junk.rs"})
+            );
+        }
+
+        /// In a batch, a target whose newest match a DIFFERENT selector already
+        /// picked is a miss rather than falling through to an older output.
+        #[test]
+        fn batch_collision_with_different_selector_is_a_miss() {
+            let f = write(&[
+                tool_use("t1", "Read", serde_json::json!({"file_path": "junk1.rs"})),
+                tool_result("t1", "body one"),
+                tool_use("t2", "Read", serde_json::json!({"file_path": "junk2.rs"})),
+                tool_result("t2", "body two"),
+            ]);
+            let targets = [
+                PruneTarget::new("Read", "junk2", "two"),
+                PruneTarget::new("Read", "junk", "any junk"),
+            ];
+            assert_eq!(
+                prune_batch_jsonl(f.path(), &targets)
+                    .unwrap()
+                    .results_blanked,
+                1
+            );
+            let out = read_lines(f.path());
+            assert_eq!(content_of(&out[1]), "body one");
+            assert_eq!(content_of(&out[3]), "[pruned]");
+        }
+
+        /// `freed_bytes` is the net serialized shrink — input, result and the
+        /// command's summary→marker swap — and floors at 0 when the edits grow the
+        /// transcript.
+        #[test]
+        fn freed_bytes_is_net_serialized_shrink() {
+            let transcript = |body: &str| {
+                let mut lines = vec![
+                    tool_use("a", "Read", serde_json::json!({"file_path": "src/a.rs"})),
+                    tool_result("a", body),
+                ];
+                lines.extend(prune_call(
+                    "p1",
+                    r#"p prune-context --tool-name Read --args a.rs --summary "a.rs: \"quoted\" takeaway""#,
+                ));
+                lines
+            };
+            let target = [PruneTarget::new(
+                "Read",
+                "a.rs",
+                r#"a.rs: "quoted" takeaway"#,
+            )];
+
+            let big = write(&transcript(&"line\n".repeat(200)));
+            let before = std::fs::metadata(big.path()).unwrap().len() as usize;
+            let stats = prune_batch_jsonl(big.path(), &target).unwrap();
+            let after = std::fs::metadata(big.path()).unwrap().len() as usize;
+            assert_eq!(stats.freed_bytes, before - after);
+            assert_eq!(
+                input_of(&read_lines(big.path())[2])["command"],
+                format!(
+                    "p prune-context --tool-name Read --args a.rs --summary {SUMMARY_MOVED_MARKER}"
+                )
+            );
+
+            let tiny = write(&transcript("x"));
+            let before = std::fs::metadata(tiny.path()).unwrap().len();
+            assert_eq!(
+                prune_batch_jsonl(tiny.path(), &target).unwrap().freed_bytes,
+                0
+            );
+            assert!(std::fs::metadata(tiny.path()).unwrap().len() > before);
         }
     }
 }

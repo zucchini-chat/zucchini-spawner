@@ -1193,8 +1193,8 @@ fn prune_batch_cursor(
     // subtracting earlier rounds' picks — reproduces K on-disk passes).
     let mut chosen: Vec<String> = Vec::new();
     let mut chosen_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (tool_name, needle) in targets {
-        let eligible = cursor_eligible_ids(&store, tool_name, needle);
+    for target in targets {
+        let eligible = cursor_eligible_ids(&store, &target.tool_name, &target.needle);
         if let Some(pick) = eligible
             .into_iter()
             .rev()
@@ -3435,8 +3435,11 @@ mod tests {
         );
 
         // prune one target.
-        let stats =
-            prune_batch_cursor(&path, &[("Read".to_string(), "*BACKLOG.md*".to_string())]).unwrap();
+        let stats = prune_batch_cursor(
+            &path,
+            &[crate::prune::PruneTarget::new("Read", "*BACKLOG.md*", "")],
+        )
+        .unwrap();
         assert_eq!(stats.results_blanked, 1);
         assert!(stats.freed_bytes > 0, "freed_bytes should be positive");
 
@@ -3465,8 +3468,11 @@ mod tests {
         );
 
         // idempotent: a second identical prune is a clean no-op.
-        let stats2 =
-            prune_batch_cursor(&path, &[("Read".to_string(), "*BACKLOG.md*".to_string())]).unwrap();
+        let stats2 = prune_batch_cursor(
+            &path,
+            &[crate::prune::PruneTarget::new("Read", "*BACKLOG.md*", "")],
+        )
+        .unwrap();
         assert_eq!(stats2.results_blanked, 0, "re-prune must be a no-op");
         let (root_after, _) = read_head(&path);
         assert_eq!(root_after, new_root, "no-op must not move the head");
@@ -3495,8 +3501,11 @@ mod tests {
         let (store, _ids) = build_store(&[system, assistant, tool]);
         let path = store.db_path();
 
-        let stats =
-            prune_batch_cursor(&path, &[("Read".to_string(), "*A.md*".to_string())]).unwrap();
+        let stats = prune_batch_cursor(
+            &path,
+            &[crate::prune::PruneTarget::new("Read", "*A.md*", "")],
+        )
+        .unwrap();
         assert_eq!(stats.results_blanked, 1);
 
         let (_new_root, new_order) = read_head(&path);
@@ -3527,7 +3536,8 @@ mod tests {
 
         // any-tool, prune-context's own needle → zero eligible.
         assert_eq!(count_cursor_matches(&path, "", "*A.md*").unwrap(), 0);
-        let stats = prune_batch_cursor(&path, &[("".to_string(), "*A.md*".to_string())]).unwrap();
+        let stats =
+            prune_batch_cursor(&path, &[crate::prune::PruneTarget::new("", "*A.md*", "")]).unwrap();
         assert_eq!(stats.results_blanked, 0, "self-call must not be pruned");
     }
 }

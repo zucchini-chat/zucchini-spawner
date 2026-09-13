@@ -1053,7 +1053,7 @@ fn count_pi_matches(
 /// `results_blanked = 0` and skips the timeline frame (matches codex/claude).
 fn blank_pi_entry(
     entry: &mut Value,
-    pruned_ids: &std::collections::HashSet<String>,
+    pruned_ids: &crate::prune::ChosenTargets,
     outputs_blanked: &mut std::collections::HashSet<String>,
 ) -> Option<usize> {
     let msg = entry.get_mut("message")?.as_object_mut()?;
@@ -1061,7 +1061,7 @@ fn blank_pi_entry(
         return None;
     }
     let call_id = msg.get("toolCallId").and_then(|v| v.as_str())?.to_string();
-    if !pruned_ids.contains(&call_id) {
+    if !pruned_ids.contains_key(&call_id) {
         return None;
     }
     let blocks = msg.get_mut("content").and_then(|v| v.as_array_mut())?;
@@ -1087,30 +1087,20 @@ fn blank_pi_entry(
     }
 }
 
-/// Single-target pi rewrite, LAST-ONLY: blank the `toolResult` content of just the
-/// MOST RECENT eligible match. The one-round case of [`prune_batch_pi_jsonl`];
-/// kept TEST-ONLY as the equivalence oracle the batch path is pinned against.
-/// Production goes through the batch fn. `PruneStats::results_blanked` is 0 or 1.
+/// Single-target, summary-less [`prune_batch_pi_jsonl`], a test shorthand.
 #[cfg(test)]
 fn prune_pi_jsonl(
     path: &std::path::Path,
     tool_name: &str,
     needle: &str,
 ) -> std::io::Result<PruneStats> {
-    let (stats, _final_entries) = crate::prune::rewrite_jsonl_last_only(
-        path,
-        |entry, matched| pi_collect_matched(entry, tool_name, needle, matched),
-        pi_collect_pruned,
-        blank_pi_entry,
-    )?;
-    Ok(stats)
+    prune_batch_pi_jsonl(path, &[PruneTarget::new(tool_name, needle, "")])
 }
 
 /// Batch entry point behind `PRUNE_OPS::prune_batch`: blank the last-only target of
 /// every `(tool_name, needle)` in `targets` in ONE read/write via the shared batch
-/// driver ([`crate::prune::rewrite_jsonl_batch_last_only`]), reproducing exactly
-/// what running [`prune_pi_jsonl`] once per target produced. Same pi collectors;
-/// pi has no fail-closed post-scan (result outputs aren't duplicated across the
+/// driver ([`crate::prune::rewrite_jsonl_batch_last_only`]). Pi has no fail-closed
+/// post-scan (result outputs aren't duplicated across the
 /// transcript like gemini's), so the final entries are ignored (mirrors codex).
 fn prune_batch_pi_jsonl(
     path: &std::path::Path,
@@ -1118,10 +1108,9 @@ fn prune_batch_pi_jsonl(
 ) -> std::io::Result<PruneStats> {
     let (stats, _final_entries) = crate::prune::rewrite_jsonl_batch_last_only(
         path,
-        targets.len(),
-        |idx, entry, matched| {
-            let (tool_name, needle) = &targets[idx];
-            pi_collect_matched(entry, tool_name, needle, matched)
+        targets,
+        |target, entry, matched| {
+            pi_collect_matched(entry, &target.tool_name, &target.needle, matched)
         },
         pi_collect_pruned,
         blank_pi_entry,

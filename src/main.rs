@@ -1502,7 +1502,7 @@ async fn apply_prune_group(
             Some(ops) => {
                 let targets: Vec<prune::PruneTarget> = path_reqs
                     .iter()
-                    .map(|r| (r.tool_name.clone(), r.needle.clone()))
+                    .map(|r| prune::PruneTarget::new(&r.tool_name, &r.needle, &r.reason))
                     .collect();
                 match (ops.prune_batch)(jsonl_path, &targets) {
                     Ok(stats) => {
@@ -2517,9 +2517,9 @@ async fn run_prune_context_cli(args: &[String]) {
                 // Exit 0 CLEANLY — do NOT trigger the restart from here. The
                 // daemon already has the prune queued; it applies it (abort →
                 // rewrite → respawn) when claude emits THIS call's `tool_result`
-                // frame, i.e. strictly AFTER claude has persisted our stdout
-                // summary to the transcript. That ordering is the whole point: the
-                // resumed agent then sees its own prune call + this summary in
+                // frame, i.e. strictly AFTER claude has persisted this call's
+                // result to the transcript. That ordering is the whole point: the
+                // resumed agent then sees its own completed prune call in
                 // context, so it won't re-run the now-satisfied prune. Triggering
                 // the restart here instead would SIGTERM this CLI mid-call, before
                 // the result persisted — the lost-tool_result bug this avoids.
