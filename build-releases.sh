@@ -47,9 +47,9 @@ NATIVE_TARGET="aarch64-apple-darwin"
 # before this script runs. build_target's windows branch only VERIFIES it's
 # present (warns, does not fail, if missing) and the wipe above preserves it, so
 # this Mac/Linux run builds darwin + linux and ships the Windows binary alongside
-# them untouched. On the Windows box, ONE script does build + sign + stage (+
-# optional scp to this Mac): zucchini-spawner/build-windows.ps1 (signing via
-# Azure Trusted Signing, sign-windows.ps1).
+# them untouched. On the Windows box, zucchini-spawner/build-windows.ps1 does
+# build + sign + stage (signing via Azure Trusted Signing, sign-windows.ps1) and
+# copy-windows-to-mac.ps1 copies it to this Mac.
 ALL_TARGETS="
 aarch64-apple-darwin:zucchini-spawner-darwin-arm64
 x86_64-apple-darwin:zucchini-spawner-darwin-x86_64

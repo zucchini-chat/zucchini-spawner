@@ -4,22 +4,19 @@
 
   Runs on a Windows box. Produces releases\zucchini-spawner-windows-x86_64 — the
   EXACT artifact name deploy.sh and install.ps1 expect (see build-releases.sh) —
-  Authenticode-signed via Azure Trusted Signing (sign-windows.ps1). Optionally
-  scp's it to the Mac that runs backend-powersync/deploy.sh; that script builds
-  the darwin/linux binaries and ships this Windows one alongside them untouched
-  (build-releases.sh preserves a hand-supplied windows binary).
+  Authenticode-signed via Azure Trusted Signing (sign-windows.ps1).
+  ..\copy-windows-to-mac.ps1 drops it on the Mac that runs
+  backend-powersync/deploy.sh, which builds the darwin/linux binaries and ships
+  this Windows one alongside them untouched (build-releases.sh preserves a
+  hand-supplied windows binary).
 
   Usage:
     .\build-windows.ps1              # build + sign + stage into releases\
-    .\build-windows.ps1 -Push        # also scp to $env:ZUCCHINI_MAC_RELEASES_DEST
     .\build-windows.ps1 -SkipSign    # skip the signing step (still stages)
 
-  Env:
-    ZUCCHINI_MAC_RELEASES_DEST   scp destination DIRECTORY for -Push, e.g.
-                                 user@mac:/Users/ivan/src/zucchini-chat/zucchini-spawner/releases/
-    (signing vars: see sign-windows.ps1)
+  Env: signing vars, see sign-windows.ps1
 #>
-param([switch]$Push, [switch]$SkipSign)
+param([switch]$SkipSign)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -63,18 +60,3 @@ $ver = if ($verMatch) { $verMatch.Matches[0].Groups[1].Value } else { '?' }
 Write-Host ''
 Write-Host "==> Staged $ArtifactName (v$ver):"
 Write-Host "    $staged"
-
-if ($Push) {
-    $dest = $env:ZUCCHINI_MAC_RELEASES_DEST
-    if (-not $dest) {
-        throw "-Push needs ZUCCHINI_MAC_RELEASES_DEST (scp dest DIR, e.g. user@mac:/…/zucchini-spawner/releases/)"
-    }
-    Write-Host "==> scp -> $dest"
-    scp $staged $dest
-    if ($LASTEXITCODE -ne 0) { throw "scp failed (exit $LASTEXITCODE)" }
-    Write-Host '    Sent. On the Mac, run backend-powersync/deploy.sh (it builds darwin/linux and ships this too).'
-}
-else {
-    Write-Host "    Next: copy it to <mac>:.../zucchini-spawner/releases/$ArtifactName"
-    Write-Host '    (or re-run with -Push after setting ZUCCHINI_MAC_RELEASES_DEST).'
-}
