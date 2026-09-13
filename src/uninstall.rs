@@ -128,27 +128,33 @@ fn spawn_macos() {
 
 #[cfg(target_os = "windows")]
 fn spawn_windows() {
-    // Stage the .ps1 under the install dir (mirrors the linux "body off argv"
-    // staging) and run it with `powershell -File`, detached. The cleanup runs
-    // in its own process tree — `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`
-    // severs it from ours — so it survives once we exit; the script deletes the
-    // logon Scheduled Task (which is what would otherwise respawn us) and then
-    // the install dir.
+    // Stage the .ps1 and run it with `powershell -File`, in its own process
+    // group so it outlives our exit; the script deletes the logon Scheduled Task
+    // (which is what would otherwise respawn us) and then the install dir.
     //
-    // UNTESTED on a real Windows box. Known caveat: the script removes `bin/`,
-    // but Windows won't unlink our own running .exe, so `Remove-Item
-    // -ErrorAction SilentlyContinue` leaves it behind — acceptable, since the
-    // Scheduled Task is already gone so nothing respawns, and an orphan exe in
-    // an otherwise-emptied dir is harmless (the dir is reported "Cleaned …" not
-    // "Removed …"). A perfect wipe would need a self-deleting trampoline; not
-    // worth the complexity for the rare self-uninstall path.
+    // Two Windows-specific hazards this handles — the earlier version tripped on
+    // both and cleaned up nothing:
+    //
+    //  1. Launch flags: use exactly `SPAWN_CREATION_FLAGS`
+    //     (`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`) — the SAME flags every
+    //     other spawn in this binary uses (see windows.rs). Do NOT add
+    //     `DETACHED_PROCESS`: that leaves powershell.exe with no console at all,
+    //     and Windows PowerShell's ConsoleHost then fails to initialize and exits
+    //     before running a single line. CreateProcess still SUCCEEDS (we log a
+    //     pid), so the failure is silent — the cleanup simply never happens.
+    //     `CREATE_NO_WINDOW` gives a hidden console, which powershell needs; the
+    //     child still outlives us (Windows doesn't cascade-kill children on
+    //     parent exit, and we never put this one in our job object).
+    //
+    //  2. Self-delete of the running .exe: Windows refuses to unlink the image of
+    //     a running process, so the script waits (bounded) for OUR pid to exit
+    //     before deleting the install dir — otherwise our own .exe survives the
+    //     wipe. We pass the pid via `ZUCCHINI_WAIT_PID`. Staging the script in
+    //     temp (not the install dir) is what lets the wipe remove the dir wholly,
+    //     without the script deleting the file it's currently executing.
     use std::os::windows::process::CommandExt;
 
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let staged_path = crate::zucchini_spawner_dir().join("uninstall.ps1");
+    let staged_path = std::env::temp_dir().join("zucchini-spawner-uninstall.ps1");
     if let Err(e) = std::fs::write(&staged_path, UNINSTALL_SCRIPT_PS1) {
         warn!(error = %e, path = %staged_path.display(), "failed to stage uninstall script");
         return;
@@ -168,7 +174,8 @@ fn spawn_windows() {
     ])
     .env("REMOVE_KEY", "1")
     .env("SILENT", "1")
-    .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW)
+    .env("ZUCCHINI_WAIT_PID", std::process::id().to_string())
+    .creation_flags(crate::sys::SPAWN_CREATION_FLAGS)
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null());

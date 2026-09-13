@@ -138,15 +138,20 @@ pub fn login_shell_command(cmd_string: &str) -> tokio::process::Command {
 // Process-group teardown — Job Object (step 4)
 // ---------------------------------------------------------------------------
 
-/// Per-process creation flags so a background-service spawn doesn't flash a
-/// console window. `CREATE_NO_WINDOW` suppresses the console the child would
-/// otherwise allocate (the spawner runs as a Windows Service / detached, with
-/// no console of its own to inherit). `CREATE_NEW_PROCESS_GROUP` matches the
-/// unix `setpgid` intent of putting the child in its own group — but on Windows
-/// the *killing* is done by the Job Object (assigned in `adopt`), not by the
-/// process group; the new group only detaches the child from our Ctrl-C/Break.
+/// The creation flags every background spawn in this binary uses — the single
+/// source of truth so no site (`configure_new_process_group`, the self-uninstall
+/// spawn in `uninstall.rs`) hand-ORs its own copy and silently drifts.
+/// `CREATE_NO_WINDOW` suppresses the console the child would otherwise allocate
+/// (the spawner runs as a Windows Service / detached, with no console of its own
+/// to inherit). `CREATE_NEW_PROCESS_GROUP` matches the unix `setpgid` intent of
+/// putting the child in its own group — but on Windows the *killing* is done by
+/// the Job Object (assigned in `adopt`), not by the process group; the new group
+/// only detaches the child from our Ctrl-C/Break.
+pub const SPAWN_CREATION_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+
+/// Apply [`SPAWN_CREATION_FLAGS`] to a spawn.
 pub fn configure_new_process_group(cmd: &mut tokio::process::Command) {
-    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    cmd.creation_flags(SPAWN_CREATION_FLAGS);
 }
 
 /// A `HANDLE` is a raw pointer (`*mut c_void`) and so is neither `Send` nor

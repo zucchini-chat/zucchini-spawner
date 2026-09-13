@@ -28,6 +28,18 @@ function Info($msg) {
   if (-not $Silent) { Write-Host $msg }
 }
 
+# ---------- wait for the spawner to exit (self-uninstall handoff) ----------
+# On the spawner self-uninstall path the still-running spawner spawns us, passes
+# its PID via ZUCCHINI_WAIT_PID, then exits. Windows refuses to unlink the image
+# of a running process, so we must wait for it to fully exit before deleting the
+# install dir — otherwise its own bin\zucchini-spawner.exe survives the wipe.
+# Bounded so a wedged spawner can't hang cleanup forever; Wait-Process on an
+# already-exited (or unknown) pid throws and is treated as "already gone". No-op
+# on the user-run path, where ZUCCHINI_WAIT_PID is unset.
+if ($env:ZUCCHINI_WAIT_PID) {
+  try { Wait-Process -Id ([int]$env:ZUCCHINI_WAIT_PID) -Timeout 30 -ErrorAction Stop } catch { }
+}
+
 # ---------- stop + remove the scheduled task ----------
 
 Info "Removing scheduled task ${ServiceName}..."
@@ -73,6 +85,14 @@ if (Test-Path -LiteralPath $InstallDir) {
   }
 } else {
   Info "${InstallDir} not found, skipping."
+}
+
+# On the self-uninstall path this script was staged in %TEMP% (see uninstall.rs);
+# remove it so no residue is left, matching the linux/macos paths that leave none.
+# Gated on ZUCCHINI_WAIT_PID so the user-run path never deletes the operator's own
+# copy — it runs from wherever they invoked it, not from our temp staging.
+if ($env:ZUCCHINI_WAIT_PID) {
+  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }
 
 Info ''
