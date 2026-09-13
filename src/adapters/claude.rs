@@ -112,15 +112,10 @@ fn extract_tool_result_id(line: &str) -> Option<&str> {
 /// First sentence of the one-shot `--append-system-prompt` block. One-shot
 /// `--print` is print-and-exit: the process dies at its first `result`, so any
 /// background subagent it armed is abandoned. Steer the agent away from
-/// `run_in_background:true`. (The resident session uses `RESIDENT_SYS_LEADIN`.)
+/// `run_in_background:true`. The resident session has no lead-in: claude's own
+/// tool descriptions already say background work wakes the agent.
 const ONESHOT_SYS_LEADIN: &str =
     "You are spawned via a harness, no background subagents will wake you when finished, use subagents with `run_in_background: false` only.";
-
-/// First sentence of the resident `--append-system-prompt` block. The whole
-/// point of the resident model is that background tasks/monitors run to
-/// completion and stream their results back, so it drops the one-shot lead-in.
-const RESIDENT_SYS_LEADIN: &str =
-    "You are running in a resident session; background tasks and monitors you arm will run to completion and stream their results back.";
 
 /// One token of the claude invocation. `Lit` is emitted verbatim (unquoted in
 /// the shell string) — the constant flags/values that need no escaping. `Val`
@@ -140,13 +135,13 @@ enum ClaudeArg {
 /// `prepare_session_native` via `flags_to_argv`) so the flag set (session-id
 /// resume, worktree containment, `--append-system-prompt`, `--print --verbose
 /// --output-format stream-json`, sandbox, model, the prune `--settings` hook)
-/// can't drift between the two paths. `sys_leadin` is the first sentence of the
+/// can't drift between the two paths. `sys_leadin` is the optional first sentence of the
 /// `--append-system-prompt` block (the only intentional difference); `resident`
 /// adds `--input-format stream-json` before `--output-format` so claude reads
 /// turns from the held-open stdin.
 #[allow(clippy::too_many_arguments)]
 fn claude_flag_args(
-    sys_leadin: &str,
+    sys_leadin: Option<&str>,
     chat_id: &str,
     project_path: Option<&str>,
     worktree: bool,
@@ -182,7 +177,7 @@ fn claude_flag_args(
         args.push(ClaudeArg::Val(sid.to_string()));
     }
 
-    let mut sys = String::from(sys_leadin);
+    let mut sys = sys_leadin.map(|l| format!("{l}\n\n")).unwrap_or_default();
     // Worktree containment: when `--worktree` is on and the project path is
     // known, resolve the absolute worktree path so the capability block can
     // carry the "stay inside" rule (wording in `adapter::worktree_instructions`).
@@ -204,7 +199,6 @@ fn claude_flag_args(
             });
         }
     }
-    sys.push_str("\n\n");
     // Must stay byte-stable across respawns — see `AgentAdapter::turn_time_line`.
     sys.push_str(&agent_capabilities_instructions(worktree_info.as_ref()));
     sys.push_str("\n\n");
@@ -319,7 +313,7 @@ impl AgentAdapter for ClaudeAdapter {
             shell_escape(&ctx.prompt_file.to_string_lossy())
         ));
         let args = claude_flag_args(
-            ONESHOT_SYS_LEADIN,
+            Some(ONESHOT_SYS_LEADIN),
             ctx.chat_id,
             ctx.project_path,
             ctx.worktree,
@@ -335,7 +329,7 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn prepare_native(&mut self, ctx: &TurnContext<'_>) -> Option<NativeSpawn> {
         let args = claude_flag_args(
-            ONESHOT_SYS_LEADIN,
+            Some(ONESHOT_SYS_LEADIN),
             ctx.chat_id,
             ctx.project_path,
             ctx.worktree,
@@ -375,7 +369,7 @@ impl AgentAdapter for ClaudeAdapter {
         // `resident=true`) tells it to read user/control frames from stdin.
         claude_cmd.push_str("claude");
         let args = claude_flag_args(
-            RESIDENT_SYS_LEADIN,
+            None,
             ctx.chat_id,
             ctx.project_path,
             ctx.worktree,
@@ -394,7 +388,7 @@ impl AgentAdapter for ClaudeAdapter {
         ctx: &crate::adapter::SessionContext<'_>,
     ) -> Option<NativeSpawn> {
         let args = claude_flag_args(
-            RESIDENT_SYS_LEADIN,
+            None,
             ctx.chat_id,
             ctx.project_path,
             ctx.worktree,
