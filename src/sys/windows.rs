@@ -329,7 +329,10 @@ pub async fn process_tree_footprint_kb(roots: &[u32]) -> Option<Vec<u64>> {
 /// re-parents an orphan, so its ppid can name a newer, unrelated process that
 /// reused the dead parent's pid; a real child is never older than its parent.
 fn process_rows() -> Option<Vec<(u32, u32)>> {
-    Some(drop_stale_parents(snapshot_process_rows()?, process_creation_time))
+    Some(drop_stale_parents(
+        snapshot_process_rows()?,
+        process_creation_time,
+    ))
 }
 
 fn drop_stale_parents(
@@ -397,7 +400,9 @@ fn footprint_kb(pid: u32) -> Option<u64> {
     counters.cb = size;
     // SAFETY: FFI. `process` is live; `counters` is a `_EX` struct of `size`
     // bytes, which the API accepts in place of the base struct.
-    let ok = unsafe { K32GetProcessMemoryInfo(process.0, std::ptr::addr_of_mut!(counters).cast(), size) };
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(process.0, std::ptr::addr_of_mut!(counters).cast(), size)
+    };
     (ok != 0).then_some(counters.PrivateUsage as u64 / 1024)
 }
 
