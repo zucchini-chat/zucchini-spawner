@@ -143,7 +143,8 @@ enum ClaudeArg {
 /// can't drift between the two paths. `sys_leadin` is the optional first sentence of the
 /// `--append-system-prompt` block (the only intentional difference); `resident`
 /// adds `--input-format stream-json` before `--output-format` so claude reads
-/// turns from the held-open stdin.
+/// turns from the held-open stdin. `chrome` is the user's Claude in Chrome
+/// "enabled by default" setting (`claude_in_chrome_enabled`).
 #[allow(clippy::too_many_arguments)]
 fn claude_flag_args(
     sys_leadin: Option<&str>,
@@ -155,6 +156,7 @@ fn claude_flag_args(
     model: Option<&str>,
     session_name: Option<&str>,
     resident: bool,
+    chrome: bool,
 ) -> Vec<ClaudeArg> {
     let mut args: Vec<ClaudeArg> = Vec::new();
 
@@ -237,6 +239,10 @@ fn claude_flag_args(
     args.push(ClaudeArg::Val(disallowed_tools.to_string()));
     if !is_sandboxed {
         args.push(ClaudeArg::Lit("--dangerously-skip-permissions"));
+    }
+    // The browser is signed into the owner's accounts, so an invitee never gets it.
+    if chrome && !is_sandboxed {
+        args.push(ClaudeArg::Lit("--chrome"));
     }
     // Verbatim pass-through of `chats.model` (migration 0035). Empty / blank
     // values are already filtered to `None` at the construction site in
@@ -329,6 +335,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.model,
             /* session_name = */ None,
             /* resident = */ false,
+            claude_in_chrome_enabled(),
         );
         push_posix_flags(&mut claude_cmd, &args);
         Ok(claude_cmd)
@@ -345,6 +352,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.model,
             /* session_name = */ None,
             false,
+            claude_in_chrome_enabled(),
         );
         Some(NativeSpawn {
             program: "claude".to_string(),
@@ -385,6 +393,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.model,
             ctx.session_name,
             /* resident = */ true,
+            claude_in_chrome_enabled(),
         );
         push_posix_flags(&mut claude_cmd, &args);
         Ok(claude_cmd)
@@ -404,6 +413,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.model,
             ctx.session_name,
             true,
+            claude_in_chrome_enabled(),
         );
         Some(NativeSpawn {
             program: "claude".to_string(),
@@ -898,32 +908,40 @@ fn probe_boxed() -> futures::future::BoxFuture<'static, (bool, bool)> {
     Box::pin(probe())
 }
 
+#[derive(Deserialize)]
+struct ClaudeGlobalConfig {
+    #[serde(default, rename = "oauthAccount")]
+    oauth_account: Option<serde_json::Value>,
+    #[serde(default, rename = "claudeInChromeDefaultEnabled")]
+    chrome_enabled_by_default: bool,
+}
+
+fn read_claude_global_config() -> Option<ClaudeGlobalConfig> {
+    let path = crate::home_dir_opt()?.join(".claude.json");
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| debug!(error = %e, path = %path.display(), "claude config not parseable"))
+        .ok()
+}
+
 /// claude code stores OAuth state in `~/.claude.json` under `oauthAccount` —
 /// cross-platform, regardless of where the actual token lives (macOS Keychain,
 /// `~/.claude/.credentials.json` on Linux). Fallback covers older / non-Keychain
 /// installs.
 fn is_authenticated() -> bool {
-    let Some(home) = crate::home_dir_opt() else {
-        return false;
-    };
-
-    #[derive(Deserialize)]
-    struct ClaudeCfg {
-        #[serde(default, rename = "oauthAccount")]
-        oauth_account: Option<serde_json::Value>,
+    if read_claude_global_config().is_some_and(|c| c.oauth_account.is_some()) {
+        return true;
     }
+    crate::home_dir_opt()
+        .is_some_and(|home| file_nonempty(&home.join(".claude").join(".credentials.json")))
+}
 
-    let cfg = home.join(".claude.json");
-    if let Ok(bytes) = std::fs::read(&cfg) {
-        match serde_json::from_slice::<ClaudeCfg>(&bytes) {
-            Ok(c) if c.oauth_account.is_some() => return true,
-            Ok(_) => {}
-            Err(e) => debug!(error = %e, path = %cfg.display(), "claude config not parseable"),
-        }
-    }
-
-    let creds = home.join(".claude").join(".credentials.json");
-    file_nonempty(&creds)
+/// Interactive `claude` loads the Claude in Chrome tools whenever the user set
+/// them "enabled by default" (`/chrome`), but `--print` ignores that setting and
+/// loads them only with an explicit `--chrome`. Read per spawn, so toggling it
+/// takes effect on the chat's next fresh process.
+fn claude_in_chrome_enabled() -> bool {
+    read_claude_global_config().is_some_and(|c| c.chrome_enabled_by_default)
 }
 
 // ===========================================================================
@@ -2164,6 +2182,28 @@ mod tests {
         let argv = a.prepare_session_native(&sandboxed).unwrap().args;
         let i = argv.iter().position(|s| s == "--disallowedTools").unwrap();
         assert_eq!(argv[i + 1], "AskUserQuestion SendMessage ListAgents");
+    }
+
+    #[test]
+    fn chrome_flag_follows_the_setting_for_owners_only() {
+        let has_chrome = |is_sandboxed: bool, chrome: bool| {
+            let args = claude_flag_args(
+                None,
+                "chat-1",
+                None,
+                false,
+                None,
+                is_sandboxed,
+                None,
+                None,
+                true,
+                chrome,
+            );
+            flags_to_argv(args).iter().any(|a| a == "--chrome")
+        };
+        assert!(has_chrome(false, true));
+        assert!(!has_chrome(false, false));
+        assert!(!has_chrome(true, true));
     }
 
     /// Real claude 2.1.265 shape (tmp/peer_probe2.log): a cross-session
