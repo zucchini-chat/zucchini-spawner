@@ -397,6 +397,10 @@ pub fn replace_running_exe(new_exe: &Path, current_exe: &Path) -> io::Result<()>
 /// site (startup) stays `#[cfg]`-free (the Windows arm does the real work).
 pub fn sweep_stale_exe() {}
 
+/// launchd `KeepAlive` / systemd `Restart=always` already respawn us after any
+/// exit; only the Windows Scheduled Task needs this set up at runtime.
+pub fn ensure_supervisor_keepalive() {}
+
 // ---------------------------------------------------------------------------
 // Local IPC — Unix domain sockets (windows: named pipes, step 6)
 // ---------------------------------------------------------------------------

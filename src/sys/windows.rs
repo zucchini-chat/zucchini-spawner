@@ -661,12 +661,9 @@ pub fn harden_dir(path: &Path) -> io::Result<()> {
 /// can't do the unix in-place rename. But Windows DOES allow *renaming* a
 /// running .exe out of the way (the open image handle survives the rename), so:
 /// rename the live exe to `<exe>.old`, then move the new one into its place. The
-/// service manager (the logon Scheduled Task) respawns from the new file on next
-/// start; the leftover `<exe>.old` is best-effort-deleted at startup by
-/// [`sweep_stale_exe`].
-///
-/// UNTESTED on a real Windows box — the rename-running-exe dance is correct per
-/// the documented semantics but has not been exercised here.
+/// Scheduled Task's keep-alive trigger ([`ensure_supervisor_keepalive`])
+/// respawns from the new file within a minute of our exit; the leftover
+/// `<exe>.old` is best-effort-deleted at startup by [`sweep_stale_exe`].
 pub fn replace_running_exe(new_exe: &Path, current_exe: &Path) -> io::Result<()> {
     let old_exe = stale_exe_path(current_exe);
     // A `.old` from a prior update may still exist (locked if the previous
@@ -675,6 +672,49 @@ pub fn replace_running_exe(new_exe: &Path, current_exe: &Path) -> io::Result<()>
     let _ = std::fs::remove_file(&old_exe);
     std::fs::rename(current_exe, &old_exe)?;
     std::fs::rename(new_exe, current_exe)
+}
+
+/// Adds a once-a-minute trigger to the logon Scheduled Task `install.ps1`
+/// registers, so the task relaunches us after ANY exit — the launchd `KeepAlive`
+/// / systemd `Restart=always` behavior the self-update exit relies on. Task
+/// Scheduler has no restart-on-exit (`RestartCount` covers only a failure to
+/// launch), and `MultipleInstances=IgnoreNew` turns every tick into a no-op
+/// while the launcher is still running. Done here rather than in `install.ps1`
+/// so tasks registered by older installers gain it on their next start, and so
+/// it applies to the task instance that's already running. No-op when the
+/// trigger exists or the task doesn't (a dev run).
+const ENSURE_KEEPALIVE_TRIGGER_PS1: &str = r#"
+$ErrorActionPreference = 'Stop'
+$name = 'chat.zucchini.spawner'
+$task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+if (-not $task) { exit 0 }
+if ($task.Triggers | Where-Object { $_.Repetition.Interval }) { exit 0 }
+$keepAlive = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
+Set-ScheduledTask -TaskName $name -Trigger (@($task.Triggers) + $keepAlive) | Out-Null
+"#;
+
+pub fn ensure_supervisor_keepalive() {
+    let mut cmd = tokio::process::Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        ENSURE_KEEPALIVE_TRIGGER_PS1,
+    ])
+    .creation_flags(SPAWN_CREATION_FLAGS)
+    .stdin(std::process::Stdio::null());
+    tokio::spawn(async move {
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => warn!(
+                status = %out.status,
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "failed to add the keep-alive trigger to the scheduled task"
+            ),
+            Err(e) => warn!(error = %e, "failed to run powershell for the keep-alive trigger"),
+        }
+    });
 }
 
 /// `<exe>.old`, the parking spot for the previous binary after an update.

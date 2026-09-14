@@ -2652,7 +2652,6 @@ fn acquire_single_instance_lock() -> Option<sys::InstanceLock> {
             eprintln!(
                 "zucchini-spawner: another instance is already running (pid {pid}); exiting."
             );
-            error!(pid = %pid, "another spawner instance already holds the lock; exiting");
             std::process::exit(0);
         }
         Err(e) => {
@@ -2761,6 +2760,7 @@ async fn main() {
     let _instance_lock = acquire_single_instance_lock();
     if _instance_lock.is_some() {
         orphans::sweep();
+        sys::ensure_supervisor_keepalive();
     }
 
     let prod = load_prod_config();

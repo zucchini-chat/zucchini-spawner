@@ -45,7 +45,8 @@ param(
   [string]$Key  = $env:ZUCCHINI_KEY
 )
 
-# Keep these in lockstep with uninstall.ps1 and install.sh / uninstall.sh.
+# Keep these in lockstep with uninstall.ps1, install.sh / uninstall.sh and the
+# task name in src/sys/windows.rs.
 $BaseUrl     = 'https://api.zucchini.chat'
 $InstallDir  = Join-Path $env:USERPROFILE '.zucchini-spawner'
 $BinDir      = Join-Path $InstallDir 'bin'
@@ -182,8 +183,11 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 # context, not elevation, so Limited is both correct and installable unelevated.
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
   -LogonType Interactive
-# Settings tuned to the launchd KeepAlive / systemd Restart=always intent:
-# restart on failure, never auto-expire, allow start on battery.
+# Never auto-expire, allow start on battery. RestartCount only covers a failure
+# to launch — relaunch after the spawner exits (self-update, crash; the launchd
+# KeepAlive / systemd Restart=always analogue) comes from a once-a-minute trigger
+# the spawner adds to this task at startup (`ensure_supervisor_keepalive` in
+# src/sys/windows.rs), which also upgrades tasks registered by older installers.
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
   -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
@@ -199,8 +203,8 @@ Start-ScheduledTask -TaskName $ServiceName
 Write-Host ''
 Write-Host "Installed as Scheduled Task $ServiceName"
 Write-Host "  Logs:  $InstallDir\spawner.log  (if the spawner is configured to log to file)"
-Write-Host "  Stop:  schtasks /End /TN $ServiceName"
-Write-Host "  Start: schtasks /Run /TN $ServiceName"
+Write-Host "  Stop:  schtasks /Change /TN $ServiceName /Disable; schtasks /End /TN $ServiceName"
+Write-Host "  Start: schtasks /Change /TN $ServiceName /Enable; schtasks /Run /TN $ServiceName"
 Write-Host ''
 Write-Host 'Done. The spawner is running and connected.'
 }

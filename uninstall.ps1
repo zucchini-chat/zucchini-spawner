@@ -35,7 +35,10 @@ function Info($msg) {
 # install dir — otherwise its own bin\zucchini-spawner.exe survives the wipe.
 # Bounded so a wedged spawner can't hang cleanup forever; Wait-Process on an
 # already-exited (or unknown) pid throws and is treated as "already gone". No-op
-# on the user-run path, where ZUCCHINI_WAIT_PID is unset.
+# on the user-run path, where ZUCCHINI_WAIT_PID is unset. Disable the task first:
+# its once-a-minute keep-alive trigger would otherwise relaunch the spawner in the
+# window between its exit and the Unregister below.
+Disable-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue | Out-Null
 if ($env:ZUCCHINI_WAIT_PID) {
   try { Wait-Process -Id ([int]$env:ZUCCHINI_WAIT_PID) -Timeout 30 -ErrorAction Stop } catch { }
 }

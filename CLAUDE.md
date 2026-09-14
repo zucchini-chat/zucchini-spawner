@@ -4,7 +4,7 @@ Rust. PowerSync sync-stream client (read-only NDJSON) + writeback. Spawns claude
 
 Installed via `install.sh`, which enrolls a Machine and runs a heartbeat. Runtime dir: `~/.zucchini-spawner/` (config, sync cursor, `key`). Dev JWT via `ZUCCHINI_DEV_JWT`.
 
-In prod the installer registers a **per-user service** (`SERVICE_NAME=chat.zucchini.spawner`) — `systemctl --user` on Linux (loginctl linger enabled so it survives logout), launchd LaunchAgent on macOS. Read logs with `journalctl --user -u chat.zucchini.spawner -f` (Linux); on the e2e box (`beprod`) that's the source of truth for what the spawner actually did. The install/build/ship mechanics are simpler to read in `install.sh`, `build-releases.sh`, and `uninstall.sh` than to mirror here.
+In prod the installer registers a **per-user service** (`SERVICE_NAME=chat.zucchini.spawner`) — `systemctl --user` on Linux (loginctl linger enabled so it survives logout), launchd LaunchAgent on macOS, a logon Scheduled Task on Windows (`install.ps1`; launcher `~/.zucchini-spawner/run.ps1`, log `spawner.log`). All three must relaunch the spawner after any exit — the self-update just swaps the binary and exits. Task Scheduler can't restart on exit (`RestartCount` covers only launch failures), so the spawner adds a once-a-minute trigger to its task at startup (`sys::ensure_supervisor_keepalive`); with `MultipleInstances=IgnoreNew` the tick is a no-op while it runs. Read logs with `journalctl --user -u chat.zucchini.spawner -f` (Linux); on the e2e box (`beprod`) that's the source of truth for what the spawner actually did. The install/build/ship mechanics are simpler to read in `install.sh`, `build-releases.sh`, and `uninstall.sh` than to mirror here.
 
 ## Message-frame invariant
 
