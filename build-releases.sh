@@ -40,6 +40,13 @@ NATIVE_TARGET="aarch64-apple-darwin"
 # install.sh / install.ps1 name darwin arm64 as "arm64", linux keeps "aarch64",
 # windows is "windows-x86_64" (see updater.rs::platform_suffix).
 #
+# Linux targets are **musl, statically linked** — a -gnu build inherits the build
+# image's glibc as a hard floor (cross's default image is Ubuntu 20.04 → needs
+# GLIBC_2.30+, which dies on any older LTS box with "version `GLIBC_2.29' not
+# found"). Users run the spawner on whatever server they already have, so the
+# binary must have no glibc floor at all. OpenSSL is `vendored` and TLS is
+# rustls, so nothing here needs the host's C libraries.
+#
 # Windows (x86_64-pc-windows-msvc) is NOT built here. It's built AND Authenticode-
 # signed on a Windows machine (the signing cert lives there — signing must happen
 # on that box anyway), then copied into
@@ -53,8 +60,8 @@ NATIVE_TARGET="aarch64-apple-darwin"
 ALL_TARGETS="
 aarch64-apple-darwin:zucchini-spawner-darwin-arm64
 x86_64-apple-darwin:zucchini-spawner-darwin-x86_64
-aarch64-unknown-linux-gnu:zucchini-spawner-linux-aarch64
-x86_64-unknown-linux-gnu:zucchini-spawner-linux-x86_64
+aarch64-unknown-linux-musl:zucchini-spawner-linux-aarch64
+x86_64-unknown-linux-musl:zucchini-spawner-linux-x86_64
 x86_64-pc-windows-msvc:zucchini-spawner-windows-x86_64
 "
 

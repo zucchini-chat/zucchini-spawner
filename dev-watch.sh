@@ -20,6 +20,9 @@ case "$OS_NAME" in
 esac
 
 HOST_ARCH="$(uname -m)"
+# Linux stays -gnu here (releases ship musl): this binary is built on the dev's
+# own box for that same box, so the host's glibc is by definition new enough,
+# and requiring musl-gcc would be one more thing to install for a hot reload.
 case "$PLATFORM_OS:$HOST_ARCH" in
   darwin:arm64|darwin:aarch64)   RUST_TARGET="aarch64-apple-darwin"; BIN_SUFFIX="darwin-arm64" ;;
   darwin:x86_64)                 RUST_TARGET="x86_64-apple-darwin";  BIN_SUFFIX="darwin-x86_64" ;;
