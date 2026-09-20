@@ -5,6 +5,10 @@
 //! growing rate: `48h * 2^-((n-2)^0.735)` (3 -> 24h, 15 -> 30m). Memory scales
 //! `n`: `n_eff = idle footprint / (RAM / 40)`. A single idle resident never
 //! expires.
+//!
+//! A pinned chat's resident gets `PINNED_TTL_FACTOR` x that TTL (still capped
+//! at 48h) and is picked as victim only when every idle resident is pinned —
+//! the unpinned crowd goes first, pressure included.
 
 use std::time::Duration;
 use tokio::time::Instant;
@@ -12,6 +16,8 @@ use tokio::time::Instant;
 const MAX_TTL: Duration = Duration::from_secs(48 * 3600);
 /// An idle resident this share of RAM counts as one.
 const RAM_SHARE: f64 = 1.0 / 40.0;
+/// How much longer a pinned chat's resident stays warm.
+const PINNED_TTL_FACTOR: f64 = 8.0;
 
 pub struct IdleResident {
     pub topic: String,
@@ -21,6 +27,8 @@ pub struct IdleResident {
     /// Memory its whole process tree (MCP servers and browsers included)
     /// would free if killed.
     pub footprint_kb: Option<u64>,
+    /// `chats.pinned_at` is set (`state.rs`).
+    pub pinned: bool,
 }
 
 pub struct Memory {
@@ -53,6 +61,15 @@ pub fn ttl(n_eff: f64) -> Duration {
     MAX_TTL.mul_f64(2f64.powf(-(n_eff - 2.0).powf(0.735)))
 }
 
+fn ttl_for(r: &IdleResident, n_eff: f64) -> Duration {
+    let base = ttl(n_eff);
+    if r.pinned {
+        base.mul_f64(PINNED_TTL_FACTOR).min(MAX_TTL)
+    } else {
+        base
+    }
+}
+
 /// Idle footprint in units of RAM/40, or the idle count when either is unknown.
 pub fn n_eff(idle: &[IdleResident], memory: Option<&Memory>) -> f64 {
     let footprint_kb: Option<u64> = idle.iter().map(|r| r.footprint_kb).sum();
@@ -62,29 +79,33 @@ pub fn n_eff(idle: &[IdleResident], memory: Option<&Memory>) -> f64 {
     }
 }
 
-/// The oldest idle resident goes once it outlives the TTL, or at once under
-/// memory pressure; the last one standing stays.
+/// The oldest unpinned idle resident goes once it outlives its TTL, or at once
+/// under memory pressure; the last one standing stays.
 pub fn choose(idle: &[IdleResident], memory: Option<&Memory>, now: Instant) -> Decision {
     if idle.len() < 2 {
         return Decision::KeepAll;
     }
-    let Some((victim, oldest)) = idle.iter().enumerate().min_by_key(|(_, r)| r.idle_since) else {
-        return Decision::KeepAll;
-    };
     let n_eff = n_eff(idle, memory);
-    let ttl = ttl(n_eff);
-    let age = now.saturating_duration_since(oldest.idle_since);
     let pressure = memory.is_some_and(|m| m.pressure);
-    if pressure || age >= ttl {
-        Decision::Evict(Eviction {
+    let age = |r: &IdleResident| now.saturating_duration_since(r.idle_since);
+    let victim = idle
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| pressure || age(r) >= ttl_for(r, n_eff))
+        .min_by_key(|(_, r)| (r.pinned, r.idle_since));
+    match victim {
+        Some((victim, r)) => Decision::Evict(Eviction {
             victim,
             n_eff,
-            ttl,
-            age,
+            ttl: ttl_for(r, n_eff),
+            age: age(r),
             pressure,
-        })
-    } else {
-        Decision::WaitUntil(oldest.idle_since + ttl)
+        }),
+        None => idle
+            .iter()
+            .map(|r| r.idle_since + ttl_for(r, n_eff))
+            .min()
+            .map_or(Decision::KeepAll, Decision::WaitUntil),
     }
 }
 
@@ -108,6 +129,7 @@ mod tests {
                 idle_since: now - Duration::from_secs_f64(h * HOUR),
                 pid: None,
                 footprint_kb,
+                pinned: false,
             })
             .collect()
     }
@@ -186,6 +208,43 @@ mod tests {
         assert_eq!(e.victim, 2);
         assert_eq!(e.n_eff, 3.0);
         assert!(!e.pressure);
+    }
+
+    #[test]
+    fn pinned_residents_go_last_and_on_a_longer_ttl() {
+        let now = Instant::now() + Duration::from_secs(1000 * 3600);
+        // 10 idle -> 1.96h unpinned, 15.7h pinned.
+        let mut ten = idle(&[3.0; 10], None, now);
+        ten[0].pinned = true;
+        ten[0].idle_since = now - Duration::from_secs(20 * 3600);
+        let Decision::Evict(e) = choose(&ten, None, now) else {
+            panic!("expected an eviction");
+        };
+        assert_ne!(e.victim, 0, "the pinned one outlives the unpinned crowd");
+
+        // All ten pinned: the oldest goes, but only once past the 15.7h TTL.
+        for r in ten.iter_mut() {
+            r.pinned = true;
+        }
+        let Decision::Evict(e) = choose(&ten, None, now) else {
+            panic!("expected an eviction");
+        };
+        assert_eq!(e.victim, 0);
+        assert!((hours(e.ttl) - 15.7).abs() < 0.1, "{:?}", e.ttl);
+
+        ten[0].idle_since = now - Duration::from_secs(10 * 3600);
+        assert!(matches!(choose(&ten, None, now), Decision::WaitUntil(_)));
+    }
+
+    #[test]
+    fn pinned_ttl_is_still_capped_at_48h() {
+        let now = Instant::now() + Duration::from_secs(1000 * 3600);
+        let mut two = idle(&[49.0, 1.0], None, now);
+        two[0].pinned = true;
+        let Decision::Evict(e) = choose(&two, None, now) else {
+            panic!("expected an eviction");
+        };
+        assert_eq!((e.victim, e.ttl), (0, MAX_TTL));
     }
 
     #[test]

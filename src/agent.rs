@@ -1271,6 +1271,8 @@ impl Supervisor {
     }
 
     /// Residents kept warm past their idle edge with nothing pending, by topic.
+    /// `footprint_kb` and `pinned` are filled in by the caller (`main.rs`), which
+    /// owns the process measurements and the chat mirror.
     pub fn idle_residents(&self) -> Vec<crate::warm::IdleResident> {
         let mut idle: Vec<_> = self
             .agents
@@ -1286,6 +1288,7 @@ impl Supervisor {
                     idle_since,
                     pid: st.pid,
                     footprint_kb: None,
+                    pinned: false,
                 })
             })
             .collect();

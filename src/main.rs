@@ -24,6 +24,7 @@ mod warm;
 mod writer;
 mod x25519;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -779,6 +780,7 @@ async fn evict_idle_residents(
     supervisor: &mut Supervisor,
     memory: fn() -> Option<warm::Memory>,
     write_tx: &mpsc::Sender<WriteEvent>,
+    pinned: &HashSet<String>,
 ) -> Option<tokio::time::Instant> {
     loop {
         let mut idle = supervisor.idle_residents();
@@ -786,6 +788,9 @@ async fn evict_idle_residents(
             return None;
         }
         measure_idle_footprint(&mut idle).await;
+        for r in idle.iter_mut() {
+            r.pinned = pinned.contains(&r.topic);
+        }
         let eviction = match warm::choose(&idle, memory().as_ref(), tokio::time::Instant::now()) {
             warm::Decision::Evict(e) => e,
             warm::Decision::WaitUntil(deadline) => return Some(deadline),
@@ -799,6 +804,7 @@ async fn evict_idle_residents(
             ttl = ?eviction.ttl,
             age = ?eviction.age,
             pressure = eviction.pressure,
+            pinned = idle[eviction.victim].pinned,
             "evicting idle resident"
         );
         let topic = topic.clone();
@@ -3173,7 +3179,9 @@ async fn main() {
         }
 
         if warm_due || idle_set(&supervisor) != warm_idle_seen {
-            warm_deadline = evict_idle_residents(&mut supervisor, sys::memory, &write_tx).await;
+            let pinned = mirror.read().await.pinned_chats();
+            warm_deadline =
+                evict_idle_residents(&mut supervisor, sys::memory, &write_tx, &pinned).await;
             warm_idle_seen = idle_set(&supervisor);
         }
         publish_alive_changes(&mut supervisor, &write_tx).await;
@@ -5804,7 +5812,15 @@ mod tests {
         publish_alive_changes(&mut sup, &write_tx).await;
         tokio::time::advance(hour * 21).await;
 
-        let deadline = evict_idle_residents(&mut sup, || None, &write_tx).await;
+        let pinned = HashSet::from(["idle-25h".to_string(), "idle-24h".to_string()]);
+        evict_idle_residents(&mut sup, || None, &write_tx, &pinned).await;
+        assert_eq!(
+            sup.idle_residents().len(),
+            3,
+            "the two past 24h are pinned, the third is inside its TTL"
+        );
+
+        let deadline = evict_idle_residents(&mut sup, || None, &write_tx, &HashSet::new()).await;
         assert_eq!(deadline, Some(since["idle-24h"] + hour * 48));
         publish_alive_changes(&mut sup, &write_tx).await;
         let mut alive = Vec::new();

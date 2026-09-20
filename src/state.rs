@@ -55,6 +55,10 @@ pub struct ChatState {
     /// `#[serde(skip)]`, so no plaintext reaches state.json. Feeds
     /// `claude --name` via `session_name::from_title`.
     pub title: Option<String>,
+    /// `chats.pinned_at` (migration 0014) is non-NULL: the user pinned this chat
+    /// to the top of the list. A warm resident of a pinned chat is evicted last
+    /// and on a longer TTL (`warm.rs`).
+    pub pinned: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -247,8 +251,18 @@ impl Mirror {
                         let key = keys.get_existing(&user_id)?;
                         crate::crypto::decrypt_field_b64(&key, ct)
                     }),
+                pinned: v.get("pinned_at").is_some_and(|p| !p.is_null()),
             },
         );
+    }
+
+    /// Chats the user pinned; their warm residents are evicted last (`warm.rs`).
+    pub fn pinned_chats(&self) -> HashSet<String> {
+        self.chats
+            .iter()
+            .filter(|(_, c)| c.pinned)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Stash the harvested session id locally so a fast-followup user message
