@@ -2303,15 +2303,20 @@ fn take_flag<'a>(
     }
 }
 
-/// Default a parsed `--chat-id` from the `ZUCCHINI_CHAT_ID` env var (agent.rs
-/// exports it on every spawn); an explicit flag still wins. Shared so all
-/// subcommands resolve `--chat-id` identically.
-fn chat_id_or_env(chat_id: Option<String>) -> Option<String> {
-    chat_id.or_else(|| std::env::var("ZUCCHINI_CHAT_ID").ok())
+/// The chat an agent-run subcommand acts on: `ZUCCHINI_CHAT_ID`, which agent.rs
+/// exports on every spawn.
+fn env_chat_id() -> Option<String> {
+    std::env::var("ZUCCHINI_CHAT_ID").ok()
 }
 
-/// CLI entry point for `zucchini-spawner attach-file <abs-path> [--chat-id <UUID>]`
-/// (`--chat-id` defaults to the `ZUCCHINI_CHAT_ID` env var exported on the spawn).
+/// Consumes a `--chat-id` flag and its value. The flag is gone, but resumed
+/// conversations still replay calls that pass it, so it's ignored, not rejected.
+fn skip_legacy_chat_id<'a>(arg: &str, it: &mut impl Iterator<Item = &'a String>) -> bool {
+    take_flag(arg, "--chat-id", it).is_some()
+}
+
+/// CLI entry point for `zucchini-spawner attach-file <abs-path>` (chat from
+/// `ZUCCHINI_CHAT_ID`).
 ///
 /// Parses argv (hand-rolled — clap is overkill for one flag and a positional
 /// arg), connects to the daemon's `~/.zucchini-spawner/control.sock`, runs
@@ -2320,27 +2325,24 @@ fn chat_id_or_env(chat_id: Option<String>) -> Option<String> {
 /// daemon owns the JWT and K_user.
 async fn run_attach_file_cli(args: &[String]) {
     fn usage_and_exit() -> ! {
-        eprintln!("usage: zucchini-spawner attach-file <absolute-path> [--chat-id <UUID>]\n  --chat-id defaults to $ZUCCHINI_CHAT_ID (exported on every spawn).");
+        eprintln!("usage: zucchini-spawner attach-file <absolute-path>");
         std::process::exit(2);
     }
 
-    let mut chat_id: Option<String> = None;
     let mut path: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let s = a.as_str();
         if s == "-h" || s == "--help" {
             usage_and_exit();
-        } else if let Some(v) = take_flag(s, "--chat-id", &mut it) {
-            chat_id = Some(v);
+        } else if skip_legacy_chat_id(s, &mut it) {
         } else if path.is_none() {
             path = Some(s.to_string());
         } else {
             usage_and_exit();
         }
     }
-    let chat_id = chat_id_or_env(chat_id);
-    let (Some(chat_id), Some(path)) = (chat_id, path) else {
+    let (Some(chat_id), Some(path)) = (env_chat_id(), path) else {
         usage_and_exit();
     };
 
@@ -2382,8 +2384,8 @@ fn log_prune_cli_invoked(chat_id: &str, tool_name: &str, needle: &str) {
     }
 }
 
-/// Parse `prune-context` CLI args into the call-level `--chat-id` (if given) plus
-/// the batch of prune targets. `Err(())` signals any structural problem (so the
+/// Parse `prune-context` CLI args into the call-level `--force` plus the batch
+/// of prune targets. `Err(())` signals any structural problem (so the
 /// caller prints usage + exits 2). Pure (no env, no I/O, no process exit) so the
 /// batching/terminator semantics are unit-testable.
 ///
@@ -2393,9 +2395,7 @@ fn log_prune_cli_invoked(chat_id: &str, tool_name: &str, needle: &str) {
 /// optional (`""` = any-tool selector). A `--summary` with no preceding `--args`,
 /// a dangling `--tool-name`/`--args` not closed by a `--summary`, an unknown flag,
 /// `-h`/`--help`, or an empty batch are all errors. `--flag=value` accepted.
-fn parse_prune_args(
-    args: &[String],
-) -> Result<(Option<String>, bool, Vec<control::PruneItem>), ()> {
+fn parse_prune_args(args: &[String]) -> Result<(bool, Vec<control::PruneItem>), ()> {
     fn close_item(
         items: &mut Vec<control::PruneItem>,
         tool: &mut Option<String>,
@@ -2411,7 +2411,6 @@ fn parse_prune_args(
         Ok(())
     }
 
-    let mut chat_id: Option<String> = None;
     let mut force = false;
     let mut items: Vec<control::PruneItem> = Vec::new();
     let mut cur_tool: Option<String> = None;
@@ -2429,8 +2428,7 @@ fn parse_prune_args(
             cur_tool = Some(v);
         } else if let Some(v) = take_flag(s, "--args", &mut it) {
             cur_needle = Some(v);
-        } else if let Some(v) = take_flag(s, "--chat-id", &mut it) {
-            chat_id = Some(v);
+        } else if skip_legacy_chat_id(s, &mut it) {
         } else if let Some(summary) = take_flag(s, "--summary", &mut it) {
             close_item(&mut items, &mut cur_tool, &mut cur_needle, summary)?;
         } else if let Some(summary) = take_flag(s, "--reason", &mut it) {
@@ -2444,11 +2442,11 @@ fn parse_prune_args(
     if cur_tool.is_some() || cur_needle.is_some() || items.is_empty() {
         return Err(());
     }
-    Ok((chat_id, force, items))
+    Ok((force, items))
 }
 
 /// CLI entry point for `zucchini-spawner prune-context [--tool-name <Tool>]
-/// --args "<glob>" --summary "<digest>" [... more triples ...] [--chat-id <UUID>]`.
+/// --args "<glob>" --summary "<digest>" [... more triples ...]`.
 ///
 /// Thin RPC client over the control socket (mirrors `run_attach_file_cli`).
 /// Accepts ONE OR MORE prune targets per call: each `--summary` (alias
@@ -2459,27 +2457,24 @@ fn parse_prune_args(
 /// single-call form (older-binary mid-turn stays hot-reload compatible). Per
 /// target: `--args` required (`""` = no-args selector); `--tool-name` optional
 /// (omit/`""` to match on `--args` alone, as codex does); `--summary` required
-/// (terminates the target). `--chat-id` is call-level, defaults to
-/// `ZUCCHINI_CHAT_ID`. `--flag=value` accepted. `--args` globs argument values
+/// (terminates the target). Chat from `ZUCCHINI_CHAT_ID`. `--flag=value` accepted. `--args` globs argument values
 /// and blanks only the most recent match (output reports how many remain). The
 /// daemon aborts the agent right after replying, so a post-send connection-reset
 /// is expected — the prune proceeds regardless.
 async fn run_prune_context_cli(args: &[String]) {
     fn usage_and_exit() -> ! {
         eprintln!(
-            "usage: zucchini-spawner prune-context [--tool-name <ToolName>] --args \"<glob>\" --summary \"<digest>\" [... repeat per output ...] [--chat-id <UUID>] [--force]\n  Prune one or more tool outputs in a single call: each --summary CLOSES the target made of the --tool-name/--args before it, so repeat the triple to forget several outputs at once (one restart for the whole batch). --tool-name is optional per target — omit it to match on --args alone. --summary is the takeaway from that output you still need going forward — the slice that matters for the task at hand, NOT a recap of the whole output (--reason accepted as a legacy alias). --args is a glob (supports *) over the call's argument VALUES, not key names; blanks only the most recent matching call (repeat to prune older ones). --chat-id is call-level and defaults to $ZUCCHINI_CHAT_ID (exported on every spawn); use --args \"\" to prune a call you made with no arguments. --force prunes even while background tasks/monitors are running (the restart terminates them); without it, prune-context errors so you can wait for them to finish."
+            "usage: zucchini-spawner prune-context [--tool-name <ToolName>] --args \"<glob>\" --summary \"<digest>\" [... repeat per output ...] [--force]\n  Prune one or more tool outputs in a single call: each --summary CLOSES the target made of the --tool-name/--args before it, so repeat the triple to forget several outputs at once (one restart for the whole batch). --tool-name is optional per target — omit it to match on --args alone. --summary is the takeaway from that output you still need going forward — the slice that matters for the task at hand, NOT a recap of the whole output (--reason accepted as a legacy alias). --args is a glob (supports *) over the call's argument VALUES, not key names; blanks only the most recent matching call (repeat to prune older ones). Use --args \"\" to prune a call you made with no arguments. --force prunes even while background tasks/monitors are running (the restart terminates them); without it, prune-context errors so you can wait for them to finish."
         );
         std::process::exit(2);
     }
 
     // `--reason` is the legacy alias for `--summary` (older binary mid-turn keeps
     // parsing across a hot-reload); both feed the same wire field `reason`.
-    let Ok((chat_id, force, items)) = parse_prune_args(args) else {
+    let Ok((force, items)) = parse_prune_args(args) else {
         usage_and_exit();
     };
-    // Default `--chat-id` from `ZUCCHINI_CHAT_ID` (inherited from the agent
-    // subprocess); explicit flag still wins.
-    let Some(chat_id) = chat_id.or_else(|| std::env::var("ZUCCHINI_CHAT_ID").ok()) else {
+    let Some(chat_id) = env_chat_id() else {
         usage_and_exit();
     };
 
@@ -2542,46 +2537,60 @@ async fn run_prune_context_cli(args: &[String]) {
     }
 }
 
-/// `schedule-message` subcommand. Twin of `run_attach_file_cli`: hand-rolled
-/// argv parse, one RPC over the control socket, human-readable result, exit
-/// 0/1. The daemon owns K_user + the JWT; this CLI only forwards the request.
-///
-/// `--at <local-datetime>` is required. Forwarded raw, zoned + validated
-/// daemon-side by `control::normalize_deliver_at` (naive local anchored in the
-/// user's tz, which only the daemon holds; unparseable values rejected so a
-/// garbage timestamp can't misfire). The queue-when-free path (`deliver_at` null)
-/// is composer-only — no use for the agent, which already runs at turn end.
-async fn run_schedule_message_cli(args: &[String]) {
-    fn usage_and_exit() -> ! {
-        eprintln!(
-            "usage: zucchini-spawner schedule-message --chat-id <UUID> --body <TEXT> --at <local-datetime, e.g. 2026-06-07T09:00:00>"
-        );
-        std::process::exit(2);
-    }
+const SCHEDULED_MESSAGES_USAGE: &str = "usage: zucchini-spawner scheduled-messages <command>
+commands:
+  create --body <TEXT> --at <local datetime, e.g. 2026-06-07T09:00:00>
+                      schedule a message into this chat
+  list                list this chat's pending messages (delivered ones are gone)
+  delete --id <UUID>  cancel a pending message";
 
-    let mut chat_id: Option<String> = None;
+fn scheduled_messages_usage_and_exit(code: i32) -> ! {
+    if code == 0 {
+        println!("{SCHEDULED_MESSAGES_USAGE}");
+    } else {
+        eprintln!("{SCHEDULED_MESSAGES_USAGE}");
+    }
+    std::process::exit(code);
+}
+
+/// `scheduled-messages` subcommand: the agent's create/list/delete of this
+/// chat's pending scheduled messages. Each is one RPC over the control socket;
+/// the daemon owns K_user, the JWT and the user's timezone.
+async fn run_scheduled_messages_cli(args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("create") => run_create_scheduled_message_cli(&args[1..]).await,
+        Some("list") => run_list_scheduled_messages_cli(&args[1..]).await,
+        Some("delete") => run_delete_scheduled_message_cli(&args[1..]).await,
+        Some("-h" | "--help") => scheduled_messages_usage_and_exit(0),
+        _ => scheduled_messages_usage_and_exit(2),
+    }
+}
+
+/// `scheduled-messages create`. `--at <local-datetime>` is required. Forwarded
+/// raw, zoned + validated daemon-side by `control::normalize_deliver_at` (naive
+/// local anchored in the user's tz, which only the daemon holds; unparseable
+/// values rejected so a garbage timestamp can't misfire). The queue-when-free
+/// path (`deliver_at` null) is composer-only — no use for the agent, which
+/// already runs at turn end.
+async fn run_create_scheduled_message_cli(args: &[String]) {
     let mut body: Option<String> = None;
     let mut at: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let s = a.as_str();
         if s == "-h" || s == "--help" {
-            usage_and_exit();
-        } else if let Some(v) = take_flag(s, "--chat-id", &mut it) {
-            chat_id = Some(v);
+            scheduled_messages_usage_and_exit(0);
+        } else if skip_legacy_chat_id(s, &mut it) {
         } else if let Some(v) = take_flag(s, "--body", &mut it) {
             body = Some(v);
         } else if let Some(v) = take_flag(s, "--at", &mut it) {
             at = Some(v);
         } else {
-            usage_and_exit();
+            scheduled_messages_usage_and_exit(2);
         }
     }
-    // `--chat-id` defaults to $ZUCCHINI_CHAT_ID like the other subcommands (the
-    // agent always passes it explicitly, so this is just consistency).
-    let chat_id = chat_id_or_env(chat_id);
-    let (Some(chat_id), Some(body), Some(at)) = (chat_id, body, at) else {
-        usage_and_exit();
+    let (Some(chat_id), Some(body), Some(at)) = (env_chat_id(), body, at) else {
+        scheduled_messages_usage_and_exit(2);
     };
 
     match control::schedule_message_via_socket(&chat_id, &body, Some(at)).await {
@@ -2592,7 +2601,82 @@ async fn run_schedule_message_cli(args: &[String]) {
             std::process::exit(0);
         }
         Err(e) => {
-            eprintln!("schedule-message failed: {e:#}");
+            eprintln!("scheduled-messages create failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `scheduled-messages list`: what this chat still has pending. Rows come back
+/// decrypted and already in the user's local wall-clock, so this only formats
+/// and prints. Exit 0 whether or not anything is pending; 1 only on an RPC
+/// failure.
+async fn run_list_scheduled_messages_cli(args: &[String]) {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let s = a.as_str();
+        if s == "-h" || s == "--help" {
+            scheduled_messages_usage_and_exit(0);
+        } else if !skip_legacy_chat_id(s, &mut it) {
+            scheduled_messages_usage_and_exit(2);
+        }
+    }
+    let Some(chat_id) = env_chat_id() else {
+        scheduled_messages_usage_and_exit(2);
+    };
+
+    match control::list_scheduled_messages_via_socket(&chat_id).await {
+        Ok(messages) if messages.is_empty() => {
+            println!("no pending scheduled messages in this chat");
+            std::process::exit(0);
+        }
+        Ok(messages) => {
+            for m in messages {
+                let when = m
+                    .deliver_at
+                    .unwrap_or_else(|| "when the agent is next free".to_string());
+                println!("== {}  {}", m.id, when);
+                if !m.attachments.is_empty() {
+                    println!("attachments: {}", m.attachments.join(", "));
+                }
+                println!("{}\n", m.text);
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("scheduled-messages list failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `scheduled-messages delete`. The daemon refuses an id that isn't pending in
+/// this chat, so an already-delivered row reports as such here.
+async fn run_delete_scheduled_message_cli(args: &[String]) {
+    let mut id: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let s = a.as_str();
+        if s == "-h" || s == "--help" {
+            scheduled_messages_usage_and_exit(0);
+        } else if skip_legacy_chat_id(s, &mut it) {
+        } else if let Some(v) = take_flag(s, "--id", &mut it) {
+            id = Some(v);
+        } else {
+            scheduled_messages_usage_and_exit(2);
+        }
+    }
+    let (Some(chat_id), Some(id)) = (env_chat_id(), id) else {
+        scheduled_messages_usage_and_exit(2);
+    };
+
+    match control::cancel_scheduled_message_via_socket(&chat_id, &id).await {
+        Ok(id) => {
+            println!("deleted scheduled message {id}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("scheduled-messages delete failed: {e:#}");
             std::process::exit(1);
         }
     }
@@ -2700,8 +2784,14 @@ async fn main() {
             run_prune_reminder_hook_cli();
             return;
         }
+        if first == "scheduled-messages" {
+            run_scheduled_messages_cli(&raw_args[1..]).await;
+            return;
+        }
+        // Legacy spelling: conversations started before `scheduled-messages`
+        // still carry the old instruction and resume with it.
         if first == "schedule-message" {
-            run_schedule_message_cli(&raw_args[1..]).await;
+            run_create_scheduled_message_cli(&raw_args[1..]).await;
             return;
         }
         if first == "hermes-turn" {
@@ -2735,7 +2825,7 @@ async fn main() {
         let is_help = first == "--help" || first == "-h";
         eprintln!(
             "zucchini-spawner — run with NO arguments to start the daemon.\n\
-             subcommands: attach-file, prune-context, prune-reminder-hook, schedule-message, hermes-turn\n\
+             subcommands: attach-file, prune-context, prune-reminder-hook, scheduled-messages, hermes-turn\n\
              flags: --version|-V, --help|-h"
         );
         std::process::exit(if is_help { 0 } else { 2 });
@@ -4691,7 +4781,7 @@ mod tests {
 
     #[test]
     fn parse_prune_args_single_triple_is_one_item() {
-        let (chat, force, items) = super::parse_prune_args(&sv(&[
+        let (force, items) = super::parse_prune_args(&sv(&[
             "--tool-name",
             "Read",
             "--args",
@@ -4700,7 +4790,6 @@ mod tests {
             "kept x",
         ]))
         .expect("valid");
-        assert!(chat.is_none());
         assert!(!force, "force defaults off");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].tool_name, "Read");
@@ -4710,8 +4799,8 @@ mod tests {
 
     #[test]
     fn parse_prune_args_summary_terminates_each_target() {
-        // Three targets in one call; `--chat-id` is call-level and can sit anywhere.
-        let (chat, force, items) = super::parse_prune_args(&sv(&[
+        // Three targets in one call; a legacy `--chat-id` is ignored wherever it sits.
+        let (force, items) = super::parse_prune_args(&sv(&[
             "--tool-name",
             "Read",
             "--args",
@@ -4733,7 +4822,6 @@ mod tests {
             "s3", // no-args selector
         ]))
         .expect("valid");
-        assert_eq!(chat.as_deref(), Some("c1"));
         assert!(force, "--force parsed as call-level boolean");
         assert_eq!(items.len(), 3);
         assert_eq!(
@@ -4753,7 +4841,7 @@ mod tests {
 
     #[test]
     fn parse_prune_args_accepts_eq_form_and_reason_alias() {
-        let (_, _, items) = super::parse_prune_args(&sv(&[
+        let (_, items) = super::parse_prune_args(&sv(&[
             "--tool-name=Read",
             "--args=a.ts",
             "--reason=legacy", //

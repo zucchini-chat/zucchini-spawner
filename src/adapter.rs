@@ -605,9 +605,8 @@ pub fn shell_escape(s: &str) -> String {
 
 /// Instruction telling the agent how to attach a local file to its next message
 /// via the `zucchini-spawner attach-file` CLI. Chat id and binary path stay in
-/// env vars (`ZUCCHINI_CHAT_ID`, `ZUCCHINI_SPAWNER_BIN`) exported on every spawn
-/// — `--chat-id` defaults to `ZUCCHINI_CHAT_ID`, so it's dropped from the command
-/// line and the text is chat-agnostic and cacheable. Tool name is left
+/// env vars (`ZUCCHINI_CHAT_ID`, `ZUCCHINI_SPAWNER_BIN`) exported on every spawn,
+/// so the text is chat-agnostic and cacheable. Tool name is left
 /// unspecified ("run the command"): every coding agent has a shell-exec facility.
 pub const ATTACH_FILE_INSTRUCTION: &str =
     "To send a file to the user, run the command `\"$ZUCCHINI_SPAWNER_BIN\" attach-file <absolute-path>` before writing the message that should accompany the attachment.";
@@ -665,16 +664,15 @@ pub const PRUNE_CONTEXT_INSTRUCTION_GEMINI: &str = prune_context_instruction!(
     "`--tool-name \"read_file\" --args \"src/main.ts\" --summary \"main.ts: initApp() wires routes then listens on PORT — entry point confirmed\" --tool-name read_file --args \"build.log\" --summary \"build: passed, nothing relevant\"` (use your own tool names — `read_file`, `list_directory`, `replace`, `grep_search`, … — not claude's `Read`/`Edit`/`Grep`)"
 );
 
-/// How the agent schedules a follow-up via `zucchini-spawner schedule-message`.
+/// How the agent schedules a follow-up via `zucchini-spawner scheduled-messages`.
 /// Same env-var contract as `ATTACH_FILE_INSTRUCTION` (`ZUCCHINI_CHAT_ID`,
 /// `ZUCCHINI_SPAWNER_BIN`) so it stays chat-agnostic and cacheable.
 ///
 /// The agent emits a NAIVE local wall-clock (no offset/`Z`); the spawner anchors
 /// it in the user's timezone (`normalize_deliver_at`) so the agent never does
-/// offset/DST math (which it gets wrong). It just echoes the digits off the
-/// per-turn current-local-time line ([`current_time_in_tz_line`]).
+/// offset/DST math (which it gets wrong).
 pub const SCHEDULE_MESSAGE_INSTRUCTION: &str =
-    "To schedule a follow-up message to yourself in this chat for a specific future time, run the command `\"$ZUCCHINI_SPAWNER_BIN\" schedule-message --chat-id \"$ZUCCHINI_CHAT_ID\" --body \"<text>\" --at <local-datetime>`. Pass `--at` as a naive local datetime — the user's wall-clock time (e.g. \"2026-06-07T09:00:00\" for 9am), read off the current-local-time line. ALWAYS use this command for any scheduling, reminder, or self-follow-up request — it is the only mechanism that reliably delivers a message back into this chat. Do NOT use your own built-in scheduling tools (the `/schedule` skill, ScheduleWakeup, CronCreate, etc.): `/schedule` runs in a context the user never sees here, and in-session timers are lost whenever this process restarts, which happens routinely (idle eviction, context pruning, updates).";
+    "To schedule a follow-up message to yourself in this chat for a specific future time, run the command `\"$ZUCCHINI_SPAWNER_BIN\" scheduled-messages create --body \"<text>\" --at <local-datetime>`. Pass `--at` as a naive local datetime — the user's wall-clock time (e.g. \"2026-06-07T09:00:00\" for 9am). `list` and `delete`: see `scheduled-messages --help`. ALWAYS use this command for any scheduling, reminder, or self-follow-up request — it is the only mechanism that reliably delivers a message back into this chat. Do NOT use your own built-in scheduling tools (the `/schedule` skill, ScheduleWakeup, CronCreate, etc.): `/schedule` runs in a context the user never sees here, and in-session timers are lost whenever this process restarts, which happens routinely (idle eviction, context pruning, updates).";
 
 /// Per-turn current-local-time line for the agent prompt, from the sender's IANA
 /// timezone (`machine_users.timezone`, migration 0040). `None` when `iana_tz` is
@@ -1197,7 +1195,10 @@ mod tests {
         let first = TurnContext::for_test(&prompt_file, None, false, None);
         let preamble = first_message_capabilities_preamble(&first).expect("first turn → Some");
         assert!(preamble.contains("attach-file"), "got: {preamble}");
-        assert!(preamble.contains("schedule-message"), "got: {preamble}");
+        assert!(
+            preamble.contains("scheduled-messages create"),
+            "got: {preamble}"
+        );
         assert!(!preamble.contains("Worktree:"), "got: {preamble}");
 
         let resume = TurnContext::for_test(&prompt_file, Some("sid"), false, None);

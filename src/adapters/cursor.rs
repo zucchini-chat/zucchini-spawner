@@ -2539,7 +2539,7 @@ mod tests {
         // Stdin preamble carries capabilities + (worktree on) the worktree rule
         // naming cursor's `~/.cursor/worktrees/<repo>/<name>` dir.
         assert!(cmd.contains("attach-file"), "got: {}", cmd);
-        assert!(cmd.contains("schedule-message"), "got: {}", cmd);
+        assert!(cmd.contains("scheduled-messages create"), "got: {}", cmd);
         assert!(cmd.contains("Worktree:"), "worktree rule present: {}", cmd);
         assert!(
             cmd.contains(".cursor/worktrees/proj/zcm-abcdef012345"),
@@ -2558,7 +2558,7 @@ mod tests {
         let cmd = a.prepare_command(&ctx).unwrap();
         // Capabilities always present; worktree rule only when worktree is on.
         assert!(cmd.contains("attach-file"), "got: {}", cmd);
-        assert!(cmd.contains("schedule-message"), "got: {}", cmd);
+        assert!(cmd.contains("scheduled-messages create"), "got: {}", cmd);
         assert!(
             !cmd.contains("Worktree:"),
             "worktree off → no rule: {}",

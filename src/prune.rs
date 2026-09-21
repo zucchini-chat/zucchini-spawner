@@ -8,8 +8,8 @@
 //! ([`pruned_frame_json`]), and the [`PruneOps`] vtable.
 //!
 //! Flow: the agent, mid-turn, runs `zucchini-spawner prune-context
-//! --tool-name <Tool> --args <needle> --summary <digest>` (`--chat-id` defaults to
-//! the `ZUCCHINI_CHAT_ID` env var exported on the spawn). The control task
+//! --tool-name <Tool> --args <needle> --summary <digest>` (chat from the `ZUCCHINI_CHAT_ID`
+//! env var exported on the spawn). The control task
 //! ([`crate::control`]) resolves the chat's [`PruneOps`] from its `AgentKind`,
 //! locates the transcript (`find_session`), pre-scans (`count_matches`), and —
 //! on ≥1 match — queues a [`PruneRequest`] for the main loop, then returns so the

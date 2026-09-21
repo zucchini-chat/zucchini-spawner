@@ -2688,7 +2688,7 @@ mod tests {
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(cmd.contains("--append-system-prompt"), "got: {}", cmd);
         assert!(cmd.contains("attach-file"), "got: {}", cmd);
-        assert!(cmd.contains("schedule-message"), "got: {}", cmd);
+        assert!(cmd.contains("scheduled-messages create"), "got: {}", cmd);
         assert!(
             !cmd.contains("Worktree:"),
             "worktree off → no rule: {}",
@@ -2726,7 +2726,7 @@ mod tests {
         assert!(cmd.contains("Parent repo: /tmp/proj"), "got: {}", cmd);
         // Capability instructions still present in the same block.
         assert!(cmd.contains("attach-file"), "got: {}", cmd);
-        assert!(cmd.contains("schedule-message"), "got: {}", cmd);
+        assert!(cmd.contains("scheduled-messages create"), "got: {}", cmd);
     }
 
     #[test]

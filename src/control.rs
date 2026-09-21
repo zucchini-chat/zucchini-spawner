@@ -11,8 +11,12 @@
 //!     or `{ "action": "schedule_message", "chat_id": "<uuid>", "body": "<text>",
 //!     "deliver_at": "<naive-local-datetime|rfc3339>"|null }\n` (null = queue for
 //!     the next agent-free window; non-null = that wall-clock time, zoned daemon-side)
+//!     or `{ "action": "list_scheduled_messages", "chat_id": "<uuid>" }\n`
+//!     or `{ "action": "cancel_scheduled_message", "chat_id": "<uuid>", "id": "<uuid>" }\n`
 //!   - response: `{ "ok": true, "blob_key": "...", "name": "..." }\n`
-//!     or `{ "ok": true, "scheduled_message_id": "<uuid>" }\n`
+//!     or `{ "ok": true, "scheduled_message_id": "<uuid>" }\n` (schedule + cancel)
+//!     or `{ "ok": true, "scheduled_messages": [ { "id": "<uuid>",
+//!     "deliver_at": "<local-wall-clock>"|null, "text": "...", "attachments": ["<name>"] } ] }\n`
 //!     or `{ "ok": false, "error": "..." }\n`
 //!
 //! Connection is one request/one response then close — the CLI exits and we
@@ -91,6 +95,29 @@ pub enum ControlRequest {
         body: String,
         deliver_at: Option<String>,
     },
+    /// Still-pending `scheduled_messages` rows for `chat_id`, soonest first. The
+    /// daemon decrypts each body with the owner's key and renders `deliver_at`
+    /// into the user's local wall-clock — the CLI holds neither the key nor the tz.
+    ListScheduledMessages { chat_id: String },
+    /// Cancel one pending row. Scoped to `chat_id`: the daemon only deletes an id
+    /// that `ListScheduledMessages` returns for that chat, so an agent can't reach
+    /// into another chat's schedule and an already-fired row reports as such
+    /// instead of succeeding silently.
+    CancelScheduledMessage { chat_id: String, id: String },
+}
+
+/// One pending scheduled message as the CLI sees it. `deliver_at` is already in
+/// the user's LOCAL wall-clock (see `local_wall_clock`; what `schedule-message --at`
+/// accepts) — rendered daemon-side because only the daemon's mirror holds the
+/// member timezone, same reason `normalize_deliver_at` lives here. `None` means
+/// the row is queued for the next agent-free window rather than a fixed time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledMessageInfo {
+    pub id: String,
+    pub deliver_at: Option<String>,
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 /// One prune target inside a (possibly batched) `prune-context` call. `tool_name`
@@ -119,10 +146,14 @@ pub struct ControlResponse {
     pub blob_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Set only by the `schedule_message` handler — the freshly minted
-    /// `scheduled_messages.id` the daemon PUT to `/api/writes`.
+    /// The `scheduled_messages.id` the call acted on — minted by
+    /// `schedule_message`, deleted by `cancel_scheduled_message`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_message_id: Option<String>,
+    /// Set only by the `list_scheduled_messages` handler. An empty vec is a
+    /// successful "nothing pending", distinct from `None` (not that handler).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_messages: Option<Vec<ScheduledMessageInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Per-item eligible-match counts, parallel to the request's `items` — set
@@ -148,6 +179,13 @@ impl ControlResponse {
         Self {
             ok: true,
             scheduled_message_id: Some(id),
+            ..Default::default()
+        }
+    }
+    fn scheduled_list(messages: Vec<ScheduledMessageInfo>) -> Self {
+        Self {
+            ok: true,
+            scheduled_messages: Some(messages),
             ..Default::default()
         }
     }
@@ -293,6 +331,24 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                 ControlResponse::err(format!("{e:#}"))
             }
         },
+        ControlRequest::ListScheduledMessages { chat_id } => {
+            match list_scheduled_messages(&chat_id, state).await {
+                Ok(messages) => ControlResponse::scheduled_list(messages),
+                Err(e) => {
+                    warn!(chat_id = %chat_id, error = %e, "list_scheduled_messages failed");
+                    ControlResponse::err(format!("{e:#}"))
+                }
+            }
+        }
+        ControlRequest::CancelScheduledMessage { chat_id, id } => {
+            match cancel_scheduled_message(&chat_id, &id, state).await {
+                Ok(()) => ControlResponse::scheduled(id),
+                Err(e) => {
+                    warn!(chat_id = %chat_id, %id, error = %e, "cancel_scheduled_message failed");
+                    ControlResponse::err(format!("{e:#}"))
+                }
+            }
+        }
     }
 }
 
@@ -629,6 +685,25 @@ async fn attach_file(
     Ok((blob_key, name))
 }
 
+/// `chat_id → (owner, owner's IANA zone)`. The read guard spans a couple of map
+/// lookups with no `.await` under it; the slow crypto/HTTP work happens in the
+/// callers after it drops.
+async fn chat_owner_and_tz(
+    chat_id: &str,
+    state: &ControlState,
+) -> Result<(uuid::Uuid, Option<chrono_tz::Tz>)> {
+    let g = state.mirror.read().await;
+    let user_id = g
+        .chats
+        .get(chat_id)
+        .map(|c| c.user_id)
+        .ok_or_else(|| anyhow!("no chat with id {chat_id} (unknown or not yet synced)"))?;
+    let tz = g
+        .member_timezone(&user_id)
+        .and_then(|s| s.parse::<chrono_tz::Tz>().ok());
+    Ok((user_id, tz))
+}
+
 /// Daemon-side handler for `ScheduleMessage`. Resolves `chat_id → user_id` from
 /// the mirror, encrypts `body` into the `messages.body` wire format, and PUTs a
 /// fresh `scheduled_messages` row to `/api/writes` (inline — one encrypt + one
@@ -639,24 +714,10 @@ async fn schedule_message(
     deliver_at: Option<&str>,
     state: &ControlState,
 ) -> Result<uuid::Uuid> {
-    // Tight read guard: chat→user lookup + the user's IANA timezone, no `.await`
-    // held. Encrypt + POST happen after it drops.
-    let (user_id, tz_name) = {
-        let g = state.mirror.read().await;
-        let user_id = g
-            .chats
-            .get(chat_id)
-            .map(|c| c.user_id)
-            .ok_or_else(|| anyhow!("no chat with id {chat_id} (unknown or not yet synced)"))?;
-        let tz_name = g.member_timezone(&user_id).map(str::to_string);
-        (user_id, tz_name)
-    };
+    let (user_id, tz) = chat_owner_and_tz(chat_id, state).await?;
 
     // Validate + canonicalize (the socket is its own entry point, so reject bad
     // values here too, not just at the CLI front-end). Absent stays NULL (queue).
-    let tz = tz_name
-        .as_deref()
-        .and_then(|s| s.parse::<chrono_tz::Tz>().ok());
     let deliver_at = normalize_deliver_at(deliver_at.map(str::to_string), tz)?;
 
     // Use `envelope::encode`, NOT `encrypt_field_b64`: the backend promotes this
@@ -709,6 +770,141 @@ async fn schedule_message(
     Ok(id)
 }
 
+/// Daemon-side handler for `ListScheduledMessages`: GET the chat's still-pending
+/// rows, decrypt each body with the owner's key and render `deliver_at` into that
+/// owner's local wall-clock. A row we can't decrypt is still returned (with
+/// placeholder text) so the agent can cancel it — hiding it would strand the row.
+async fn list_scheduled_messages(
+    chat_id: &str,
+    state: &ControlState,
+) -> Result<Vec<ScheduledMessageInfo>> {
+    #[derive(Deserialize)]
+    struct Row {
+        id: String,
+        body: String,
+        deliver_at: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Page {
+        messages: Vec<Row>,
+    }
+
+    let (user_id, tz) = chat_owner_and_tz(chat_id, state).await?;
+    let key = state.keys.get(&user_id).ok();
+
+    let url = format!(
+        "{}/api/scheduled?chat_id={chat_id}",
+        state.api_base_url.trim_end_matches('/')
+    );
+    let token = (state.fetch_token)()
+        .await
+        .context("fetch JWT for /api/scheduled")?;
+    let resp =
+        crate::net::send_reporting("GET", &url, state.http.get(&url).bearer_auth(token).send())
+            .await
+            .context("GET /api/scheduled")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = crate::net::capture_response_failure("GET", &url, resp).await;
+        // The handler's own 404s carry a reason; an empty one is a missing route.
+        if status == reqwest::StatusCode::NOT_FOUND && body.is_empty() {
+            return Err(anyhow!(
+                "the Zucchini backend doesn't support listing scheduled messages yet"
+            ));
+        }
+        return Err(anyhow!("GET /api/scheduled {}: {}", status, body));
+    }
+    let page: Page = resp.json().await.context("parse /api/scheduled response")?;
+
+    Ok(page
+        .messages
+        .into_iter()
+        .map(|row| {
+            let envelope = key
+                .as_deref()
+                .and_then(|k| crate::envelope::decode(&row.body, k).ok());
+            ScheduledMessageInfo {
+                id: row.id,
+                deliver_at: row.deliver_at.map(|at| local_wall_clock(&at, tz)),
+                text: envelope
+                    .as_ref()
+                    .map_or_else(|| "<undecryptable>".to_string(), |env| env.text.clone()),
+                attachments: envelope
+                    .map(|env| env.attachments.into_iter().map(|a| a.name).collect())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect())
+}
+
+/// Render a UTC RFC3339 instant as the owner's local wall-clock — the same shape
+/// `schedule-message --at` accepts, so a listed time can be re-scheduled verbatim.
+/// Falls back to the raw value when the zone is unknown or unparseable, which is
+/// honest about the instant instead of guessing UTC is local.
+///
+/// In the repeated fall-back hour the offset is appended: a bare wall-clock would
+/// re-schedule as its earlier occurrence. Only then, so the agent doesn't learn to
+/// write offsets (and do DST math) itself.
+fn local_wall_clock(rfc3339: &str, tz: Option<chrono_tz::Tz>) -> String {
+    use chrono::TimeZone;
+    match (chrono::DateTime::parse_from_rfc3339(rfc3339), tz) {
+        (Ok(dt), Some(tz)) => {
+            let local = dt.with_timezone(&tz);
+            let ambiguous = matches!(
+                tz.from_local_datetime(&local.naive_local()),
+                chrono::offset::LocalResult::Ambiguous(..)
+            );
+            let fmt = if ambiguous {
+                "%Y-%m-%dT%H:%M:%S%:z"
+            } else {
+                "%Y-%m-%dT%H:%M:%S"
+            };
+            local.format(fmt).to_string()
+        }
+        _ => rfc3339.to_string(),
+    }
+}
+
+fn not_pending_error(id: &str) -> anyhow::Error {
+    anyhow!("no pending scheduled message {id} in this chat — already delivered or cancelled")
+}
+
+/// Daemon-side handler for `CancelScheduledMessage`. The id must appear in THIS
+/// chat's pending list before we delete it: that stops an agent in one chat from
+/// cancelling another chat's message, and turns "already fired" into an honest
+/// error rather than a silent success.
+async fn cancel_scheduled_message(chat_id: &str, id: &str, state: &ControlState) -> Result<()> {
+    let pending = list_scheduled_messages(chat_id, state).await?;
+    if !pending.iter().any(|m| m.id == id) {
+        return Err(not_pending_error(id));
+    }
+
+    let url = format!(
+        "{}/api/scheduled/{id}",
+        state.api_base_url.trim_end_matches('/')
+    );
+    let token = (state.fetch_token)()
+        .await
+        .context("fetch JWT for /api/scheduled")?;
+    let resp = crate::net::send_reporting(
+        "DELETE",
+        &url,
+        state.http.delete(&url).bearer_auth(token).send(),
+    )
+    .await
+    .context("DELETE /api/scheduled")?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(not_pending_error(id));
+    }
+    if !status.is_success() {
+        let body = crate::net::capture_response_failure("DELETE", &url, resp).await;
+        return Err(anyhow!("DELETE /api/scheduled {}: {}", status, body));
+    }
+    info!(chat_id, %id, "cancelled scheduled message");
+    Ok(())
+}
+
 // ===== CLI client side =====
 
 /// One request/one response round-trip over the control socket: connect → write
@@ -740,10 +936,15 @@ async fn send_control_request(req: &ControlRequest) -> Result<ControlResponse> {
     let resp: ControlResponse =
         serde_json::from_str(line.trim_end_matches('\n')).context("parse control response JSON")?;
     if !resp.ok {
-        return Err(anyhow!(
-            "{}",
-            resp.error.unwrap_or_else(|| "unknown error".to_string())
-        ));
+        let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
+        // After a self-update the CLI can be newer than the daemon still running.
+        if error.contains("unknown variant") {
+            return Err(anyhow!(
+                "the running zucchini-spawner daemon is older than this command and \
+                 doesn't support it yet; it updates once no agent is busy ({error})"
+            ));
+        }
+        return Err(anyhow!("{error}"));
     }
     Ok(resp)
 }
@@ -871,7 +1072,7 @@ fn zone_local_to_utc(
     }
 }
 
-/// Run one `schedule-message` RPC. Mirrors `attach_file_via_socket`: CLI never
+/// Run one `scheduled-messages create` RPC. Mirrors `attach_file_via_socket`: CLI never
 /// touches K_user or the JWT — the daemon encrypts + POSTs. Returns the minted
 /// `scheduled_messages.id`. `deliver_at` is forwarded raw and zoned daemon-side
 /// (`normalize_deliver_at`), since only the daemon's mirror holds the user's tz.
@@ -884,6 +1085,31 @@ pub async fn schedule_message_via_socket(
         chat_id: chat_id.to_string(),
         body: body.to_string(),
         deliver_at,
+    })
+    .await?;
+    resp.scheduled_message_id
+        .ok_or_else(|| anyhow!("response missing scheduled_message_id"))
+}
+
+/// Run one `scheduled-messages list` RPC. Bodies come back already decrypted and
+/// times already zoned — the CLI holds neither K_user nor the member timezone.
+pub async fn list_scheduled_messages_via_socket(
+    chat_id: &str,
+) -> Result<Vec<ScheduledMessageInfo>> {
+    let resp = send_control_request(&ControlRequest::ListScheduledMessages {
+        chat_id: chat_id.to_string(),
+    })
+    .await?;
+    resp.scheduled_messages
+        .ok_or_else(|| anyhow!("response missing scheduled_messages"))
+}
+
+/// Run one `scheduled-messages delete` RPC, returning the cancelled row's id.
+/// An id that isn't pending in this chat comes back as a daemon-side error.
+pub async fn cancel_scheduled_message_via_socket(chat_id: &str, id: &str) -> Result<String> {
+    let resp = send_control_request(&ControlRequest::CancelScheduledMessage {
+        chat_id: chat_id.to_string(),
+        id: id.to_string(),
     })
     .await?;
     resp.scheduled_message_id
@@ -974,6 +1200,21 @@ mod tests {
             out_utc("2026-03-08T02:30:00", Some(ny)),
             utc("2026-03-08T07:30:00Z")
         );
+    }
+
+    #[test]
+    fn listed_time_round_trips_through_create_in_fall_back_hour() {
+        // Lisbon falls back 02:00 WEST -> 01:00 WET on 2026-10-25, so 01:30 occurs twice.
+        let lisbon: chrono_tz::Tz = "Europe/Lisbon".parse().unwrap();
+        for (instant, listed) in [
+            ("2026-10-25T00:30:00Z", "2026-10-25T01:30:00+01:00"),
+            ("2026-10-25T01:30:00Z", "2026-10-25T01:30:00+00:00"),
+            ("2026-10-25T12:00:00Z", "2026-10-25T12:00:00"),
+        ] {
+            let shown = local_wall_clock(instant, Some(lisbon));
+            assert_eq!(shown, listed);
+            assert_eq!(out_utc(&shown, Some(lisbon)), utc(instant));
+        }
     }
 
     #[test]
