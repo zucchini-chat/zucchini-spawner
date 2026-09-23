@@ -1,45 +1,41 @@
-//! codex (openai codex-cli) adapter. Normalizes codex's `exec --json` stream
-//! frames into claude-shape envelopes on the wire so iOS's
-//! `SpawnerMessageDescriber` (which only knows claude's wire format) can
-//! render them WITHOUT any codex-specific branches in the iOS code: every
-//! codex tool item is remapped to the equivalent claude tool name on the
-//! wire so iOS's toolSummary table picks it up as if it were a claude
-//! tool_use. Single seam, single source of truth.
+//! codex (openai codex-cli) adapter. A RESIDENT: one long-lived `codex
+//! app-server` per chat (JSON-RPC over stdio), kept warm between turns exactly
+//! like the claude resident. Protocol facts (codex-cli 0.154) and the raw
+//! captures behind the tests: `tmp/codex-appserver-spike.md`.
 //!
-//! Frame mapping (codex → claude-shape). Tool items surface on `item.started`
-//! (so they show IN-FLIGHT — codex populates input fields at
-//! `status:in_progress`); the matching `item.completed` is deduped away
-//! (`dedup_item`), acting only as a fallback when no usable started arrived:
-//!  - `thread.started`     → `SessionIdHarvested` only (no Frame; matches claude's init-skip)
-//!  - `turn.started`       → drop (no claude analog)
-//!  - command_execution    → claude `Bash` `{command}`
-//!  - file_change          → one Frame per change: add→`Write`, update→`Edit`,
-//!    delete→`Bash {command: "rm <path>"}` (no claude delete tool; `rm` is what
-//!    claude itself emits)
-//!  - web_search           → claude `WebSearch` `{query}`
-//!  - mcp_tool_call        → claude `mcp__<server>__<tool>`, codex's raw
-//!    `arguments` object as input (`mcp__server__tool` IS claude's own MCP naming)
-//!  - collab_tool_call     → `spawn_agent` w/ prompt → claude `Agent` `{description}`;
-//!    other collab subtools (or `spawn_agent` w/o prompt) → collab tool name verbatim
-//!  - agent_message        → Frame on `item.completed` only (text empty at start):
-//!    claude-shape assistant text envelope
-//!  - `turn.completed`     → Frame (result envelope) + Result (context tokens are
-//!    sourced post-turn from the rollout, not this frame)
-//!  - `turn.failed`        → Frame (error result envelope) + Result
-//!  - anything else (unknown type, missing `type`, non-JSON) → DROPPED with a
-//!    debug breadcrumb. codex frames are never iOS-wire-compatible (we always
-//!    transform), so forwarding a raw line renders user-facing junk (`[X]`);
-//!    the log preserves drift observability without spamming the chat.
+//! Session: `initialize` → `initialized` + `thread/resume <agent_session_id>`
+//! (threads `codex exec` created resume too) or `thread/start`; the thread id in
+//! its response is the session id. Every user turn is a `turn/start` stamped
+//! with `clientUserMessageId`: on a busy thread it joins the running turn, and
+//! codex echoes the id on the `userMessage` item once the input is recorded
+//! (`UserTurnConsumed`). `/stop` is `turn/interrupt`. `/compact` is
+//! `thread/compact/start`, held until the chat is idle — on a busy thread it
+//! would interrupt the running turn. Teardown closes stdin: SIGTERM leaves the
+//! shell commands codex runs (in process groups of their own) orphaned.
 //!
-//! Codex's actual wire format observed via `codex exec --json` on
-//! codex-cli 0.133.0: each turn starts with `thread.started` carrying a
-//! UUIDv7 thread_id, ends with `turn.completed` carrying a `usage` block
-//! ({input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens}).
-//! That `usage.input_tokens` is cumulative, not live occupancy, so context
-//! tokens come post-turn from the rollout instead — see
-//! `read_rollout_last_context_tokens`. Item payload shapes are pinned by
-//! `codex-rs/exec/src/exec_events.rs` (CommandExecutionItem, FileChangeItem,
-//! WebSearchItem).
+//! JSON-RPC ids are strings naming what they answer: `init`, `thread`,
+//! `turn:<uuid>`, `compact:<uuid>`, `interrupt:<request id>`.
+//!
+//! Notification mapping (codex → claude-shape; codex frames are never
+//! iOS-renderable as-is). Tool items surface on `item/started` (in flight); the
+//! matching `item/completed` is deduped away (`render_item_once`), acting only as a
+//! fallback when no usable started arrived:
+//!  - commandExecution    → claude `Bash` `{command}`, plus `CommandStarted` /
+//!    `CommandFinished` for the prune guard
+//!  - fileChange         → one Frame per change by `kind.type`: add→`Write`,
+//!    update→`Edit`, delete→`Bash {command: "rm <path>"}` (no claude delete tool)
+//!  - webSearch           → claude `WebSearch` `{query}` (query only on completed)
+//!  - mcpToolCall         → claude `mcp__<server>__<tool>`, raw `arguments` as input
+//!  - collabAgentToolCall → `spawnAgent` with a prompt → claude `Agent`
+//!    `{description}`; any other tool passes through snake_cased (`send_input`)
+//!  - agentMessage        → assistant text envelope on `item/completed`
+//!  - userMessage         → `UserTurnConsumed(clientId)`, no frame
+//!  - contextCompaction   → `CompactBoundary` (the last `tokenUsage.last.totalTokens`)
+//!  - thread/tokenUsage/updated → `ContextTokens(last.totalTokens)`
+//!  - turn/started        → `TurnStarted(turn id)`
+//!  - turn/completed      → `Result` + result envelope by status (completed →
+//!    success, failed → error, interrupted → interrupted)
+//!  - everything else     → dropped with a debug breadcrumb
 //!
 //! Also hosts the install/auth `probe()` for codex (free function, not on
 //! the `AgentAdapter` trait — `dyn AgentAdapter` can't dispatch statics).
@@ -64,10 +60,11 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::adapter::{
-    claude_assistant_text_envelope, claude_tool_use_envelope, effective_cwd, extract_json_type,
-    file_nonempty, first_message_capabilities_preamble, parse_json_obj, probe_with_blocking_auth,
-    shell_escape, worktree_cwd_prefix, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind,
-    ImportProgress, TurnContext, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_CODEX,
+    agent_capabilities_instructions, claude_assistant_text_envelope, claude_tool_use_envelope,
+    effective_cwd, extract_json_string_field, file_nonempty, parse_json_obj,
+    probe_with_blocking_auth, slash_command_name, worktree_cwd_prefix, AdapterDescriptor,
+    AgentAdapter, AgentEvent, AgentKind, ImportProgress, LastTokensDedup, SessionContext,
+    TurnContext, INTERRUPTED_RESULT, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_CODEX,
 };
 use crate::writer::WriteEvent;
 
@@ -110,50 +107,251 @@ fn make_boxed() -> Box<dyn AgentAdapter> {
     Box::new(CodexAdapter::new())
 }
 
-/// Per-turn state for the codex adapter. Carries the thread id harvested from
-/// the `thread.started` frame so `post_turn_context_tokens` can locate the
-/// session's rollout even on the FIRST turn (where the spawner hasn't persisted
-/// `chats.agent_session_id` yet, so the turn context's `agent_session_id` is
-/// `None`). On resume turns the harvested value and the turn context's id agree.
-///
-/// `emitted_item_ids` dedupes tool bubbles across the `item.started` /
-/// `item.completed` pair: we surface tool items (command/file_change/web_search)
-/// on `item.started` so they show in-flight, then suppress the matching
-/// `item.completed` so the same id isn't rendered twice. A fresh adapter is
-/// built per turn (`agent.rs`), so item ids never collide across turns.
+/// Chatter the spawner never reads, opted out of at `initialize` so it isn't
+/// even parsed (`turn/diff/updated` carries the whole cumulative diff).
+const QUIET_NOTIFICATIONS: &[&str] = &[
+    "item/agentMessage/delta",
+    "item/reasoning/textDelta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",
+    "item/plan/delta",
+    "turn/diff/updated",
+    "account/rateLimits/updated",
+    "mcpServer/startupStatus/updated",
+    "remoteControl/status/changed",
+];
+
+/// State of one `codex app-server` session, shared by the stdout reader
+/// (`handle_line`) and the stdin writer (`outbound_frames`, `encode_*`).
 #[derive(Default)]
 pub struct CodexAdapter {
-    session_id: Option<String>,
+    /// `thread/start` or `thread/resume`, sent once `initialize` is answered.
+    thread_request: Option<String>,
+    /// The `thread/start` a resume falls back to when its thread has no
+    /// rollout: codex writes none until the first turn, so a thread torn down
+    /// before that can't be resumed and would fail the chat for good.
+    fresh_thread_request: Option<String>,
+    handshake: Handshake,
+    /// Frames for the writer: the handshake and refusals of server requests.
+    outbound: Vec<String>,
+    /// The running turn, the target of `turn/interrupt`.
+    active_turn: Option<String>,
+    /// `(uuid, turn id)` of accepted `turn/start`s whose `clientId` echo hasn't
+    /// arrived. A turn that ends without recording the input (it failed first,
+    /// or a CLI ignores `clientUserMessageId`) still consumes them — otherwise
+    /// the chat would stay busy forever: never evicted, and blocking the
+    /// spawner's self-update.
+    awaiting_echo: Vec<(String, String)>,
+    /// The thread failed to open and a turn has reported it: close the session.
+    over: bool,
+    /// `tokenUsage.last.totalTokens` of the latest model round-trip — after a
+    /// compaction, the compacted context (`last.inputTokens` reads 0 there).
+    context_tokens: Option<i64>,
+    tokens: LastTokensDedup,
+    /// Tool items rendered from `item/started` and not completed yet.
     emitted_item_ids: HashSet<String>,
 }
+
+#[derive(Default)]
+enum Handshake {
+    #[default]
+    NotStarted,
+    Initializing,
+    OpeningThread,
+    Open(String),
+    /// The thread couldn't be opened; every turn fails with this message.
+    Failed(String),
+}
+
+type Events = SmallVec<[AgentEvent; 2]>;
 
 impl CodexAdapter {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Dedupe a rendered item by its `item.id` across the started/completed
-    /// pair: returns `frames` only the FIRST non-empty render for an id (then
-    /// records it); later sightings return empty. An EMPTY render is never
-    /// recorded, so an item whose `item.started` carried no usable payload still
-    /// renders from its `item.completed`. Items without an id bypass dedup.
-    fn dedup_item(&mut self, obj: &Value, frames: Vec<String>) -> Vec<String> {
-        if frames.is_empty() {
-            return frames;
-        }
-        let id = obj
-            .get("item")
-            .and_then(|i| i.get("id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if id.is_empty() {
-            return frames;
-        }
-        if self.emitted_item_ids.contains(id) {
+    /// Render a tool item once across its started/completed pair: from
+    /// `item/started` when that carries a usable payload, else from
+    /// `item/completed`. A rendered id stays recorded until its completion,
+    /// which can arrive after the turn ended (a command `/stop` left running).
+    /// Items without an id bypass dedup.
+    fn render_item_once(&mut self, item: &Value, completed: bool) -> Vec<String> {
+        let id = item["id"].as_str().unwrap_or("");
+        if completed && self.emitted_item_ids.remove(id) {
             return Vec::new();
         }
-        self.emitted_item_ids.insert(id.to_string());
+        let frames = render_tool_item(item);
+        if !completed
+            && !frames.is_empty()
+            && !id.is_empty()
+            && !self.emitted_item_ids.insert(id.to_string())
+        {
+            return Vec::new();
+        }
         frames
+    }
+
+    fn handle_response(&mut self, id: &Value, msg: &Value, out: &mut Events) {
+        let Some(id) = id.as_str() else {
+            debug!(%id, "codex response to an id we never sent");
+            return;
+        };
+        let error = msg.get("error").map(|e| {
+            e["message"]
+                .as_str()
+                .unwrap_or("codex request failed")
+                .to_string()
+        });
+        let (kind, key) = id.split_once(':').unwrap_or((id, ""));
+        match (kind, error) {
+            ("init", None) => {
+                self.handshake = Handshake::OpeningThread;
+                self.outbound.push(rpc_notification("initialized"));
+                self.outbound.extend(self.thread_request.take());
+            }
+            ("thread", None) => match msg["result"]["thread"]["id"].as_str() {
+                Some(thread_id) => {
+                    self.handshake = Handshake::Open(thread_id.to_string());
+                    out.push(AgentEvent::SessionIdHarvested(thread_id.to_string()));
+                }
+                None => self.handshake = Handshake::Failed("codex opened no thread".to_string()),
+            },
+            ("thread", Some(e))
+                if e.contains("no rollout found") && self.fresh_thread_request.is_some() =>
+            {
+                warn!(error = %e, "codex thread has no rollout; starting a new one");
+                self.outbound.extend(self.fresh_thread_request.take());
+            }
+            ("init" | "thread", Some(e)) => {
+                warn!(error = %e, "codex could not open the thread");
+                self.handshake = Handshake::Failed(format!("codex could not open the thread: {e}"));
+            }
+            ("turn" | "compact", Some(e)) => self.fail_turn(key, &e, out),
+            ("turn", None) => {
+                if let Some(turn_id) = msg["result"]["turn"]["id"].as_str() {
+                    self.awaiting_echo
+                        .push((key.to_string(), turn_id.to_string()));
+                }
+            }
+            ("compact", None) => out.push(AgentEvent::UserTurnConsumed(key.to_string())),
+            // A refused interrupt means the turn already ended: ack it, so the
+            // stop settles as a no-op instead of waiting out its timeout.
+            ("interrupt", _) => out.push(AgentEvent::InterruptAcked(key.to_string())),
+            _ => {}
+        }
+    }
+
+    /// A turn request codex refused: consumed, so it no longer holds the chat
+    /// busy, and answered with an error result.
+    fn fail_turn(&mut self, uuid: &str, error: &str, out: &mut Events) {
+        let message = match &self.handshake {
+            Handshake::Failed(why) => {
+                self.over = true;
+                why.clone()
+            }
+            _ => error.to_string(),
+        };
+        out.push(AgentEvent::UserTurnConsumed(uuid.to_string()));
+        if self.active_turn.is_none() {
+            out.push(AgentEvent::Result {
+                origin_is_task: false,
+            });
+        }
+        out.push(AgentEvent::Frame(error_result_frame(&message)));
+    }
+
+    /// Approvals and elicitations can't reach the user here (turns run with
+    /// `approvalPolicy: never`), and an unanswered request hangs the turn.
+    fn refuse_server_request(&mut self, id: &Value, method: &str) {
+        warn!(%method, "codex asked the spawner for something it can't answer; refusing");
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": format!("zucchini does not handle {method}") },
+        });
+        self.outbound.push(format!("{reply}\n"));
+    }
+
+    fn handle_notification(&mut self, method: &str, params: &Value, out: &mut Events) {
+        match method {
+            // Busy even when no turn of ours started it (a goal continuation),
+            // like claude's self-fired turns; its `turn/completed` ends it.
+            "turn/started" => {
+                self.active_turn = params["turn"]["id"].as_str().map(str::to_string);
+                out.extend(self.active_turn.clone().map(AgentEvent::TurnStarted));
+            }
+            // Result first: the reader swallows the frames of a line that ends
+            // a `/stop`-interrupted turn from its `Result` on.
+            "turn/completed" => {
+                self.active_turn = None;
+                let turn_id = params["turn"]["id"].as_str().unwrap_or("");
+                let (unechoed, rest) = std::mem::take(&mut self.awaiting_echo)
+                    .into_iter()
+                    .partition(|(_, t)| t == turn_id);
+                self.awaiting_echo = rest;
+                for (uuid, _) in unechoed {
+                    warn!(%uuid, "codex turn ended without echoing this input");
+                    out.push(AgentEvent::UserTurnConsumed(uuid));
+                }
+                out.push(AgentEvent::Result {
+                    origin_is_task: false,
+                });
+                out.push(AgentEvent::Frame(turn_result_frame(&params["turn"])));
+            }
+            "item/started" => {
+                let item = &params["item"];
+                let frames = self.render_item_once(item, false);
+                out.extend(frames.into_iter().map(AgentEvent::Frame));
+                out.extend(live_command(item));
+            }
+            "item/completed" => self.item_completed(&params["item"], out),
+            "thread/tokenUsage/updated" => {
+                if let Some(n) = params["tokenUsage"]["last"]["totalTokens"].as_i64() {
+                    self.context_tokens = Some(n);
+                    out.extend(self.tokens.observe(n).map(AgentEvent::ContextTokens));
+                }
+            }
+            other => debug!(method = %other, "codex notification dropped"),
+        }
+    }
+
+    fn item_completed(&mut self, item: &Value, out: &mut Events) {
+        match item["type"].as_str() {
+            Some("userMessage") => {
+                if let Some(uuid) = item["clientId"].as_str() {
+                    self.awaiting_echo.retain(|(u, _)| u != uuid);
+                    out.push(AgentEvent::UserTurnConsumed(uuid.to_string()));
+                }
+            }
+            Some("agentMessage") => {
+                let text = item["text"].as_str().unwrap_or("");
+                if !text.is_empty() {
+                    out.push(AgentEvent::Frame(claude_assistant_text_envelope(text)));
+                }
+            }
+            Some("contextCompaction") => {
+                out.extend(self.context_tokens.map(AgentEvent::CompactBoundary));
+            }
+            _ => {
+                // Call-keyed prune cue: only the `prune-context` command's own
+                // completion — its output is in the rollout now — may drive
+                // the restart, never a sibling's. Emitted after the item's own
+                // bubble so the restart can't preempt it.
+                let is_command = item["type"] == "commandExecution";
+                let is_prune =
+                    is_command && crate::prune::value_is_prune_context_call(&item["command"]);
+                let frames = self.render_item_once(item, true);
+                out.extend(frames.into_iter().map(AgentEvent::Frame));
+                if let Some(id) = item["id"].as_str().filter(|_| is_command && !is_prune) {
+                    out.push(AgentEvent::CommandFinished(id.to_string()));
+                }
+                if is_prune {
+                    out.push(AgentEvent::ToolResult);
+                }
+            }
+        }
     }
 }
 
@@ -162,565 +360,372 @@ impl AgentAdapter for CodexAdapter {
         AgentKind::Codex
     }
 
-    fn prepare_command(&mut self, ctx: &TurnContext<'_>) -> Result<String> {
-        let mut cmd = String::new();
-        // cwd (+ spawner-side worktree create/cd). Codex passes cwd TWICE: this
-        // leading `cd` AND a `-C <cwd>` flag on the first turn. `run_cwd` is the
-        // resolved dir (worktree under worktree mode, else project) shared with
-        // both `-C` sites below so the shell cwd and the flag can never disagree.
-        // The prefix's `git worktree add` runs first in the same `&&` chain, so
-        // the worktree dir exists by the time `-C <worktree>` is evaluated.
-        cmd.push_str(&worktree_cwd_prefix(ctx));
-        let run_cwd: Option<String> = effective_cwd(ctx);
-        // Subcommand selection. First turn uses `codex exec`; follow-up turns
-        // use `codex exec resume <thread_id>`. `--json --skip-git-repo-check`
-        // work on both. Flag availability differs across the two:
-        //   - `-s` (sandbox) and `-C` (cwd) ONLY exist on the first-turn
-        //     `codex exec` — they are locked at session creation, so
-        //     `codex exec resume` rejects them with `unexpected argument`.
-        //   - `-a` / `--ask-for-approval` does NOT exist on `codex exec` at
-        //     all (only on the top-level `codex` interactive command). Approval
-        //     policy on `exec` is set via `-c approval_policy=never` (config
-        //     override, allowed on BOTH first turn and resume) or folded into
-        //     `--dangerously-bypass-approvals-and-sandbox` (also allowed on
-        //     both).
-        let is_resume = ctx.agent_session_id.is_some();
-        cmd.push_str("codex exec");
-        if let Some(sid) = ctx.agent_session_id {
-            cmd.push_str(&format!(" resume {}", shell_escape(sid)));
-        }
-        cmd.push_str(" --json --skip-git-repo-check");
-
-        // Sender's `machine_users.is_sandboxed`. Non-sandboxed =
-        // `--dangerously-bypass-approvals-and-sandbox` (no sandbox at all +
-        // skip approval prompts in one flag), mirroring claude's
-        // `--dangerously-skip-permissions` and cursor's `--force` — the
-        // BYO-spawner trust model is "the owner accepts what their agent
-        // does on their machine". Sandboxed = `read-only` sandbox (first
-        // turn only — locked at session creation) plus `-c approval_policy=
-        // never` every turn so a refusal (or any prompt) surfaces as an
-        // error frame instead of hanging on a TTY.
-        if ctx.is_sandboxed {
-            cmd.push_str(" -c approval_policy=never");
-            if !is_resume {
-                cmd.push_str(" -s read-only");
-                if let Some(cwd) = &run_cwd {
-                    cmd.push_str(&format!(" -C {}", shell_escape(cwd)));
-                }
-            }
-        } else {
-            cmd.push_str(" --dangerously-bypass-approvals-and-sandbox");
-            if !is_resume {
-                if let Some(cwd) = &run_cwd {
-                    cmd.push_str(&format!(" -C {}", shell_escape(cwd)));
-                }
-            }
-        }
-
-        // Worktree cwd is handled via the shared `worktree_cwd_prefix` (leading
-        // `cd` + first-turn `git worktree add`) and `effective_cwd` (the `-C`
-        // flag above), so both the shell cwd and codex's authoritative `-C` root
-        // point at the worktree dir under worktree mode.
-
-        // Codex has no system-prompt injection point (no `--append-system-prompt`;
-        // `AGENTS.md` would clobber/persist the user's, `-c instructions=` would
-        // drop their global config), so capabilities ride the first user message
-        // via `prompt_file_preamble` below. The prune nudge rides the same path
-        // via `first_turn_prompt_suffix` (codex variant).
-
-        // Verbatim pass-through of `chats.model` (migration 0035). Codex
-        // uses `-m, --model`; the model label drifts per-release so we
-        // don't validate it locally — an invalid value surfaces as a
-        // codex error frame in the chat.
-        if let Some(model) = ctx.model {
-            cmd.push_str(&format!(" --model {}", shell_escape(model)));
-        }
-
-        // Prompt is read from stdin. `-` as the positional argument tells
-        // codex to consume stdin; the shell `<` redirect feeds it the
-        // prompt file the supervisor wrote.
-        cmd.push_str(&format!(
-            " - < {}",
-            shell_escape(&ctx.prompt_file.to_string_lossy())
-        ));
-
-        Ok(cmd)
+    fn prepare_command(&mut self, _ctx: &TurnContext<'_>) -> Result<String> {
+        unreachable!("codex runs as a resident")
     }
 
-    /// Codex has no `--append-system-prompt`, so the prune nudge rides in on the
-    /// first user message instead (the Supervisor appends it on the first turn
-    /// only). Uses the codex-specific variant: codex reads/greps/edits run through
-    /// the shell (mapped to `Bash`), so its example targets `Bash`, not `Read`.
-    /// See `AgentAdapter::first_turn_prompt_suffix`.
+    fn is_resident(&self) -> bool {
+        true
+    }
+
+    /// `codex app-server` in the chat's cwd (the shared worktree prefix creates
+    /// the worktree on a brand-new chat). Sandbox, model and cwd ride the
+    /// thread request instead of flags. Sandboxed = `read-only` with approvals
+    /// off, so a refused write fails instead of waiting on a prompt nobody can
+    /// answer; otherwise the owner's agent runs unsandboxed, like claude's
+    /// `--dangerously-skip-permissions`.
+    fn prepare_session_command(&mut self, ctx: &SessionContext<'_>) -> Result<String> {
+        let cwd = ctx.cwd();
+        let (start, resume) = thread_requests(ctx, effective_cwd(&cwd).as_deref());
+        match resume {
+            Some(resume) => {
+                self.thread_request = Some(resume);
+                self.fresh_thread_request = Some(start);
+            }
+            None => self.thread_request = Some(start),
+        }
+        Ok(format!("{}codex app-server", worktree_cwd_prefix(&cwd)))
+    }
+
+    /// Codex has no system-prompt injection point (`AGENTS.md` would clobber
+    /// the user's, `developerInstructions` would have to be byte-stable across
+    /// every resume of every older thread), so capabilities ride the first
+    /// user message; worktree ignored.
+    fn session_first_turn_preamble(&self) -> Option<String> {
+        Some(agent_capabilities_instructions(None))
+    }
+
+    /// No `--append-system-prompt` either, so the prune nudge rides in on the
+    /// first user message. The codex variant omits `--tool-name`: its reads,
+    /// greps and edits all run through the shell.
     fn first_turn_prompt_suffix(&self) -> Option<&'static str> {
         Some(PRUNE_CONTEXT_INSTRUCTION_CODEX)
     }
 
-    /// No system-prompt injection point (see `prepare_command`), so capabilities
-    /// ride the first user message; worktree ignored. See
-    /// [`first_message_capabilities_preamble`].
-    fn prompt_file_preamble(&self, ctx: &TurnContext<'_>) -> Option<String> {
-        first_message_capabilities_preamble(ctx)
+    fn outbound_frames(&mut self) -> Vec<String> {
+        if matches!(self.handshake, Handshake::NotStarted) {
+            self.handshake = Handshake::Initializing;
+            self.outbound.insert(0, initialize_request());
+        }
+        std::mem::take(&mut self.outbound)
     }
 
-    /// Read live context-window occupancy from the rollout once the `codex exec`
-    /// process has exited (each turn is a fresh, short-lived process, so the
-    /// rollout is closed and flushed by then). The occupancy isn't in the `--json`
-    /// stream — see `read_rollout_last_context_tokens`. Prefer the id harvested
-    /// this turn (`thread.started`), falling back to the resume id from the turn
-    /// context. Returns `None` (suppressing the PATCH) when the rollout can't be
-    /// located or read, leaving the prior gauge value in place rather than zeroing.
-    fn post_turn_context_tokens(&self, agent_session_id: Option<&str>) -> Option<i64> {
-        let sid = self.session_id.as_deref().or(agent_session_id)?;
-        // Same base-dir resolution as the prune path (honors CODEX_HOME, else
-        // $HOME/.codex) — `find_codex_rollout` searches `<base>/sessions/**`.
-        let base = AgentKind::Codex.cli_home()?;
-        let path = find_codex_rollout(&base, sid)?;
-        read_rollout_last_context_tokens(&path)
+    fn encode_user_turn(&mut self, uuid: &str, text: &str) -> Option<String> {
+        let thread_id = match &self.handshake {
+            Handshake::Open(id) => id.as_str(),
+            // Sent anyway: codex refuses it, and `fail_turn` reports why the
+            // thread isn't open.
+            Handshake::Failed(_) => "",
+            _ => return None,
+        };
+        Some(if is_compact(text) {
+            rpc_request(
+                &format!("compact:{uuid}"),
+                "thread/compact/start",
+                json!({ "threadId": thread_id }),
+            )
+        } else {
+            rpc_request(
+                &format!("turn:{uuid}"),
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "clientUserMessageId": uuid,
+                    "input": [{ "type": "text", "text": text, "text_elements": [] }],
+                }),
+            )
+        })
+    }
+
+    fn can_interrupt(&self) -> bool {
+        true
+    }
+
+    fn encode_interrupt(&mut self, request_id: &str) -> Option<String> {
+        let Handshake::Open(thread_id) = &self.handshake else {
+            return None;
+        };
+        let turn_id = self.active_turn.as_ref()?;
+        Some(rpc_request(
+            &format!("interrupt:{request_id}"),
+            "turn/interrupt",
+            json!({ "threadId": thread_id, "turnId": turn_id }),
+        ))
+    }
+
+    fn exits_on_stdin_eof(&self) -> bool {
+        true
+    }
+
+    /// `/compact [instructions]` → `thread/compact/start`, which takes no
+    /// instructions. Other slash commands are the codex TUI's and reach the
+    /// model as text.
+    fn is_command_turn(&self, prompt: &str) -> bool {
+        is_compact(prompt)
+    }
+
+    fn command_interrupts_turn(&self) -> bool {
+        false
+    }
+
+    fn serializes_command_turns(&self) -> bool {
+        true
+    }
+
+    fn writer_follows_every_line(&self) -> bool {
+        true
+    }
+
+    fn session_over(&self) -> bool {
+        self.over
+    }
+
+    fn startup_complete(&self) -> bool {
+        matches!(self.handshake, Handshake::Open(_) | Handshake::Failed(_))
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
-        let mut out: SmallVec<[AgentEvent; 2]> = SmallVec::new();
-
-        // Oversize-frame fast-path. `serde_json::from_str` on a multi-MB line
-        // allocates a tree of `Map<String, Value>` nodes; the per-item dispatch
-        // below needs the parsed tree, so a single big shell output
-        // (command_execution often embeds full stdout) can churn the heap by
-        // megabytes. But codex frames are NEVER iOS-wire-compatible (we always
-        // transform them), so forwarding a raw codex line verbatim is wrong —
-        // iOS renders an unknown `{"type":"X"}` as the literal `[X]`. So
-        // classify CHEAPLY via `extract_json_type` (no full parse) and branch
-        // on whether the body is needed:
-        if line.len() > MAX_STREAM_FRAME_BYTES {
-            match extract_json_type(&line) {
-                // BODY-INDEPENDENT terminal: the success envelope is a fixed
-                // shape, so emit it WITHOUT parsing the multi-MB line and
-                // return early (nothing downstream needs the body). Same output
-                // as the normal `"turn.completed"` arm. Dropping it here is what
-                // would make the user see "Agent interrupted".
-                Some("turn.completed") => {
-                    push_turn_completed_terminal(&mut out);
-                    return out;
-                }
-                // BODY-DERIVED terminal: `turn.failed` pulls `error.message`
-                // from the body, and an oversize error message is realistic. A
-                // terminal frame that MUST render its body is worth the one-time
-                // full-parse heap blip — DON'T early-return; fall through to the
-                // normal `"turn.failed"` arm so it still emits a correct
-                // `[result: error]` + Result.
-                Some("turn.failed") => {}
-                // BODY-DERIVED content: `item.completed` embedding full stdout is
-                // the COMMON oversize case and MUST render; `item.started` too.
-                // Correctness beats the heap blip — fall through to full parse.
-                Some("item.started") | Some("item.completed") => {}
-                // Lifecycle (thread.started/turn.started — realistically never
-                // oversize) + any unknown type → DROP. Forwarding raw codex JSON
-                // is strictly worse than dropping (iOS can't render it).
-                Some(other) => {
-                    debug!(ty = %other, "codex oversize lifecycle frame dropped");
-                    return out;
-                }
-                // Couldn't classify (no `"type"` near the start, escaped value,
-                // …). Drop: raw codex JSON is never renderable, so a forward
-                // would only surface garbage. Safe fallback.
-                None => {
-                    debug!("codex oversize frame without classifiable type dropped");
-                    return out;
-                }
-            }
+        let mut out = Events::new();
+        // Skip the parse of a multi-MB line nothing is rendered from.
+        if line.len() > MAX_STREAM_FRAME_BYTES && !oversize_line_renders(&line) {
+            debug!("codex oversize notification dropped");
+            return out;
         }
-
-        let Some(obj) = parse_json_obj(&line) else {
-            // Non-JSON line: DROP. codex stdout is pure JSONL, so a non-JSON line
-            // is stray noise; forwarding it raw is wire-incompatible (codex frames
-            // are never iOS-renderable — unlike claude, which is pass-through).
-            // Real startup/auth failures arrive on stderr (stderr_failure_message),
-            // not here. Breadcrumb preserves observability.
-            debug!("codex non-json stdout line dropped");
+        let Some(msg) = parse_json_obj(&line) else {
+            debug!("codex non-object stdout line dropped");
             return out;
         };
-        let Some(ty) = obj.get("type").and_then(|v| v.as_str()) else {
-            // Object without a `type` — can't transform it, so DROP (raw forward
-            // would only surface garbage on iOS).
-            debug!("codex json line without type dropped");
-            return out;
-        };
-
-        match ty {
-            "thread.started" => {
-                // Harvest thread id → `chats.agent_session_id`; drop the
-                // frame so it never reaches the chat (matches claude's
-                // init-skip).
-                if let Some(sid) = obj.get("thread_id").and_then(|v| v.as_str()) {
-                    // Stash it so `post_turn_context_tokens` can find this
-                    // session's rollout after the process exits, even on the
-                    // first turn (before the id is persisted to chats).
-                    self.session_id = Some(sid.to_string());
-                    out.push(AgentEvent::SessionIdHarvested(sid.to_string()));
-                } else {
-                    debug!("codex thread.started without thread_id");
-                }
-            }
-            "turn.started" => {
-                // No claude analog — drop.
-                debug!("codex turn.started dropped");
-            }
-            "item.started" => {
-                // Surface tool items in-flight (codex populates input fields at
-                // `status:in_progress`); the matching `item.completed` is deduped
-                // below. `agent_message` is skipped here (text empty at start).
-                let frames = self.dedup_item(&obj, normalize_item_started(&obj));
-                for frame in frames {
-                    out.push(AgentEvent::Frame(frame));
-                }
-            }
-            "item.completed" => {
-                // `agent_message` renders here (text final now); tool items already
-                // surfaced on `item.started` are deduped, but one with no usable
-                // started still renders here as a fallback.
-                // Call-keyed prune cue: fire ONLY when the completed command is
-                // the `prune-context` call itself, matched on its own `command`
-                // (present on the completed item). A sibling shell call's
-                // completion in the same batch must NOT drive the apply — it
-                // would abort→respawn before this call's `function_call_output`
-                // is flushed to the rollout, so the resumed agent re-runs the
-                // prune. No cross-frame state needed: the command is right here.
-                let is_prune_command = item_parts(&obj)
-                    .filter(|(_, t, _)| *t == "command_execution")
-                    .and_then(|(item, _, _)| item.get("command"))
-                    .is_some_and(crate::prune::value_is_prune_context_call);
-                let frames = self.dedup_item(&obj, normalize_item_completed(&obj));
-                if frames.is_empty() {
-                    debug!("codex item.completed: no new renderable item (dropped or already surfaced on item.started)");
-                }
-                for frame in frames {
-                    out.push(AgentEvent::Frame(frame));
-                }
-                // The `prune-context` command's completion is codex's "tool
-                // result persisted" signal — its `function_call_output` is now in
-                // the rollout. Emit the content-free `ToolResult` cue (AFTER any
-                // visible frame, so a restart never preempts the item's own
-                // bubble) so the main loop applies the queued prune strictly after
-                // the result landed (the mechanism claude/gemini use too). No-op
-                // unless a `PruneRequest` is pending. Codex emits no standalone
-                // tool_result frame, so this completion is the only per-tool
-                // boundary.
-                if is_prune_command {
-                    out.push(AgentEvent::ToolResult);
-                }
-            }
-            "turn.completed" => {
-                // Deliberately NO ContextTokens here: the frame's
-                // `usage.input_tokens` is cumulative, not live occupancy. The
-                // gauge is sourced post-turn from the rollout instead — see
-                // `read_rollout_last_context_tokens` / `post_turn_context_tokens`.
-                //
-                // Emit claude-shape result envelope + Result marker. Same fixed
-                // (body-independent) output as the oversize fast-path above, so
-                // both go through the single helper.
-                push_turn_completed_terminal(&mut out);
-            }
-            "turn.failed" => {
-                // Codex emits a terminal failure frame instead of a claude
-                // `result` frame. Normalize it to the same result shape iOS
-                // already renders and emit the Result marker so the
-                // supervisor does not append the generic interrupted line.
-                out.push(AgentEvent::Frame(normalize_turn_failed_frame(&obj)));
-                out.push(AgentEvent::Result {
-                    origin_is_task: false,
-                });
-            }
-            other => {
-                // Unknown type (codex format drift or a lifecycle event we don't
-                // transform) → DROP. Forwarding raw codex JSON is wire-incompatible:
-                // iOS renders an unknown `{"type":"X"}` as the literal `[X]`, which
-                // is user-facing junk, not a useful "observe the drift" signal. The
-                // breadcrumb gives us the observability without spamming the chat.
-                debug!(ty = %other, "codex unknown frame type dropped");
-            }
+        match (msg["method"].as_str(), msg.get("id")) {
+            (Some(method), Some(id)) => self.refuse_server_request(id, method),
+            (Some(method), None) => self.handle_notification(method, &msg["params"], &mut out),
+            (None, Some(id)) => self.handle_response(id, &msg, &mut out),
+            (None, None) => debug!("codex message without method or id dropped"),
         }
-
         out
     }
 }
 
-/// Read the live context-window occupancy from a codex rollout: the
-/// `last_token_usage.input_tokens` of the LAST `token_count` record in the file.
-///
-/// Codex writes a `token_count` `event_msg` after each model round-trip:
-/// `{"type":"event_msg","payload":{"type":"token_count","info":{
-///    "total_token_usage":{...}, "last_token_usage":{"input_tokens":N,...},
-///    "model_context_window":W}}}`. `total_token_usage` is the cumulative sum
-/// across the whole thread (what the `--json` stream's `turn.completed.usage`
-/// echoes); `last_token_usage` is just the final round-trip's prompt — i.e. the
-/// current context occupancy, bounded by `model_context_window`. We want the
-/// latter, taken from the LAST such record (the most recent round-trip).
-///
-/// Scans the whole file because the final `token_count` is near (but not
-/// guaranteed at) EOF — codex may append a few non-token records after it. A
-/// rollout is at most a few MB and this runs once per turn, off the hot path.
-/// Returns `None` if the file is unreadable or carries no `token_count` record,
-/// so the caller leaves the prior gauge value untouched.
-fn read_rollout_last_context_tokens(path: &Path) -> Option<i64> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut last: Option<i64> = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        // `event_msg` wrapper → `payload.type == "token_count"` →
-        // `payload.info.last_token_usage.input_tokens`.
-        let info = entry
-            .get("payload")
-            .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("token_count"))
-            .and_then(|p| p.get("info"));
-        let Some(info) = info else {
-            continue;
-        };
-        if let Some(n) = info
-            .get("last_token_usage")
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|v| v.as_i64())
-        {
-            last = Some(n);
-        }
-    }
-    last
+/// A started shell command a prune restart would kill. The `prune-context`
+/// call itself is exempt: it can't block its own prune.
+fn live_command(item: &Value) -> Option<AgentEvent> {
+    let command = item["command"].as_str()?;
+    let id = item["id"].as_str()?;
+    let counts = item["type"] == "commandExecution"
+        && !crate::prune::value_is_prune_context_call(&item["command"]);
+    counts.then(|| AgentEvent::CommandStarted {
+        id: id.to_string(),
+        command: command.to_string(),
+    })
 }
 
-/// Extract `(item, item_type, item_id)` from an `item.*` frame, or `None` when
-/// the frame has no typed `item`. `item_id` defaults to `""` when absent (the
-/// dedup + per-change-id logic tolerate an empty id).
-fn item_parts(obj: &Value) -> Option<(&Value, &str, String)> {
-    let item = obj.get("item")?;
-    let item_type = item.get("type").and_then(|v| v.as_str())?;
-    let item_id = item
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    Some((item, item_type, item_id))
+fn is_compact(prompt: &str) -> bool {
+    slash_command_name(prompt) == Some("compact")
 }
 
-/// Render the codex TOOL items (input field populated at `status:in_progress`) →
-/// claude-shape `tool_use` envelopes, so they surface in-flight on `item.started`.
-/// `agent_message` is absent (text empty at start; renders on `item.completed`);
-/// unknown types → empty. A render with an empty primary field returns empty so
-/// the started/completed dedup falls through to the completed frame (no empty
-/// bubble that then suppresses the real one). `file_change` is the only multi-
-/// frame case — codex bundles N edits in one item, fanned out one bubble each.
-///
-/// Mapping (see file-level doc for the full table). Field projection only — we
-/// drop codex-side metadata (aggregated_output, exit_code, action variants, …)
-/// since iOS only summarizes the primary input field; matching claude's wire
-/// shape means no codex-specific branches in iOS.
-fn normalize_item_started(obj: &Value) -> Vec<String> {
-    let Some((item, item_type, item_id)) = item_parts(obj) else {
-        return Vec::new();
-    };
-    match item_type {
-        "command_execution" => {
-            let command = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            // Empty → fall through to the completed frame (see fn doc).
-            if command.is_empty() {
-                return Vec::new();
-            }
-            vec![claude_tool_use_envelope(
-                &item_id,
-                "Bash",
-                json!({ "command": command }),
-            )]
-        }
-        "file_change" => {
-            let Some(changes) = item.get("changes").and_then(|v| v.as_array()) else {
-                return Vec::new();
-            };
-            changes
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, change)| {
-                    let path = change.get("path").and_then(|v| v.as_str())?.to_string();
-                    let kind = change
-                        .get("kind")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("update");
-                    // Per-change unique id so iOS can key its row diffing
-                    // off `tool_use.id` without collisions when N>1 (claude
-                    // itself mints unique ids per tool_use).
-                    let id = if changes.len() == 1 {
-                        item_id.clone()
-                    } else {
-                        format!("{}.{}", item_id, idx)
-                    };
-                    Some(match kind {
-                        "add" => {
-                            claude_tool_use_envelope(&id, "Write", json!({ "file_path": path }))
-                        }
-                        "delete" => claude_tool_use_envelope(
-                            &id,
-                            "Bash",
-                            json!({ "command": format!("rm {}", path) }),
-                        ),
-                        // "update" + defensive fallback for any future kind
-                        // we haven't seen — Edit conveys "an existing file
-                        // was changed", which is the best generic match.
-                        _ => claude_tool_use_envelope(&id, "Edit", json!({ "file_path": path })),
-                    })
-                })
-                .collect()
-        }
-        "web_search" => {
-            let query = item.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            // Empty → fall through to the completed frame (see fn doc).
-            if query.is_empty() {
-                return Vec::new();
-            }
-            vec![claude_tool_use_envelope(
-                &item_id,
-                "WebSearch",
-                json!({ "query": query }),
-            )]
-        }
-        "mcp_tool_call" => render_mcp_tool_call(item, &item_id),
-        "collab_tool_call" => render_collab_tool_call(item, &item_id),
-        // agent_message: text not final at start. Unknown: drop.
+/// Whether an oversize line is worth a full parse: tool items (a command's
+/// whole output rides on its `item/completed`), the turn's end, responses, and
+/// anything with an `id` key — it may be a server request, which must be
+/// refused or its turn hangs.
+fn oversize_line_renders(line: &str) -> bool {
+    line.contains(r#""id""#)
+        || matches!(
+            extract_json_string_field(line, "method"),
+            None | Some("item/started" | "item/completed" | "turn/completed")
+        )
+}
+
+fn rpc_request(id: &str, method: &str, params: Value) -> String {
+    let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    format!("{request}\n")
+}
+
+fn rpc_notification(method: &str) -> String {
+    format!("{}\n", json!({ "jsonrpc": "2.0", "method": method }))
+}
+
+fn initialize_request() -> String {
+    rpc_request(
+        "init",
+        "initialize",
+        json!({
+            "clientInfo": {
+                "name": "zucchini",
+                "title": "Zucchini",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "requestAttestation": false,
+                "optOutNotificationMethods": QUIET_NOTIFICATIONS,
+            },
+        }),
+    )
+}
+
+/// `thread/start`, and the `thread/resume` to send instead when the chat has a
+/// session. A resume re-passes every override: codex falls back to the user's
+/// config for any it isn't given. `excludeTurns` keeps a long chat's history
+/// out of the response.
+fn thread_requests(ctx: &SessionContext<'_>, cwd: Option<&str>) -> (String, Option<String>) {
+    let mut params = json!({
+        "cwd": cwd,
+        "model": ctx.model,
+        "approvalPolicy": "never",
+        "sandbox": if ctx.is_sandboxed { "read-only" } else { "danger-full-access" },
+    });
+    let start = rpc_request("thread", "thread/start", params.clone());
+    let resume = ctx.agent_session_id.map(|thread_id| {
+        params["threadId"] = json!(thread_id);
+        params["excludeTurns"] = json!(true);
+        rpc_request("thread", "thread/resume", params)
+    });
+    (start, resume)
+}
+
+/// Render a codex TOOL item → claude-shape `tool_use` envelopes. Unknown types
+/// → empty. A render with an empty primary field returns empty so the
+/// started/completed dedup falls through to the completed item (no empty bubble
+/// that then suppresses the real one). Field projection only — iOS summarizes
+/// just the primary input field, so matching claude's wire shape means no
+/// codex-specific branches in iOS.
+fn render_tool_item(item: &Value) -> Vec<String> {
+    let id = item["id"].as_str().unwrap_or("");
+    let non_empty = |field: &str| item[field].as_str().filter(|s| !s.is_empty());
+    match item["type"].as_str().unwrap_or("") {
+        "commandExecution" => non_empty("command")
+            .map(|command| claude_tool_use_envelope(id, "Bash", json!({ "command": command })))
+            .into_iter()
+            .collect(),
+        "fileChange" => render_file_changes(item, id),
+        "webSearch" => non_empty("query")
+            .map(|query| claude_tool_use_envelope(id, "WebSearch", json!({ "query": query })))
+            .into_iter()
+            .collect(),
+        "mcpToolCall" => render_mcp_tool_call(item, id),
+        "collabAgentToolCall" => render_collab_tool_call(item, id),
         _ => Vec::new(),
     }
 }
 
-/// codex `mcp_tool_call` item → claude-shape `tool_use` named
-/// `mcp__<server>__<tool>` — claude's own MCP naming, so iOS's default summary
-/// branch renders the qualified name with no codex-specific branching.
-///
-/// The exec stream's `arguments` is a RAW JSON object, NOT the JSON-encoded STRING
-/// the PERSISTED `function_call.arguments` carries, so we pass it through under
-/// `input` (no decode). Degrades when a name part is missing: with one present we
-/// emit the best qualified name (`mcp__<server>` / `mcp__<tool>`); with neither we
-/// return empty so the completed fallback fires instead of a garbage `mcp__`.
+/// One bubble per change — codex bundles N edits in one item.
+fn render_file_changes(item: &Value, item_id: &str) -> Vec<String> {
+    let Some(changes) = item["changes"].as_array() else {
+        return Vec::new();
+    };
+    changes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, change)| {
+            let path = change["path"].as_str()?;
+            // Per-change unique id so iOS can key its row diffing off
+            // `tool_use.id` without collisions when N>1.
+            let id = if changes.len() == 1 {
+                item_id.to_string()
+            } else {
+                format!("{item_id}.{idx}")
+            };
+            Some(match change["kind"]["type"].as_str() {
+                Some("add") => claude_tool_use_envelope(&id, "Write", json!({ "file_path": path })),
+                Some("delete") => claude_tool_use_envelope(
+                    &id,
+                    "Bash",
+                    json!({ "command": format!("rm {path}") }),
+                ),
+                // "update" + any future kind: an existing file was changed.
+                _ => claude_tool_use_envelope(&id, "Edit", json!({ "file_path": path })),
+            })
+        })
+        .collect()
+}
+
+/// codex `mcpToolCall` → claude-shape `tool_use` named `mcp__<server>__<tool>`
+/// — claude's own MCP naming, so iOS renders the qualified name with no codex
+/// branch. `arguments` is a raw JSON object, passed through as `input`.
+/// Degrades when a name part is missing; with neither, returns empty so the
+/// completed fallback fires instead of a garbage `mcp__`.
 fn render_mcp_tool_call(item: &Value, item_id: &str) -> Vec<String> {
-    let server = item.get("server").and_then(|v| v.as_str()).unwrap_or("");
-    let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+    let server = item["server"].as_str().unwrap_or("");
+    let tool = item["tool"].as_str().unwrap_or("");
     let name = match (server.is_empty(), tool.is_empty()) {
         (false, false) => format!("mcp__{server}__{tool}"),
         (false, true) => format!("mcp__{server}"),
         (true, false) => format!("mcp__{tool}"),
         (true, true) => return Vec::new(),
     };
-    // Raw JSON object, not an encoded string — forward verbatim. Absent → `{}`.
     let input = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
     vec![claude_tool_use_envelope(item_id, &name, input)]
 }
 
-/// codex `collab_tool_call` item (sub-agent orchestration: `spawn_agent`,
-/// `send_input`, `wait`, `close_agent`) → claude-shape `tool_use`.
-///
-/// A `spawn_agent` with a `prompt` → claude's `Agent` `{description}` (iOS's
-/// `toolSummary` reads `Agent`→`description`, showing the sub-agent's task). Any
-/// other subtool (or `spawn_agent` w/o prompt) passes the `tool` name through
-/// verbatim with its routing fields under `input` (iOS renders tool-name-only).
-/// Empty/absent `tool` → empty so the completed fallback fires.
+/// codex `collabAgentToolCall` (sub-agent orchestration) → claude-shape
+/// `tool_use`. `spawnAgent` with a prompt → claude's `Agent` `{description}`
+/// (iOS shows the sub-agent's task). Any other tool passes through under its
+/// snake_case name (what `codex exec` called it) with the routing fields as
+/// input (iOS renders the bare name). Empty `tool` → empty (completed fallback).
 fn render_collab_tool_call(item: &Value, item_id: &str) -> Vec<String> {
-    let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+    let tool = item["tool"].as_str().unwrap_or("");
     if tool.is_empty() {
         return Vec::new();
     }
-    let prompt = item.get("prompt").and_then(|v| v.as_str());
-    if tool == "spawn_agent" {
-        if let Some(desc) = prompt.filter(|p| !p.is_empty()) {
+    let prompt = item["prompt"].as_str();
+    if tool == "spawnAgent" {
+        if let Some(description) = prompt.filter(|p| !p.is_empty()) {
             return vec![claude_tool_use_envelope(
                 item_id,
                 "Agent",
-                json!({ "description": desc }),
+                json!({ "description": description }),
             )];
         }
     }
-    // Pass-through: keep the collab subtool name; surface the thread routing +
-    // prompt under input so the stored frame stays useful (iOS renders the bare
-    // tool name). Drop `agents_states` (verbose, not summarized by iOS).
     let mut input = serde_json::Map::new();
     if let Some(p) = prompt {
         input.insert("prompt".to_string(), json!(p));
     }
-    if let Some(s) = item.get("sender_thread_id") {
+    if let Some(s) = item.get("senderThreadId") {
         input.insert("sender_thread_id".to_string(), s.clone());
     }
-    if let Some(r) = item.get("receiver_thread_ids") {
+    if let Some(r) = item.get("receiverThreadIds") {
         input.insert("receiver_thread_ids".to_string(), r.clone());
     }
     vec![claude_tool_use_envelope(
         item_id,
-        tool,
+        &snake_case(tool),
         Value::Object(input),
     )]
 }
 
-/// Render an `item.completed` frame. `agent_message`'s `text` is final only here,
-/// so it renders now. Tool items reuse `normalize_item_started`'s renderers as a
-/// FALLBACK (one whose `item.started` was absent/empty still gets a bubble);
-/// `dedup_item` at the call site suppresses the common already-surfaced case.
-fn normalize_item_completed(obj: &Value) -> Vec<String> {
-    let Some((item, item_type, _item_id)) = item_parts(obj) else {
-        return Vec::new();
-    };
-    if item_type == "agent_message" {
-        // Context tokens are sourced post-turn from the rollout, not here. The
-        // shared envelope helper stamps the claude-shape zero `usage` so iOS sees
-        // the same key set across adapters mid-turn.
-        let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        return vec![claude_assistant_text_envelope(text)];
+fn snake_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for c in name.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('_');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
     }
-    // Tool items: same renderers as the started path; deduped by id at the call site.
-    normalize_item_started(obj)
+    out
 }
 
-/// Terminal output for a codex `turn.completed`: the claude-shape success
-/// `result` envelope (so iOS renders `[result: success]`) + the `Result` marker
-/// (so the supervisor latches `Done.has_result` once and only once).
-/// Body-independent — emitted from BOTH the normal `"turn.completed"` arm and
-/// the oversize fast-path, so this is the single source (repo rule: never
-/// copy-paste the result-frame block).
-fn push_turn_completed_terminal(out: &mut SmallVec<[AgentEvent; 2]>) {
-    out.push(AgentEvent::Frame(normalize_turn_completed_frame()));
-    out.push(AgentEvent::Result {
-        origin_is_task: false,
-    });
+/// The claude-shape `result` envelope for a finished turn — what iOS renders
+/// as `[result: success]` / `[result: error]` / "Agent interrupted".
+fn turn_result_frame(turn: &Value) -> String {
+    match turn["status"].as_str() {
+        Some("failed") => {
+            error_result_frame(turn["error"]["message"].as_str().unwrap_or("turn failed"))
+        }
+        Some("interrupted") => INTERRUPTED_RESULT.to_string(),
+        _ => json!({ "type": "result", "subtype": "success", "is_error": false }).to_string(),
+    }
 }
 
-/// Builds the claude-shape result envelope emitted on `turn.completed`. We
-/// don't carry codex's per-turn duration through. iOS's describer renders
-/// this as `[result: success]`.
-fn normalize_turn_completed_frame() -> String {
-    json!({
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-    })
-    .to_string()
-}
-
-/// Builds the claude-shape result envelope emitted on `turn.failed`.
-/// Upstream Codex shape is:
-/// `{"type":"turn.failed","error":{"message":"..."}}`.
-/// iOS only uses `subtype` for the visible terminator (`[result: error]`),
-/// but preserving `error.message` keeps the stored frame useful for logs and
-/// future clients without leaking the raw Codex event shape into chat rows.
-fn normalize_turn_failed_frame(obj: &Value) -> String {
-    let message = obj
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("turn failed");
+/// Keeps the error message in the stored frame (useful for logs and future
+/// clients) without leaking codex's own error shape into chat rows.
+fn error_result_frame(message: &str) -> String {
     json!({
         "type": "result",
         "subtype": "error",
         "is_error": true,
-        "error": {
-            "message": message,
-        },
+        "error": { "message": message },
     })
     .to_string()
 }
@@ -1621,11 +1626,16 @@ fn codex_collect_pruned(
     let Some(payload) = entry.get("payload") else {
         return;
     };
-    if payload.get("type").and_then(|t| t.as_str()) != Some("function_call_output") {
-        return;
-    }
-    // A `[pruned]` output marks its call ineligible.
-    if payload.get("output").and_then(|o| o.as_str()) == Some(crate::prune::PRUNED_PLACEHOLDER) {
+    let pruned = match payload.get("type").and_then(|t| t.as_str()) {
+        Some("function_call_output") => {
+            payload.get("output").and_then(|o| o.as_str()) == Some(crate::prune::PRUNED_PLACEHOLDER)
+        }
+        Some("custom_tool_call_output") => payload
+            .get("output")
+            .is_some_and(|o| *o == pruned_custom_output(o)),
+        _ => false,
+    };
+    if pruned {
         if let Some(id) = payload.get("call_id").and_then(|v| v.as_str()) {
             already_pruned.insert(id.to_string());
         }
@@ -1656,11 +1666,15 @@ fn collect_codex_call_id_if_matches(
     let Some(payload) = entry.get("payload") else {
         return;
     };
-    if payload.get("type").and_then(|t| t.as_str()) != Some("function_call") {
-        return;
-    }
+    // codex ≥0.15x "code mode" persists shell calls as `custom_tool_call`
+    // `exec` whose freeform `input` is a JS script; it globs as one raw leaf.
+    let args_key = match payload.get("type").and_then(|t| t.as_str()) {
+        Some("function_call") => "arguments",
+        Some("custom_tool_call") => "input",
+        _ => return,
+    };
     let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let arguments = payload.get("arguments").and_then(|v| v.as_str());
+    let arguments = payload.get(args_key).and_then(|v| v.as_str());
     if codex_function_call_matches(name, arguments, tool_name, needle) {
         if let Some(id) = payload.get("call_id").and_then(|v| v.as_str()) {
             ids.insert(id.to_string());
@@ -1737,7 +1751,15 @@ fn blank_codex_entry(
             // object `"{}"`, keeping the wire type (string) intact.
             crate::prune::blank_string_field(payload, "arguments", "{}")
         }
-        Some("function_call_output") => {
+        Some("custom_tool_call") => {
+            let id = payload.get("call_id").and_then(|v| v.as_str())?;
+            if !pruned_ids.contains_key(id) {
+                return None;
+            }
+            crate::prune::blank_string_field(payload, "input", "")
+        }
+        Some(kind @ ("function_call_output" | "custom_tool_call_output")) => {
+            let custom = kind == "custom_tool_call_output";
             let call_id = payload.get("call_id").and_then(|v| v.as_str());
             let pruned = call_id
                 .map(|id| pruned_ids.contains_key(id))
@@ -1751,11 +1773,15 @@ fn blank_codex_entry(
             // already `[pruned]` (idempotent re-prune), so a re-run over a
             // fully-pruned rollout reports `results_blanked = 0` and skips the
             // timeline frame — matching the claude pruner's `already` guard.
-            let freed = crate::prune::blank_string_field(
-                payload,
-                "output",
-                crate::prune::PRUNED_PLACEHOLDER,
-            )?;
+            let freed = if custom {
+                blank_custom_output(payload)
+            } else {
+                crate::prune::blank_string_field(
+                    payload,
+                    "output",
+                    crate::prune::PRUNED_PLACEHOLDER,
+                )
+            }?;
             if let Some(id) = call_id {
                 outputs_blanked.insert(id);
             }
@@ -1765,10 +1791,37 @@ fn blank_codex_entry(
     }
 }
 
+/// The `[pruned]` placeholder in the shape of `output`: a `custom_tool_call_output`
+/// carries either a plain string or (codex ≥0.15x) an `input_text` item array, and
+/// the placeholder keeps that shape so resume deserializes it as before.
+fn pruned_custom_output(output: &serde_json::Value) -> serde_json::Value {
+    let placeholder = crate::prune::PRUNED_PLACEHOLDER;
+    if output.is_array() {
+        serde_json::json!([{ "type": "input_text", "text": placeholder }])
+    } else {
+        serde_json::Value::String(placeholder.to_string())
+    }
+}
+
+/// Blank a `custom_tool_call_output.output` to [`pruned_custom_output`]. `None` when
+/// absent or already blanked (idempotent); else the freed serialized bytes.
+fn blank_custom_output(payload: &mut serde_json::Map<String, serde_json::Value>) -> Option<usize> {
+    let existing = payload.get("output")?;
+    let blank = pruned_custom_output(existing);
+    if *existing == blank {
+        return None;
+    }
+    let freed = existing
+        .to_string()
+        .len()
+        .saturating_sub(blank.to_string().len());
+    payload.insert("output".into(), blank);
+    Some(freed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     /// Returns the SmallVec as a Vec of human-readable tags + payload for
     /// easy assertion equality. Delegates to the shared stringifier in
@@ -1777,818 +1830,622 @@ mod tests {
         crate::adapter::stringify_events(adapter.handle_line(line.to_string()))
     }
 
-    fn ctx<'a>(
-        prompt_file: &'a std::path::Path,
-        agent_session_id: Option<&'a str>,
-        is_sandboxed: bool,
-        model: Option<&'a str>,
-    ) -> TurnContext<'a> {
-        TurnContext::for_test(prompt_file, agent_session_id, is_sandboxed, model)
-    }
-
-    // First-turn-prepend / resume-omit is covered once in adapter.rs's
-    // `first_message_preamble_first_turn_then_resume` (codex/gemini/hermes all
-    // delegate to `first_message_capabilities_preamble`), not re-asserted here.
-
-    // `for_test` hard-codes chat_id="0000...0" → chat8 "00000000".
-    const WT_CHAT8: &str = "00000000";
-
-    fn worktree_path_esc() -> String {
-        let wt = crate::zucchini_spawner_dir()
-            .join("worktrees")
-            .join(WT_CHAT8);
-        shell_escape(&wt.to_string_lossy())
-    }
-
-    #[test]
-    fn prepare_command_worktree_first_turn_creates_cds_and_dash_c_points_at_worktree() {
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        let wt_esc = worktree_path_esc();
-        // BOTH branches (sandboxed read-only + non-sandboxed bypass) emit `-C` on
-        // the first turn — assert each points at the WORKTREE, not the project.
-        for sandboxed in [true, false] {
-            let mut a = CodexAdapter::new();
-            let c = TurnContext {
-                worktree: true,
-                ..ctx(&prompt_file, None, sandboxed, None)
-            };
-            let cmd = a.prepare_command(&c).unwrap();
-            assert!(
-                cmd.contains(&format!(
-                    "git -C '/tmp/proj' worktree add {wt_esc} -b zc-{WT_CHAT8} && "
-                )),
-                "first turn emits worktree add (sandboxed={sandboxed}): {cmd}"
-            );
-            assert!(
-                cmd.contains(&format!("cd {wt_esc} && ")),
-                "cd's into the worktree (sandboxed={sandboxed}): {cmd}"
-            );
-            // codex's own `-C` (after `codex exec`) — distinct from the `git -C
-            // '/tmp/proj'` in the worktree-add prefix.
-            let codex_part = cmd.split("codex exec").nth(1).unwrap();
-            assert!(
-                codex_part.contains(&format!(" -C {wt_esc}")),
-                "codex -C points at the worktree (sandboxed={sandboxed}): {cmd}"
-            );
-            assert!(
-                !codex_part.contains(" -C '/tmp/proj'"),
-                "codex -C must NOT point at the project (sandboxed={sandboxed}): {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn prepare_command_worktree_resume_cds_no_create_no_dash_c() {
-        let mut a = CodexAdapter::new();
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        let wt_esc = worktree_path_esc();
-        let c = TurnContext {
-            worktree: true,
-            ..ctx(
-                &prompt_file,
-                Some("11111111-2222-3333-4444-555555555555"),
-                false,
-                None,
-            )
-        };
-        let cmd = a.prepare_command(&c).unwrap();
-        assert!(
-            !cmd.contains("worktree add"),
-            "resume must NOT recreate the worktree: {cmd}"
-        );
-        assert!(
-            cmd.contains(&format!("cd {wt_esc} && ")),
-            "resume cd's into the recomputed worktree path: {cmd}"
-        );
-        assert!(
-            !cmd.contains(" -C "),
-            "resume passes no -C (locked at session creation): {cmd}"
-        );
-    }
-
-    #[test]
-    fn prepare_command_no_worktree_unchanged() {
-        let mut a = CodexAdapter::new();
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        let c = ctx(&prompt_file, None, false, None);
-        let cmd = a.prepare_command(&c).unwrap();
-        assert!(
-            cmd.contains("cd '/tmp/proj' && "),
-            "no-worktree cd's into the project: {cmd}"
-        );
-        assert!(
-            cmd.contains(" -C '/tmp/proj'"),
-            "no-worktree -C points at the project: {cmd}"
-        );
-        assert!(
-            !cmd.contains("worktree add"),
-            "no-worktree never creates a worktree: {cmd}"
-        );
-    }
-
-    #[test]
-    fn time_line_injected_on_resume_turn() {
-        // Capability block is first-message-only, but the volatile time line must
-        // still land on a resumed turn (default `turn_time_line` fires every turn
-        // regardless of session id).
-        let a = CodexAdapter::new();
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        // Resumed turn (Some session id) WITH a known tz.
-        let c = TurnContext {
-            user_timezone: Some("America/Los_Angeles"),
-            ..ctx(
-                &prompt_file,
-                Some("0192f00d-7ce0-7e9a-8d6f-abcdef012345"),
-                false,
-                None,
-            )
-        };
-        assert!(
-            a.prompt_file_preamble(&c).is_none(),
-            "resume still omits the once-only capability block"
-        );
-        let time_line = a
-            .turn_time_line(c.user_timezone)
-            .expect("time line present on resume turn when tz known");
-        assert!(
-            time_line.contains("America/Los_Angeles"),
-            "time line names the zone on resume: {time_line}"
-        );
-        // No tz → no line, even on resume.
-        let c_no_tz = TurnContext {
-            user_timezone: None,
-            ..c
-        };
-        assert!(
-            a.turn_time_line(c_no_tz.user_timezone).is_none(),
-            "no tz → no time line"
-        );
-    }
-
-    #[test]
-    fn thread_started_frame_harvests_session_id_and_drops_frame() {
-        let mut a = CodexAdapter::new();
-        let line =
-            r#"{"type":"thread.started","thread_id":"0192f00d-7ce0-7e9a-8d6f-abcdef012345"}"#;
-        let events = run(&mut a, line);
-        assert_eq!(
-            events,
-            vec!["SessionIdHarvested(0192f00d-7ce0-7e9a-8d6f-abcdef012345)"]
-        );
-    }
-
-    #[test]
-    fn oversize_turn_completed_still_emits_result_and_marker() {
-        // A >64KB turn.completed must bypass the (now removed) raw-forward and
-        // STILL produce the terminal result — else `has_result` stays false and
-        // the user sees "Agent interrupted". The success envelope is fixed/
-        // body-independent, so this is handled without a full parse.
-        let mut a = CodexAdapter::new();
-        let pad = "x".repeat(MAX_STREAM_FRAME_BYTES + 1024);
-        // "type" first so `extract_json_type` sees it early on the huge line.
-        let line = format!(r#"{{"type":"turn.completed","pad":"{pad}"}}"#);
-        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
-        let events = run(&mut a, &line);
-        // Identical to a small turn.completed: result frame + Result marker.
-        assert_eq!(events.len(), 2, "got: {:?}", events);
-        let v = frame_value(&events[0]);
-        assert_eq!(v["type"], "result");
-        assert_eq!(v["subtype"], "success");
-        assert_eq!(v["is_error"], false);
-        assert_eq!(events[1], "Result");
-    }
-
-    #[test]
-    fn oversize_turn_failed_falls_through_and_emits_error_result() {
-        // A >64KB turn.failed is body-derived (error.message) and a terminal:
-        // it must fall through to the full-parse arm and still emit a
-        // `[result: error]` Frame + Result (no "Agent interrupted").
-        let mut a = CodexAdapter::new();
-        let pad = "z".repeat(MAX_STREAM_FRAME_BYTES + 1024);
-        let line =
-            format!(r#"{{"type":"turn.failed","error":{{"message":"boom"}},"pad":"{pad}"}}"#);
-        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
-        let events = run(&mut a, &line);
-        assert_eq!(events.len(), 2, "got: {:?}", events);
-        let v = frame_value(&events[0]);
-        assert_eq!(v["type"], "result");
-        assert_eq!(v["subtype"], "error");
-        assert_eq!(v["is_error"], true);
-        assert_eq!(v["error"]["message"], "boom");
-        assert_eq!(events[1], "Result");
-    }
-
-    #[test]
-    fn oversize_lifecycle_frame_dropped_not_forwarded() {
-        // A >64KB lifecycle / unknown frame must DROP — never forward raw codex
-        // JSON (iOS would render it as the literal `[X]`).
-        let mut a = CodexAdapter::new();
-        let pad = "y".repeat(MAX_STREAM_FRAME_BYTES + 1024);
-        for ty in ["turn.started", "thread.started", "some.unknown.type"] {
-            let line = format!(r#"{{"type":"{ty}","pad":"{pad}"}}"#);
-            assert!(line.len() > MAX_STREAM_FRAME_BYTES);
-            assert!(
-                run(&mut a, &line).is_empty(),
-                "oversize {ty} must be dropped, not forwarded"
-            );
-        }
-        // Unclassifiable oversize line (no leading "type") → also dropped.
-        let line = format!(r#"{{"pad":"{pad}"}}"#);
-        assert!(line.len() > MAX_STREAM_FRAME_BYTES);
-        assert!(run(&mut a, &line).is_empty());
-    }
-
-    #[test]
-    fn item_completed_agent_message_normalizes_to_assistant_text_frame() {
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Hello there"}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
-        assert!(events[0].starts_with("Frame("));
-        // Strip the wrapper and re-parse to assert structure.
-        let v = frame_value(&events[0]);
-        assert_eq!(v["type"], "assistant");
-        assert_eq!(v["message"]["content"][0]["type"], "text");
-        assert_eq!(v["message"]["content"][0]["text"], "Hello there");
-    }
-
-    /// Strips the `Frame(...)` test wrapper and parses the inner JSON. Used
-    /// by the per-tool tests below to keep them readable.
     fn frame_value(event: &str) -> Value {
         crate::adapter::frame_value(event)
     }
 
-    #[test]
-    fn item_completed_file_change_update_normalizes_to_claude_edit() {
-        // Codex's `file_change` with kind=update should land as a claude
-        // `Edit` tool_use with `input.file_path` — iOS's existing toolSummary
-        // switch picks the file path off `Edit`, so no codex-specific iOS
-        // branch is needed.
+    fn session_ctx(agent_session_id: Option<&str>) -> SessionContext<'_> {
+        SessionContext {
+            chat_id: "00000000-0000-0000-0000-000000000000",
+            project_path: Some("/tmp/proj"),
+            worktree: false,
+            agent_session_id,
+            is_sandboxed: false,
+            model: None,
+            session_name: None,
+        }
+    }
+
+    fn rpc(frame: &str) -> Value {
+        assert!(
+            frame.ends_with('\n'),
+            "frames are newline-terminated: {frame}"
+        );
+        serde_json::from_str(frame.trim_end()).unwrap()
+    }
+
+    // Real codex-cli 0.154 lines (tmp/spike-logs/), ids swapped for ours where
+    // the spawner picks them.
+    const THREAD: &str = "01a0ccc6-1c43-75b3-b5c7-637798bff872";
+    const INIT_OK: &str = r#"{"id":"init","result":{"userAgent":"zucchini/0.154.0 (Mac OS 26.6.2; arm64) unknown (zucchini; 0.0.1)","codexHome":"/Users/ivanpchelintsev/.codex","platformFamily":"unix","platformOs":"macos"}}"#;
+    const THREAD_OK: &str = r#"{"id":"thread","result":{"thread":{"id":"01a0ccc6-1c43-75b3-b5c7-637798bff872","sessionId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","preview":"","ephemeral":false,"historyMode":"paginated","modelProvider":"openai","model":"gpt-6-astra","reasoningEffort":"low","status":{"type":"idle"},"path":"/Users/ivanpchelintsev/.codex/sessions/2026/09/23/rollout-2026-09-23T06-38-50-01a0ccc6-1c43-75b3-b5c7-637798bff872.jsonl","cwd":"/tmp/codex-spike","cliVersion":"0.154.0","originator":"zucchini","source":"vscode","turns":[]},"model":"gpt-6-astra","cwd":"/tmp/codex-spike","approvalPolicy":"never","approvalsReviewer":"user","sandbox":{"type":"dangerFullAccess"},"reasoningEffort":"low"}}"#;
+    const TURN_STARTED: &str = r#"{"method":"turn/started","params":{"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","turn":{"id":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":1790141930,"completedAt":null,"durationMs":null}},"emittedAtMs":1790141930784}"#;
+    const TURN_COMPLETED: &str = r#"{"method":"turn/completed","params":{"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","turn":{"id":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","items":[{"type":"agentMessage","id":"msg_0b690fad2e21428f016ab365f3163c87d289aea24e41508b56","text":"done","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}],"itemsView":"summary","status":"completed","error":null,"startedAt":1790141930,"completedAt":1790141939,"durationMs":8405}},"emittedAtMs":1790141939174}"#;
+    const TURN_FAILED: &str = r#"{"method":"turn/completed","params":{"threadId":"01a0cccf-0fbb-7340-af02-1b26c6ee2f69","turn":{"id":"01a0cccf-3516-7842-bb38-1c23c4249439","items":[],"itemsView":"notLoaded","status":"failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'no-such-model-xyz' model is not supported when using Codex with a ChatGPT account.\"}}","codexErrorInfo":"other","additionalDetails":null,"misalignment":null},"startedAt":1790142526,"completedAt":1790142528,"durationMs":2008}},"emittedAtMs":1790142528763}"#;
+    const TURN_INTERRUPTED: &str = r#"{"method":"turn/completed","params":{"threadId":"01a0cccf-6a10-75a2-bda0-84a0c78626b3","turn":{"id":"01a0cccf-6a66-7112-a065-afd89626f6da","items":[],"itemsView":"notLoaded","status":"interrupted","error":null,"startedAt":1790142540,"completedAt":1790142547,"durationMs":6738}},"emittedAtMs":1790142547132}"#;
+    const USER_ECHO: &str = r#"{"method":"item/completed","params":{"item":{"type":"userMessage","id":"01a0cccf-18c6-7831-93df-a6cc121a59b5","clientId":"cli-1","content":[{"type":"text","text":"Run the shell command `sleep 20` (wait for it to finish) and then reply FIRST.","text_elements":[]}]},"threadId":"01a0cccf-0fbb-7340-af02-1b26c6ee2f69","turnId":"01a0cccf-1040-7e23-b565-ff9c831e0521","completedAtMs":1790142519494},"emittedAtMs":1790142519498}"#;
+    const USER_NO_CLIENT_ID: &str = r#"{"method":"item/completed","params":{"item":{"type":"userMessage","id":"01a0ccc6-2627-7530-83bf-35f0d4c4dc87","clientId":null,"content":[{"type":"text","text":"hi","text_elements":[]}]},"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","turnId":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","completedAtMs":1790141933095},"emittedAtMs":1790141933098}"#;
+    const AGENT_MESSAGE_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg_0b690fad2e21428f016ab365ef131087d288e8aad9a75f024b","text":"","phase":"commentary","memoryCitation":null,"delivery":null,"questions":null},"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","turnId":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","startedAtMs":1790141935005},"emittedAtMs":1790141935005}"#;
+    const AGENT_MESSAGE: &str = r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg_0b690fad2e21428f016ab365ef131087d288e8aad9a75f024b","text":"I’ll run the command and create `note.txt`.\n","phase":"commentary","memoryCitation":null,"delivery":null,"questions":null},"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","turnId":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","completedAtMs":1790141935989},"emittedAtMs":1790141935990}"#;
+    const COMMAND_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"exec-565056be-aca3-4c8e-85fc-1f837d1825d0","pluginId":null,"scriptPath":null,"command":"/bin/zsh -lc 'echo hello && ls'","cwd":"/tmp/codex-spike","processId":"42287","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"listFiles","command":"ls","path":null}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","turnId":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","startedAtMs":1790141937567},"emittedAtMs":1790141937569}"#;
+    const COMMAND_COMPLETED: &str = r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"exec-565056be-aca3-4c8e-85fc-1f837d1825d0","pluginId":null,"scriptPath":null,"command":"/bin/zsh -lc 'echo hello && ls'","cwd":"/tmp/codex-spike","processId":"42287","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"listFiles","command":"ls","path":null}],"aggregatedOutput":"hello\n","exitCode":0,"durationMs":0},"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","turnId":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","completedAtMs":1790141937567},"emittedAtMs":1790141937570}"#;
+    const FILE_CHANGE_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"exec-05d666b1-db56-4043-96bb-37b7f8274ea7","changes":[{"path":"/tmp/codex-spike/note.txt","kind":{"type":"add"},"diff":"hi\n"}],"status":"inProgress"},"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","turnId":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","startedAtMs":1790141937574},"emittedAtMs":1790141937575}"#;
+    const WEB_SEARCH_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"webSearch","id":"exec-dee48c2b-3563-4ebb-81fe-f288de91aa60","query":"","action":null,"results":null},"threadId":"01a0ccca-7626-7971-818c-a8f9ff5cc90f","turnId":"01a0ccca-7695-72a1-ae08-2ac1524dd00e","startedAtMs":1790142224261},"emittedAtMs":1790142224262}"#;
+    const WEB_SEARCH_COMPLETED: &str = r#"{"method":"item/completed","params":{"item":{"type":"webSearch","id":"exec-dee48c2b-3563-4ebb-81fe-f288de91aa60","query":"site:github.com/openai/codex/releases latest codex cli release","action":{"type":"search","query":"site:github.com/openai/codex/releases latest codex cli release","queries":null},"results":[]},"threadId":"01a0ccca-7626-7971-818c-a8f9ff5cc90f","turnId":"01a0ccca-7695-72a1-ae08-2ac1524dd00e","completedAtMs":1790142224900},"emittedAtMs":1790142224901}"#;
+    const MCP_STARTED: &str = r#"{"method":"item/started","params":{"item":{"type":"mcpToolCall","id":"exec-73f8c546-00bd-4d39-b1ca-d7edc3e73c8c","server":"node_repl","tool":"js","status":"inProgress","arguments":{"code":"nodeRepl.write(2+2)","title":"Evaluate 2+2"},"appContext":null,"pluginId":null,"readOnlyHint":true,"result":null,"error":null,"durationMs":null},"threadId":"01a0ccd0-0188-7071-9eff-0a3429828ea5","turnId":"01a0ccd0-01ed-7761-8dc4-9c39a1758dc1","startedAtMs":1790142589227},"emittedAtMs":1790142589229}"#;
+    const COMPACT_TOKENS: &str = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"01a0ccc8-f265-7603-9514-213024507e6c","turnId":"01a0ccc9-1c1b-7b72-88b9-5be8efb5dcdf","tokenUsage":{"total":{"totalTokens":32404,"inputTokens":32350,"cachedInputTokens":28416,"cacheWriteInputTokens":0,"outputTokens":54,"reasoningOutputTokens":0},"last":{"totalTokens":5575,"inputTokens":0,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"modelContextWindow":258400}},"emittedAtMs":1790142133096}"#;
+    const TURN_TOKENS: &str = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","turnId":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","tokenUsage":{"total":{"totalTokens":15917,"inputTokens":15844,"cachedInputTokens":12928,"cacheWriteInputTokens":0,"outputTokens":73,"reasoningOutputTokens":0},"last":{"totalTokens":15917,"inputTokens":15844,"cachedInputTokens":12928,"cacheWriteInputTokens":0,"outputTokens":73,"reasoningOutputTokens":0},"modelContextWindow":258400}},"emittedAtMs":1790141937581}"#;
+    const COMPACTION_DONE: &str = r#"{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"01a0ccc9-1c2a-7b30-8baf-5e2f3bc113d2"},"threadId":"01a0ccc8-f265-7603-9514-213024507e6c","turnId":"01a0ccc9-1c1b-7b72-88b9-5be8efb5dcdf","completedAtMs":1790142133096},"emittedAtMs":1790142133098}"#;
+
+    /// A session through its handshake with the thread open.
+    fn open_session() -> CodexAdapter {
         let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"src/foo.rs","kind":"update"}],"status":"completed"}}"#;
-        let events = run(&mut a, line);
+        a.prepare_session_command(&session_ctx(None)).unwrap();
+        a.outbound_frames();
+        run(&mut a, INIT_OK);
+        a.outbound_frames();
+        run(&mut a, THREAD_OK);
+        a
+    }
+
+    #[test]
+    fn handshake_opens_the_thread_before_any_turn() {
+        let mut a = CodexAdapter::new();
+        let cmd = a.prepare_session_command(&session_ctx(None)).unwrap();
+        assert_eq!(cmd, "cd '/tmp/proj' && codex app-server");
+        assert!(a.encode_user_turn("u1", "hi").is_none(), "no thread yet");
+
+        let init = a.outbound_frames();
+        assert_eq!(init.len(), 1);
+        let init = rpc(&init[0]);
+        assert_eq!(
+            (init["id"].as_str(), init["method"].as_str()),
+            (Some("init"), Some("initialize"))
+        );
+        assert_eq!(init["params"]["clientInfo"]["name"], "zucchini");
+        assert!(a.outbound_frames().is_empty(), "initialize goes out once");
+
+        assert!(run(&mut a, INIT_OK).is_empty());
+        let frames = a.outbound_frames();
+        assert_eq!(
+            rpc(&frames[0]),
+            json!({ "jsonrpc": "2.0", "method": "initialized" })
+        );
+        let start = rpc(&frames[1]);
+        assert_eq!(start["method"], "thread/start");
+        assert_eq!(
+            start["params"],
+            json!({
+                "cwd": "/tmp/proj",
+                "model": null,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            })
+        );
+        assert!(
+            a.encode_user_turn("u1", "hi").is_none(),
+            "thread not open yet"
+        );
+        assert!(
+            !a.startup_complete(),
+            "handshake chatter doesn't stop the startup watchdog"
+        );
+
+        assert_eq!(
+            run(&mut a, THREAD_OK),
+            vec![format!("SessionIdHarvested({THREAD})")]
+        );
+        assert!(a.startup_complete());
+        let turn = rpc(&a.encode_user_turn("u1", "hello \"there\"").unwrap());
+        assert_eq!(turn["id"], "turn:u1");
+        assert_eq!(turn["method"], "turn/start");
+        assert_eq!(
+            turn["params"],
+            json!({
+                "threadId": THREAD,
+                "clientUserMessageId": "u1",
+                "input": [{ "type": "text", "text": "hello \"there\"", "text_elements": [] }],
+            })
+        );
+    }
+
+    #[test]
+    fn a_chat_with_a_session_resumes_its_thread_with_every_override() {
+        let mut a = CodexAdapter::new();
+        let ctx = SessionContext {
+            is_sandboxed: true,
+            model: Some("gpt-6-astra"),
+            ..session_ctx(Some(THREAD))
+        };
+        a.prepare_session_command(&ctx).unwrap();
+        a.outbound_frames();
+        run(&mut a, INIT_OK);
+        let resume = rpc(&a.outbound_frames()[1]);
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(
+            resume["params"],
+            json!({
+                "threadId": THREAD,
+                "excludeTurns": true,
+                "cwd": "/tmp/proj",
+                "model": "gpt-6-astra",
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+            })
+        );
+    }
+
+    #[test]
+    fn a_new_worktree_chat_creates_the_worktree_and_runs_the_thread_in_it() {
+        let wt = crate::adapter::worktree_for("00000000-0000-0000-0000-000000000000");
+        let wt_dir = wt.dir.to_string_lossy().into_owned();
+        let mut a = CodexAdapter::new();
+        let ctx = SessionContext {
+            worktree: true,
+            ..session_ctx(None)
+        };
+        let cmd = a.prepare_session_command(&ctx).unwrap();
+        assert_eq!(
+            cmd,
+            format!(
+                "git -C '/tmp/proj' worktree add '{wt_dir}' -b {} && cd '{wt_dir}' && codex app-server",
+                wt.branch
+            )
+        );
+        a.outbound_frames();
+        run(&mut a, INIT_OK);
+        assert_eq!(
+            rpc(&a.outbound_frames()[1])["params"]["cwd"],
+            wt_dir.as_str()
+        );
+    }
+
+    #[test]
+    fn a_thread_that_fails_to_open_fails_every_turn_with_the_reason() {
+        let mut a = CodexAdapter::new();
+        a.prepare_session_command(&session_ctx(Some(THREAD)))
+            .unwrap();
+        a.outbound_frames();
+        run(&mut a, INIT_OK);
+        a.outbound_frames();
+        run(
+            &mut a,
+            r#"{"id":"thread","error":{"code":-32600,"message":"permission denied"}}"#,
+        );
+        assert!(a.startup_complete(), "a failed thread ends the startup");
+        let turn = rpc(&a.encode_user_turn("u1", "hi").expect("sent to be refused"));
+        assert_eq!(turn["params"]["threadId"], "");
+        let events = run(
+            &mut a,
+            r#"{"id":"turn:u1","error":{"code":-32600,"message":"thread not found"}}"#,
+        );
+        assert_eq!(events[..2], ["UserTurnConsumed(u1)", "Result"]);
+        assert_eq!(
+            frame_value(&events[2])["error"]["message"],
+            "codex could not open the thread: permission denied"
+        );
+    }
+
+    /// A thread torn down before its first turn has no rollout to resume
+    /// (real codex 0.154 error): a new thread replaces it.
+    #[test]
+    fn a_thread_without_a_rollout_is_replaced_by_a_new_one() {
+        let mut a = CodexAdapter::new();
+        a.prepare_session_command(&session_ctx(Some(THREAD)))
+            .unwrap();
+        a.outbound_frames();
+        run(&mut a, INIT_OK);
+        a.outbound_frames();
+        assert!(run(
+            &mut a,
+            r#"{"id":"thread","error":{"code":-32600,"message":"no rollout found for thread id 01a0ccc6-1c43-75b3-b5c7-637798bff872"}}"#,
+        )
+        .is_empty());
+        let start = rpc(&a.outbound_frames()[0]);
+        assert_eq!(start["method"], "thread/start");
+        assert!(start["params"].get("threadId").is_none());
+        assert!(!a.startup_complete(), "still opening");
+        assert_eq!(
+            run(&mut a, THREAD_OK),
+            vec![format!("SessionIdHarvested({THREAD})")]
+        );
+        assert!(a.startup_complete());
+    }
+
+    /// A refused turn must not hold the chat busy; inside a running turn it
+    /// doesn't end that turn.
+    #[test]
+    fn a_refused_turn_is_consumed_and_answered_with_an_error() {
+        let refused = r#"{"error":{"code":-32600,"message":"bad input"},"id":"turn:u2"}"#;
+        let mut a = open_session();
+        let events = run(&mut a, refused);
+        assert_eq!(events[..2], ["UserTurnConsumed(u2)", "Result"]);
+        assert_eq!(frame_value(&events[2])["subtype"], "error");
+
+        run(&mut a, TURN_STARTED);
+        let events = run(&mut a, refused);
+        assert_eq!(events[0], "UserTurnConsumed(u2)");
+        assert!(!events.contains(&"Result".to_string()), "{events:?}");
+    }
+
+    #[test]
+    fn the_client_id_echo_marks_the_turn_consumed() {
+        let mut a = open_session();
+        assert_eq!(run(&mut a, USER_ECHO), vec!["UserTurnConsumed(cli-1)"]);
+        assert!(run(&mut a, USER_NO_CLIENT_ID).is_empty());
+    }
+
+    #[test]
+    fn stop_interrupts_the_running_turn() {
+        let mut a = open_session();
+        assert!(a.can_interrupt());
+        assert!(
+            a.encode_interrupt("r1").is_none(),
+            "no turn to interrupt yet"
+        );
+        run(&mut a, TURN_STARTED);
+        let interrupt = rpc(&a.encode_interrupt("r1").unwrap());
+        assert_eq!(interrupt["id"], "interrupt:r1");
+        assert_eq!(interrupt["method"], "turn/interrupt");
+        assert_eq!(
+            interrupt["params"],
+            json!({ "threadId": THREAD, "turnId": "01a0ccc6-1d09-7902-a2b6-7d39a30c6290" })
+        );
+        assert_eq!(
+            run(&mut a, r#"{"id":"interrupt:r1","result":{}}"#),
+            vec!["InterruptAcked(r1)"]
+        );
+        let events = run(&mut a, TURN_INTERRUPTED);
+        assert_eq!(
+            events[0], "Result",
+            "Result first: the reader swallows what follows"
+        );
+        assert_eq!(events[1], format!("Frame({INTERRUPTED_RESULT})"));
+        assert!(a.encode_interrupt("r2").is_none(), "the turn is over");
+    }
+
+    /// An interrupt racing the turn's natural end is refused; the ack still
+    /// comes, so the stop settles instead of waiting out its timeout.
+    #[test]
+    fn a_refused_interrupt_still_acks() {
+        let mut a = open_session();
+        assert_eq!(
+            run(
+                &mut a,
+                r#"{"id":"interrupt:r1","error":{"code":-32600,"message":"no active turn"}}"#
+            ),
+            vec!["InterruptAcked(r1)"]
+        );
+    }
+
+    /// A turn that ends without echoing an accepted input still consumes it,
+    /// or the chat would stay busy forever.
+    #[test]
+    fn an_unechoed_input_is_consumed_when_its_turn_ends() {
+        let mut a = open_session();
+        let accepted = r#"{"id":"turn:u1","result":{"turn":{"id":"01a0ccc6-1d09-7902-a2b6-7d39a30c6290","items":[],"itemsView":"notLoaded","status":"inProgress","error":null}}}"#;
+        let echoed = accepted.replace("turn:u1", "turn:cli-1");
+        assert!(run(&mut a, accepted).is_empty());
+        assert!(run(&mut a, &echoed).is_empty());
+        run(&mut a, TURN_STARTED);
+        assert_eq!(run(&mut a, USER_ECHO), vec!["UserTurnConsumed(cli-1)"]);
+        let events = run(&mut a, TURN_COMPLETED);
+        assert_eq!(events[..2], ["UserTurnConsumed(u1)", "Result"]);
+        assert_eq!(run(&mut a, TURN_COMPLETED)[0], "Result", "only once");
+    }
+
+    /// A thread that won't open reports it on the next turn, then ends the
+    /// session so the next message respawns.
+    #[test]
+    fn a_failed_thread_ends_the_session_after_reporting() {
+        let mut a = CodexAdapter::new();
+        a.prepare_session_command(&session_ctx(Some(THREAD)))
+            .unwrap();
+        a.outbound_frames();
+        run(
+            &mut a,
+            r#"{"id":"init","error":{"code":-32600,"message":"boom"}}"#,
+        );
+        assert!(!a.session_over(), "not before a turn has reported it");
+        run(
+            &mut a,
+            r#"{"id":"turn:u1","error":{"code":-32600,"message":"Not initialized"}}"#,
+        );
+        assert!(a.session_over());
+    }
+
+    #[test]
+    fn compact_is_a_command_turn_that_waits_for_idle() {
+        let mut a = open_session();
+        assert!(a.is_command_turn("/compact"));
+        assert!(a.is_command_turn(" /compact keep the plan"));
+        assert!(!a.is_command_turn("/init"));
+        assert!(!a.is_command_turn("please /compact"));
+        assert!(!a.command_interrupts_turn());
+
+        let compact = rpc(&a.encode_user_turn("u3", "/compact keep the plan").unwrap());
+        assert_eq!(compact["id"], "compact:u3");
+        assert_eq!(compact["method"], "thread/compact/start");
+        assert_eq!(compact["params"], json!({ "threadId": THREAD }));
+        assert_eq!(
+            run(&mut a, r#"{"id":"compact:u3","result":{}}"#),
+            vec!["UserTurnConsumed(u3)"]
+        );
+        // After compaction `last.inputTokens` is 0; `last.totalTokens` is the
+        // compacted context.
+        assert_eq!(run(&mut a, COMPACT_TOKENS), vec!["ContextTokens(5575)"]);
+        assert_eq!(run(&mut a, COMPACTION_DONE), vec!["CompactBoundary(5575)"]);
+    }
+
+    #[test]
+    fn token_usage_drives_the_context_gauge_deduped() {
+        let mut a = open_session();
+        assert_eq!(run(&mut a, TURN_TOKENS), vec!["ContextTokens(15917)"]);
+        assert!(run(&mut a, TURN_TOKENS).is_empty());
+    }
+
+    #[test]
+    fn turn_completed_emits_result_then_its_frame() {
+        let mut a = open_session();
+        let events = run(&mut a, TURN_COMPLETED);
+        assert_eq!(events[0], "Result");
+        assert_eq!(
+            frame_value(&events[1]),
+            json!({ "type": "result", "subtype": "success", "is_error": false })
+        );
+        let events = run(&mut a, TURN_FAILED);
+        assert_eq!(events[0], "Result");
+        let failed = frame_value(&events[1]);
+        assert_eq!(
+            (failed["subtype"].as_str(), failed["is_error"].as_bool()),
+            (Some("error"), Some(true))
+        );
+        assert!(failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no-such-model-xyz"));
+    }
+
+    #[test]
+    fn agent_message_renders_on_completed_only() {
+        let mut a = open_session();
+        assert!(run(&mut a, AGENT_MESSAGE_STARTED).is_empty());
+        let events = run(&mut a, AGENT_MESSAGE);
         assert_eq!(events.len(), 1);
         let v = frame_value(&events[0]);
         assert_eq!(v["type"], "assistant");
-        assert_eq!(v["message"]["content"][0]["type"], "tool_use");
-        assert_eq!(v["message"]["content"][0]["name"], "Edit");
-        assert_eq!(v["message"]["content"][0]["id"], "item_2");
         assert_eq!(
-            v["message"]["content"][0]["input"]["file_path"],
-            "src/foo.rs"
+            v["message"]["content"][0],
+            json!({ "type": "text", "text": "I\u{2019}ll run the command and create `note.txt`.\n" })
         );
     }
 
     #[test]
-    fn item_completed_file_change_add_normalizes_to_claude_write() {
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"src/new.rs","kind":"add"}],"status":"completed"}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
+    fn a_command_surfaces_in_flight_and_its_completion_is_deduped() {
+        let mut a = open_session();
+        let id = "exec-565056be-aca3-4c8e-85fc-1f837d1825d0";
+        let events = run(&mut a, COMMAND_STARTED);
+        assert_eq!(events[1], format!("CommandStarted({id})"));
+        let v = frame_value(&events[0]);
+        assert_eq!(
+            v["message"]["content"][0],
+            json!({
+                "type": "tool_use",
+                "id": id,
+                "name": "Bash",
+                "input": { "command": "/bin/zsh -lc 'echo hello && ls'" },
+            })
+        );
+        assert_eq!(
+            run(&mut a, COMMAND_COMPLETED),
+            vec![format!("CommandFinished({id})")]
+        );
+        // A completion with no started renders.
+        let events = run(&mut a, COMMAND_COMPLETED);
+        assert_eq!(events.len(), 2);
+        assert!(events[0].starts_with("Frame("), "{events:?}");
+    }
+
+    /// A command `/stop` left running completes after its turn ended: still
+    /// one bubble (real sequence, `tmp/spike-logs/int3.jsonl`).
+    #[test]
+    fn a_command_completing_after_its_turn_renders_once() {
+        let mut a = open_session();
+        run(&mut a, COMMAND_STARTED);
+        run(&mut a, TURN_INTERRUPTED);
+        let events = run(&mut a, COMMAND_COMPLETED);
+        assert!(
+            !events.iter().any(|e| e.starts_with("Frame(")),
+            "{events:?}"
+        );
+    }
+
+    /// A turn nobody sent (a goal continuation) is busy like our own.
+    #[test]
+    fn every_started_turn_is_announced() {
+        let mut a = open_session();
+        assert_eq!(
+            run(&mut a, TURN_STARTED),
+            vec!["TurnStarted(01a0ccc6-1d09-7902-a2b6-7d39a30c6290)"]
+        );
+        let mut st = crate::agent::SessionState::default();
+        crate::agent::reduce(
+            &mut st,
+            &AgentEvent::TurnStarted("01a0ccc6-1d09-7902-a2b6-7d39a30c6290".into()),
+        );
+        assert!(st.running());
+        crate::agent::reduce(
+            &mut st,
+            &AgentEvent::Result {
+                origin_is_task: false,
+            },
+        );
+        assert!(!st.running());
+    }
+
+    /// Running commands block a prune but never keep the chat busy; the prune
+    /// call itself doesn't count.
+    #[test]
+    fn running_commands_block_a_prune_without_making_the_chat_busy() {
+        let mut a = open_session();
+        let mut st = crate::agent::SessionState::default();
+        let prune = COMMAND_STARTED.replace(
+            "/bin/zsh -lc 'echo hello && ls'",
+            r#"/bin/zsh -lc '\"$ZUCCHINI_SPAWNER_BIN\" prune-context --args x --summary y'"#,
+        );
+        for ev in a.handle_line(prune) {
+            crate::agent::reduce(&mut st, &ev);
+        }
+        assert!(st.live_commands.is_empty(), "the prune call is exempt");
+        for ev in a.handle_line(COMMAND_STARTED.to_string()) {
+            crate::agent::reduce(&mut st, &ev);
+        }
+        assert_eq!(st.live_commands.len(), 1);
+        assert!(!st.running());
+        for ev in a.handle_line(COMMAND_COMPLETED.to_string()) {
+            crate::agent::reduce(&mut st, &ev);
+        }
+        assert!(st.live_commands.is_empty());
+    }
+
+    #[test]
+    fn only_the_prune_context_command_completion_cues_the_prune() {
+        let mut a = open_session();
+        let prune = COMMAND_COMPLETED.replace(
+            "/bin/zsh -lc 'echo hello && ls'",
+            r#"/bin/zsh -lc '\"$ZUCCHINI_SPAWNER_BIN\" prune-context --args \"*.log\" --summary x'"#,
+        );
+        let events = run(&mut a, &prune);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events[0].starts_with("Frame("));
+        assert_eq!(events[1], "ToolResult");
+        assert!(!run(&mut a, TURN_COMPLETED).contains(&"ToolResult".to_string()));
+        assert!(!run(&mut a, COMMAND_COMPLETED).contains(&"ToolResult".to_string()));
+    }
+
+    #[test]
+    fn file_changes_map_by_kind_type() {
+        let mut a = open_session();
+        let events = run(&mut a, FILE_CHANGE_STARTED);
         let v = frame_value(&events[0]);
         assert_eq!(v["message"]["content"][0]["name"], "Write");
         assert_eq!(
-            v["message"]["content"][0]["input"]["file_path"],
-            "src/new.rs"
+            v["message"]["content"][0]["input"],
+            json!({ "file_path": "/tmp/codex-spike/note.txt" })
         );
-    }
+        assert!(run(
+            &mut a,
+            &FILE_CHANGE_STARTED.replace("item/started", "item/completed")
+        )
+        .is_empty());
 
-    #[test]
-    fn item_completed_file_change_delete_normalizes_to_claude_bash_rm() {
-        // Claude has no dedicated delete tool, and claude code itself uses
-        // `Bash` with `rm <path>` for deletes — mirror that so the iOS row
-        // reads naturally ("Bash: rm src/old.rs").
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"src/old.rs","kind":"delete"}],"status":"completed"}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
-        let v = frame_value(&events[0]);
-        assert_eq!(v["message"]["content"][0]["name"], "Bash");
+        let multi = r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"fc","changes":[{"path":"/a","kind":{"type":"update","move_path":null},"diff":""},{"path":"/b","kind":{"type":"delete"},"diff":""}],"status":"inProgress"}}}"#;
+        let events = run(&mut a, multi);
+        let edit = frame_value(&events[0]);
+        assert_eq!(edit["message"]["content"][0]["id"], "fc.0");
+        assert_eq!(edit["message"]["content"][0]["name"], "Edit");
+        let rm = frame_value(&events[1]);
+        assert_eq!(rm["message"]["content"][0]["id"], "fc.1");
         assert_eq!(
-            v["message"]["content"][0]["input"]["command"],
-            "rm src/old.rs"
+            rm["message"]["content"][0]["input"],
+            json!({ "command": "rm /b" })
         );
     }
 
     #[test]
-    fn item_completed_file_change_multi_emits_one_frame_per_change() {
-        // Codex bundles N edits in a single `file_change` item; fan them out
-        // so each shows up as its own bubble line (claude itself emits one
-        // tool_use per edit). Ids are suffixed `.<idx>` to stay unique.
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"a.rs","kind":"update"},{"path":"b.rs","kind":"add"}],"status":"completed"}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 2);
-        let v0 = frame_value(&events[0]);
-        assert_eq!(v0["message"]["content"][0]["name"], "Edit");
-        assert_eq!(v0["message"]["content"][0]["id"], "item_2.0");
-        assert_eq!(v0["message"]["content"][0]["input"]["file_path"], "a.rs");
-        let v1 = frame_value(&events[1]);
-        assert_eq!(v1["message"]["content"][0]["name"], "Write");
-        assert_eq!(v1["message"]["content"][0]["id"], "item_2.1");
-        assert_eq!(v1["message"]["content"][0]["input"]["file_path"], "b.rs");
-    }
-
-    #[test]
-    fn item_completed_command_execution_normalizes_to_claude_bash() {
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"ls -la","aggregated_output":"out","exit_code":0,"status":"completed"}}"#;
-        let events = run(&mut a, line);
-        // Just the visible bubble — an ordinary command is NOT the prune-context
-        // call, so the call-keyed cue does not fire.
-        assert_eq!(events.len(), 1);
-        let v = frame_value(&events[0]);
-        assert_eq!(v["message"]["content"][0]["name"], "Bash");
-        assert_eq!(v["message"]["content"][0]["input"]["command"], "ls -la");
-        // We drop codex-side metadata — iOS doesn't render it and keeping it
-        // would just bloat the persisted body.
-        assert!(v["message"]["content"][0]["input"]["aggregated_output"].is_null());
-        assert!(v["message"]["content"][0]["input"]["exit_code"].is_null());
-    }
-
-    #[test]
-    fn item_completed_web_search_normalizes_to_claude_websearch() {
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.completed","item":{"id":"item_4","type":"web_search","query":"rust async traits","action":{"type":"search","query":"rust async traits"}}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
+    fn web_search_renders_once_its_query_is_known() {
+        let mut a = open_session();
+        assert!(run(&mut a, WEB_SEARCH_STARTED).is_empty());
+        let events = run(&mut a, WEB_SEARCH_COMPLETED);
         let v = frame_value(&events[0]);
         assert_eq!(v["message"]["content"][0]["name"], "WebSearch");
         assert_eq!(
-            v["message"]["content"][0]["input"]["query"],
-            "rust async traits"
+            v["message"]["content"][0]["input"],
+            json!({ "query": "site:github.com/openai/codex/releases latest codex cli release" })
         );
     }
 
     #[test]
-    fn turn_completed_emits_result_frame_and_marker_but_no_context_tokens() {
-        let mut a = CodexAdapter::new();
-        // `usage` here is the cumulative `total_token_usage` — deliberately NOT
-        // surfaced as ContextTokens (occupancy comes post-turn from the
-        // rollout, see `read_rollout_last_context_tokens`).
-        let line = r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":500,"output_tokens":200,"reasoning_output_tokens":50}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|e| !e.starts_with("ContextTokens")));
-        assert!(events[0].starts_with("Frame("));
-        assert_eq!(events[1], "Result");
-        // Verify the result envelope shape.
-        let v = frame_value(&events[0]);
-        assert_eq!(v["type"], "result");
-        assert_eq!(v["subtype"], "success");
-        assert_eq!(v["is_error"], false);
-    }
-
-    #[test]
-    fn turn_failed_emits_error_result_frame_and_result_marker() {
-        let mut a = CodexAdapter::new();
-        let line =
-            r#"{"type":"turn.failed","error":{"message":"sandbox denied: read-only filesystem"}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 2);
-        assert!(events[0].starts_with("Frame("));
-        assert_eq!(events[1], "Result");
-
-        let v = frame_value(&events[0]);
-        assert_eq!(v["type"], "result");
-        assert_eq!(v["subtype"], "error");
-        assert_eq!(v["is_error"], true);
+    fn mcp_tool_call_uses_claude_mcp_naming() {
+        let mut a = open_session();
+        let v = frame_value(&run(&mut a, MCP_STARTED)[0]);
+        assert_eq!(v["message"]["content"][0]["name"], "mcp__node_repl__js");
         assert_eq!(
-            v["error"]["message"],
-            "sandbox denied: read-only filesystem"
+            v["message"]["content"][0]["input"],
+            json!({ "code": "nodeRepl.write(2+2)", "title": "Evaluate 2+2" })
         );
     }
 
+    /// Schema-only shapes (collabAgentToolCall never fired in the spike).
     #[test]
-    fn turn_failed_without_message_uses_generic_error_result() {
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"turn.failed","error":{}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 2);
-        let v = frame_value(&events[0]);
-        assert_eq!(v["subtype"], "error");
-        assert_eq!(v["is_error"], true);
-        assert_eq!(v["error"]["message"], "turn failed");
-        assert_eq!(events[1], "Result");
-    }
-
-    #[test]
-    fn read_rollout_last_context_tokens_returns_last_records_last_token_usage() {
-        // A rollout with two `token_count` records: the gauge must read the
-        // LAST record's `last_token_usage.input_tokens` (occupancy), NOT
-        // `total_token_usage` (cumulative) and NOT the earlier record.
-        let dir = std::env::temp_dir().join(format!(
-            "zucchini-codex-rollout-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("rollout-test.jsonl");
-        let body = concat!(
-            r#"{"type":"session_meta","payload":{"id":"abc"}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":53584},"last_token_usage":{"input_tokens":19590}}}}"#,
-            "\n",
-            r#"{"type":"response_item","payload":{"type":"message"}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":122951},"last_token_usage":{"input_tokens":24930},"model_context_window":258400}}}"#,
-            "\n",
-        );
-        std::fs::write(&path, body).unwrap();
-
-        assert_eq!(read_rollout_last_context_tokens(&path), Some(24930));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn read_rollout_last_context_tokens_none_without_token_count() {
-        let dir = std::env::temp_dir().join(format!(
-            "zucchini-codex-rollout-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("rollout-empty.jsonl");
-        std::fs::write(
-            &path,
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\"}}\n",
-        )
-        .unwrap();
-
-        assert_eq!(read_rollout_last_context_tokens(&path), None);
-        // Unreadable path → None (caller leaves the gauge untouched).
-        assert_eq!(
-            read_rollout_last_context_tokens(&dir.join("does-not-exist.jsonl")),
-            None
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn post_turn_context_tokens_none_when_no_session_id() {
-        // No harvested id and no resume id → nothing to locate, returns None.
-        let a = CodexAdapter::new();
-        assert_eq!(a.post_turn_context_tokens(None), None);
-    }
-
-    #[test]
-    fn turn_started_and_agent_message_item_started_dropped() {
-        // `turn.started` has no claude analog; an `agent_message` `item.started`
-        // carries no final text yet (it renders on `item.completed`). Tool
-        // `item.started`s, by contrast, DO render — see the tests below.
-        let mut a = CodexAdapter::new();
-        let ts = r#"{"type":"turn.started"}"#;
-        let is_ = r#"{"type":"item.started","item":{"id":"item_4","type":"agent_message"}}"#;
-        assert!(run(&mut a, ts).is_empty());
-        assert!(run(&mut a, is_).is_empty());
-    }
-
-    #[test]
-    fn item_started_command_execution_surfaces_in_flight_bash() {
-        // The whole point of the started-not-completed switch: a command shows
-        // the instant codex starts it (status:in_progress), not after it ends.
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"npm ci","status":"in_progress"}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
-        let v = frame_value(&events[0]);
-        assert_eq!(v["message"]["content"][0]["name"], "Bash");
-        assert_eq!(v["message"]["content"][0]["id"], "item_3");
-        assert_eq!(v["message"]["content"][0]["input"]["command"], "npm ci");
-    }
-
-    #[test]
-    fn item_started_then_completed_command_dedupes_to_single_bubble() {
-        // started renders the bubble; the matching completed (same id) is
-        // suppressed so the command isn't shown twice.
-        let mut a = CodexAdapter::new();
-        let started = r#"{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"ls -la","status":"in_progress"}}"#;
-        let completed = r#"{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"ls -la","aggregated_output":"out","exit_code":0,"status":"completed"}}"#;
-        let first = run(&mut a, started);
-        assert_eq!(first.len(), 1, "started should surface the command");
-        let second = run(&mut a, completed);
-        // The bubble is deduped (already surfaced on started); an ordinary
-        // command fires no prune cue (call-keyed), so nothing is left.
-        assert!(
-            second.is_empty(),
-            "deduped non-prune completion emits nothing, got {second:?}"
-        );
-    }
-
-    #[test]
-    fn item_completed_command_execution_without_started_still_renders() {
-        // Fallback path: if a tool item never produced a usable item.started,
-        // its item.completed must still render (nothing vanishes). The id was
-        // never recorded, so dedup doesn't suppress it.
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.completed","item":{"id":"item_9","type":"command_execution","command":"echo hi","status":"completed"}}"#;
-        let events = run(&mut a, line);
-        // Fallback render bubble only — an ordinary command fires no prune cue.
-        assert_eq!(events.len(), 1);
-        let v = frame_value(&events[0]);
-        assert_eq!(v["message"]["content"][0]["name"], "Bash");
-        assert_eq!(v["message"]["content"][0]["input"]["command"], "echo hi");
-    }
-
-    #[test]
-    fn item_completed_prune_context_command_fires_cue_siblings_do_not() {
-        // Call-keyed: only the `prune-context` command's own completion drives
-        // the queued prune's apply. A sibling shell command completing first in
-        // the same batch must not preempt it.
-        let mut a = CodexAdapter::new();
-        let sibling = r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"grep -rn foo src/","aggregated_output":"hits","exit_code":0,"status":"completed"}}"#;
-        let sib_events = run(&mut a, sibling);
-        assert_eq!(sib_events.len(), 1, "sibling renders its bubble, no cue");
-        assert_ne!(sib_events[0], "ToolResult");
-        let prune = r#"{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"\"$ZUCCHINI_SPAWNER_BIN\" prune-context --tool-name Bash --args \"*foo*\" --reason y","aggregated_output":"pruned","exit_code":0,"status":"completed"}}"#;
-        let prune_events = run(&mut a, prune);
-        // Bubble, then the prune cue (the call's own completion).
-        assert_eq!(prune_events.len(), 2);
-        assert_eq!(prune_events[1], "ToolResult");
-    }
-
-    #[test]
-    fn item_started_then_completed_file_change_dedupes() {
-        // Multi-change file_change surfaces on started (one bubble per change),
-        // and the completed for the same item id is deduped to nothing.
-        let mut a = CodexAdapter::new();
-        let started = r#"{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"a.rs","kind":"update"},{"path":"b.rs","kind":"add"}],"status":"in_progress"}}"#;
-        let completed = r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"a.rs","kind":"update"},{"path":"b.rs","kind":"add"}],"status":"completed"}}"#;
-        assert_eq!(run(&mut a, started).len(), 2);
-        assert!(run(&mut a, completed).is_empty());
-    }
-
-    #[test]
-    fn item_started_mcp_tool_call_surfaces_qualified_name_and_raw_args() {
-        // codex's exec-stream `arguments` is a RAW JSON object (not the encoded
-        // string the persisted function_call carries), so it passes straight
-        // through under `input`. The tool_use name is claude's own
-        // `mcp__<server>__<tool>` convention → iOS's default summary branch
-        // renders the qualified name with no codex-specific iOS code.
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.started","item":{"id":"item_5","type":"mcp_tool_call","server":"github","tool":"create_issue","arguments":{"title":"bug","repo":"acme/app"},"status":"in_progress"}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
-        let v = frame_value(&events[0]);
-        assert_eq!(v["message"]["content"][0]["type"], "tool_use");
-        assert_eq!(
-            v["message"]["content"][0]["name"],
-            "mcp__github__create_issue"
-        );
-        assert_eq!(v["message"]["content"][0]["id"], "item_5");
-        assert_eq!(v["message"]["content"][0]["input"]["title"], "bug");
-        assert_eq!(v["message"]["content"][0]["input"]["repo"], "acme/app");
-    }
-
-    #[test]
-    fn item_started_then_completed_mcp_tool_call_dedupes_to_single_bubble() {
-        // started surfaces the MCP bubble; the matching completed (same id,
-        // now carrying a result) is suppressed so it isn't rendered twice.
-        let mut a = CodexAdapter::new();
-        let started = r#"{"type":"item.started","item":{"id":"item_5","type":"mcp_tool_call","server":"github","tool":"create_issue","arguments":{"title":"bug"},"status":"in_progress"}}"#;
-        let completed = r#"{"type":"item.completed","item":{"id":"item_5","type":"mcp_tool_call","server":"github","tool":"create_issue","arguments":{"title":"bug"},"result":{"ok":true},"status":"completed"}}"#;
-        assert_eq!(run(&mut a, started).len(), 1);
-        assert!(
-            run(&mut a, completed).is_empty(),
-            "completed for an already-surfaced MCP id must be deduped"
-        );
-    }
-
-    #[test]
-    fn item_started_mcp_tool_call_missing_both_names_falls_through_to_completed() {
-        // No server AND no tool → started renders nothing (no garbage `mcp__`
-        // bubble), so the completed fallback fires instead. Here completed
-        // carries a tool name, so the fallback renders a usable bubble.
-        let mut a = CodexAdapter::new();
-        let started = r#"{"type":"item.started","item":{"id":"item_6","type":"mcp_tool_call","arguments":{},"status":"in_progress"}}"#;
-        assert!(
-            run(&mut a, started).is_empty(),
-            "started with no server/tool must render nothing"
-        );
-        let completed = r#"{"type":"item.completed","item":{"id":"item_6","type":"mcp_tool_call","server":"fs","tool":"read","arguments":{"path":"/x"},"status":"completed"}}"#;
-        let events = run(&mut a, completed);
-        assert_eq!(events.len(), 1, "completed fallback must render the bubble");
-        let v = frame_value(&events[0]);
-        assert_eq!(v["message"]["content"][0]["name"], "mcp__fs__read");
-    }
-
-    #[test]
-    fn item_started_collab_spawn_agent_with_prompt_maps_to_claude_agent() {
-        // A `spawn_agent` carrying a prompt → claude `Agent` `{description}`, so
-        // iOS's toolSummary (`Agent`→`description`) shows the sub-agent's task.
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.started","item":{"id":"item_7","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"t0","receiver_thread_ids":["t1"],"prompt":"investigate the flaky test","agents_states":{},"status":"in_progress"}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
-        let v = frame_value(&events[0]);
-        assert_eq!(v["message"]["content"][0]["type"], "tool_use");
+    fn collab_tools_map_to_agent_or_their_exec_names() {
+        let mut a = open_session();
+        let spawn = r#"{"method":"item/started","params":{"item":{"type":"collabAgentToolCall","id":"c1","tool":"spawnAgent","status":"inProgress","senderThreadId":"t0","receiverThreadIds":[],"prompt":"audit the parser","model":null}}}"#;
+        let v = frame_value(&run(&mut a, spawn)[0]);
         assert_eq!(v["message"]["content"][0]["name"], "Agent");
-        assert_eq!(v["message"]["content"][0]["id"], "item_7");
         assert_eq!(
-            v["message"]["content"][0]["input"]["description"],
-            "investigate the flaky test"
+            v["message"]["content"][0]["input"],
+            json!({ "description": "audit the parser" })
         );
-    }
-
-    #[test]
-    fn item_started_collab_send_input_passes_tool_name_through() {
-        // Non-spawn collab subtools (or spawn with no prompt) pass the collab
-        // tool name through verbatim → iOS renders the tool-name-only branch.
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"item.started","item":{"id":"item_8","type":"collab_tool_call","tool":"send_input","sender_thread_id":"t0","receiver_thread_ids":["t1"],"prompt":"keep going","agents_states":{},"status":"in_progress"}}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events.len(), 1);
-        let v = frame_value(&events[0]);
+        let send = r#"{"method":"item/started","params":{"item":{"type":"collabAgentToolCall","id":"c2","tool":"sendInput","status":"inProgress","senderThreadId":"t0","receiverThreadIds":["t1"],"prompt":"go on","model":null}}}"#;
+        let v = frame_value(&run(&mut a, send)[0]);
         assert_eq!(v["message"]["content"][0]["name"], "send_input");
-        assert_eq!(v["message"]["content"][0]["id"], "item_8");
-        // routing + prompt preserved under input (iOS ignores them, but the
-        // stored frame stays useful).
-        assert_eq!(v["message"]["content"][0]["input"]["prompt"], "keep going");
         assert_eq!(
-            v["message"]["content"][0]["input"]["receiver_thread_ids"][0],
-            "t1"
+            v["message"]["content"][0]["input"],
+            json!({ "prompt": "go on", "sender_thread_id": "t0", "receiver_thread_ids": ["t1"] })
         );
     }
 
     #[test]
-    fn item_started_then_completed_collab_dedupes_to_single_bubble() {
-        let mut a = CodexAdapter::new();
-        let started = r#"{"type":"item.started","item":{"id":"item_7","type":"collab_tool_call","tool":"spawn_agent","prompt":"do X","status":"in_progress"}}"#;
-        let completed = r#"{"type":"item.completed","item":{"id":"item_7","type":"collab_tool_call","tool":"spawn_agent","prompt":"do X","status":"completed"}}"#;
-        assert_eq!(run(&mut a, started).len(), 1);
-        assert!(
-            run(&mut a, completed).is_empty(),
-            "completed for an already-surfaced collab id must be deduped"
-        );
+    fn a_server_request_is_refused_so_the_turn_cannot_hang() {
+        let mut a = open_session();
+        let request = r#"{"method":"item/commandExecution/requestApproval","id":7,"params":{"threadId":"t","turnId":"u","itemId":"i"}}"#;
+        assert!(run(&mut a, request).is_empty());
+        let reply = rpc(&a.outbound_frames()[0]);
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], -32601);
     }
 
     #[test]
-    fn unknown_frame_type_dropped() {
-        // codex format drift / a lifecycle type we don't transform → DROP.
-        // Forwarding raw codex JSON is wire-incompatible (iOS renders an unknown
-        // `{"type":"X"}` as the literal `[X]` junk); the debug breadcrumb keeps
-        // observability without spamming the chat.
-        let mut a = CodexAdapter::new();
-        let line = r#"{"type":"some.future.event","payload":{"k":"v"}}"#;
-        let events = run(&mut a, line);
-        assert!(
-            events.is_empty(),
-            "unknown frame must drop, got: {events:?}"
-        );
+    fn noise_is_dropped() {
+        let mut a = open_session();
+        for line in [
+            r#"{"method":"thread/status/changed","params":{"threadId":"01a0ccc6-1c43-75b3-b5c7-637798bff872","status":{"type":"idle"}},"emittedAtMs":1790141939174}"#,
+            r#"{"method":"item/completed","params":{"item":{"type":"reasoning","id":"rs_0f03","summary":[],"content":[]},"threadId":"t","turnId":"u","completedAtMs":1}}"#,
+            r#"{"method":"warning","params":{"threadId":"t","message":"Model metadata for `x` not found."}}"#,
+            r#"{"id":"turn:u9","result":{"turn":{"id":"u","items":[],"itemsView":"notLoaded","status":"inProgress","error":null}}}"#,
+            "not json",
+        ] {
+            assert!(run(&mut a, line).is_empty(), "{line}");
+        }
     }
 
     #[test]
-    fn non_json_line_dropped() {
-        // codex stdout is pure JSONL; a non-JSON line is stray noise and is
-        // DROPPED (forwarding it raw is wire-incompatible). Real failures arrive
-        // on stderr, handled separately.
-        let mut a = CodexAdapter::new();
-        let events = run(&mut a, "non-json-line");
-        assert!(
-            events.is_empty(),
-            "non-json line must drop, got: {events:?}"
+    fn an_oversize_line_is_parsed_only_when_something_renders_from_it() {
+        let mut a = open_session();
+        let big = "x".repeat(MAX_STREAM_FRAME_BYTES + 1);
+        let diff = format!(
+            r#"{{"method":"turn/diff/updated","params":{{"threadId":"t","turnId":"u","diff":"{big}"}}}}"#
         );
-    }
-
-    #[test]
-    fn json_object_without_type_dropped() {
-        let mut a = CodexAdapter::new();
-        let events = run(&mut a, r#"{"payload":{"k":"v"}}"#);
-        assert!(
-            events.is_empty(),
-            "typeless object must drop, got: {events:?}"
+        assert!(run(&mut a, &diff).is_empty());
+        let output = COMMAND_COMPLETED.replace(
+            r#""aggregatedOutput":"hello\n""#,
+            &format!(r#""aggregatedOutput":"{big}""#),
         );
-    }
-
-    #[test]
-    fn model_some_appends_model_flag_on_first_turn() {
-        let mut a = CodexAdapter::new();
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        let c = ctx(&prompt_file, None, false, Some("gpt-5.5"));
-        let cmd = a.prepare_command(&c).unwrap();
-        assert!(cmd.contains("--model 'gpt-5.5'"), "got: {}", cmd);
-    }
-
-    #[test]
-    fn model_none_omits_model_flag() {
-        let mut a = CodexAdapter::new();
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        let c = ctx(&prompt_file, None, false, None);
-        let cmd = a.prepare_command(&c).unwrap();
-        assert!(!cmd.contains("--model"), "got: {}", cmd);
-    }
-
-    #[test]
-    fn resume_command_omits_sandbox_and_cwd_flags() {
-        // `codex exec resume` does NOT accept -s, -C, --add-dir (locked at
-        // session creation). prepare_command must omit them on the resume
-        // path or the spawn fails on argv parse. The bypass flag IS allowed
-        // on resume and survives across turns so the agent stays unsandboxed.
-        let mut a = CodexAdapter::new();
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        let c = ctx(&prompt_file, Some("uuid-here"), false, None);
-        let cmd = a.prepare_command(&c).unwrap();
+        assert!(output.len() > MAX_STREAM_FRAME_BYTES);
         assert!(
-            cmd.contains("exec resume 'uuid-here'"),
-            "expected resume subcommand, got: {}",
-            cmd
+            run(&mut a, &output)[0].starts_with("Frame("),
+            "a completed command still renders"
         );
-        assert!(
-            !cmd.contains(" -s "),
-            "resume must not pass sandbox flag, got: {}",
-            cmd
+        let elicitation = format!(
+            r#"{{"method":"mcpServer/elicitation/request","id":7,"params":{{"message":"{big}"}}}}"#
         );
+        run(&mut a, &elicitation);
         assert!(
-            !cmd.contains(" -C "),
-            "resume must not pass cwd flag, got: {}",
-            cmd
-        );
-        assert!(
-            cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
-            "non-sandboxed resume should still emit the bypass flag, got: {}",
-            cmd
-        );
-    }
-
-    #[test]
-    fn first_turn_command_uses_bypass_flag_and_cwd() {
-        // Non-sandboxed first turn collapses sandbox + approval skip into a
-        // single `--dangerously-bypass-approvals-and-sandbox` flag (codex
-        // exec has no `-a` / `--ask-for-approval`; the previous code path
-        // was invalid and failed at argv parse).
-        let mut a = CodexAdapter::new();
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        let c = ctx(&prompt_file, None, false, None);
-        let cmd = a.prepare_command(&c).unwrap();
-        assert!(
-            cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
-            "expected bypass flag for non-sandboxed sender, got: {}",
-            cmd
-        );
-        assert!(
-            !cmd.contains(" -a "),
-            "codex exec rejects -a / --ask-for-approval, must not emit it, got: {}",
-            cmd
-        );
-        assert!(
-            cmd.contains("-C '/tmp/proj'"),
-            "expected -C cwd flag, got: {}",
-            cmd
-        );
-    }
-
-    #[test]
-    fn sandboxed_first_turn_uses_read_only_and_config_approval() {
-        // Sandboxed invitees get the most restrictive codex sandbox
-        // (read-only) plus `-c approval_policy=never` (the only way to
-        // skip prompts on `codex exec` — the top-level `-a` short flag
-        // doesn't exist on the subcommand).
-        let mut a = CodexAdapter::new();
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        let c = ctx(&prompt_file, None, true, None);
-        let cmd = a.prepare_command(&c).unwrap();
-        assert!(
-            cmd.contains("-s read-only"),
-            "expected read-only sandbox for sandboxed sender, got: {}",
-            cmd
-        );
-        assert!(
-            cmd.contains("-c approval_policy=never"),
-            "expected -c approval_policy=never to suppress TTY prompts, got: {}",
-            cmd
-        );
-        assert!(
-            !cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
-            "sandboxed sender must not get the bypass flag, got: {}",
-            cmd
-        );
-    }
-
-    #[test]
-    fn sandboxed_resume_drops_sandbox_keeps_approval_override() {
-        // Sandbox is locked at session creation, so resume drops `-s`. The
-        // approval-policy config override is allowed on resume and we want
-        // it on every turn so a stale config.toml can't reintroduce prompts.
-        let mut a = CodexAdapter::new();
-        let prompt_file = PathBuf::from("/tmp/p.txt");
-        let c = ctx(&prompt_file, Some("uuid-here"), true, None);
-        let cmd = a.prepare_command(&c).unwrap();
-        assert!(
-            !cmd.contains(" -s "),
-            "sandboxed resume must not pass -s, got: {}",
-            cmd
-        );
-        assert!(
-            !cmd.contains(" -C "),
-            "sandboxed resume must not pass -C, got: {}",
-            cmd
-        );
-        assert!(
-            cmd.contains("-c approval_policy=never"),
-            "expected -c approval_policy=never on sandboxed resume, got: {}",
-            cmd
+            a.outbound_frames()
+                .iter()
+                .any(|f| f.contains(r#""id":7"#) && f.contains("error")),
+            "an oversize server request is still refused"
         );
     }
 
@@ -2978,6 +2835,40 @@ mod tests {
                 r#"{"command":["bash","-lc","cat keep.rs"]}"#
             );
             assert_eq!(lines[4]["payload"]["output"], "KEEP BODY");
+        }
+
+        #[test]
+        fn codex_prune_matches_code_mode_exec_custom_tool_call() {
+            // codex-cli 0.154.0 "code mode" rollout shapes (redacted from a real
+            // rollout): shell calls are `custom_tool_call` `exec` with a JS `input`,
+            // outputs are `custom_tool_call_output` with an `input_text` array.
+            let f = write_jsonl(&[
+                &session_meta("01a0cc82-6d96-7c62-b3fd-952ee1d7c12b", "/p"),
+                r#"{"timestamp":"2026-09-23T04:25:04.642Z","ordinal":12,"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_A","name":"exec","input":"const results = await Promise.allSettled([\n  tools.exec_command({cmd:\"git pull\", max_output_tokens:1500}),\n  tools.exec_command({cmd:\"cat tools.md\", max_output_tokens:4000}),\n]);","internal_chat_message_metadata_passthrough":{"turn_id":"t1","create_time":1790137498.4}}}"#,
+                r#"{"timestamp":"2026-09-23T04:25:06.099Z","ordinal":18,"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_A","output":[{"type":"input_text","text":"Script completed\nWall time 1.4 seconds\nOutput:\n"},{"type":"input_text","text":"BULKY TOOLS BODY"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t1","create_time":1790137506.1}}}"#,
+                r#"{"timestamp":"2026-09-23T04:26:46.887Z","ordinal":66,"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_2","status":"completed","call_id":"call_B","name":"exec","input":"text(await tools.exec_command({cmd:'\"$ZUCCHINI_SPAWNER_BIN\" prune-context --args \"*cat tools.md*\" --summary \"s\"'}))","internal_chat_message_metadata_passthrough":{"turn_id":"t1","create_time":1790137606.8}}}"#,
+            ]);
+            assert_eq!(
+                count_codex_matches(f.path(), "", "*cat tools.md*").unwrap(),
+                1
+            );
+            let stats = prune_codex_jsonl(f.path(), "", "*cat tools.md*").unwrap();
+            assert_eq!(stats.results_blanked, 1);
+            let lines = read_lines(f.path());
+            assert_eq!(lines.len(), 4);
+            assert_eq!(lines[1]["payload"]["input"], "");
+            assert_eq!(
+                lines[2]["payload"]["output"],
+                serde_json::json!([{ "type": "input_text", "text": "[pruned]" }])
+            );
+            assert!(lines[3]["payload"]["input"]
+                .as_str()
+                .unwrap()
+                .contains("prune-context"));
+            assert_eq!(
+                count_codex_matches(f.path(), "", "*cat tools.md*").unwrap(),
+                0
+            );
         }
 
         #[test]

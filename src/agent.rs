@@ -51,8 +51,8 @@ pub type PendingAttachments =
 /// / Monitor (whose runtime is in-process and not restored by `--resume`).
 pub type LiveSessions = Arc<StdMutex<HashMap<String, Arc<StdMutex<SessionState>>>>>;
 
-/// How many background tasks / monitors the chat's resident has armed right now
-/// (0 when it has no resident). The control task's `prune-context` guard: a
+/// How many background tasks / monitors the chat's resident has armed right now,
+/// plus the codex shell commands still running (0 when it has no resident). The control task's `prune-context` guard: a
 /// prune hard-restarts the agent and `--resume` does not re-arm in-process
 /// tasks, so a non-zero count refuses the prune unless it was forced.
 pub fn live_task_count(sessions: &LiveSessions, topic: &str) -> usize {
@@ -60,7 +60,7 @@ pub fn live_task_count(sessions: &LiveSessions, topic: &str) -> usize {
         .lock()
         .expect("LiveSessions mutex")
         .get(topic)
-        .map(|st| st.lock().expect("SessionState mutex").live_tasks.len())
+        .map(|st| st.lock().expect("SessionState mutex").prune_victims().len())
         .unwrap_or(0)
 }
 
@@ -129,9 +129,16 @@ pub struct SessionState {
     /// out on `TaskFinished`). A `Vec`, not a map: it never exceeds a handful of
     /// entries and the client renders it in arm order.
     pub live_tasks: Vec<LiveTask>,
+    /// `(id, command)` of codex shell commands still running. Only the prune
+    /// guard reads them: they don't make the session busy.
+    pub(crate) live_commands: Vec<(String, String)>,
     /// User turns queued for stdin and not yet echoed as consumed, in order.
     /// Registered before the write, so a racing `result` can't read Idle.
     pub unconsumed: Vec<QueuedTurn>,
+    /// The consumed turn in flight is a command turn (`/compact`): nothing else
+    /// is written until its `result` — a turn injected into a compaction has no
+    /// defined outcome.
+    pub(crate) command_in_flight: bool,
     /// The reader left its stdout loop: the process is exiting and takes no
     /// more turns. Set before its `Done`.
     pub closed: bool,
@@ -192,7 +199,6 @@ fn now_epoch_ms() -> i64 {
 #[derive(Debug, Clone)]
 pub struct PendingInterrupt {
     pub request_id: String,
-    frame: String,
     /// The CLI acked it: the next `result` is the interrupted turn's.
     acked: bool,
     /// A `result` ended the turn before the ack: a natural end.
@@ -205,8 +211,10 @@ pub struct QueuedTurn {
     /// The user's prompt, re-queued by a hard restart that kills the process
     /// before it consumed the turn.
     pub prompt: String,
-    frame: String,
-    /// A slash command: claude expands it only as a turn of its own.
+    /// What goes to the CLI (`turn_text`), encoded by the writer at write time.
+    text: String,
+    /// A command turn (`AgentAdapter::is_command_turn`): runs only as a turn
+    /// of its own.
     own_turn: bool,
     /// Queued by the spawner, not the user (`/rename`): invisible to
     /// `running()` and dropped rather than re-queued by a respawn.
@@ -260,6 +268,13 @@ impl SessionState {
     fn interrupt_acked(&self) -> bool {
         self.interrupt.as_ref().is_some_and(|i| i.acked)
     }
+    /// What a prune restart would kill, by label: armed tasks, then running
+    /// codex commands.
+    fn prune_victims(&self) -> Vec<String> {
+        let tasks = self.live_tasks.iter().map(|t| t.label().to_string());
+        let commands = self.live_commands.iter().map(|(_, c)| c.clone());
+        tasks.chain(commands).collect()
+    }
     /// Kept warm past its idle edge with nothing pending: evictable.
     fn warm_idle_since(&self) -> Option<tokio::time::Instant> {
         self.idle_since.filter(|_| !self.closed && self.is_idle())
@@ -310,6 +325,7 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
     match ev {
         AgentEvent::Result { origin_is_task } => {
             state.close_internal_window();
+            state.command_in_flight = false;
             if state.interrupt_acked() {
                 state.interrupt = None;
                 state.turn_in_flight = false;
@@ -357,13 +373,21 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
         AgentEvent::TaskFinished(id) => {
             state.live_tasks.retain(|t| &t.id != id);
         }
+        AgentEvent::CommandStarted { id, command } => {
+            if !state.live_commands.iter().any(|(i, _)| i == id) {
+                state.live_commands.push((id.clone(), command.clone()));
+            }
+        }
+        AgentEvent::CommandFinished(id) => {
+            state.live_commands.retain(|(i, _)| i != id);
+        }
         AgentEvent::UserTurnConsumed(uuid) => {
             let ours = state.start_internal(uuid);
             if !ours {
                 state.close_internal_window();
             }
             if let Some(i) = state.unconsumed.iter().position(|t| &t.uuid == uuid) {
-                state.unconsumed.remove(i);
+                state.command_in_flight = state.unconsumed.remove(i).own_turn;
                 if !ours {
                     state.turn_in_flight = true;
                 }
@@ -502,33 +526,15 @@ impl InternalLine {
 
 const TURN_PART_SEPARATOR: &str = "\n\n---\n\n";
 
-/// An expanding CLI (`AgentAdapter::expands_slash_commands`) runs a slash
-/// command only when the turn STARTS with it, so such a turn ships verbatim —
-/// whole prompt, no time line, preamble or first-turn suffix (an expanding CLI
-/// swallows a trailing suffix as the command's arguments). Only the first token
-/// of the first line is inspected: `/compact`, `/plugin:cmd args` and `/tmp`
-/// match; `/Users/...` does not, its `/` disqualifying the name. A turn carrying
-/// attachments never matches — `blobs::build_prompt` puts the file list first —
-/// which mirrors the `attachments.is_empty()` gate on `/stop` in `main.rs`.
-fn is_slash_command(prompt: &str) -> bool {
-    // Claude matches on `value.trim().startsWith("/")`, so leading blanks must
-    // not defeat us either.
-    let first_line = prompt.trim_start().lines().next().unwrap_or("");
-    let Some(rest) = first_line.strip_prefix('/') else {
-        return false;
-    };
-    let name = rest.split(char::is_whitespace).next().unwrap_or("");
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
-}
-
 /// User-turn text shared by both lifecycles: the time line, then `preamble`,
 /// then the prompt with the adapter's first-turn suffix appended after a
 /// horizontal rule. Absent parts are skipped. `first_turn` == brand-new session
 /// (no resume id). The time line rides the turn rather than the system prompt —
-/// see `AgentAdapter::turn_time_line`.
+/// see `AgentAdapter::turn_time_line`. A command turn ships verbatim: the CLI
+/// recognizes it only when the turn STARTS with it (and claude swallows a
+/// trailing suffix as the command's arguments) — unless it would drop a
+/// first-turn preamble, which is never sent again (codex's capabilities): then
+/// it goes as text.
 fn turn_text(
     adapter: &dyn crate::adapter::AgentAdapter,
     prompt: String,
@@ -536,7 +542,7 @@ fn turn_text(
     user_timezone: Option<&str>,
     preamble: Option<String>,
 ) -> String {
-    if adapter.expands_slash_commands() && is_slash_command(&prompt) {
+    if adapter.is_command_turn(&prompt) && !(first_turn && preamble.is_some()) {
         return prompt;
     }
     let suffix = first_turn
@@ -590,38 +596,78 @@ mod turn_text_tests {
                 prompt.to_string(),
                 true,
                 Some("Asia/Bangkok"),
-                Some("PREAMBLE".to_string()),
+                adapter.session_first_turn_preamble(),
             );
             assert_eq!(text, prompt);
         }
     }
 
     /// The verbatim path would cost a non-expanding adapter its one-per-chat
-    /// capabilities preamble (and codex's prune suffix) for no slash expansion
+    /// capabilities preamble (and its prune suffix) for no slash expansion
     /// at all — this is the only call shape where those parts are ever `Some`.
+    /// Codex runs only `/compact` as a command; `/init` stays text.
     #[test]
     fn a_slash_command_keeps_every_part_for_a_non_expanding_adapter() {
+        for kind in [AgentKind::Gemini, AgentKind::Codex] {
+            let adapter = kind.make_adapter();
+            let suffix = adapter
+                .first_turn_prompt_suffix()
+                .expect("sets a first-turn suffix");
+            let text = turn_text(
+                adapter.as_ref(),
+                "/init".to_string(),
+                true,
+                Some("Asia/Bangkok"),
+                Some("PREAMBLE".to_string()),
+            );
+            assert!(text.contains("PREAMBLE"), "{text}");
+            assert!(text.contains(suffix), "{text}");
+            assert!(text.contains("current local time"), "{text}");
+        }
+    }
+
+    #[test]
+    fn codex_compact_ships_verbatim() {
         let adapter = AgentKind::Codex.make_adapter();
-        let suffix = adapter
-            .first_turn_prompt_suffix()
-            .expect("codex sets a first-turn suffix");
         let text = turn_text(
             adapter.as_ref(),
-            "/init".to_string(),
-            true,
+            "/compact keep the plan".to_string(),
+            false,
             Some("Asia/Bangkok"),
-            Some("PREAMBLE".to_string()),
+            None,
         );
-        assert!(text.contains("PREAMBLE"), "{text}");
-        assert!(text.contains(suffix), "{text}");
-        assert!(text.contains("current local time"), "{text}");
+        assert_eq!(text, "/compact keep the plan");
+    }
+
+    /// The capabilities preamble goes out on the first turn only: a first
+    /// `/compact` carries it as text rather than lose it for good.
+    #[test]
+    fn a_first_turn_codex_compact_keeps_the_preamble() {
+        let adapter = AgentKind::Codex.make_adapter();
+        let preamble = adapter
+            .session_first_turn_preamble()
+            .expect("codex has one");
+        let text = turn_text(
+            adapter.as_ref(),
+            "/compact".to_string(),
+            true,
+            None,
+            Some(preamble.clone()),
+        );
+        assert!(text.starts_with(&preamble), "{text}");
+        assert!(!adapter.is_command_turn(&text), "goes as text: {text}");
     }
 
     #[test]
     fn slash_command_matching_edges() {
-        assert!(is_slash_command(" /compact"));
-        assert!(!is_slash_command("/Users/ivan/notes.txt what is this?"));
-        assert!(!is_slash_command("/ compact"));
+        use crate::adapter::slash_command_name;
+        assert_eq!(slash_command_name(" /compact"), Some("compact"));
+        assert_eq!(slash_command_name("/plugin:cmd args"), Some("plugin:cmd"));
+        assert_eq!(
+            slash_command_name("/Users/ivan/notes.txt what is this?"),
+            None
+        );
+        assert_eq!(slash_command_name("/ compact"), None);
     }
 }
 
@@ -762,6 +808,8 @@ impl AgentEvent {
             // can't panic the match.
             AgentEvent::TaskStarted { .. }
             | AgentEvent::TaskFinished(_)
+            | AgentEvent::CommandStarted { .. }
+            | AgentEvent::CommandFinished(_)
             | AgentEvent::UserTurnConsumed(_)
             | AgentEvent::PeerTurnConsumed { .. }
             | AgentEvent::TurnStarted(_)
@@ -865,7 +913,7 @@ impl ResidentSession {
         self.push_turn(prompt, first_turn, user_timezone, false);
     }
 
-    /// A turn of the spawner's own (`/rename <name>`). `is_slash_command` makes
+    /// A turn of the spawner's own (`/rename <name>`). `is_command_turn` makes
     /// it an `own_turn`, so the writer holds it until it heads the queue with
     /// no turn in flight and `turn_text` ships it verbatim — nothing special.
     fn queue_internal_turn(&self, name: &str) {
@@ -881,32 +929,34 @@ impl ResidentSession {
     ) {
         let adapter = self.knobs.agent_kind.make_adapter();
         let uuid = Uuid::now_v7().to_string();
+        let preamble = first_turn
+            .then(|| adapter.session_first_turn_preamble())
+            .flatten();
         let text = turn_text(
             adapter.as_ref(),
             prompt.clone(),
             first_turn,
             user_timezone,
-            None,
+            preamble,
         );
-        let frame = adapter.encode_user_turn(&uuid, &text);
         let mut st = self.state.lock().expect("SessionState mutex");
         if internal {
             st.queue_internal(uuid.clone());
         }
         st.unconsumed.push(QueuedTurn {
-            own_turn: adapter.expands_slash_commands() && is_slash_command(&prompt),
+            own_turn: adapter.is_command_turn(&text),
             internal,
             uuid,
             prompt,
-            frame,
+            text,
         });
         drop(st);
         self.wake.notify_one();
     }
 }
 
-/// Either a one-shot per-turn task (codex/gemini/cursor/hermes) or a resident
-/// session (claude). One-shot keeps the historic `(handle, token)` pair; the
+/// Either a one-shot per-turn task (gemini/cursor/hermes/pi) or a resident
+/// session (claude, codex). One-shot keeps the historic `(handle, token)` pair; the
 /// `agents` map holds one entry per chat regardless of kind.
 enum AgentEntry {
     OneShot {
@@ -938,7 +988,7 @@ pub type SpawnFn = Arc<
         + Sync,
 >;
 
-/// Per-session spawn closure for RESIDENT adapters (claude): spawns the
+/// Per-session spawn closure for RESIDENT adapters (claude, codex): spawns the
 /// resident process, starts the writer + reader tasks, and returns the handles
 /// the Supervisor needs to drive it. Default is `default_resident_spawn_fn`
 /// (real process); tests inject a recorder via `with_spawn_fns` that records the
@@ -1045,14 +1095,7 @@ impl Supervisor {
             .lock()
             .expect("LiveSessions mutex")
             .get(topic)
-            .map(|st| {
-                st.lock()
-                    .expect("SessionState mutex")
-                    .live_tasks
-                    .iter()
-                    .map(|t| t.label().to_string())
-                    .collect()
-            })
+            .map(|st| st.lock().expect("SessionState mutex").prune_victims())
             .unwrap_or_default()
     }
 
@@ -1159,9 +1202,9 @@ impl Supervisor {
     /// stdin. `false` — the caller respawns instead — when there's no live
     /// session, its spawn knobs differ, a `/stop` interrupt is pending (its
     /// timeout hard-aborts and would drop the turn; the respawn re-queues it),
-    /// or it's a slash command while a turn is in flight (that one interrupts,
-    /// as before; a slash command queued behind other turns is held by the
-    /// writer until it can run on its own).
+    /// or it's a claude slash command while a turn is in flight (that one
+    /// interrupts, as before; a command queued behind other turns — or any
+    /// codex `/compact` — is held by the writer until it can run on its own).
     pub fn send_user_turn(&self, req: &SpawnRequest) -> bool {
         let Some(AgentEntry::Resident(s)) = self.agents.get(&req.chat_id) else {
             return false;
@@ -1173,10 +1216,8 @@ impl Supervisor {
         if closed || interrupting || s.reader.is_finished() || s.knobs != SessionKnobs::of(req) {
             return false;
         }
-        if in_flight
-            && req.agent_kind.make_adapter().expands_slash_commands()
-            && is_slash_command(&req.prompt)
-        {
+        let adapter = req.agent_kind.make_adapter();
+        if in_flight && adapter.is_command_turn(&req.prompt) && adapter.command_interrupts_turn() {
             return false;
         }
         s.queue_turn(req.prompt.clone(), false, req.user_timezone.as_deref());
@@ -1211,15 +1252,10 @@ impl Supervisor {
         let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
             return false;
         };
-        let request_id = Uuid::now_v7().to_string();
-        let Some(frame) = s
-            .knobs
-            .agent_kind
-            .make_adapter()
-            .encode_interrupt(&request_id)
-        else {
+        if !s.knobs.agent_kind.make_adapter().can_interrupt() {
             return false;
-        };
+        }
+        let request_id = Uuid::now_v7().to_string();
         {
             let mut st = s.state.lock().expect("SessionState mutex");
             if st.closed || s.reader.is_finished() || !st.in_turn() || st.user_queued() {
@@ -1230,7 +1266,6 @@ impl Supervisor {
             }
             st.interrupt = Some(PendingInterrupt {
                 request_id: request_id.clone(),
-                frame,
                 acked: false,
                 turn_ended: false,
             });
@@ -1328,7 +1363,10 @@ impl Supervisor {
         let Some(AgentEntry::Resident(s)) = self.agents.get_mut(topic) else {
             return false;
         };
-        if s.reader.is_finished() || s.state.lock().expect("SessionState mutex").closed {
+        if !s.knobs.agent_kind.make_adapter().names_session()
+            || s.reader.is_finished()
+            || s.state.lock().expect("SessionState mutex").closed
+        {
             return false;
         }
         if s.asked_name.as_deref() == Some(name) {
@@ -1397,7 +1435,7 @@ impl Supervisor {
         }
     }
 
-    /// Spawn a fresh agent process: resident kinds (claude) resume the chat's
+    /// Spawn a fresh agent process: resident kinds (claude, codex) resume the chat's
     /// session with `req.prompt` as the first stdin turn; one-shot kinds keep
     /// the historic per-turn spawn. Branches on the adapter's `is_resident()`.
     pub fn spawn_agent(&mut self, req: SpawnRequest) {
@@ -1408,7 +1446,7 @@ impl Supervisor {
         }
     }
 
-    /// One-shot per-turn spawn (codex/gemini/cursor/hermes) — historic path.
+    /// One-shot per-turn spawn (gemini/cursor/hermes/pi) — historic path.
     fn spawn_oneshot(&mut self, req: SpawnRequest) {
         let topic = req.chat_id.clone();
         let cancel = CancellationToken::new();
@@ -1878,19 +1916,6 @@ fn default_spawn_fn(
 
         let _ = tokio::fs::remove_file(&prompt_file).await;
 
-        // Post-turn context-token correction for adapters (codex) that read
-        // occupancy from the on-disk transcript, now flushed after exit.
-        // `None` (stream-sourced adapters, or a read miss) ⇒ gauge keeps its
-        // last value, not zeroed.
-        if let Some(tokens) = adapter.post_turn_context_tokens(agent_session_id.as_deref()) {
-            let _ = tx
-                .send(AgentResponse::ContextTokens {
-                    topic: topic_clone.clone(),
-                    tokens,
-                })
-                .await;
-        }
-
         let _ = tx
             .send(AgentResponse::Done {
                 topic: topic_clone,
@@ -1900,8 +1925,8 @@ fn default_spawn_fn(
     })
 }
 
-/// Default RESIDENT spawn implementation (claude). Spawns one `claude` process
-/// with stdin held open (`Stdio::piped()`), owns the `ChildStdin` in a single
+/// Default RESIDENT spawn implementation (claude, codex). Spawns one agent
+/// process with stdin held open (`Stdio::piped()`), owns the `ChildStdin` in a single
 /// writer task (`spawn_stdin_writer`), and drives stdout in a reader task
 /// that never exits at the first `result` — it loops until stdout EOF / read
 /// error / `cancel`. The reader runs each line through `adapter.handle_line`,
@@ -1964,7 +1989,14 @@ fn default_resident_spawn_fn(
         };
         // Held only while busy, so an idle resident doesn't keep the Mac awake.
         let mut _power_assertion: Option<crate::power::AgentPowerAssertion> = None;
-        let mut adapter = agent_kind.make_adapter();
+        // Shared with the stdin writer, which encodes turns and protocol frames
+        // from what this reader has seen (codex: the open thread, the running
+        // turn).
+        let adapter: SharedAdapter = Arc::new(StdMutex::new(agent_kind.make_adapter()));
+        let (exits_on_stdin_eof, writer_follows_every_line) = {
+            let a = lock_adapter(&adapter);
+            (a.exits_on_stdin_eof(), a.writer_follows_every_line())
+        };
         info!(
             topic = %topic,
             resume = agent_session_id.is_some(),
@@ -1984,7 +2016,7 @@ fn default_resident_spawn_fn(
             session_name: session_name.as_deref(),
         };
         let native = if cfg!(windows) {
-            adapter.prepare_session_native(&ctx)
+            lock_adapter(&adapter).prepare_session_native(&ctx)
         } else {
             None
         };
@@ -2000,7 +2032,8 @@ fn default_resident_spawn_fn(
                 }
             }
         } else {
-            let cmd_string = match adapter.prepare_session_command(&ctx) {
+            let prepared = lock_adapter(&adapter).prepare_session_command(&ctx);
+            let cmd_string = match prepared {
                 Ok(s) => s,
                 Err(e) => {
                     error!("adapter prepare_session_command failed: {}", e);
@@ -2057,6 +2090,7 @@ fn default_resident_spawn_fn(
                 spawn_stdin_writer(
                     stdin,
                     state_for_reader.clone(),
+                    adapter.clone(),
                     wake_for_writer.clone(),
                     cancel.clone(),
                 )
@@ -2096,10 +2130,38 @@ fn default_resident_spawn_fn(
                 let startup_timeout = AGENT_STARTUP_TIMEOUT * (attempt + 1);
                 let startup_deadline = tokio::time::Instant::now() + startup_timeout;
                 'read: loop {
+                    // A send blocked on a full response queue must still see a
+                    // teardown: back to the loop, whose cancel arm wins. The
+                    // send goes first, so a queue with room still takes the
+                    // turn's last frames when shutdown cancels right after
+                    // its `result` was reduced.
+                    macro_rules! send_or_cancel {
+                        ($resp:expr) => {
+                            tokio::select! {
+                                biased;
+                                sent = tx.send($resp) => if sent.is_err() { break 'read; },
+                                _ = cancel.cancelled() => continue 'read,
+                            }
+                        };
+                    }
                     tokio::select! {
+                        biased;
                         _ = cancel.cancelled() => {
                             warn!(topic = %topic, "resident session cancelled, tearing down process group");
                             cancelled = true;
+                            if exits_on_stdin_eof {
+                                // Dropping the writer closes stdin.
+                                if let Some(wh) = &writer_handle {
+                                    wh.abort();
+                                }
+                                // Keep draining stdout so the CLI can't block on
+                                // a full pipe while it shuts down.
+                                let drain = async { while let Ok(Some(_)) = lines.next_line().await {} };
+                                let exit = async { tokio::join!(child.wait(), drain) };
+                                if tokio::time::timeout(STDIN_EOF_GRACE, exit).await.is_err() {
+                                    warn!(topic = %topic, "resident agent ignored stdin EOF for {:?}", STDIN_EOF_GRACE);
+                                }
+                            }
                             group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
                             break 'read;
                         }
@@ -2112,22 +2174,32 @@ fn default_resident_spawn_fn(
                                 }
                                 let _ = child.wait().await;
                                 crate::orphans::forget(pgid);
+                                // The new process needs its own handshake.
+                                let mut fresh = agent_kind.make_adapter();
+                                let _ = fresh.prepare_session_command(&ctx);
+                                *lock_adapter(&adapter) = fresh;
                                 attempt += 1;
                                 continue 'spawn;
                             }
                             error!(topic = %topic, "resident agent produced no output within {:?}, killing", startup_timeout);
-                            let _ = tx.send(AgentResponse::Line {
+                            send_or_cancel!(AgentResponse::Line {
                                 topic: topic.clone(),
                                 content: startup_timeout_message(startup_timeout, attempt > 0),
-                            }).await;
+                            });
                             break 'read;
                         }
                         line_result = lines.next_line() => {
                             match line_result {
                                 Ok(Some(line)) => {
-                                    agent_started.store(true, Ordering::Relaxed);
-                                    ANY_AGENT_STARTED.store(true, Ordering::Relaxed);
-                                    let events = adapter.handle_line(line);
+                                    let (events, started) = {
+                                        let mut a = lock_adapter(&adapter);
+                                        let events = a.handle_line(line);
+                                        (events, a.startup_complete())
+                                    };
+                                    if started {
+                                        agent_started.store(true, Ordering::Relaxed);
+                                        ANY_AGENT_STARTED.store(true, Ordering::Relaxed);
+                                    }
                                     // This line is the `result` ending an interrupted turn.
                                     let mut interrupted = false;
                                     let mut renaming = InternalLine::default();
@@ -2165,38 +2237,42 @@ fn default_resident_spawn_fn(
                                         if is_result {
                                             wake_for_writer.notify_one();
                                         }
+                                        // Attachments no assistant text picked up
+                                        // belong to this turn, not the next one.
+                                        if is_result && !swallow {
+                                            if let Some(row) = attachment_row(&topic, &mut attach_rx) {
+                                                send_or_cancel!(row);
+                                            }
+                                        }
                                         match ev {
                                             _ if swallow => {}
                                             AgentEvent::Frame(_) if interrupted => {}
                                             AgentEvent::Result { .. } if interrupted => {
                                                 let session = state_for_reader.clone();
-                                                if tx.send(AgentResponse::Interrupted { topic: topic.clone(), session }).await.is_err() { break 'read; }
+                                                send_or_cancel!(AgentResponse::Interrupted { topic: topic.clone(), session });
                                             }
                                             AgentEvent::Frame(content) => {
-                                                let resp = AgentResponse::Line { topic: topic.clone(), content };
-                                                let followup = if let AgentResponse::Line { topic: t, content: c } = &resp {
-                                                    attach_followup_for(t, c, &mut attach_rx)
-                                                } else { None };
-                                                if tx.send(resp).await.is_err() { break 'read; }
+                                                let followup = attach_followup_for(&topic, &content, &mut attach_rx);
+                                                send_or_cancel!(AgentResponse::Line { topic: topic.clone(), content });
                                                 if let Some(f) = followup {
-                                                    if tx.send(f).await.is_err() { break 'read; }
+                                                    send_or_cancel!(f);
                                                 }
                                             }
                                             AgentEvent::ContextTokens(tokens) => {
-                                                if tx.send(AgentResponse::ContextTokens { topic: topic.clone(), tokens }).await.is_err() { break 'read; }
+                                                send_or_cancel!(AgentResponse::ContextTokens { topic: topic.clone(), tokens });
                                             }
                                             AgentEvent::CompactBoundary(post_tokens) => {
-                                                if tx.send(AgentResponse::CompactBoundary { topic: topic.clone(), post_tokens }).await.is_err() { break 'read; }
+                                                send_or_cancel!(AgentResponse::CompactBoundary { topic: topic.clone(), post_tokens });
                                             }
                                             AgentEvent::SessionIdHarvested(session_id) => {
-                                                if tx.send(AgentResponse::SessionIdHarvested { topic: topic.clone(), session_id }).await.is_err() { break 'read; }
+                                                send_or_cancel!(AgentResponse::SessionIdHarvested { topic: topic.clone(), session_id });
                                             }
                                             AgentEvent::ToolResult => {
-                                                if tx.send(AgentResponse::ToolResult { topic: topic.clone() }).await.is_err() { break 'read; }
+                                                send_or_cancel!(AgentResponse::ToolResult { topic: topic.clone() });
                                             }
                                             AgentEvent::PeerTurnConsumed { name, body } => {
                                                 let content = peer_message_frame_json(&name, &body);
-                                                if tx.send(AgentResponse::Line { topic: topic.clone(), content }).await.is_err() { break 'read; }
+                                                send_or_cancel!(AgentResponse::Line { topic: topic.clone(), content });
                                             }
                                             // Run-state-bearing events (Result/TaskStarted/
                                             // TaskFinished) already updated the FSM via
@@ -2205,6 +2281,8 @@ fn default_resident_spawn_fn(
                                             AgentEvent::Result { .. }
                                             | AgentEvent::TaskStarted { .. }
                                             | AgentEvent::TaskFinished(_)
+                                            | AgentEvent::CommandStarted { .. }
+                                            | AgentEvent::CommandFinished(_)
                                             | AgentEvent::UserTurnConsumed(_)
                                             | AgentEvent::TurnStarted(_)
                                             | AgentEvent::InterruptAcked(_) => {}
@@ -2221,7 +2299,7 @@ fn default_resident_spawn_fn(
                                             _power_assertion = running.then(crate::power::AgentPowerAssertion::acquire).flatten();
                                             // [DIAG tasktrace] TEMPORARY — the busy↔idle edge that writes agent_running.
                                             tracing::info!(diag = "tasktrace", topic = %topic, running, "RunState transition -> chat_running");
-                                            if tx.send(AgentResponse::RunState { topic: topic.clone(), running }).await.is_err() { break 'read; }
+                                            send_or_cancel!(AgentResponse::RunState { topic: topic.clone(), running });
                                         }
                                         // What's armed changed: publish the blob (or a
                                         // clear). Unlike the idle edge this is NOT
@@ -2230,8 +2308,13 @@ fn default_resident_spawn_fn(
                                         // the chat is Waiting.
                                         if let Some(tasks) = live_tasks {
                                             let session = state_for_reader.clone();
-                                            if tx.send(AgentResponse::LiveTasks { topic: topic.clone(), session, tasks }).await.is_err() { break 'read; }
+                                            send_or_cancel!(AgentResponse::LiveTasks { topic: topic.clone(), session, tasks });
                                         }
+                                    }
+                                    // A response or notification may have made a
+                                    // held frame sendable.
+                                    if writer_follows_every_line {
+                                        wake_for_writer.notify_one();
                                     }
                                 }
                                 Ok(None) => { break 'read; }
@@ -2346,27 +2429,58 @@ struct CapturedStderr {
     tail: VecDeque<String>,
 }
 
-/// Spawn the resident stdin writer task: write each queued
-/// `SessionState::unconsumed` frame it hasn't written yet, then sleep until
-/// `wake`. A startup-timeout retry's fresh writer re-writes them all to the new
-/// process. Exits on `cancel`, closing stdin; claude ignores stdin EOF, so real
-/// teardown is the SIGTERM.
+/// A resident's adapter, shared by its stdout reader and stdin writer. Both
+/// only hold the lock for synchronous work.
+type SharedAdapter = Arc<StdMutex<Box<dyn crate::adapter::AgentAdapter>>>;
+
+fn lock_adapter(
+    adapter: &SharedAdapter,
+) -> std::sync::MutexGuard<'_, Box<dyn crate::adapter::AgentAdapter>> {
+    adapter.lock().expect("adapter mutex")
+}
+
+/// How long teardown waits for a CLI that exits on stdin EOF before
+/// signalling its process group (codex exits in <100ms).
+const STDIN_EOF_GRACE: Duration = Duration::from_secs(3);
+
+/// Spawn the resident stdin writer task: write the adapter's protocol frames
+/// and each queued `SessionState::unconsumed` turn it hasn't written yet, then
+/// sleep until `wake`. A startup-timeout retry's fresh writer re-writes them all
+/// to the new process. Exits on `cancel`, closing stdin; claude ignores stdin
+/// EOF, so its real teardown is the SIGTERM.
 fn spawn_stdin_writer(
     mut stdin: tokio::process::ChildStdin,
     state: Arc<StdMutex<SessionState>>,
+    adapter: SharedAdapter,
     wake: Arc<Notify>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
+        let serializes = lock_adapter(&adapter).serializes_command_turns();
         let mut written: HashSet<String> = HashSet::new();
         loop {
-            let frames = frames_to_write(&state.lock().expect("SessionState mutex"), &mut written);
+            // The state lock is released before the adapter's is taken: the
+            // reader holds the adapter through a multi-MB line's parse, and the
+            // Supervisor locks the state from the main loop.
+            let due = due_writes(
+                &state.lock().expect("SessionState mutex"),
+                serializes,
+                &written,
+            );
+            let (frames, over) = {
+                let mut adapter = lock_adapter(&adapter);
+                let frames = encode_due(adapter.as_mut(), due, &mut written);
+                (frames, adapter.session_over())
+            };
             for frame in frames {
                 if stdin.write_all(frame.as_bytes()).await.is_err() || stdin.flush().await.is_err()
                 {
                     return;
                 }
+            }
+            if over {
+                return;
             }
             tokio::select! {
                 _ = wake.notified() => {}
@@ -2376,23 +2490,68 @@ fn spawn_stdin_writer(
     })
 }
 
-/// Unwritten frames of `st.unconsumed`, in order. A slash-command turn is held
-/// (with everything behind it) until it heads the queue with no turn in
-/// flight: written earlier, claude would inject it into the running turn as
-/// plain text at the next tool boundary.
-fn frames_to_write(st: &SessionState, written: &mut HashSet<String>) -> Vec<String> {
-    let mut frames = Vec::new();
+/// Something the writer owes the CLI, read off the `SessionState`.
+enum Due {
+    Interrupt(String),
+    Turn { uuid: String, text: String },
+}
+
+/// A pending interrupt, then the unwritten turns of `st.unconsumed` in order.
+/// A command turn is held (with everything behind it) until it heads the queue
+/// with no turn in flight: written earlier, claude would inject it into the
+/// running turn as plain text at the next tool boundary. With `serializes`
+/// (`AgentAdapter::serializes_command_turns`) nothing behind an unconsumed
+/// command turn is due either, nor anything while one is in flight.
+fn due_writes(st: &SessionState, serializes: bool, written: &HashSet<String>) -> Vec<Due> {
+    let mut due = Vec::new();
     if let Some(i) = &st.interrupt {
-        if written.insert(i.request_id.clone()) {
-            frames.push(i.frame.clone());
+        if !written.contains(&i.request_id) {
+            due.push(Due::Interrupt(i.request_id.clone()));
         }
+    }
+    if serializes && st.command_in_flight {
+        return due;
     }
     for (i, t) in st.unconsumed.iter().enumerate() {
         if t.own_turn && (i > 0 || st.in_turn()) {
             break;
         }
-        if written.insert(t.uuid.clone()) {
-            frames.push(t.frame.clone());
+        if !written.contains(&t.uuid) {
+            due.push(Due::Turn {
+                uuid: t.uuid.clone(),
+                text: t.text.clone(),
+            });
+        }
+        if serializes && t.own_turn {
+            break;
+        }
+    }
+    due
+}
+
+/// The adapter's protocol frames, then `due` encoded in order. A turn the
+/// adapter can't encode yet holds the queue behind it.
+fn encode_due(
+    adapter: &mut dyn crate::adapter::AgentAdapter,
+    due: Vec<Due>,
+    written: &mut HashSet<String>,
+) -> Vec<String> {
+    let mut frames = adapter.outbound_frames();
+    for d in due {
+        match d {
+            Due::Interrupt(request_id) => {
+                if let Some(frame) = adapter.encode_interrupt(&request_id) {
+                    written.insert(request_id);
+                    frames.push(frame);
+                }
+            }
+            Due::Turn { uuid, text } => {
+                let Some(frame) = adapter.encode_user_turn(&uuid, &text) else {
+                    break;
+                };
+                written.insert(uuid);
+                frames.push(frame);
+            }
         }
     }
     frames
@@ -2533,6 +2692,15 @@ fn attach_followup_for(
     if !is_assistant_text_frame(content) {
         return None;
     }
+    attachment_row(topic, attach_rx)
+}
+
+/// Everything in `attach_rx` as one attachment-only row, or `None` when it is
+/// empty.
+fn attachment_row(
+    topic: &str,
+    attach_rx: &mut mpsc::UnboundedReceiver<EnvelopeAttachment>,
+) -> Option<AgentResponse> {
     let mut attachments: Vec<EnvelopeAttachment> = Vec::new();
     while let Ok(att) = attach_rx.try_recv() {
         attachments.push(att);
@@ -2591,12 +2759,53 @@ pub(crate) fn live_task(id: &str) -> LiveTask {
     }
 }
 
+/// An adapter whose stdin frames are just the turn's uuid (and `interrupt`),
+/// so writer tests can assert what goes out and in which order.
+#[cfg(test)]
+struct UuidFrames {
+    serializes: bool,
+}
+
+#[cfg(test)]
+impl crate::adapter::AgentAdapter for UuidFrames {
+    fn serializes_command_turns(&self) -> bool {
+        self.serializes
+    }
+    fn kind(&self) -> AgentKind {
+        AgentKind::Claude
+    }
+    fn prepare_command(&mut self, _ctx: &TurnContext<'_>) -> anyhow::Result<String> {
+        unreachable!()
+    }
+    fn handle_line(&mut self, _line: String) -> smallvec::SmallVec<[AgentEvent; 2]> {
+        smallvec::SmallVec::new()
+    }
+    fn encode_user_turn(&mut self, uuid: &str, _text: &str) -> Option<String> {
+        Some(uuid.to_string())
+    }
+    fn encode_interrupt(&mut self, _request_id: &str) -> Option<String> {
+        Some("interrupt".to_string())
+    }
+}
+
+/// One writer pass with claude's semantics (turns behind a command go at once).
+#[cfg(test)]
+fn test_frames_to_write(st: &SessionState, written: &mut HashSet<String>) -> Vec<String> {
+    frames_for(false, st, written)
+}
+
+#[cfg(test)]
+fn frames_for(serializes: bool, st: &SessionState, written: &mut HashSet<String>) -> Vec<String> {
+    let due = due_writes(st, serializes, written);
+    encode_due(&mut UuidFrames { serializes }, due, written)
+}
+
 #[cfg(test)]
 mod reduce_tests {
     use super::{
-        frames_to_write, internal_turn_swallows, live_task, live_tasks_payload,
-        peer_message_frame_json, reduce, task_started, AgentEvent, LiveTask, LiveTasksDedup,
-        PendingInterrupt, QueuedTurn, SessionState,
+        internal_turn_swallows, live_task, live_tasks_payload, peer_message_frame_json, reduce,
+        task_started, test_frames_to_write as frames_to_write, AgentEvent, LiveTask,
+        LiveTasksDedup, PendingInterrupt, QueuedTurn, SessionState,
     };
     use std::collections::HashSet;
 
@@ -2864,7 +3073,7 @@ mod reduce_tests {
         QueuedTurn {
             uuid: uuid.into(),
             prompt: String::new(),
-            frame: uuid.into(),
+            text: String::new(),
             own_turn: false,
             internal: false,
         }
@@ -2887,12 +3096,53 @@ mod reduce_tests {
         assert_eq!(frames_to_write(&s, &mut written), vec!["b", "c"]);
     }
 
+    /// Codex: a message queued right behind `/compact` must not reach the CLI
+    /// as a `turn/start` into the compaction — not in the same pass, not
+    /// before the compact is consumed, not while it runs.
+    #[test]
+    fn a_serialized_command_turn_runs_alone() {
+        let mut s = SessionState::default();
+        let compact = QueuedTurn {
+            own_turn: true,
+            ..queued("compact")
+        };
+        s.unconsumed = vec![compact, queued("next")];
+        let mut written = HashSet::new();
+        assert_eq!(super::frames_for(true, &s, &mut written), vec!["compact"]);
+        assert!(super::frames_for(true, &s, &mut written).is_empty());
+
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("compact".into()));
+        assert!(s.command_in_flight);
+        assert!(super::frames_for(true, &s, &mut written).is_empty());
+
+        reduce(&mut s, &RESULT);
+        assert_eq!(super::frames_for(true, &s, &mut written), vec!["next"]);
+    }
+
+    /// Claude's queue is unchanged: turns behind a slash command go at once.
+    #[test]
+    fn claude_writes_turns_behind_a_command_at_once() {
+        let cmd = QueuedTurn {
+            own_turn: true,
+            ..queued("cmd")
+        };
+        let mut s = SessionState {
+            unconsumed: vec![cmd, queued("next")],
+            ..Default::default()
+        };
+        let mut written = HashSet::new();
+        assert_eq!(frames_to_write(&s, &mut written), vec!["cmd", "next"]);
+
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("cmd".into()));
+        s.unconsumed.push(queued("later"));
+        assert_eq!(frames_to_write(&s, &mut written), vec!["later"]);
+    }
+
     fn interrupting() -> SessionState {
         SessionState {
             turn_in_flight: true,
             interrupt: Some(PendingInterrupt {
                 request_id: "int-1".into(),
-                frame: "interrupt".into(),
                 acked: false,
                 turn_ended: false,
             }),
@@ -3369,9 +3619,7 @@ mod live_session_tests {
         );
         assert_eq!(sup.unconsumed_prompts("chat"), vec!["hi", "second"]);
         let st = first_state.lock().unwrap();
-        let frame: serde_json::Value = serde_json::from_str(&st.unconsumed[1].frame).unwrap();
-        assert_eq!(frame["uuid"], st.unconsumed[1].uuid.as_str());
-        let text = frame["message"]["content"][0]["text"].as_str().unwrap();
+        let text = &st.unconsumed[1].text;
         assert!(
             text.contains("current local time") && text.ends_with("second"),
             "{text}"
@@ -3536,9 +3784,13 @@ mod live_session_tests {
         {
             let mut st = session.lock().expect("SessionState mutex");
             st.turn_in_flight = true;
-            assert!(frames_to_write(&st, &mut written).is_empty());
+            assert!(test_frames_to_write(&st, &mut written).is_empty());
             st.turn_in_flight = false;
-            assert_eq!(frames_to_write(&st, &mut written).len(), 1, "one at a time");
+            assert_eq!(
+                test_frames_to_write(&st, &mut written).len(),
+                1,
+                "one at a time"
+            );
         }
 
         let requeued: Vec<String> = sup
@@ -3624,6 +3876,17 @@ mod live_session_tests {
         set_waiting(&exposed, "chat"); // arms "t1"
         assert_eq!(live_task_count(&dir, "chat"), 1, "the prune is refused");
 
+        let dev_server = AgentEvent::CommandStarted {
+            id: "exec-1".into(),
+            command: "npm run dev".into(),
+        };
+        reduce(
+            &mut exposed.lock().unwrap()["chat"].lock().unwrap(),
+            &dev_server,
+        );
+        assert_eq!(live_task_count(&dir, "chat"), 2, "a codex command counts");
+        assert_eq!(sup.live_task_labels("chat")[1], "npm run dev");
+
         sup.abort_agent("chat").await;
         assert_eq!(live_task_count(&dir, "chat"), 0, "teardown unblocks it");
     }
@@ -3702,5 +3965,179 @@ mod stderr_diagnostic_tests {
     #[test]
     fn started_died_with_only_blank_stderr_is_silent() {
         assert!(stderr_failure_message(&cap(&[], &["", "  ", "\t"]), true, false).is_none());
+    }
+}
+
+/// End-to-end run of the codex resident against the real `codex` CLI in a
+/// scratch dir: turn, message while busy, `/stop`, `/compact`, respawn with
+/// resume. Spends real model calls, so it's opt-in:
+/// `cargo test codex_resident_smoke -- --ignored --nocapture`.
+#[cfg(test)]
+mod codex_smoke {
+    use super::*;
+
+    const CHAT: &str = "5c0de000-0000-4000-8000-000000000000";
+    const TURN_TIMEOUT: Duration = Duration::from_secs(240);
+
+    fn req(prompt: &str, agent_session_id: Option<String>) -> SpawnRequest {
+        SpawnRequest {
+            chat_id: CHAT.to_string(),
+            prompt: prompt.to_string(),
+            project_path: Some("/tmp/codex-smoke".to_string()),
+            worktree: false,
+            agent_session_id,
+            agent_kind: AgentKind::Codex,
+            is_sandboxed: false,
+            model: None,
+            user_timezone: Some("Asia/Bangkok".to_string()),
+            session_name: None,
+        }
+    }
+
+    fn describe(resp: &AgentResponse) -> String {
+        match resp {
+            AgentResponse::Line { content, .. } => format!("Line {content}"),
+            AgentResponse::ContextTokens { tokens, .. } => format!("ContextTokens {tokens}"),
+            AgentResponse::CompactBoundary { post_tokens, .. } => {
+                format!("CompactBoundary {post_tokens}")
+            }
+            AgentResponse::SessionIdHarvested { session_id, .. } => {
+                format!("SessionIdHarvested {session_id}")
+            }
+            AgentResponse::Done { has_result, .. } => format!("Done has_result={has_result}"),
+            AgentResponse::RunState { running, .. } => format!("RunState running={running}"),
+            AgentResponse::ToolResult { .. } => "ToolResult".to_string(),
+            AgentResponse::Interrupted { .. } => "Interrupted".to_string(),
+            AgentResponse::InterruptTimedOut { .. } => "InterruptTimedOut".to_string(),
+            AgentResponse::LiveTasks { tasks, .. } => format!("LiveTasks {tasks:?}"),
+        }
+    }
+
+    /// Responses up to and including the first one `stop` matches.
+    async fn until(
+        rx: &mut mpsc::Receiver<AgentResponse>,
+        stop: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
+        loop {
+            let resp = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out; seen: {seen:#?}"))
+                .expect("response channel open");
+            let d = describe(&resp);
+            eprintln!("  <- {}", d.chars().take(240).collect::<String>());
+            let done = stop(&d);
+            seen.push(d);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    fn idle(d: &str) -> bool {
+        d == "RunState running=false"
+    }
+
+    fn text_of(seen: &[String]) -> String {
+        seen.iter()
+            .filter(|d| d.contains("\"type\":\"assistant\""))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn session_pid(sup: &Supervisor) -> Option<u32> {
+        match sup.agents.get(CHAT) {
+            Some(AgentEntry::Resident(s)) => s.state.lock().unwrap().pid,
+            _ => None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "drives the real codex CLI"]
+    async fn codex_resident_smoke() {
+        std::fs::create_dir_all("/tmp/codex-smoke").unwrap();
+        let (tx, mut rx) = mpsc::channel::<AgentResponse>(256);
+        let mut sup = Supervisor::new(tx);
+
+        eprintln!("== 1. first turn");
+        sup.spawn_agent(req("Reply with the single word PONG.", None));
+        let seen = until(&mut rx, idle).await;
+        let sid = seen
+            .iter()
+            .find_map(|d| d.strip_prefix("SessionIdHarvested ").map(str::to_string))
+            .expect("thread id harvested");
+        assert!(text_of(&seen).contains("PONG"), "{seen:#?}");
+        assert!(seen.iter().any(|d| d.starts_with("ContextTokens")));
+        assert!(sup.has_agent(CHAT) && !sup.is_running(CHAT), "kept warm");
+        let pid = session_pid(&sup).expect("pid");
+
+        eprintln!("== 2. a message while busy joins the running turn");
+        assert!(sup.send_user_turn(&req(
+            "Run the shell command `sleep 12` (wait for it to finish), then reply with the word FIRST.",
+            Some(sid.clone()),
+        )));
+        until(&mut rx, |d| d.contains("\"name\":\"Bash\"")).await;
+        assert!(sup.send_user_turn(&req(
+            "Also append the word SECOND to your final reply.",
+            Some(sid.clone()),
+        )));
+        let seen = until(&mut rx, idle).await;
+        let text = text_of(&seen);
+        assert!(
+            text.contains("FIRST") && text.contains("SECOND"),
+            "{seen:#?}"
+        );
+        assert_eq!(session_pid(&sup), Some(pid), "same process");
+
+        eprintln!("== 3. /stop interrupts and keeps the process");
+        assert!(sup.send_user_turn(&req(
+            "Run the shell command `sleep 60`, then reply DONE.",
+            Some(sid.clone()),
+        )));
+        until(&mut rx, |d| d.contains("\"name\":\"Bash\"")).await;
+        assert!(sup.interrupt(CHAT), "interruptible");
+        let seen = until(&mut rx, idle).await;
+        assert!(seen.iter().any(|d| d == "Interrupted"), "{seen:#?}");
+        assert!(
+            !seen
+                .iter()
+                .any(|d| d.contains("\"subtype\":\"interrupted\"")),
+            "the spawner publishes its own frame, not codex's"
+        );
+        assert_eq!(session_pid(&sup), Some(pid), "same process");
+
+        eprintln!("== 4. /compact, a message right behind it runs after it");
+        assert!(sup.send_user_turn(&req("/compact", Some(sid.clone()))));
+        assert!(sup.send_user_turn(&req("Reply with the single word AFTER.", Some(sid.clone()),)));
+        let seen = until(&mut rx, idle).await;
+        let boundary = seen
+            .iter()
+            .position(|d| d.starts_with("CompactBoundary"))
+            .unwrap_or_else(|| panic!("{seen:#?}"));
+        let after = seen
+            .iter()
+            .position(|d| d.contains("\"type\":\"assistant\"") && d.contains("AFTER"))
+            .unwrap_or_else(|| panic!("{seen:#?}"));
+        assert!(boundary < after, "{seen:#?}");
+
+        eprintln!("== 5. teardown by stdin EOF, respawn with resume");
+        sup.abort_agent(CHAT).await;
+        assert!(
+            !crate::sys::process_group_exists(pid),
+            "the whole group exited"
+        );
+        sup.spawn_agent(req(
+            "What single word did you reply with in your very first answer in this conversation?",
+            Some(sid.clone()),
+        ));
+        let seen = until(&mut rx, idle).await;
+        assert!(
+            seen.contains(&format!("SessionIdHarvested {sid}")),
+            "same thread: {seen:#?}"
+        );
+        assert!(text_of(&seen).contains("PONG"), "{seen:#?}");
+        sup.shutdown_all().await;
     }
 }

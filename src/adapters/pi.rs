@@ -223,7 +223,7 @@ impl AgentAdapter for PiAdapter {
         // `git worktree add` vs resume `cd`, plain `cd <proj>` when worktree is
         // off) lives in the shared `worktree_cwd_prefix` helper so codex/gemini/
         // hermes can adopt it with the same one-liner.
-        cmd.push_str(&worktree_cwd_prefix(ctx));
+        cmd.push_str(&worktree_cwd_prefix(&ctx.cwd()));
 
         // Prompt piped via stdin — `pi -p` with no positional prompt reads stdin
         // as the prompt (verified). Keeps multi-MB attachment bodies out of argv.

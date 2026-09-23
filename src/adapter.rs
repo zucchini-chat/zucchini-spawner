@@ -8,10 +8,11 @@
 //! shape, so adapters for other CLIs must normalize their frames to claude
 //! shape before emitting.
 //!
-//! Adapter state lives for one turn (one user message → one agent run). The
-//! Supervisor constructs a fresh adapter per `spawn_agent` call, holds it in
-//! the spawned task, and drops it when the agent exits. Per-turn dedup state
-//! like claude's `last_emitted_tokens` belongs on the adapter instance.
+//! Adapter state lives for one agent process: one turn for a one-shot adapter,
+//! the whole session for a resident one (shared by its stdout reader and stdin
+//! writer). The Supervisor constructs a fresh adapter per spawn and drops it
+//! when the agent exits. Dedup state like claude's `last_emitted_tokens`
+//! belongs on the adapter instance.
 
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -273,7 +274,7 @@ pub struct TurnContext<'a> {
 }
 
 /// Inputs the Supervisor hands to `prepare_session_command` for a RESIDENT
-/// session (claude). Same fields as `TurnContext` MINUS `prompt_file` — a
+/// session (claude, codex). Same fields as `TurnContext` MINUS `prompt_file` — a
 /// resident session is spawned once with stdin held open, and per-turn prompts
 /// arrive as `encode_user_turn` stdin frames rather than a piped prompt file.
 /// The session-level knobs (`model`, `worktree`, `is_sandboxed`,
@@ -330,8 +331,8 @@ pub enum AgentEvent {
     /// Cumulative context tokens for this turn — caller overwrites
     /// `chats.context_tokens`.
     ContextTokens(i64),
-    /// Claude only — manual `/compact` or auto-compact completed. Carries
-    /// `compact_metadata.post_tokens`. Other adapters don't expose this signal.
+    /// Manual `/compact` or auto-compact completed (claude, codex). Carries the
+    /// post-compaction context tokens.
     CompactBoundary(i64),
     /// Harvested from the agent's first stdout frame; persisted to
     /// `chats.agent_session_id` so subsequent turns can resume.
@@ -373,6 +374,12 @@ pub enum AgentEvent {
     /// a terminal `task_notification` (completed/failed/cancelled). Carries the
     /// same `task_id`; the Supervisor removes it from `live_tasks`.
     TaskFinished(String),
+    /// Resident codex only — a shell command started. It can outlive its turn
+    /// (and a prune restart kills it), so the prune guard counts it; it never
+    /// makes the chat busy — a dev server would keep it busy forever.
+    CommandStarted { id: String, command: String },
+    /// The `CommandStarted` command with this id ended.
+    CommandFinished(String),
     /// Resident model only — claude consumed a user frame we wrote to stdin
     /// (its `--replay-user-messages` echo). Carries the frame's `uuid`, which
     /// claude preserves from our frame.
@@ -403,7 +410,7 @@ pub enum AgentEvent {
     /// the restart before the prune's own result persists, losing the prune.
     /// Per-adapter "prune call persisted" boundary: claude/gemini match their
     /// `tool_result` frame's id against the recorded `prune-context` `tool_use` id;
-    /// codex matches the completed `command_execution`'s `command` (it has no
+    /// codex matches the completed `commandExecution`'s `command` (it has no
     /// standalone tool_result frame). See `crate::prune` flow.
     ToolResult,
 }
@@ -445,17 +452,46 @@ pub trait AgentAdapter: Send + Sync {
         current_time_in_tz_line(user_timezone)
     }
 
-    /// Resident adapters (claude) run ONE process across many turns with stdin
-    /// held open; one-shot adapters (codex/gemini/cursor/hermes — default
+    /// Resident adapters (claude, codex) run ONE process across many turns with
+    /// stdin held open; one-shot adapters (gemini/cursor/hermes/pi — default
     /// `false`) keep the per-turn `prepare_command` spawn path. The Supervisor
     /// branches on this to pick the session vs one-shot lifecycle.
     fn is_resident(&self) -> bool {
         false
     }
 
+    /// Resident: text prepended to the session's FIRST turn only (a brand-new
+    /// chat). The resident twin of [`Self::prompt_file_preamble`] for adapters
+    /// with no system-prompt injection point (codex).
+    fn session_first_turn_preamble(&self) -> Option<String> {
+        None
+    }
+
+    /// Resident: protocol frames the adapter wants written to stdin now, ahead
+    /// of any turn (a handshake, replies to requests from the CLI). The writer
+    /// polls this whenever it wakes — after every stdout line.
+    fn outbound_frames(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Resident: the CLI exits on stdin EOF, and must be stopped that way —
+    /// codex's SIGTERM orphans the shell commands it runs in process groups of
+    /// their own. Teardown then closes stdin and waits before signalling.
+    fn exits_on_stdin_eof(&self) -> bool {
+        false
+    }
+
+    /// Resident: the process registers a peer-addressable name (claude
+    /// `--name`), kept in sync with the chat title by an internal `/rename`.
+    fn names_session(&self) -> bool {
+        false
+    }
+
     /// Resident: build the per-SESSION shell command (spawned once; stdin
     /// piped). Like `prepare_command` but with no prompt piping — turns arrive
-    /// as `encode_user_turn` stdin frames. Default `unreachable!` because the
+    /// as `encode_user_turn` stdin frames. Called on the adapter instance that
+    /// then drives the session, so it may keep spawn settings it needs later
+    /// (codex's `thread/start` params). Default `unreachable!` because the
     /// Supervisor only calls it when `is_resident()` returned `true`, and the
     /// one-shot adapters never set that.
     fn prepare_session_command(&mut self, _ctx: &SessionContext<'_>) -> Result<String> {
@@ -476,15 +512,23 @@ pub trait AgentAdapter: Send + Sync {
     }
 
     /// Resident: serialize one user turn as a newline-terminated stdin frame
-    /// stamped with `uuid` (echoed back as `UserTurnConsumed`).
+    /// stamped with `uuid` (echoed back as `UserTurnConsumed`). Called by the
+    /// writer at write time; `None` holds the turn (and the queue behind it)
+    /// until the CLI is ready for turns (codex: its thread is open).
     /// Default `unreachable!` (one-shot adapters pipe the prompt instead).
-    fn encode_user_turn(&self, _uuid: &str, _text: &str) -> String {
+    fn encode_user_turn(&mut self, _uuid: &str, _text: &str) -> Option<String> {
         unreachable!("encode_user_turn called on a one-shot adapter")
     }
 
-    /// Resident: a stdin frame asking the CLI to end its running turn while
-    /// the process lives on. `None` (default) ⇒ `/stop` hard-aborts.
-    fn encode_interrupt(&self, _request_id: &str) -> Option<String> {
+    /// Resident: `/stop` can end the running turn while the process lives on
+    /// (`encode_interrupt`). `false` (default) ⇒ `/stop` hard-aborts.
+    fn can_interrupt(&self) -> bool {
+        false
+    }
+
+    /// Resident: the stdin frame asking the CLI to end its running turn,
+    /// written by the writer; `None` while it can't be addressed yet.
+    fn encode_interrupt(&mut self, _request_id: &str) -> Option<String> {
         None
     }
 
@@ -524,36 +568,59 @@ pub trait AgentAdapter: Send + Sync {
         None
     }
 
-    /// Whether the CLI expands a leading `/command` in a non-interactive turn.
-    /// Only then may `agent.rs::turn_text` ship such a turn verbatim; every
-    /// other adapter would drop its time line, preamble and first-turn suffix
-    /// for nothing. Gemini expands too, but its capabilities preamble is
+    /// `prompt` is a command the CLI runs as a turn of its own: claude expands
+    /// any leading `/command`, codex maps `/compact` to `thread/compact/start`.
+    /// Such a turn ships verbatim (`agent.rs::turn_text`) — no time line,
+    /// preamble or first-turn suffix — and the writer holds it until it heads
+    /// the queue with no turn in flight. Every other adapter would drop those
+    /// parts for nothing. Gemini expands too, but its capabilities preamble is
     /// emitted ONCE per chat (`first_message_capabilities_preamble`), so a
     /// `/cmd` first message would cost that chat attach-file/schedule-message/
     /// prune for good — a bad trade, so it stays `false`.
-    fn expands_slash_commands(&self) -> bool {
+    fn is_command_turn(&self, _prompt: &str) -> bool {
         false
     }
 
-    /// Called once after the agent process for a turn has fully exited (so any
-    /// on-disk transcript is closed and flushed), just before the Supervisor
-    /// emits `Done`. Lets an adapter publish a corrected context-token reading
-    /// sourced from disk state the live stream can't expose; the returned value
-    /// (if any) is emitted as this turn's `AgentEvent::ContextTokens`.
-    ///
-    /// Default `None`. Codex overrides it: the live `--json` stream only carries
-    /// the cumulative `total_token_usage` (grows unbounded across turns), while
-    /// the real context occupancy (`last_token_usage.input_tokens`) lives only
-    /// in the rollout's `token_count` records — see `adapters/codex.rs`. The
-    /// other adapters report occupancy inline from the stream and return `None`.
-    ///
-    /// `agent_session_id` is the resume id passed into the turn (`None` on a
-    /// brand-new chat, where the adapter may instead use a session id it
-    /// harvested from the stream this turn).
-    fn post_turn_context_tokens(&self, _agent_session_id: Option<&str>) -> Option<i64> {
-        None
+    /// A command turn sent while a turn is in flight hard-aborts that turn and
+    /// respawns (claude). `false`: it waits in the queue until the chat is idle
+    /// (codex — its compaction would interrupt the running turn anyway).
+    fn command_interrupts_turn(&self) -> bool {
+        true
+    }
+
+    /// A command turn runs alone: nothing queued behind it is written until it
+    /// is consumed and its `result` arrives (codex — a `turn/start` sent into a
+    /// compaction has no defined outcome). `false` (claude): turns behind it go
+    /// to stdin at once and the CLI queues them itself.
+    fn serializes_command_turns(&self) -> bool {
+        false
+    }
+
+    /// Resident: the writer re-checks after EVERY stdout line, not just after a
+    /// `result` — a JSON-RPC response or notification can make a held frame
+    /// sendable (codex: the thread opened, a turn started).
+    fn writer_follows_every_line(&self) -> bool {
+        false
+    }
+
+    /// Resident: the session can't take turns any more (codex: its thread
+    /// failed to open and the failure has been reported). The writer then
+    /// closes stdin, so the process exits and the next message respawns.
+    fn session_over(&self) -> bool {
+        false
+    }
+
+    /// Resident: the lines seen so far prove the agent started, which stops
+    /// the startup watchdog (`AGENT_STARTUP_TIMEOUT`). Codex chatters from
+    /// launch, so only its opened (or failed) thread counts.
+    fn startup_complete(&self) -> bool {
+        true
     }
 }
+
+/// The spawner's canonical frame for a turn cut short (`/stop`, a hard abort, a
+/// process that died mid-turn).
+pub const INTERRUPTED_RESULT: &str = r#"{"type":"result","subtype":"interrupted"}"#;
 
 /// Per-line frame-size cap used by every adapter to skip a full
 /// `serde_json::Value` parse (or even a full-line substring scan) on multi-MB
@@ -574,12 +641,19 @@ pub(crate) const MAX_STREAM_FRAME_BYTES: usize = 65_536;
 /// `"` is correct; on any malformed/escaped input we return `None` rather than
 /// risk a wrong classification.
 pub(crate) fn extract_json_type(line: &str) -> Option<&str> {
-    // Locate the `"type"` key. `find` on the literal is fine — a `"type"`
-    // substring inside an earlier string value is vanishingly unlikely as the
-    // FIRST occurrence (type is the leading key), and a wrong hit just yields a
-    // value that fails the conservative checks below → None.
-    let key = line.find("\"type\"")?;
-    let rest = &line[key + "\"type\"".len()..];
+    extract_json_string_field(line, "type")
+}
+
+/// [`extract_json_type`] for any leading string field (codex app-server
+/// notifications lead with `"method"`).
+pub(crate) fn extract_json_string_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    // Locate the key. `find` on the literal is fine — the key inside an
+    // earlier string value is vanishingly unlikely as the FIRST occurrence (it
+    // is the leading key), and a wrong hit just yields a value that fails the
+    // conservative checks below → None.
+    let quoted = format!("\"{key}\"");
+    let at = line.find(&quoted)?;
+    let rest = &line[at + quoted.len()..];
     // Skip whitespace, require a single `:`, skip whitespace again.
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(':')?;
@@ -601,6 +675,25 @@ pub(crate) fn extract_json_type(line: &str) -> Option<&str> {
 /// `agent.rs`.
 pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The command name when `prompt` starts with a slash command (`/compact`,
+/// `/plugin:cmd args`), else `None`. Only the first token of the first line is
+/// inspected: `/Users/...` does not match, its `/` disqualifying the name. A
+/// turn carrying attachments never matches — `blobs::build_prompt` puts the
+/// file list first — which mirrors the `attachments.is_empty()` gate on
+/// `/stop` in `main.rs`.
+pub(crate) fn slash_command_name(prompt: &str) -> Option<&str> {
+    // Claude matches on `value.trim().startsWith("/")`, so leading blanks must
+    // not defeat us either.
+    let first_line = prompt.trim_start().lines().next().unwrap_or("");
+    let rest = first_line.strip_prefix('/')?;
+    let name = rest.split(char::is_whitespace).next().unwrap_or("");
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'));
+    valid.then_some(name)
 }
 
 /// Instruction telling the agent how to attach a local file to its next message
@@ -777,12 +870,59 @@ pub fn worktree_for(chat_id: &str) -> Worktree {
     }
 }
 
-/// The absolute path the agent actually runs in this turn: the worktree dir when
+/// What decides a spawn's cwd, shared by the one-shot and resident contexts.
+pub struct CwdSpec<'a> {
+    pub chat_id: &'a str,
+    pub project_path: Option<&'a str>,
+    pub worktree: bool,
+    /// A prior session exists, so its worktree does too.
+    pub resume: bool,
+}
+
+impl<'a> CwdSpec<'a> {
+    fn new(
+        chat_id: &'a str,
+        project_path: Option<&'a str>,
+        worktree: bool,
+        agent_session_id: Option<&str>,
+    ) -> Self {
+        CwdSpec {
+            chat_id,
+            project_path,
+            worktree,
+            resume: agent_session_id.is_some(),
+        }
+    }
+}
+
+impl TurnContext<'_> {
+    pub fn cwd(&self) -> CwdSpec<'_> {
+        CwdSpec::new(
+            self.chat_id,
+            self.project_path,
+            self.worktree,
+            self.agent_session_id,
+        )
+    }
+}
+
+impl SessionContext<'_> {
+    pub fn cwd(&self) -> CwdSpec<'_> {
+        CwdSpec::new(
+            self.chat_id,
+            self.project_path,
+            self.worktree,
+            self.agent_session_id,
+        )
+    }
+}
+
+/// The absolute path the agent actually runs in: the worktree dir when
 /// worktree mode is on AND a project path exists, else the project path; `None`
 /// when there's no project path. This is exactly the dir `worktree_cwd_prefix`
-/// cd's into — adapters that ALSO need the cwd as an explicit flag (codex's `-C`)
-/// call this so the shell cwd and the flag can never disagree.
-pub fn effective_cwd(ctx: &TurnContext<'_>) -> Option<String> {
+/// cd's into — adapters that ALSO pass the cwd explicitly (codex's
+/// `thread/start.cwd`) call this so the shell cwd and theirs can never disagree.
+pub fn effective_cwd(ctx: &CwdSpec<'_>) -> Option<String> {
     let pp = ctx.project_path?;
     if ctx.worktree {
         Some(worktree_for(ctx.chat_id).dir.to_string_lossy().into_owned())
@@ -796,18 +936,18 @@ pub fn effective_cwd(ctx: &TurnContext<'_>) -> Option<String> {
 /// fragment ENDING in ` && ` (or an empty string when there is no project path
 /// and worktree is off). Cases:
 /// - worktree off: `cd <project> && ` (empty String if project_path is None)
-/// - worktree on + project, FIRST turn (agent_session_id None):
+/// - worktree on + project, FIRST turn (no resume):
 ///   `git -C <project> worktree add <dir> -b <branch> && cd <dir> && `
 /// - worktree on + project, resume: `cd <dir> && `
 /// - worktree on but project_path None: empty String (no worktree without a repo)
 ///
 /// The cd target is [`effective_cwd`] (the worktree dir under worktree mode, else
-/// the project path) — shared with codex's `-C` so the shell cwd and the flag
-/// can't drift. The `git -C <PROJECT>` repo arg uses the PROJECT path (the repo to
+/// the project path) — shared with codex's `thread/start.cwd` so the two can't
+/// drift. The `git -C <PROJECT>` repo arg uses the PROJECT path (the repo to
 /// branch off), NOT the worktree dir.
 ///
 /// A failed `git worktree add` propagates as the turn's stderr failure (no guard).
-pub fn worktree_cwd_prefix(ctx: &TurnContext<'_>) -> String {
+pub fn worktree_cwd_prefix(ctx: &CwdSpec<'_>) -> String {
     let mut prefix = String::new();
     let Some(pp) = ctx.project_path else {
         // No project path ⇒ no cwd to set (worktree on or off).
@@ -820,7 +960,7 @@ pub fn worktree_cwd_prefix(ctx: &TurnContext<'_>) -> String {
     let cwd = if ctx.worktree {
         let wt = worktree_for(ctx.chat_id);
         // The repo to branch off is the PROJECT path. Create on the first turn only.
-        if ctx.agent_session_id.is_none() {
+        if !ctx.resume {
             prefix.push_str(&format!(
                 "git -C {} worktree add {} -b {} && ",
                 shell_escape(pp),
@@ -1016,6 +1156,8 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             } => "Result(task)".to_string(),
             AgentEvent::TaskStarted { id, .. } => format!("TaskStarted({})", id),
             AgentEvent::TaskFinished(s) => format!("TaskFinished({})", s),
+            AgentEvent::CommandStarted { id, .. } => format!("CommandStarted({id})"),
+            AgentEvent::CommandFinished(id) => format!("CommandFinished({id})"),
             AgentEvent::UserTurnConsumed(s) => format!("UserTurnConsumed({})", s),
             AgentEvent::PeerTurnConsumed { name, body } => {
                 format!("PeerTurnConsumed({name}: {body})")
@@ -1234,19 +1376,19 @@ mod tests {
         };
         let wt = worktree_for(on.chat_id);
         assert_eq!(
-            effective_cwd(&on),
+            effective_cwd(&on.cwd()),
             Some(wt.dir.to_string_lossy().into_owned())
         );
         // worktree off + project → project path.
         let off = TurnContext::for_test(&prompt_file, None, false, None);
-        assert_eq!(effective_cwd(&off), Some("/tmp/proj".to_string()));
+        assert_eq!(effective_cwd(&off.cwd()), Some("/tmp/proj".to_string()));
         // no project → None (worktree on or off).
         let no_proj = TurnContext {
             worktree: true,
             project_path: None,
             ..TurnContext::for_test(&prompt_file, None, false, None)
         };
-        assert_eq!(effective_cwd(&no_proj), None);
+        assert_eq!(effective_cwd(&no_proj.cwd()), None);
     }
 
     #[test]
@@ -1255,7 +1397,7 @@ mod tests {
         let prompt_file = PathBuf::from("/tmp/p.txt");
         // worktree=false, project_path=Some("/tmp/proj") (for_test defaults).
         let ctx = TurnContext::for_test(&prompt_file, None, false, None);
-        assert_eq!(worktree_cwd_prefix(&ctx), "cd '/tmp/proj' && ");
+        assert_eq!(worktree_cwd_prefix(&ctx.cwd()), "cd '/tmp/proj' && ");
     }
 
     #[test]
@@ -1266,7 +1408,7 @@ mod tests {
             project_path: None,
             ..TurnContext::for_test(&prompt_file, None, false, None)
         };
-        assert_eq!(worktree_cwd_prefix(&ctx), "");
+        assert_eq!(worktree_cwd_prefix(&ctx.cwd()), "");
     }
 
     #[test]
@@ -1281,7 +1423,7 @@ mod tests {
         let wt_esc = shell_escape(&wt.dir.to_string_lossy());
         // Exact create-case string: `git -C <proj> worktree add <dir> -b zc-<chat8> && cd <dir> && `.
         assert_eq!(
-            worktree_cwd_prefix(&ctx),
+            worktree_cwd_prefix(&ctx.cwd()),
             format!("git -C '/tmp/proj' worktree add {wt_esc} -b zc-{WT_CHAT8} && cd {wt_esc} && "),
         );
     }
@@ -1297,7 +1439,7 @@ mod tests {
         let wt = worktree_for(ctx.chat_id);
         let wt_esc = shell_escape(&wt.dir.to_string_lossy());
         // Resume: cd-only, no `worktree add`.
-        assert_eq!(worktree_cwd_prefix(&ctx), format!("cd {wt_esc} && "));
+        assert_eq!(worktree_cwd_prefix(&ctx.cwd()), format!("cd {wt_esc} && "));
     }
 
     #[test]
@@ -1310,6 +1452,6 @@ mod tests {
             ..TurnContext::for_test(&prompt_file, None, false, None)
         };
         // No worktree without a repo path.
-        assert_eq!(worktree_cwd_prefix(&ctx), "");
+        assert_eq!(worktree_cwd_prefix(&ctx.cwd()), "");
     }
 }

@@ -366,7 +366,15 @@ impl AgentAdapter for ClaudeAdapter {
         true
     }
 
-    fn expands_slash_commands(&self) -> bool {
+    fn is_command_turn(&self, prompt: &str) -> bool {
+        crate::adapter::slash_command_name(prompt).is_some()
+    }
+
+    fn names_session(&self) -> bool {
+        true
+    }
+
+    fn can_interrupt(&self) -> bool {
         true
     }
 
@@ -423,7 +431,7 @@ impl AgentAdapter for ClaudeAdapter {
         })
     }
 
-    fn encode_user_turn(&self, uuid: &str, text: &str) -> String {
+    fn encode_user_turn(&mut self, uuid: &str, text: &str) -> Option<String> {
         // Build via serde so the user's text (quotes / newlines / control chars)
         // is encoded safely — never string concat. Newline-terminated: claude's
         // stream-json input is newline-delimited frames.
@@ -435,10 +443,10 @@ impl AgentAdapter for ClaudeAdapter {
                 "content": [{ "type": "text", "text": text }],
             },
         });
-        format!("{}\n", frame)
+        Some(format!("{}\n", frame))
     }
 
-    fn encode_interrupt(&self, request_id: &str) -> Option<String> {
+    fn encode_interrupt(&mut self, request_id: &str) -> Option<String> {
         let frame = serde_json::json!({
             "type": "control_request",
             "request_id": request_id,
@@ -2077,8 +2085,10 @@ mod tests {
 
     #[test]
     fn encode_user_turn_is_valid_json_with_trailing_newline() {
-        let a = ClaudeAdapter::new();
-        let frame = a.encode_user_turn("u-1", "hello \"world\"\nwith newline");
+        let mut a = ClaudeAdapter::new();
+        let frame = a
+            .encode_user_turn("u-1", "hello \"world\"\nwith newline")
+            .unwrap();
         assert!(frame.ends_with('\n'), "frame must be newline-terminated");
         let v: serde_json::Value = serde_json::from_str(frame.trim_end()).unwrap();
         assert_eq!(v["type"], "user");

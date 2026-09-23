@@ -54,7 +54,7 @@ use writer::{WriteEvent, Writer, WriterConfig};
 type ProbeStatusesCache = Arc<std::sync::OnceLock<Vec<(AgentKind, (bool, bool))>>>;
 
 const SENTRY_DSN: &str = "https://05d5deab2efce04e4f801af41ea39def@o4511216603234304.ingest.de.sentry.io/4511216616669264";
-const INTERRUPTED_RESULT: &str = r#"{"type":"result","subtype":"interrupted"}"#;
+use adapter::INTERRUPTED_RESULT;
 const PROD_BASE_URL: &str = "https://api.zucchini.chat";
 const DEV_SYNC_BASE_URL: &str = "http://localhost:8080";
 const DEV_API_BASE_URL: &str = "http://localhost:3100";
@@ -894,7 +894,13 @@ async fn route_agent_response(
             // silent. (Earlier this DEFERRED until Idle to spare the
             // monitor; the immediate apply — so the freed context helps the
             // turn that asked for it — is the behavior we kept.)
-            if let Some(reqs) = take_prunes(&topic, pending_prunes, supervisor).await {
+            //
+            // An idle chat's cue comes from a turn `/stop` already ended (codex
+            // leaves the prune command running past `turn/interrupt`): applying
+            // it would restart the stopped chat, so it is dropped.
+            if !supervisor.is_running(&topic) {
+                pending_prunes.lock().await.remove(&topic);
+            } else if let Some(reqs) = take_prunes(&topic, pending_prunes, supervisor).await {
                 apply_prune_group(&topic, reqs, mirror, supervisor, write_tx).await;
             }
         }
@@ -916,8 +922,18 @@ async fn route_agent_response(
             // request: leaving it in `pending_prunes` leaks the entry for the
             // process lifetime and would mis-fire on a LATER turn's
             // `prune-context` cue for this chat (applying a stale rewrite).
-            if let AgentResponse::Done { topic, .. } = &other {
-                pending_prunes.lock().await.remove(topic);
+            // Likewise for a `/stop`: the idle edge must not apply a prune of
+            // the turn it cut and restart the stopped chat.
+            match &other {
+                AgentResponse::Done { topic, .. } => {
+                    pending_prunes.lock().await.remove(topic);
+                }
+                AgentResponse::Interrupted { topic, session }
+                    if supervisor.is_current_session(topic, session) =>
+                {
+                    pending_prunes.lock().await.remove(topic);
+                }
+                _ => {}
             }
             // Write guard scoped tightly so the control task can interleave
             // a read between agent responses but not within one.
@@ -1247,9 +1263,9 @@ async fn handle_message_put(
         s
     };
 
-    // Resident adapters (claude) host one process across its turns PLUS its
-    // in-process background tasks/Monitors, and take a new message on stdin
-    // (below); one-shot adapters (codex/gemini/cursor/hermes) spawn per turn.
+    // Resident adapters (claude, codex) host one process across its turns (claude:
+    // PLUS its in-process background tasks/Monitors), and take a new message on
+    // stdin (below); one-shot adapters (gemini/cursor/hermes/pi) spawn per turn.
     let was_running = supervisor.is_running(&chat_id);
 
     if is_kill {
@@ -6342,6 +6358,57 @@ mod tests {
             assert!(prunes.lock().await.is_empty());
         }
         assert_eq!(c.spawned_prompts(), vec!["first"]);
+    }
+
+    /// A prune parked by the turn `/stop` cut must not restart the stopped
+    /// chat: neither at its interrupted result nor from a late cue (codex's
+    /// prune command outlives `turn/interrupt`).
+    #[tokio::test]
+    async fn a_prune_of_a_stopped_turn_does_not_restart_the_chat() {
+        let mut c = stopped_mid_turn().await;
+        c.mirror.set_agent_session_id(&c.chat_id, "sid".into());
+        let prunes = c.supervisor.pending_prunes();
+        park_prune(&prunes, &c.chat_id);
+        let session = c.session();
+        let request_id = session
+            .lock()
+            .unwrap()
+            .interrupt
+            .clone()
+            .unwrap()
+            .request_id;
+        for ev in [
+            adapter::AgentEvent::InterruptAcked(request_id),
+            adapter::AgentEvent::Result {
+                origin_is_task: false,
+            },
+        ] {
+            crate::agent::reduce(&mut session.lock().unwrap(), &ev);
+        }
+        let mirror = c.shared_mirror();
+        let topic = c.chat_id.clone();
+        for resp in [
+            AgentResponse::Interrupted {
+                topic: topic.clone(),
+                session,
+            },
+            AgentResponse::RunState {
+                topic: topic.clone(),
+                running: false,
+            },
+        ] {
+            route_agent_response(resp, &prunes, &mirror, &mut c.supervisor, &c.write_tx).await;
+        }
+        assert!(prunes.lock().await.is_empty());
+
+        park_prune(&prunes, &topic);
+        let cue = AgentResponse::ToolResult {
+            topic: topic.clone(),
+        };
+        route_agent_response(cue, &prunes, &mirror, &mut c.supervisor, &c.write_tx).await;
+        assert!(prunes.lock().await.is_empty());
+        assert_eq!(c.spawned_prompts(), vec!["first"]);
+        assert!(c.supervisor.has_agent(&topic), "the process is kept");
     }
 
     #[tokio::test]

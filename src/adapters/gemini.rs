@@ -211,7 +211,7 @@ impl AgentAdapter for GeminiAdapter {
         let mut cmd = String::new();
         // cwd (+ spawner-side worktree create/cd) — gemini sets cwd only via this
         // leading `cd`, no separate cwd flag, so the shared prefix is a pure drop-in.
-        cmd.push_str(&worktree_cwd_prefix(ctx));
+        cmd.push_str(&worktree_cwd_prefix(&ctx.cwd()));
 
         // Prompt is piped via stdin (prompts can be multi-MB with attachments;
         // never inline via `-p` argv). Piped non-TTY stdin triggers gemini's
