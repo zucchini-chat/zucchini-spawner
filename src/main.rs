@@ -231,6 +231,8 @@ struct SyncStaging {
     chats: std::collections::HashMap<String, StagedRow>, // id -> last op this window
     projects: std::collections::HashMap<String, StagedRow>, // id -> last op this window
     messages: Vec<String>, // deferred user-message raw row JSON, arrival order
+    /// The window CLEARed the bucket: chats it doesn't re-PUT were deleted.
+    cleared: bool,
 }
 
 /// A staged chats/projects op for one id within a window (last-write-wins).
@@ -439,6 +441,15 @@ async fn handle_sync_event(
             }
             _ => SyncEventOutcome::Nothing,
         },
+        SyncEvent::Clear => {
+            // Everything staged before it is superseded: the bucket re-sends
+            // every live row after the CLEAR.
+            *staging = SyncStaging {
+                cleared: true,
+                ..Default::default()
+            };
+            SyncEventOutcome::Nothing
+        }
         SyncEvent::CheckpointComplete { buckets } => {
             // Apply the staged window in dependency order: projects → chats →
             // messages, so chat.project_id and message.chat resolve against a
@@ -460,6 +471,11 @@ async fn handle_sync_event(
 
             // 2. chats (with agent_session_id restore — replaces the old inline
             //    merge-on-upsert hack in state.rs::upsert_chat)
+            if std::mem::take(&mut staging.cleared) {
+                for id in mirror.chat_ids(|_| true) {
+                    staging.chats.entry(id).or_insert(StagedRow::Remove);
+                }
+            }
             for (id, row) in staging.chats.drain() {
                 match row {
                     StagedRow::Put(json) => {
@@ -500,15 +516,17 @@ async fn handle_sync_event(
 
             // Boot: clear the run flags no agent backs anymore, before any
             // message below spawns one. Stopped-by-user: no "finished" push.
-            for chat_id in mirror.stale_flagged_chats_at_boot() {
-                info!(chat_id = %chat_id, "resetting stale agent_running/agent_alive/live_tasks");
-                let _ = write_tx
-                    .send(WriteEvent::chat_stopped_by_user(chat_id.clone()))
-                    .await;
-                let _ = write_tx
-                    .send(WriteEvent::chat_alive(chat_id.clone(), false))
-                    .await;
-                clear_live_tasks(write_tx, &chat_id).await;
+            if mirror.first_checkpoint() {
+                for chat_id in mirror.flagged_chat_ids() {
+                    info!(chat_id = %chat_id, "resetting stale agent_running/agent_alive/live_tasks");
+                    let _ = write_tx
+                        .send(WriteEvent::chat_stopped_by_user(chat_id.clone()))
+                        .await;
+                    let _ = write_tx
+                        .send(WriteEvent::chat_alive(chat_id.clone(), false))
+                        .await;
+                    clear_live_tasks(write_tx, &chat_id).await;
+                }
             }
 
             // 3. messages — spawn against the now-consistent mirror, arrival order
@@ -517,6 +535,10 @@ async fn handle_sync_event(
             for raw in pending_messages {
                 handle_message_put(&raw, &window, mirror, supervisor, blobs, keys, write_tx).await;
             }
+
+            // After the messages: a client switches always-on off no later than
+            // its `/stop`, and a chat a message spawned already has its agent.
+            reconcile_always_on(mirror, supervisor);
 
             // One-shot agents seed — driven here because the owner row only
             // arrives via sync; the set flag persists with the cursor at the
@@ -615,20 +637,6 @@ pub(crate) async fn handle_agent_response(
         // never reaches here at runtime. The arm exists only to keep the match
         // exhaustive (and stays a no-op if a future caller routes one through).
         AgentResponse::ToolResult { .. } => {}
-        // The `/stop`-interrupted turn ended. With background tasks still
-        // armed the chat stays busy until its idle edge. From a session a
-        // `/kill` or respawn already replaced, it is stale: that teardown
-        // closed the chat out.
-        AgentResponse::Interrupted { topic, session } => {
-            if !supervisor.is_current_session(&topic, &session) {
-                info!(topic = %topic, "ignoring interrupted result of a replaced session");
-                return;
-            }
-            send_agent_line(write_tx, mirror, &topic, INTERRUPTED_RESULT.to_string()).await;
-            if !supervisor.is_running(&topic) {
-                let _ = write_tx.send(WriteEvent::chat_stopped_by_user(topic)).await;
-            }
-        }
         // What the resident has armed changed. From a session a teardown
         // already replaced it is stale: that teardown cleared the column, and
         // re-writing its task list would show phantom tasks on the live one.
@@ -647,12 +655,14 @@ pub(crate) async fn handle_agent_response(
             }
             send_live_tasks(write_tx, mirror, topic, tasks).await;
         }
-        AgentResponse::InterruptTimedOut { topic, request_id } => {
-            if supervisor.interrupt_pending(&topic, &request_id) {
-                warn!(topic = %topic, "no result after the interrupt, tearing down the resident session");
-                if let Some(user_id) = mirror.chats.get(&topic).map(|c| c.user_id) {
-                    hard_stop(&topic, user_id, supervisor, write_tx).await;
-                }
+        AgentResponse::TurnEnded { topic } => {
+            if let Some(chat) = mirror.chats.get(&topic) {
+                supervisor.after_turn(
+                    &topic,
+                    chat.auto_compact_tokens,
+                    mirror.is_always_on(&topic),
+                    mirror.member_timezone(&chat.user_id),
+                );
             }
         }
     }
@@ -781,6 +791,7 @@ async fn evict_idle_residents(
     memory: fn() -> Option<warm::Memory>,
     write_tx: &mpsc::Sender<WriteEvent>,
     pinned: &HashSet<String>,
+    always_on: &HashSet<String>,
 ) -> Option<tokio::time::Instant> {
     loop {
         let mut idle = supervisor.idle_residents();
@@ -790,6 +801,7 @@ async fn evict_idle_residents(
         measure_idle_footprint(&mut idle).await;
         for r in idle.iter_mut() {
             r.pinned = pinned.contains(&r.topic);
+            r.always_on = always_on.contains(&r.topic);
         }
         let eviction = match warm::choose(&idle, memory().as_ref(), tokio::time::Instant::now()) {
             warm::Decision::Evict(e) => e,
@@ -895,9 +907,8 @@ async fn route_agent_response(
             // monitor; the immediate apply — so the freed context helps the
             // turn that asked for it — is the behavior we kept.)
             //
-            // An idle chat's cue comes from a turn `/stop` already ended (codex
-            // leaves the prune command running past `turn/interrupt`): applying
-            // it would restart the stopped chat, so it is dropped.
+            // An idle chat's cue is stale: applying it would restart a chat no
+            // turn is running in, so it is dropped.
             if !supervisor.is_running(&topic) {
                 pending_prunes.lock().await.remove(&topic);
             } else if let Some(reqs) = take_prunes(&topic, pending_prunes, supervisor).await {
@@ -922,18 +933,8 @@ async fn route_agent_response(
             // request: leaving it in `pending_prunes` leaks the entry for the
             // process lifetime and would mis-fire on a LATER turn's
             // `prune-context` cue for this chat (applying a stale rewrite).
-            // Likewise for a `/stop`: the idle edge must not apply a prune of
-            // the turn it cut and restart the stopped chat.
-            match &other {
-                AgentResponse::Done { topic, .. } => {
-                    pending_prunes.lock().await.remove(topic);
-                }
-                AgentResponse::Interrupted { topic, session }
-                    if supervisor.is_current_session(topic, session) =>
-                {
-                    pending_prunes.lock().await.remove(topic);
-                }
-                _ => {}
+            if let AgentResponse::Done { topic, .. } = &other {
+                pending_prunes.lock().await.remove(topic);
             }
             // Write guard scoped tightly so the control task can interleave
             // a read between agent responses but not within one.
@@ -946,7 +947,7 @@ async fn route_agent_response(
 }
 
 /// The chat's parked prunes, if its agent is still tracked. A `prune-context`
-/// RPC can park after `/kill` or shutdown cleared the entry; applying it would
+/// RPC can park after `/stop` or shutdown cleared the entry; applying it would
 /// respawn the torn-down chat, so it is dropped instead.
 async fn take_prunes(
     topic: &str,
@@ -1022,40 +1023,26 @@ async fn shutdown_and_flush(
     }
 }
 
-/// `/stop` by killing the process group, background tasks included.
-async fn hard_stop(
+/// `/stop` (and `/kill`, its alias for older clients): kill the chat's agent
+/// process group, background tasks included. The transcript stays, so the
+/// next message resumes it.
+async fn stop_agent(
     chat_id: &str,
     user_id: Uuid,
     supervisor: &mut Supervisor,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
-    publish_interrupted(write_tx, chat_id, user_id).await;
-    supervisor.abort_agent(chat_id).await;
-    let _ = write_tx
-        .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
-        .await;
-    clear_live_tasks(write_tx, chat_id).await;
-}
-
-/// `/kill`: end the chat's agent process, and with it the warm session.
-async fn kill_agent(
-    chat_id: &str,
-    user_id: Uuid,
-    supervisor: &mut Supervisor,
-    write_tx: &mpsc::Sender<WriteEvent>,
-) {
+    let running = supervisor.is_running(chat_id);
     if supervisor.is_working(chat_id) {
-        hard_stop(chat_id, user_id, supervisor, write_tx).await;
-    } else {
-        let running = supervisor.is_running(chat_id);
-        supervisor.abort_agent(chat_id).await;
-        if running {
-            let _ = write_tx
-                .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
-                .await;
-        }
-        clear_live_tasks(write_tx, chat_id).await;
+        publish_interrupted(write_tx, chat_id, user_id).await;
     }
+    supervisor.abort_agent(chat_id).await;
+    if running {
+        let _ = write_tx
+            .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
+            .await;
+    }
+    clear_live_tasks(write_tx, chat_id).await;
     // Written even with no process: the row may be stale.
     supervisor.forget_alive(chat_id);
     let _ = write_tx
@@ -1224,11 +1211,9 @@ async fn handle_message_put(
         }
     };
 
-    // Detect /stop and /kill early but defer the return: the abort+INTERRUPTED publish
-    // below must still run for an explicit user stop (so the chat gets the
-    // "Agent interrupted" system frame), while the membership gate that
-    // follows must run BEFORE any abort so an invitee with an unsynced
-    // machine_users row can never trigger a stray INTERRUPTED.
+    // Detect /stop and /kill early but act after the membership gate, so an
+    // invitee with an unsynced machine_users row can never trigger a stray
+    // abort.
     let command = |name: &str| envelope.attachments.is_empty() && envelope.text.trim() == name;
     let is_stop = command("/stop");
     let is_kill = command("/kill");
@@ -1263,47 +1248,18 @@ async fn handle_message_put(
         s
     };
 
-    // Resident adapters (claude, codex) host one process across its turns (claude:
-    // PLUS its in-process background tasks/Monitors), and take a new message on
-    // stdin (below); one-shot adapters (gemini/cursor/hermes/pi) spawn per turn.
-    let was_running = supervisor.is_running(&chat_id);
-
-    if is_kill {
-        kill_agent(&chat_id, user_id, supervisor, write_tx).await;
+    if is_stop || is_kill {
+        stop_agent(&chat_id, user_id, supervisor, write_tx).await;
         return;
     }
-    if is_resident {
-        if is_stop {
-            // RESIDENT /stop ends the turn in flight but keeps the process
-            // and its background tasks; `Interrupted` then closes the turn
-            // out. Otherwise (tasks or queued turns only) it is a HARD stop:
-            // `abort_agent` on a resident session emits NO `Done`, so
-            // `hard_stop` clears the run state explicitly. The next message
-            // respawns with `--resume`.
-            if was_running {
-                if supervisor.interrupt(&chat_id) {
-                    info!(chat_id = %chat_id, "stop: interrupting the resident's turn");
-                } else {
-                    info!(chat_id = %chat_id, "stop: tearing down resident session (kills armed monitors)");
-                    hard_stop(&chat_id, user_id, supervisor, write_tx).await;
-                }
-            }
-            return;
-        }
-    } else {
-        // ONE-SHOT path (historic): abort any running agent + publish
-        // INTERRUPTED_RESULT, then either return (/stop) or spawn a fresh turn.
-        if was_running {
-            info!(chat_id = %chat_id, "aborting running one-shot agent before handling new message");
-            supervisor.abort_agent(&chat_id).await;
-            publish_interrupted(write_tx, &chat_id, user_id).await;
-        }
-        if is_stop {
-            let _ = write_tx
-                .send(WriteEvent::chat_stopped_by_user(chat_id.clone()))
-                .await;
-            return;
-        }
+    // One-shot adapters (gemini/cursor/hermes/pi) spawn per turn: a new message
+    // aborts the running one. Resident adapters (claude, codex) take it on
+    // stdin (below).
+    let was_running = supervisor.is_running(&chat_id);
+    if !is_resident && was_running {
+        info!(chat_id = %chat_id, "aborting running one-shot agent before handling new message");
+        supervisor.abort_agent(&chat_id).await;
+        publish_interrupted(write_tx, &chat_id, user_id).await;
     }
 
     let Some(project_path) = mirror.projects.get(&project_id).cloned() else {
@@ -1407,29 +1363,11 @@ async fn handle_message_put(
     }
 }
 
-/// Per-chat spawn parameters resolved from the `Mirror`, shared between the
-/// message-put path and the prune-context respawn. `agent_session_id` is `Some`
-/// for any chat that's had at least one turn (always true for a prune request —
-/// it's issued from inside a turn).
-struct ChatSpawnParams {
-    project_path: String,
-    worktree: bool,
-    agent_session_id: Option<String>,
-    agent_kind: AgentKind,
-    is_sandboxed: bool,
-    model: Option<String>,
-    /// Sender's IANA timezone (migration 0040), mirrored per `handle_message_put`
-    /// so the prune respawn keeps injecting the current-local-time line.
-    user_timezone: Option<String>,
-    /// See `SpawnRequest::session_name`.
-    session_name: Option<String>,
-}
-
-/// Resolve spawn params for `chat_id`, mirroring `handle_message_put`'s gates
-/// (project-path resolution, owner-vs-member sandbox). `None` (with a logged
-/// reason) if the chat/project isn't synced or a non-owner's `machine_users`
-/// row hasn't landed.
-fn resolve_chat_spawn_params(mirror: &Mirror, chat_id: &str) -> Option<ChatSpawnParams> {
+/// `chat_id`'s spawn with `prompt`, resolved from the `Mirror` with
+/// `handle_message_put`'s gates (project-path resolution, owner-vs-member
+/// sandbox). `None` (with a logged reason) if the chat/project isn't synced or
+/// a non-owner's `machine_users` row hasn't landed.
+fn chat_spawn_request(mirror: &Mirror, chat_id: &str, prompt: String) -> Option<SpawnRequest> {
     let chat = mirror.chats.get(chat_id)?;
     let project_path = match mirror.projects.get(&chat.project_id) {
         Some(p) => p.clone(),
@@ -1450,8 +1388,10 @@ fn resolve_chat_spawn_params(mirror: &Mirror, chat_id: &str) -> Option<ChatSpawn
             }
         }
     };
-    Some(ChatSpawnParams {
-        project_path,
+    Some(SpawnRequest {
+        chat_id: chat_id.to_string(),
+        prompt,
+        project_path: Some(project_path),
         worktree: chat.worktree,
         agent_session_id: chat.agent_session_id.clone(),
         agent_kind: chat.agent_kind,
@@ -1464,6 +1404,56 @@ fn resolve_chat_spawn_params(mirror: &Mirror, chat_id: &str) -> Option<ChatSpawn
         user_timezone: mirror.member_timezone(&chat.user_id).map(str::to_string),
         session_name: chat.title.as_deref().and_then(session_name::from_title),
     })
+}
+
+/// The first turn of an always-on resident the spawner (re)starts.
+const RESTART_NOTICE: &str = "[Zucchini] Your process was (re)started with this session resumed \
+(spawner restart, machine reboot, always-on switched on, or a crash). Background tasks, monitors, \
+dev servers, watchers and scheduled loops you started may have stopped. Check what is still \
+running before restarting anything that should be; if nothing should be, reply in one line.";
+
+/// How many starts of an always-on resident `reconcile_always_on` makes
+/// before a pass sees it alive.
+const ALWAYS_ON_RETRIES: u32 = 3;
+
+/// Start the resident of the next always-on chat that has a session to resume,
+/// a resident adapter and no agent, with `RESTART_NOTICE` as its turn. One
+/// at a time and only while no agent is busy, so a boot doesn't run several
+/// agents at once past the clients' free-tier gate. A chat whose starts no
+/// pass saw alive `ALWAYS_ON_RETRIES` times is left alone.
+fn reconcile_always_on(mirror: &mut Mirror, supervisor: &mut Supervisor) {
+    if !mirror.booted() {
+        return;
+    }
+    let always_on = mirror.always_on_chats();
+    // Switching always-on off resets the count, even while another chat is busy.
+    mirror.always_on_starts.retain(|id, _| always_on.contains(id));
+    if supervisor.any_in_foreground() {
+        return;
+    }
+    // Past the foreground gate an open resident has finished its notice turn;
+    // a closed one is still dying and must keep its count.
+    mirror
+        .always_on_starts
+        .retain(|id, _| !supervisor.has_open_resident(id));
+    let next = always_on
+        .into_iter()
+        .filter(|id| {
+            let chat = &mirror.chats[id];
+            chat.agent_session_id.is_some()
+                && chat.agent_kind.make_adapter().is_resident()
+                && !supervisor.has_agent(id)
+                && mirror.always_on_starts.get(id).copied().unwrap_or(0) < ALWAYS_ON_RETRIES
+        })
+        .min();
+    let Some(chat_id) = next else {
+        return;
+    };
+    *mirror.always_on_starts.entry(chat_id.clone()).or_default() += 1;
+    if let Some(req) = chat_spawn_request(mirror, &chat_id, RESTART_NOTICE.to_string()) {
+        info!(chat_id = %chat_id, "starting always-on resident");
+        supervisor.spawn_agent(req);
+    }
 }
 
 /// Abort `chat_id`'s agent (if any) and apply its coalesced prune requests, then
@@ -1592,42 +1582,23 @@ async fn apply_prune_group(
     }
 
     // Resolve spawn params from the mirror (read guard) and respawn.
-    let params = {
+    let req = {
         let g = mirror.read().await;
-        resolve_chat_spawn_params(&g, chat_id)
+        chat_spawn_request(&g, chat_id, prompt)
     };
-    let Some(params) = params else {
+    let Some(req) = req else {
         error!(chat_id = %chat_id, "cannot resolve spawn params after prune; chat left idle");
         return;
     };
-    if params.agent_session_id.is_none() {
+    if req.agent_session_id.is_none() {
         // A prune request only fires mid-turn, so the session id is already
         // harvested — but guard anyway: resuming requires it, and a fresh session
         // would re-run from scratch with the wrong prompt.
         error!(chat_id = %chat_id, "no agent_session_id after prune; cannot resume, chat left idle");
         return;
     }
-    let unconsumed = turns_to_requeue(
-        aborted,
-        params.agent_kind,
-        params.agent_session_id.as_deref(),
-    );
-
-    supervisor.spawn_agent_then(
-        SpawnRequest {
-            chat_id: chat_id.to_string(),
-            prompt,
-            project_path: Some(params.project_path),
-            worktree: params.worktree,
-            agent_session_id: params.agent_session_id,
-            agent_kind: params.agent_kind,
-            is_sandboxed: params.is_sandboxed,
-            model: params.model,
-            user_timezone: params.user_timezone,
-            session_name: params.session_name,
-        },
-        unconsumed,
-    );
+    let unconsumed = turns_to_requeue(aborted, req.agent_kind, req.agent_session_id.as_deref());
+    supervisor.spawn_agent_then(req, unconsumed);
 }
 
 /// Prompts an aborted resident never consumed, minus those its transcript
@@ -3285,10 +3256,17 @@ async fn main() {
         }
 
         if warm_due || idle_set(&supervisor) != warm_idle_seen {
-            let pinned = mirror.read().await.pinned_chats();
+            let (pinned, always_on) = {
+                let g = mirror.read().await;
+                (g.pinned_chats(), g.always_on_chats())
+            };
             warm_deadline =
-                evict_idle_residents(&mut supervisor, sys::memory, &write_tx, &pinned).await;
+                evict_idle_residents(&mut supervisor, sys::memory, &write_tx, &pinned, &always_on)
+                    .await;
             warm_idle_seen = idle_set(&supervisor);
+        }
+        if warm_due {
+            reconcile_always_on(&mut *mirror.write().await, &mut supervisor);
         }
         publish_alive_changes(&mut supervisor, &write_tx).await;
 
@@ -5236,29 +5214,6 @@ mod tests {
             self.supervisor.live_sessions().lock().unwrap()[&self.chat_id].clone()
         }
 
-        /// Claude acks the pending interrupt, ends the turn, and the reader
-        /// reports it.
-        async fn end_interrupted_turn(&mut self) {
-            let session = self.session();
-            let request_id = {
-                let st = session.lock().unwrap();
-                st.interrupt.clone().unwrap().request_id
-            };
-            for ev in [
-                adapter::AgentEvent::InterruptAcked(request_id),
-                adapter::AgentEvent::Result {
-                    origin_is_task: true,
-                },
-            ] {
-                crate::agent::reduce(&mut session.lock().unwrap(), &ev);
-            }
-            self.respond(AgentResponse::Interrupted {
-                topic: self.chat_id.clone(),
-                session,
-            })
-            .await;
-        }
-
         /// Drive the events of ONE stdout line exactly as the resident reader
         /// would: reduce each in order and publish what it leaves standing,
         /// with the internal `/rename` suppression window latched for the whole
@@ -5360,6 +5315,280 @@ mod tests {
         c.mirror.set_user_id(Uuid::now_v7());
         c.mirror.upsert_member(row_id.into(), c.user_id, false);
         c.mirror.record_sealed_blob(&c.user_id, "blob");
+    }
+
+    /// `c.chat(last_seq, "")` with `fields` overriding its columns.
+    fn chat_with(c: &ResidentChat, last_seq: i64, fields: serde_json::Value) -> SyncEvent {
+        let SyncEvent::Put { table, id, data } = c.chat(last_seq, "") else {
+            unreachable!("chat() is a Put")
+        };
+        let mut row: serde_json::Value = serde_json::from_str(&data).expect("chat row");
+        for (k, v) in fields.as_object().expect("fields object") {
+            row[k] = v.clone();
+        }
+        SyncEvent::Put {
+            table,
+            id,
+            data: row.to_string(),
+        }
+    }
+
+    fn always_on_chat(c: &ResidentChat, last_seq: i64, always_on: bool) -> SyncEvent {
+        chat_with(
+            c,
+            last_seq,
+            json!({ "always_on": always_on as i64, "agent_session_id": "sid" }),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_turn_ending_past_the_threshold_queues_a_compaction() {
+        let mut c = ResidentChat::new();
+        let chat = chat_with(&c, 1, json!({ "auto_compact_tokens": 100_000 }));
+        c.window(vec![c.project(), chat, c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.reader_line(vec![
+            adapter::AgentEvent::ContextTokens(120_000),
+            adapter::AgentEvent::Result {
+                origin_is_task: false,
+            },
+        ])
+        .await;
+        c.respond(AgentResponse::TurnEnded {
+            topic: c.chat_id.clone(),
+        })
+        .await;
+        let queued = c.unconsumed();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].starts_with("/compact "));
+        assert!(c.supervisor.is_running(&c.chat_id), "no idle edge");
+    }
+
+    fn notices(c: &ResidentChat) -> usize {
+        c.spawned_prompts()
+            .iter()
+            .filter(|p| *p == RESTART_NOTICE)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn always_on_chat_starts_with_a_notice_and_stops_once_its_flag_is_off() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project()]).await;
+        c.writes();
+        c.window(vec![always_on_chat(&c, 1, true)]).await;
+        assert_eq!(c.spawned_prompts(), vec![RESTART_NOTICE.to_string()]);
+        assert_eq!(
+            c.recorded.lock().unwrap()[0].agent_session_id.as_deref(),
+            Some("sid")
+        );
+        assert!(
+            !c.writes()
+                .iter()
+                .any(|w| matches!(w, WriteEvent::PutMessage { .. })),
+            "the notice is no message row"
+        );
+
+        c.window(vec![always_on_chat(&c, 2, false), c.message(2, "/stop")])
+            .await;
+        assert!(!c.supervisor.has_agent(&c.chat_id));
+        assert_eq!(notices(&c), 1, "flag off in the /stop's window: no restart");
+
+        c.window(vec![always_on_chat(&c, 2, true)]).await;
+        assert_eq!(notices(&c), 2, "turning it on starts it again");
+
+        c.window(vec![always_on_chat(&c, 2, false)]).await;
+        c.window(vec![always_on_chat(&c, 3, false), c.message(3, "/stop")])
+            .await;
+        assert!(!c.supervisor.has_agent(&c.chat_id));
+        assert_eq!(notices(&c), 2, "flag off a window earlier: no restart");
+    }
+
+    #[tokio::test]
+    async fn a_clear_drops_the_chats_it_does_not_re_stream() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        restart(&mut c);
+        c.window(vec![
+            SyncEvent::Clear,
+            c.project(),
+            always_on_chat(&c, 1, true),
+        ])
+        .await;
+        assert_eq!(notices(&c), 1, "a re-streamed chat survives the clear");
+
+        restart(&mut c);
+        c.window(vec![SyncEvent::Clear, c.project()]).await;
+        assert_eq!(notices(&c), 0, "a chat deleted meanwhile doesn't start");
+        assert!(!c.mirror.chats.contains_key(&c.chat_id));
+    }
+
+    #[tokio::test]
+    async fn a_clear_discards_a_chat_staged_before_it() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        restart(&mut c);
+        c.window(vec![
+            always_on_chat(&c, 1, true),
+            SyncEvent::Clear,
+            c.project(),
+        ])
+        .await;
+        assert_eq!(notices(&c), 0);
+        assert!(!c.mirror.chats.contains_key(&c.chat_id));
+    }
+
+    /// The spawner restarts: state.json reloads, the supervisor is empty.
+    fn restart(c: &mut ResidentChat) {
+        let saved = serde_json::to_string(&c.mirror).unwrap();
+        c.mirror = serde_json::from_str(&saved).unwrap();
+        (c.supervisor, c.recorded) = supervisor_with_resident_recorder(c.resp_tx.clone());
+    }
+
+    #[tokio::test]
+    async fn boot_restarts_always_on_chats_unless_stopped() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        restart(&mut c);
+        c.window(vec![]).await;
+        assert_eq!(notices(&c), 1);
+
+        restart(&mut c);
+        c.window(vec![always_on_chat(&c, 2, false), c.message(2, "/stop")])
+            .await;
+        assert_eq!(notices(&c), 0, "a /stop synced at boot wins");
+
+        restart(&mut c);
+        c.window(vec![]).await;
+        assert_eq!(notices(&c), 0);
+    }
+
+    #[tokio::test]
+    async fn always_on_chats_start_one_at_a_time() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        c.chat_id = Uuid::now_v7().to_string();
+        c.window(vec![always_on_chat(&c, 1, true)]).await;
+        restart(&mut c);
+        c.window(vec![]).await;
+        assert_eq!(notices(&c), 1);
+
+        for session in c.supervisor.live_sessions().lock().unwrap().values() {
+            let mut st = session.lock().unwrap();
+            st.unconsumed.clear();
+            st.live_tasks.push(agent::LiveTask {
+                id: "monitor".into(),
+                description: String::new(),
+                task_type: "bash".into(),
+                subagent_type: None,
+                started_at: 0,
+            });
+        }
+        reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+        assert_eq!(
+            notices(&c),
+            2,
+            "the second starts once the first's turn is done, its monitor still armed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dying_always_on_resident_is_restarted_a_bounded_number_of_times() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        for _ in 0..5 {
+            c.supervisor.abort_agent(&c.chat_id).await;
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+        }
+        assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
+    }
+
+    #[tokio::test]
+    async fn toggling_always_on_while_another_chat_is_busy_resets_the_start_count() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        for _ in 0..ALWAYS_ON_RETRIES {
+            c.supervisor.abort_agent(&c.chat_id).await;
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+        }
+        let exhausted = c.chat_id.clone();
+        c.chat_id = Uuid::now_v7().to_string();
+        c.window(vec![c.chat(0, ""), c.message(1, "busy")]).await;
+        let busy = c.chat_id.clone();
+        c.chat_id = exhausted;
+        c.window(vec![always_on_chat(&c, 2, false)]).await;
+        c.window(vec![always_on_chat(&c, 3, true)]).await;
+        assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
+
+        c.supervisor.abort_agent(&busy).await;
+        reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+        assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize + 1);
+    }
+
+    #[tokio::test]
+    async fn a_pass_during_a_dying_residents_cleanup_keeps_its_start_count() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        for _ in 0..5 {
+            for session in c.supervisor.live_sessions().lock().unwrap().values() {
+                let mut st = session.lock().unwrap();
+                st.unconsumed.clear();
+                st.closed = true;
+            }
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+            c.supervisor.abort_agent(&c.chat_id).await;
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+        }
+        assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
+    }
+
+    #[tokio::test]
+    async fn a_members_always_on_chat_is_neither_started_nor_exempt() {
+        let mut c = ResidentChat::new();
+        invite(&mut c, "row");
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        assert!(c.spawned_prompts().is_empty());
+        assert!(c.mirror.always_on_chats().is_empty());
+    }
+
+    #[test]
+    fn a_saved_chat_missing_fields_still_loads() {
+        let mirror: Mirror =
+            serde_json::from_str(r#"{"chats":{"c":{"always_on":true}},"projects":{"p":"/p"}}"#)
+                .unwrap();
+        assert!(mirror.chats["c"].always_on);
+        assert_eq!(mirror.projects["p"], "/p");
+    }
+
+    #[tokio::test]
+    async fn only_always_on_chats_persist_and_without_their_title() {
+        let mut c = ResidentChat::new();
+        let key = c.keys.get(&c.user_id).expect("seeded key");
+        for (id, on) in [("on", true), ("off", false)] {
+            c.chat_id = id.into();
+            let SyncEvent::Put { data, .. } = always_on_chat(&c, 1, on) else {
+                unreachable!("always_on_chat() is a Put")
+            };
+            let mut row: serde_json::Value = serde_json::from_str(&data).unwrap();
+            row["title"] = json!(crypto::encrypt_field_b64(&key, "secret"));
+            c.mirror.upsert_chat(id.into(), &row.to_string(), &c.keys);
+        }
+        assert_eq!(c.mirror.chats["on"].title.as_deref(), Some("secret"));
+        let json = serde_json::to_string(&c.mirror).unwrap();
+        assert!(!json.contains("secret"));
+        let loaded: Mirror = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.always_on_chats(), HashSet::from(["on".to_string()]));
+        assert_eq!(loaded.chats["on"].agent_session_id.as_deref(), Some("sid"));
+        assert!(loaded.chats["on"].title.is_none());
     }
 
     #[tokio::test]
@@ -5917,14 +6146,21 @@ mod tests {
         tokio::time::advance(hour * 21).await;
 
         let pinned = HashSet::from(["idle-25h".to_string(), "idle-24h".to_string()]);
-        evict_idle_residents(&mut sup, || None, &write_tx, &pinned).await;
+        evict_idle_residents(&mut sup, || None, &write_tx, &pinned, &HashSet::new()).await;
         assert_eq!(
             sup.idle_residents().len(),
             3,
             "the two past 24h are pinned, the third is inside its TTL"
         );
 
-        let deadline = evict_idle_residents(&mut sup, || None, &write_tx, &HashSet::new()).await;
+        let deadline = evict_idle_residents(
+            &mut sup,
+            || None,
+            &write_tx,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .await;
         assert_eq!(deadline, Some(since["idle-24h"] + hour * 48));
         publish_alive_changes(&mut sup, &write_tx).await;
         let mut alive = Vec::new();
@@ -5975,86 +6211,46 @@ mod tests {
         )
     }
 
-    /// A resident mid-turn, then `/stop`.
-    async fn stopped_mid_turn() -> ResidentChat {
+    /// `/stop` and its old alias `/kill` end the turn and the process; the next
+    /// message resumes the session in a new one.
+    #[tokio::test]
+    async fn stop_ends_the_turn_and_the_process() {
+        for stop in ["/stop", "/kill"] {
+            let mut c = ResidentChat::new();
+            c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+                .await;
+            c.consume_first_turn();
+            assert_eq!(alive_writes(&c.writes()), vec![true]);
+            c.window(vec![c.chat(2, ""), c.message(2, stop)]).await;
+
+            assert!(!c.supervisor.has_agent(&c.chat_id), "{stop}");
+            let writes = c.writes();
+            assert!(writes.iter().any(is_interrupted), "{writes:?}");
+            assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
+            assert_eq!(alive_writes(&writes), vec![false]);
+
+            c.window(vec![c.chat(3, ""), c.message(3, "second")]).await;
+            assert_eq!(c.spawned_prompts(), vec!["first", "second"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_on_an_idle_resident_kills_it_quietly() {
         let mut c = ResidentChat::new();
         c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
             .await;
-        c.consume_first_turn();
+        c.session().lock().unwrap().unconsumed.clear();
         c.writes();
         c.window(vec![c.chat(2, ""), c.message(2, "/stop")]).await;
-        c
-    }
 
-    #[tokio::test]
-    async fn stop_interrupts_the_turn_and_keeps_the_process() {
-        let mut c = stopped_mid_turn().await;
-        assert!(c.session().lock().unwrap().interrupt.is_some());
-        assert!(c.writes().is_empty(), "nothing until the turn's result");
-
-        c.end_interrupted_turn().await;
-
+        assert!(!c.supervisor.has_agent(&c.chat_id));
         let writes = c.writes();
-        assert!(writes.iter().any(is_interrupted), "{writes:?}");
-        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
-        assert!(alive_writes(&writes).is_empty(), "process kept: {writes:?}");
-        assert_eq!(c.spawned_prompts(), vec!["first"]);
-    }
-
-    /// A message sent while the interrupt awaits its result respawns the
-    /// session with it, so the interrupt's hard-abort fallback can't drop it.
-    #[tokio::test(start_paused = true)]
-    async fn a_message_during_a_pending_interrupt_survives_its_timeout() {
-        let mut c = stopped_mid_turn().await;
-        c.window(vec![c.chat(3, ""), c.message(3, "second")]).await;
-        assert_eq!(c.spawned_prompts(), vec!["first", "second"]);
-        let writes = c.writes();
-        assert_eq!(writes.iter().filter(|w| is_interrupted(w)).count(), 1);
-
-        let timed_out = c.resp_rx.recv().await.unwrap();
-        assert!(matches!(timed_out, AgentResponse::InterruptTimedOut { .. }));
-        c.respond(timed_out).await;
-        assert!(
-            c.supervisor.is_running(&c.chat_id),
-            "second is still queued"
-        );
-        assert_eq!(c.unconsumed(), vec!["second"]);
-        assert!(c.writes().is_empty());
-    }
-
-    /// The old session's `Interrupted` was queued before a `/kill` closed
-    /// the chat out: no second "Agent interrupted".
-    #[tokio::test]
-    async fn an_interrupted_result_from_a_killed_session_is_ignored() {
-        let mut c = stopped_mid_turn().await;
-        let old = c.session();
-        c.window(vec![c.chat(3, ""), c.message(3, "/kill")]).await;
-        assert_eq!(c.writes().iter().filter(|w| is_interrupted(w)).count(), 1);
-
-        c.respond(AgentResponse::Interrupted {
-            topic: c.chat_id.clone(),
-            session: old,
-        })
-        .await;
-        assert!(c.writes().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stop_hard_aborts_when_the_interrupt_gets_no_result() {
-        let mut c = stopped_mid_turn().await;
-        let timed_out = c.resp_rx.recv().await.unwrap();
-        assert!(matches!(timed_out, AgentResponse::InterruptTimedOut { .. }));
-        c.respond(timed_out).await;
-
-        assert!(!c.supervisor.is_running(&c.chat_id));
-        let writes = c.writes();
-        assert!(writes.iter().any(is_interrupted), "{writes:?}");
-        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
+        assert!(!writes.iter().any(is_interrupted), "{writes:?}");
         assert_eq!(alive_writes(&writes), vec![false]);
     }
 
     #[tokio::test]
-    async fn stop_with_a_queued_turn_hard_aborts_dropping_it() {
+    async fn stop_with_a_queued_turn_drops_it() {
         let mut c = ResidentChat::new();
         c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
             .await;
@@ -6063,82 +6259,14 @@ mod tests {
         c.writes();
         c.window(vec![c.chat(3, ""), c.message(3, "/stop")]).await;
 
-        assert!(!c.supervisor.is_running(&c.chat_id));
+        assert!(!c.supervisor.has_agent(&c.chat_id));
         let writes = c.writes();
         assert!(writes.iter().any(is_interrupted), "{writes:?}");
         assert_eq!(alive_writes(&writes), vec![false]);
     }
 
-    /// Renaming the chat mid-turn queues the spawner's own `/rename`. `/stop`
-    /// must still be the soft interrupt it promises: the process, its armed
-    /// monitors and `agent_alive` all survive.
     #[tokio::test]
-    async fn stop_past_a_queued_rename_keeps_the_process() {
-        let mut c = ResidentChat::new();
-        c.window(vec![
-            c.project(),
-            c.titled_chat(1, "cover letters"),
-            c.message(1, "first"),
-        ])
-        .await;
-        c.consume_first_turn();
-        c.window(vec![c.titled_chat(1, "my voice writer")]).await;
-        assert_eq!(c.unconsumed(), vec!["/rename my voice writer"]);
-        c.writes();
-
-        c.window(vec![
-            c.titled_chat(2, "my voice writer"),
-            c.message(2, "/stop"),
-        ])
-        .await;
-
-        assert!(c.session().lock().unwrap().interrupt.is_some());
-        assert!(c.supervisor.is_working(&c.chat_id), "process kept");
-        let writes = c.writes();
-        assert!(
-            writes.is_empty(),
-            "nothing until the turn's result: {writes:?}"
-        );
-
-        c.end_interrupted_turn().await;
-        let writes = c.writes();
-        assert!(writes.iter().any(is_interrupted), "{writes:?}");
-        assert!(alive_writes(&writes).is_empty(), "process kept: {writes:?}");
-
-        // Claude runs the rename right after the interrupt (`still_queued`) —
-        // as silently as ever.
-        let uuid = c.session().lock().unwrap().unconsumed[0].uuid.clone();
-        for line in [
-            format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"started","session_id":"s1"}}"#),
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Session renamed to: my voice writer"}],"usage":{"input_tokens":9000,"output_tokens":1}}}"#.to_string(),
-            format!(r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"/rename my voice writer"}}]}},"session_id":"s1","uuid":"{uuid}","isReplay":true}}"#),
-            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#.to_string(),
-        ] {
-            c.reader_raw(&line).await;
-            assert!(!c.supervisor.is_running(&c.chat_id), "never busy");
-        }
-        let writes = c.writes();
-        assert!(writes.is_empty(), "the rename is silent: {writes:?}");
-    }
-
-    #[tokio::test]
-    async fn kill_ends_the_process_and_its_alive_flag() {
-        let mut c = ResidentChat::new();
-        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
-            .await;
-        c.consume_first_turn();
-        assert_eq!(alive_writes(&c.writes()), vec![true]);
-        c.window(vec![c.chat(2, ""), c.message(2, "/kill")]).await;
-
-        assert!(!c.supervisor.is_running(&c.chat_id));
-        let writes = c.writes();
-        assert!(writes.iter().any(is_interrupted), "{writes:?}");
-        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
-        assert_eq!(alive_writes(&writes), vec![false]);
-    }
-
-    #[tokio::test]
-    async fn kill_without_a_process_only_clears_the_alive_flag() {
+    async fn stop_without_a_process_only_clears_the_alive_flag() {
         let mut c = ResidentChat::new();
         c.window(vec![c.project(), c.chat(1, ""), c.message(1, "/kill")])
             .await;
@@ -6360,47 +6488,22 @@ mod tests {
         assert_eq!(c.spawned_prompts(), vec!["first"]);
     }
 
-    /// A prune parked by the turn `/stop` cut must not restart the stopped
-    /// chat: neither at its interrupted result nor from a late cue (codex's
-    /// prune command outlives `turn/interrupt`).
+    /// A prune cue arriving after `/stop` (a late RPC) must not restart the
+    /// stopped chat.
     #[tokio::test]
     async fn a_prune_of_a_stopped_turn_does_not_restart_the_chat() {
-        let mut c = stopped_mid_turn().await;
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
         c.mirror.set_agent_session_id(&c.chat_id, "sid".into());
         let prunes = c.supervisor.pending_prunes();
         park_prune(&prunes, &c.chat_id);
-        let session = c.session();
-        let request_id = session
-            .lock()
-            .unwrap()
-            .interrupt
-            .clone()
-            .unwrap()
-            .request_id;
-        for ev in [
-            adapter::AgentEvent::InterruptAcked(request_id),
-            adapter::AgentEvent::Result {
-                origin_is_task: false,
-            },
-        ] {
-            crate::agent::reduce(&mut session.lock().unwrap(), &ev);
-        }
-        let mirror = c.shared_mirror();
-        let topic = c.chat_id.clone();
-        for resp in [
-            AgentResponse::Interrupted {
-                topic: topic.clone(),
-                session,
-            },
-            AgentResponse::RunState {
-                topic: topic.clone(),
-                running: false,
-            },
-        ] {
-            route_agent_response(resp, &prunes, &mirror, &mut c.supervisor, &c.write_tx).await;
-        }
+        c.window(vec![c.chat(2, ""), c.message(2, "/stop")]).await;
         assert!(prunes.lock().await.is_empty());
 
+        let mirror = c.shared_mirror();
+        let topic = c.chat_id.clone();
         park_prune(&prunes, &topic);
         let cue = AgentResponse::ToolResult {
             topic: topic.clone(),
@@ -6408,7 +6511,7 @@ mod tests {
         route_agent_response(cue, &prunes, &mirror, &mut c.supervisor, &c.write_tx).await;
         assert!(prunes.lock().await.is_empty());
         assert_eq!(c.spawned_prompts(), vec!["first"]);
-        assert!(c.supervisor.has_agent(&topic), "the process is kept");
+        assert!(!c.supervisor.has_agent(&topic));
     }
 
     #[tokio::test]

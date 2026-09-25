@@ -370,11 +370,11 @@ impl AgentAdapter for ClaudeAdapter {
         crate::adapter::slash_command_name(prompt).is_some()
     }
 
-    fn names_session(&self) -> bool {
-        true
+    fn command_runs_alone(&self, prompt: &str) -> bool {
+        crate::adapter::slash_command_name(prompt) == Some("compact")
     }
 
-    fn can_interrupt(&self) -> bool {
+    fn names_session(&self) -> bool {
         true
     }
 
@@ -442,15 +442,6 @@ impl AgentAdapter for ClaudeAdapter {
                 "role": "user",
                 "content": [{ "type": "text", "text": text }],
             },
-        });
-        Some(format!("{}\n", frame))
-    }
-
-    fn encode_interrupt(&mut self, request_id: &str) -> Option<String> {
-        let frame = serde_json::json!({
-            "type": "control_request",
-            "request_id": request_id,
-            "request": { "subtype": "interrupt" },
         });
         Some(format!("{}\n", frame))
     }
@@ -613,13 +604,6 @@ impl AgentAdapter for ClaudeAdapter {
                     }
                 }
                 skip = true;
-            } else if line.contains("\"type\":\"control_response\"") {
-                // Ack of our interrupt `control_request`. An error ack is no
-                // ack: `/stop`'s timeout then hard-aborts a still-running turn.
-                if line.contains("\"subtype\":\"success\"") {
-                    out.extend(parse_control_response_id(&line).map(AgentEvent::InterruptAcked));
-                }
-                skip = true;
             } else if line.contains("\"type\":\"command_lifecycle\"") {
                 // Queue bookkeeping emitted only under `--replay-user-messages`.
                 if line.contains("\"state\":\"started\"") {
@@ -644,9 +628,8 @@ impl AgentAdapter for ClaudeAdapter {
                 let origin_is_task =
                     line.contains("\"origin\"") && line.contains("\"kind\":\"task-notification\"");
                 out.push(AgentEvent::Result { origin_is_task });
-                // Resident interrupt suppression. Now mainly covers the /stop
-                // SIGTERM race (and interrupt-then-send, also a SIGTERM): we
-                // publish our own canonical `{"type":"result","subtype":
+                // Hard-abort suppression (`/stop`, interrupt-then-send - both
+                // SIGTERM): we publish our own canonical `{"type":"result","subtype":
                 // "interrupted"}` row, and claude may flush a real abort result
                 // for the killed turn before the process dies.
                 // claude ALSO emits a real abort result for the killed turn —
@@ -687,20 +670,6 @@ fn parse_started_command_uuid(line: &str) -> Option<String> {
     serde_json::from_str::<Lifecycle>(line)
         .ok()
         .map(|l| l.command_uuid)
-}
-
-fn parse_control_response_id(line: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Response {
-        request_id: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct ControlResponse {
-        response: Response,
-    }
-    serde_json::from_str::<ControlResponse>(line)
-        .ok()
-        .map(|r| r.response.request_id)
 }
 
 fn parse_replay_echo(line: &str) -> Option<AgentEvent> {
@@ -1978,6 +1947,14 @@ mod tests {
     }
 
     #[test]
+    fn only_compact_runs_alone() {
+        let a = ClaudeAdapter::new();
+        assert!(a.command_runs_alone("/compact keep the plan"));
+        assert!(!a.command_runs_alone("/rename x"));
+        assert!(!a.command_runs_alone("/compacting"));
+    }
+
+    #[test]
     fn command_lifecycle_frame_is_dropped() {
         let mut a = ClaudeAdapter::new();
         let line = r#"{"type":"command_lifecycle","command_uuid":"01a08b19-5a10-7bf2-a142-2dd72f212045","state":"queued","uuid":"20832165-4c87-43cf-b694-bb2c0b58bce5","session_id":"s1"}"#;
@@ -2099,27 +2076,6 @@ mod tests {
             v["message"]["content"][0]["text"],
             "hello \"world\"\nwith newline"
         );
-    }
-
-    /// Real claude 2.1.265 ack (tmp/queued_interrupt_probe.log) is not a row;
-    /// an error ack is no ack.
-    #[test]
-    fn interrupt_request_and_its_ack() {
-        let mut a = ClaudeAdapter::new();
-        let frame = a.encode_interrupt("int-1").unwrap();
-        let v: serde_json::Value = serde_json::from_str(frame.trim_end()).unwrap();
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "type": "control_request",
-                "request_id": "int-1",
-                "request": { "subtype": "interrupt" },
-            })
-        );
-        let ack = r#"{"type":"control_response","response":{"subtype":"success","request_id":"int-1","response":{"still_queued":[]}}}"#;
-        assert_eq!(run(&mut a, ack), vec!["InterruptAcked(int-1)"]);
-        let error = r#"{"type":"control_response","response":{"subtype":"error","request_id":"int-1","error":"x"}}"#;
-        assert!(run(&mut a, error).is_empty());
     }
 
     #[test]

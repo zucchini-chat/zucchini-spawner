@@ -8,13 +8,13 @@
 //! its response is the session id. Every user turn is a `turn/start` stamped
 //! with `clientUserMessageId`: on a busy thread it joins the running turn, and
 //! codex echoes the id on the `userMessage` item once the input is recorded
-//! (`UserTurnConsumed`). `/stop` is `turn/interrupt`. `/compact` is
+//! (`UserTurnConsumed`). `/compact` is
 //! `thread/compact/start`, held until the chat is idle — on a busy thread it
 //! would interrupt the running turn. Teardown closes stdin: SIGTERM leaves the
 //! shell commands codex runs (in process groups of their own) orphaned.
 //!
 //! JSON-RPC ids are strings naming what they answer: `init`, `thread`,
-//! `turn:<uuid>`, `compact:<uuid>`, `interrupt:<request id>`.
+//! `turn:<uuid>`, `compact:<uuid>`.
 //!
 //! Notification mapping (codex → claude-shape; codex frames are never
 //! iOS-renderable as-is). Tool items surface on `item/started` (in flight); the
@@ -136,7 +136,7 @@ pub struct CodexAdapter {
     handshake: Handshake,
     /// Frames for the writer: the handshake and refusals of server requests.
     outbound: Vec<String>,
-    /// The running turn, the target of `turn/interrupt`.
+    /// The running turn.
     active_turn: Option<String>,
     /// `(uuid, turn id)` of accepted `turn/start`s whose `clientId` echo hasn't
     /// arrived. A turn that ends without recording the input (it failed first,
@@ -236,9 +236,6 @@ impl CodexAdapter {
                 }
             }
             ("compact", None) => out.push(AgentEvent::UserTurnConsumed(key.to_string())),
-            // A refused interrupt means the turn already ended: ack it, so the
-            // stop settles as a no-op instead of waiting out its timeout.
-            ("interrupt", _) => out.push(AgentEvent::InterruptAcked(key.to_string())),
             _ => {}
         }
     }
@@ -282,8 +279,6 @@ impl CodexAdapter {
                 self.active_turn = params["turn"]["id"].as_str().map(str::to_string);
                 out.extend(self.active_turn.clone().map(AgentEvent::TurnStarted));
             }
-            // Result first: the reader swallows the frames of a line that ends
-            // a `/stop`-interrupted turn from its `Result` on.
             "turn/completed" => {
                 self.active_turn = None;
                 let turn_id = params["turn"]["id"].as_str().unwrap_or("");
@@ -437,22 +432,6 @@ impl AgentAdapter for CodexAdapter {
         })
     }
 
-    fn can_interrupt(&self) -> bool {
-        true
-    }
-
-    fn encode_interrupt(&mut self, request_id: &str) -> Option<String> {
-        let Handshake::Open(thread_id) = &self.handshake else {
-            return None;
-        };
-        let turn_id = self.active_turn.as_ref()?;
-        Some(rpc_request(
-            &format!("interrupt:{request_id}"),
-            "turn/interrupt",
-            json!({ "threadId": thread_id, "turnId": turn_id }),
-        ))
-    }
-
     fn exits_on_stdin_eof(&self) -> bool {
         true
     }
@@ -468,8 +447,8 @@ impl AgentAdapter for CodexAdapter {
         false
     }
 
-    fn serializes_command_turns(&self) -> bool {
-        true
+    fn command_runs_alone(&self, prompt: &str) -> bool {
+        is_compact(prompt)
     }
 
     fn writer_follows_every_line(&self) -> bool {
@@ -2076,46 +2055,12 @@ mod tests {
     }
 
     #[test]
-    fn stop_interrupts_the_running_turn() {
+    fn an_interrupted_turn_renders_as_interrupted() {
         let mut a = open_session();
-        assert!(a.can_interrupt());
-        assert!(
-            a.encode_interrupt("r1").is_none(),
-            "no turn to interrupt yet"
-        );
         run(&mut a, TURN_STARTED);
-        let interrupt = rpc(&a.encode_interrupt("r1").unwrap());
-        assert_eq!(interrupt["id"], "interrupt:r1");
-        assert_eq!(interrupt["method"], "turn/interrupt");
-        assert_eq!(
-            interrupt["params"],
-            json!({ "threadId": THREAD, "turnId": "01a0ccc6-1d09-7902-a2b6-7d39a30c6290" })
-        );
-        assert_eq!(
-            run(&mut a, r#"{"id":"interrupt:r1","result":{}}"#),
-            vec!["InterruptAcked(r1)"]
-        );
         let events = run(&mut a, TURN_INTERRUPTED);
-        assert_eq!(
-            events[0], "Result",
-            "Result first: the reader swallows what follows"
-        );
+        assert_eq!(events[0], "Result");
         assert_eq!(events[1], format!("Frame({INTERRUPTED_RESULT})"));
-        assert!(a.encode_interrupt("r2").is_none(), "the turn is over");
-    }
-
-    /// An interrupt racing the turn's natural end is refused; the ack still
-    /// comes, so the stop settles instead of waiting out its timeout.
-    #[test]
-    fn a_refused_interrupt_still_acks() {
-        let mut a = open_session();
-        assert_eq!(
-            run(
-                &mut a,
-                r#"{"id":"interrupt:r1","error":{"code":-32600,"message":"no active turn"}}"#
-            ),
-            vec!["InterruptAcked(r1)"]
-        );
     }
 
     /// A turn that ends without echoing an accepted input still consumes it,
@@ -2162,6 +2107,7 @@ mod tests {
         assert!(!a.is_command_turn("/init"));
         assert!(!a.is_command_turn("please /compact"));
         assert!(!a.command_interrupts_turn());
+        assert!(a.command_runs_alone("/compact keep the plan"));
 
         let compact = rpc(&a.encode_user_turn("u3", "/compact keep the plan").unwrap());
         assert_eq!(compact["id"], "compact:u3");

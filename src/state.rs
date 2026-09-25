@@ -1,7 +1,7 @@
 //! In-memory mirror of the chats/projects rows streamed from PowerSync, plus the
-//! per-bucket sync cursors. Projects + cursors are persisted to `state.json`; chats
-//! are transient because PowerSync only delivers ops after the saved cursor and we'd
-//! miss any chat created before the last restart otherwise.
+//! per-bucket sync cursors. Projects + cursors are persisted to `state.json`; of
+//! the chats only the always-on ones are (minus the plaintext title), so boot can
+//! start their residents although PowerSync resumes from the saved cursor.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -21,6 +21,8 @@ use crate::adapter::AgentKind;
 /// `std::sync::RwLock` would deadlock + trip `clippy::await_holding_lock`.
 pub type SharedMirror = Arc<tokio::sync::RwLock<Mirror>>;
 
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChatState {
     pub user_id: Uuid,
     pub project_id: String,
@@ -51,19 +53,26 @@ pub struct ChatState {
     /// `chats.title`, DECRYPTED (the column is K_machine-sealed under the chat
     /// OWNER's key, like `messages.body`). `None` when the chat has no title or
     /// the owner's key isn't unsealed yet — a chats row re-streams on every
-    /// writeback, so a miss heals on the next one. Never persisted: `chats` is
-    /// `#[serde(skip)]`, so no plaintext reaches state.json. Feeds
+    /// writeback, so a miss heals on the next one. Never persisted, so no
+    /// plaintext reaches state.json. Feeds
     /// `claude --name` via `session_name::from_title`.
+    #[serde(skip)]
     pub title: Option<String>,
     /// `chats.pinned_at` (migration 0014) is non-NULL: the user pinned this chat
     /// to the top of the list. A warm resident of a pinned chat is evicted last
     /// and on a longer TTL (`warm.rs`).
     pub pinned: bool,
+    /// `chats.always_on` (migration 0052): the chat's resident is never evicted
+    /// and is started whenever missing (`main.rs::reconcile_always_on`).
+    pub always_on: bool,
+    /// `chats.auto_compact_tokens` (migration 0054): compact the resident once
+    /// its context reaches this many tokens (`SessionState::after_turn`).
+    pub auto_compact_tokens: Option<i64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Mirror {
-    #[serde(skip)]
+    #[serde(default, serialize_with = "serialize_always_on_chats")]
     pub chats: HashMap<String, ChatState>,
     #[serde(default)]
     pub projects: HashMap<String, String>,
@@ -113,9 +122,20 @@ pub struct Mirror {
     /// no agent outlives the spawner (`orphans.rs`).
     #[serde(default)]
     flagged_chats: HashSet<String>,
-    /// `stale_flagged_chats_at_boot` already ran this process.
+    /// `first_checkpoint` already ran this process.
     #[serde(skip)]
-    stale_flags_taken: bool,
+    booted: bool,
+    /// Per always-on chat, starts of its resident no reconcile pass has seen
+    /// alive yet (`main.rs::reconcile_always_on`).
+    #[serde(skip)]
+    pub always_on_starts: HashMap<String, u32>,
+}
+
+fn serialize_always_on_chats<S: serde::Serializer>(
+    chats: &HashMap<String, ChatState>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.collect_map(chats.iter().filter(|(_, c)| c.always_on))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -252,17 +272,41 @@ impl Mirror {
                         crate::crypto::decrypt_field_b64(&key, ct)
                     }),
                 pinned: v.get("pinned_at").is_some_and(|p| !p.is_null()),
+                always_on: crate::json_pg_bool(v.get("always_on")),
+                auto_compact_tokens: v.get("auto_compact_tokens").and_then(crate::json_to_i64),
             },
         );
     }
 
     /// Chats the user pinned; their warm residents are evicted last (`warm.rs`).
     pub fn pinned_chats(&self) -> HashSet<String> {
+        self.chat_ids(|c| c.pinned).into_iter().collect()
+    }
+
+    /// Always-on chats whose warm residents are never evicted (`warm.rs`).
+    /// Only the machine owner's: a member must not pin the owner's machine.
+    pub fn always_on_chats(&self) -> HashSet<String> {
         self.chats
-            .iter()
-            .filter(|(_, c)| c.pinned)
-            .map(|(id, _)| id.clone())
+            .keys()
+            .filter(|id| self.is_always_on(id))
+            .cloned()
             .collect()
+    }
+
+    pub fn is_always_on(&self, chat_id: &str) -> bool {
+        self.chats
+            .get(chat_id)
+            .is_some_and(|c| c.always_on && self.is_owner(c.user_id))
+    }
+
+    /// True on the first call per process.
+    pub fn first_checkpoint(&mut self) -> bool {
+        !std::mem::replace(&mut self.booted, true)
+    }
+
+    /// `first_checkpoint` ran: the boot window is applied.
+    pub fn booted(&self) -> bool {
+        self.booted
     }
 
     /// Stash the harvested session id locally so a fast-followup user message
@@ -518,13 +562,10 @@ impl Mirror {
         self.flagged_chats.remove(id);
     }
 
-    /// The flagged chats on the first call per process (at boot all their
-    /// flags are stale), none after. They stay flagged until their reset rows
-    /// sync back, so a restart before the writer flushes resets them again.
-    pub fn stale_flagged_chats_at_boot(&mut self) -> Vec<String> {
-        if std::mem::replace(&mut self.stale_flags_taken, true) {
-            return Vec::new();
-        }
+    /// The flagged chats; at boot all their flags are stale. They stay flagged
+    /// until their reset rows sync back, so a restart before the writer
+    /// flushes resets them again.
+    pub fn flagged_chat_ids(&self) -> Vec<String> {
         self.flagged_chats.iter().cloned().collect()
     }
 

@@ -43,9 +43,12 @@ pub type ImportProgress = Box<dyn Fn(u8) -> BoxFuture<'static, ()> + Send + Sync
 
 /// Picks the adapter at spawn time. Mirrors the `chats.agent_kind` enum
 /// stored in Postgres.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
+    #[default]
     Claude,
     Cursor,
     Codex,
@@ -393,9 +396,6 @@ pub enum AgentEvent {
     /// `SendMessage`, or a self-fired one (a `CronCreate` prompt) that is
     /// never echoed.
     TurnStarted(String),
-    /// Resident model only — the CLI accepted our interrupt `control_request`
-    /// with this `request_id`. It precedes the interrupted turn's `result`.
-    InterruptAcked(String),
     /// The agent's own `prune-context` call has PERSISTED its result. Content-free
     /// CUE the main loop uses to drive the prune restart: when the chat has a queued
     /// `PruneRequest`, the loop aborts → rewrites → respawns NOW (strictly after the
@@ -520,18 +520,6 @@ pub trait AgentAdapter: Send + Sync {
         unreachable!("encode_user_turn called on a one-shot adapter")
     }
 
-    /// Resident: `/stop` can end the running turn while the process lives on
-    /// (`encode_interrupt`). `false` (default) ⇒ `/stop` hard-aborts.
-    fn can_interrupt(&self) -> bool {
-        false
-    }
-
-    /// Resident: the stdin frame asking the CLI to end its running turn,
-    /// written by the writer; `None` while it can't be addressed yet.
-    fn encode_interrupt(&mut self, _request_id: &str) -> Option<String> {
-        None
-    }
-
     /// Per-stdout-line processing. Stateful for the lifetime of one turn so
     /// future delta-shaped adapters (hermes/gemini) can buffer internally.
     /// Returns 0..N events to forward to Supervisor's response channel.
@@ -588,11 +576,12 @@ pub trait AgentAdapter: Send + Sync {
         true
     }
 
-    /// A command turn runs alone: nothing queued behind it is written until it
-    /// is consumed and its `result` arrives (codex — a `turn/start` sent into a
-    /// compaction has no defined outcome). `false` (claude): turns behind it go
-    /// to stdin at once and the CLI queues them itself.
-    fn serializes_command_turns(&self) -> bool {
+    /// `prompt` (a command turn) runs alone: nothing queued behind it is
+    /// written until it is consumed and its `result` arrives — a turn sent into
+    /// a compaction has no defined outcome. `/compact` on claude and codex;
+    /// behind any other command turn claude takes the turns at once and queues
+    /// them itself.
+    fn command_runs_alone(&self, _prompt: &str) -> bool {
         false
     }
 
@@ -1163,7 +1152,6 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
                 format!("PeerTurnConsumed({name}: {body})")
             }
             AgentEvent::TurnStarted(s) => format!("TurnStarted({})", s),
-            AgentEvent::InterruptAcked(s) => format!("InterruptAcked({})", s),
             AgentEvent::ToolResult => "ToolResult".to_string(),
         })
         .collect()

@@ -8,7 +8,8 @@
 //!
 //! A pinned chat's resident gets `PINNED_TTL_FACTOR` x that TTL (still capped
 //! at 48h) and is picked as victim only when every idle resident is pinned —
-//! the unpinned crowd goes first, pressure included.
+//! the unpinned crowd goes first, pressure included. An always-on chat's
+//! resident is never picked; it still counts toward `n_eff`.
 
 use std::time::Duration;
 use tokio::time::Instant;
@@ -29,6 +30,8 @@ pub struct IdleResident {
     pub footprint_kb: Option<u64>,
     /// `chats.pinned_at` is set (`state.rs`).
     pub pinned: bool,
+    /// `chats.always_on` is set (`state.rs`).
+    pub always_on: bool,
 }
 
 pub struct Memory {
@@ -91,7 +94,7 @@ pub fn choose(idle: &[IdleResident], memory: Option<&Memory>, now: Instant) -> D
     let victim = idle
         .iter()
         .enumerate()
-        .filter(|(_, r)| pressure || age(r) >= ttl_for(r, n_eff))
+        .filter(|(_, r)| !r.always_on && (pressure || age(r) >= ttl_for(r, n_eff)))
         .min_by_key(|(_, r)| (r.pinned, r.idle_since));
     match victim {
         Some((victim, r)) => Decision::Evict(Eviction {
@@ -103,6 +106,7 @@ pub fn choose(idle: &[IdleResident], memory: Option<&Memory>, now: Instant) -> D
         }),
         None => idle
             .iter()
+            .filter(|r| !r.always_on)
             .map(|r| r.idle_since + ttl_for(r, n_eff))
             .min()
             .map_or(Decision::KeepAll, Decision::WaitUntil),
@@ -130,6 +134,7 @@ mod tests {
                 pid: None,
                 footprint_kb,
                 pinned: false,
+                always_on: false,
             })
             .collect()
     }
@@ -245,6 +250,27 @@ mod tests {
             panic!("expected an eviction");
         };
         assert_eq!((e.victim, e.ttl), (0, MAX_TTL));
+    }
+
+    #[test]
+    fn always_on_residents_are_never_evicted() {
+        let now = Instant::now() + Duration::from_secs(1000 * 3600);
+        let pressed = Memory {
+            total_kb: GB_KB,
+            pressure: true,
+        };
+        let mut three = idle(&[999.0, 998.0, 1.0], Some(GB_KB), now);
+        three[0].always_on = true;
+        three[1].always_on = true;
+        let Decision::Evict(e) = choose(&three, Some(&pressed), now) else {
+            panic!("expected an eviction");
+        };
+        assert_eq!(e.victim, 2);
+        assert_eq!(e.n_eff, 120.0, "always-on residents still count");
+
+        three[2].always_on = true;
+        assert_eq!(choose(&three, Some(&pressed), now), Decision::KeepAll);
+        assert_eq!(choose(&three, None, now), Decision::KeepAll);
     }
 
     #[test]

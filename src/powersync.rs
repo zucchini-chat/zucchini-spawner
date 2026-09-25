@@ -66,6 +66,9 @@ pub enum SyncEvent {
         table: String,
         id: String,
     },
+    /// A compacted bucket restarts: every live row re-streams before the next
+    /// `CheckpointComplete`, and rows deleted meanwhile get no `Remove`.
+    Clear,
     /// Emitted on every `CheckpointComplete` frame. The caller should persist the
     /// snapshot atomically alongside any derived state (projects mirror, etc.).
     CheckpointComplete {
@@ -405,6 +408,9 @@ async fn connect_and_stream(
                         OpKind::Move => {}
                         OpKind::Clear => {
                             buckets.insert(data.bucket.clone(), "0".to_string());
+                            if tx.send(SyncEvent::Clear).await.is_err() {
+                                return Ok(ConnectExit::Eof);
+                            }
                         }
                     }
                 }
