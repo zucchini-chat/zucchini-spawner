@@ -476,9 +476,12 @@ async fn handle_sync_event(
                     staging.chats.entry(id).or_insert(StagedRow::Remove);
                 }
             }
+            let mut thresholds_set = Vec::new();
             for (id, row) in staging.chats.drain() {
                 match row {
                     StagedRow::Put(json) => {
+                        let old_threshold =
+                            mirror.chats.get(&id).and_then(|c| c.auto_compact_tokens);
                         // Preserve a locally-harvested session id across a
                         // checkpoint that re-delivers the row with
                         // agent_session_id=NULL (the harvest is set locally
@@ -508,6 +511,11 @@ async fn handle_sync_event(
                         if let Some(chat) = mirror.chats.get(&id) {
                             let name = chat.title.as_deref().and_then(session_name::from_title);
                             supervisor.rename_resident(&id, name.as_deref());
+                            if chat.auto_compact_tokens.is_some()
+                                && chat.auto_compact_tokens != old_threshold
+                            {
+                                thresholds_set.push(id.clone());
+                            }
                         }
                     }
                     StagedRow::Remove => delete_chat(&id, mirror, supervisor).await,
@@ -534,6 +542,17 @@ async fn handle_sync_event(
             let window = window_user_seqs(&pending_messages);
             for raw in pending_messages {
                 handle_message_put(&raw, &window, mirror, supervisor, blobs, keys, write_tx).await;
+            }
+
+            // After the messages: a user turn they queued comes before any compaction.
+            for chat_id in thresholds_set {
+                let Some(chat) = mirror.chats.get(&chat_id) else {
+                    continue;
+                };
+                let timezone = mirror.member_timezone(&chat.user_id);
+                if supervisor.after_threshold_set(&chat_id, chat.auto_compact_tokens, timezone) {
+                    publish_queued_turn(supervisor, write_tx, mirror, chat_id).await;
+                }
             }
 
             // After the messages: a client switches always-on off no later than
@@ -736,6 +755,21 @@ async fn publish_interrupted(write_tx: &mpsc::Sender<WriteEvent>, chat_id: &str,
 /// background task / monitor is still armed (the old "Waiting…" window). The
 /// Thinking-vs-Waiting sub-state is re-derived on the client, so the spawner
 /// does NOT distinguish them on the wire. One write per busy↔idle transition.
+/// A turn was queued on a live resident: the queued count is part of the
+/// pill's task list, and nothing else publishes it until the CLI echoes the
+/// turn.
+async fn publish_queued_turn(
+    supervisor: &Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+    mirror: &Mirror,
+    chat_id: String,
+) {
+    if let Some(tasks) = supervisor.live_tasks_change(&chat_id) {
+        send_live_tasks(write_tx, mirror, chat_id.clone(), tasks).await;
+    }
+    send_run_state(write_tx, chat_id, true).await;
+}
+
 async fn send_run_state(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String, running: bool) {
     let _ = write_tx
         .send(WriteEvent::chat_running(chat_id, running))
@@ -1308,12 +1342,7 @@ async fn handle_message_put(
         // claude answers it within the running turn or right after it.
         if supervisor.send_user_turn(&req) {
             info!(chat_id = %chat_id, "queued user turn on the live resident session");
-            // The queued count is part of the pill's task list, and nothing else
-            // publishes it until the CLI echoes the turn.
-            if let Some(tasks) = supervisor.live_tasks_change(&chat_id) {
-                send_live_tasks(write_tx, mirror, chat_id.clone(), tasks).await;
-            }
-            send_run_state(write_tx, chat_id, true).await;
+            publish_queued_turn(supervisor, write_tx, mirror, chat_id).await;
             return;
         }
         // Otherwise (no live process, other knobs, or a slash command mid-turn)
@@ -1427,7 +1456,9 @@ fn reconcile_always_on(mirror: &mut Mirror, supervisor: &mut Supervisor) {
     }
     let always_on = mirror.always_on_chats();
     // Switching always-on off resets the count, even while another chat is busy.
-    mirror.always_on_starts.retain(|id, _| always_on.contains(id));
+    mirror
+        .always_on_starts
+        .retain(|id, _| always_on.contains(id));
     if supervisor.any_in_foreground() {
         return;
     }
@@ -5363,6 +5394,57 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert!(queued[0].starts_with("/compact "));
         assert!(c.supervisor.is_running(&c.chat_id), "no idle edge");
+    }
+
+    #[tokio::test]
+    async fn a_threshold_set_below_an_idle_residents_context_compacts_at_once() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.reader_line(vec![
+            adapter::AgentEvent::ContextTokens(120_000),
+            adapter::AgentEvent::Result {
+                origin_is_task: false,
+            },
+        ])
+        .await;
+        c.window(vec![chat_with(
+            &c,
+            2,
+            json!({ "auto_compact_tokens": 200_000 }),
+        )])
+        .await;
+        assert!(c.unconsumed().is_empty(), "below the threshold");
+
+        c.window(vec![
+            chat_with(&c, 2, json!({ "auto_compact_tokens": 100_000 })),
+            c.message(2, "second"),
+        ])
+        .await;
+        assert_eq!(c.unconsumed().len(), 1, "the user's turn goes first");
+        c.consume_first_turn();
+        c.reader_line(vec![adapter::AgentEvent::Result {
+            origin_is_task: false,
+        }])
+        .await;
+
+        c.window(vec![chat_with(
+            &c,
+            3,
+            json!({ "auto_compact_tokens": 110_000 }),
+        )])
+        .await;
+        let queued = c.unconsumed();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].starts_with("/compact "));
+        c.window(vec![chat_with(
+            &c,
+            3,
+            json!({ "auto_compact_tokens": 90_000 }),
+        )])
+        .await;
+        assert_eq!(c.unconsumed().len(), 1, "already compacting");
     }
 
     fn notices(c: &ResidentChat) -> usize {

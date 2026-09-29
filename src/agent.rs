@@ -349,6 +349,16 @@ impl SessionState {
             }
         }
     }
+
+    /// `after_turn` for a threshold the user just set: an idle session already
+    /// past it compacts now, not after its next turn. A compaction under way
+    /// is left to its own turn ends.
+    fn after_threshold_set(&mut self, threshold: Option<i64>) -> Option<String> {
+        if self.auto_compact != AutoCompact::Off {
+            return None;
+        }
+        self.after_turn(threshold, false)
+    }
 }
 
 /// PURE event→state reducer — the single source of truth for the resident
@@ -1262,14 +1272,35 @@ impl Supervisor {
         always_on: bool,
         user_timezone: Option<&str>,
     ) -> bool {
+        self.queue_auto_compaction(topic, user_timezone, |st| {
+            st.after_turn(threshold, always_on)
+        })
+    }
+
+    /// Queue the compaction a threshold just set on an idle live resident
+    /// owes (`SessionState::after_threshold_set`).
+    pub fn after_threshold_set(
+        &self,
+        topic: &str,
+        threshold: Option<i64>,
+        user_timezone: Option<&str>,
+    ) -> bool {
+        self.queue_auto_compaction(topic, user_timezone, |st| st.after_threshold_set(threshold))
+    }
+
+    fn queue_auto_compaction(
+        &self,
+        topic: &str,
+        user_timezone: Option<&str>,
+        decide: impl FnOnce(&mut SessionState) -> Option<String>,
+    ) -> bool {
         let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
             return false;
         };
-        let prompt = s
-            .state
-            .lock()
-            .expect("SessionState mutex")
-            .after_turn(threshold, always_on);
+        if s.reader.is_finished() {
+            return false;
+        }
+        let prompt = decide(&mut s.state.lock().expect("SessionState mutex"));
         let Some(prompt) = prompt else {
             return false;
         };
@@ -3163,6 +3194,15 @@ mod reduce_tests {
         assert!(s.after_turn(Some(100_000), false).is_some());
         assert_eq!(s.after_turn(Some(100_000), false), None, "no notice");
         assert!(s.after_turn(Some(100_000), false).is_some());
+    }
+
+    #[test]
+    fn a_threshold_set_mid_compaction_leaves_it_alone() {
+        let mut s = SessionState::default();
+        reduce(&mut s, &AgentEvent::ContextTokens(200_000));
+        assert!(s.after_threshold_set(Some(100_000)).is_some());
+        assert_eq!(s.after_threshold_set(Some(100_000)), None);
+        assert_eq!(s.auto_compact, super::AutoCompact::Compacting);
     }
 
     /// Turns behind any other claude slash command go at once.
