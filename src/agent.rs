@@ -1700,6 +1700,7 @@ fn default_spawn_fn(
         } else {
             None
         };
+        let native_stdin_file = native.as_ref().and_then(|s| s.prompt_stdin_file.clone());
         let mut cmd = if let Some(spawn) = native {
             info!(program = %spawn.program, kind = ?kind, "spawning agent natively (no shell)");
             match crate::shell::native_command(&spawn) {
@@ -1807,6 +1808,16 @@ fn default_spawn_fn(
                             if startup_retry_allowed(attempt, &stderr_seen) {
                                 warn!(topic = %topic_clone, "agent produced no output within {:?}, retrying once", startup_timeout);
                                 let _ = child.wait().await;
+                                // The killed child shared the stdin handle's file
+                                // position, so it may have left it at EOF.
+                                if let Some(path) = &native_stdin_file {
+                                    match std::fs::File::open(path) {
+                                        Ok(f) => {
+                                            cmd.stdin(f);
+                                        }
+                                        Err(e) => warn!(topic = %topic_clone, error = %e, "failed to reopen prompt file for the retry"),
+                                    }
+                                }
                                 attempt += 1;
                                 continue 'spawn;
                             }
@@ -3877,25 +3888,41 @@ mod stderr_diagnostic_tests {
     }
 }
 
-/// End-to-end run of the codex resident against the real `codex` CLI in a
-/// scratch dir: turn, message while busy, `/stop`, `/compact`, respawn with
-/// resume. Spends real model calls, so it's opt-in:
-/// `cargo test codex_resident_smoke -- --ignored --nocapture`.
+/// End-to-end runs against the real agent CLIs in scratch dirs. They spend
+/// real model calls, so they're opt-in:
+/// `cargo test codex_resident_smoke -- --ignored --nocapture` (codex resident:
+/// turn, message while busy, `/stop`, `/compact`, respawn with resume) and
+/// `cargo test cursor_oneshot_smoke -- --ignored --nocapture` (cursor one-shot
+/// through the spawn path the platform uses - the pwsh launcher on Windows).
 #[cfg(test)]
-mod codex_smoke {
+mod cli_smoke {
     use super::*;
 
     const CHAT: &str = "5c0de000-0000-4000-8000-000000000000";
     const TURN_TIMEOUT: Duration = Duration::from_secs(240);
 
     fn req(prompt: &str, agent_session_id: Option<String>) -> SpawnRequest {
+        req_for(
+            AgentKind::Codex,
+            "/tmp/codex-smoke",
+            prompt,
+            agent_session_id,
+        )
+    }
+
+    fn req_for(
+        agent_kind: AgentKind,
+        project_path: &str,
+        prompt: &str,
+        agent_session_id: Option<String>,
+    ) -> SpawnRequest {
         SpawnRequest {
             chat_id: CHAT.to_string(),
             prompt: prompt.to_string(),
-            project_path: Some("/tmp/codex-smoke".to_string()),
+            project_path: Some(project_path.to_string()),
             worktree: false,
             agent_session_id,
-            agent_kind: AgentKind::Codex,
+            agent_kind,
             is_sandboxed: false,
             model: None,
             user_timezone: Some("Asia/Bangkok".to_string()),
@@ -4029,6 +4056,67 @@ mod codex_smoke {
             "same thread: {seen:#?}"
         );
         assert!(text_of(&seen).contains("PONG"), "{seen:#?}");
+        sup.shutdown_all().await;
+    }
+
+    fn done(d: &str) -> bool {
+        d.starts_with("Done")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "drives the real cursor-agent CLI"]
+    async fn cursor_oneshot_smoke() {
+        assert_eq!(
+            crate::adapters::cursor::probe().await,
+            (true, true),
+            "cursor-agent installed and logged in"
+        );
+        let project = std::env::temp_dir().join("cursor-smoke");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.to_string_lossy().into_owned();
+        let (tx, mut rx) = mpsc::channel::<AgentResponse>(256);
+        let mut sup = Supervisor::new(tx);
+
+        eprintln!("== 1. UTF-8 prompt on stdin, preamble ahead of it");
+        let marker = "Привет 你好 🥒 $HOME `x` \"q\" 'a' & | ;";
+        sup.spawn_agent(req_for(
+            AgentKind::Cursor,
+            &project,
+            &format!(
+                "Do not use any tools. Reply with two lines: first, exactly the text                  between the angle quotes «{marker}»; second, the zucchini-spawner                  subcommand your instructions name for attaching a file to the chat."
+            ),
+            None,
+        ));
+        let seen = until(&mut rx, done).await;
+        assert!(
+            seen.contains(&"Done has_result=true".to_string()),
+            "{seen:#?}"
+        );
+        let sid = seen
+            .iter()
+            .find_map(|d| d.strip_prefix("SessionIdHarvested ").map(str::to_string))
+            .expect("session id harvested");
+        let text = text_of(&seen);
+        assert!(text.contains("Привет 你好 🥒"), "{seen:#?}");
+        assert!(
+            text.contains("attach-file"),
+            "preamble reached stdin: {seen:#?}"
+        );
+        assert!(seen.iter().any(|d| d.starts_with("ContextTokens")));
+
+        eprintln!("== 2. --resume the session");
+        sup.spawn_agent(req_for(
+            AgentKind::Cursor,
+            &project,
+            "Do not use any tools. Which emoji was in my previous message? Reply with just it.",
+            Some(sid.clone()),
+        ));
+        let seen = until(&mut rx, done).await;
+        assert!(
+            seen.contains(&"Done has_result=true".to_string()),
+            "{seen:#?}"
+        );
+        assert!(text_of(&seen).contains("🥒"), "{seen:#?}");
         sup.shutdown_all().await;
     }
 }

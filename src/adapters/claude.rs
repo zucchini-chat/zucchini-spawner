@@ -17,9 +17,10 @@ use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::adapter::{
-    agent_capabilities_instructions, file_nonempty, probe_with_blocking_auth, shell_escape,
-    AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, LastTokensDedup, NativeSpawn,
-    TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION,
+    agent_capabilities_instructions, cli_argv, file_nonempty, probe_with_blocking_auth,
+    push_posix_args, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, CliArg,
+    LastTokensDedup, NativeSpawn, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
+    PRUNE_CONTEXT_INSTRUCTION,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -122,22 +123,11 @@ const ONESHOT_SYS_LEADIN: &str =
 const PRUNE_SUMMARY_MOVE_INSTRUCTION: &str =
     "Each --summary is moved into the pruned tool result (the prune command keeps a marker in its place), so write it to stand on its own next to that call.";
 
-/// One token of the claude invocation. `Lit` is emitted verbatim (unquoted in
-/// the shell string) — the constant flags/values that need no escaping. `Val`
-/// is a dynamic value: shell-escaped in the POSIX string, one argv element
-/// natively. Splitting them lets the POSIX renderer reproduce the exact
-/// historical string (constant flags stay unquoted) while the native renderer
-/// yields clean argv — one source of truth for the flag list.
-enum ClaudeArg {
-    Lit(&'static str),
-    Val(String),
-}
-
 /// Build the ordered claude flag tokens AFTER the base invocation (`cat … |
 /// claude` for one-shot, bare `claude` for resident). Shared by the POSIX
 /// string path (`prepare_command`/`prepare_session_command` via
-/// `push_posix_flags`) and the Windows-native argv path (`prepare_native`/
-/// `prepare_session_native` via `flags_to_argv`) so the flag set (session-id
+/// `push_posix_args`) and the Windows-native argv path (`prepare_native`/
+/// `prepare_session_native` via `cli_argv`) so the flag set (session-id
 /// resume, worktree containment, `--append-system-prompt`, `--print --verbose
 /// --output-format stream-json`, sandbox, model, the prune `--settings` hook)
 /// can't drift between the two paths. `sys_leadin` is the optional first sentence of the
@@ -157,8 +147,8 @@ fn claude_flag_args(
     session_name: Option<&str>,
     resident: bool,
     chrome: bool,
-) -> Vec<ClaudeArg> {
-    let mut args: Vec<ClaudeArg> = Vec::new();
+) -> Vec<CliArg> {
+    let mut args: Vec<CliArg> = Vec::new();
 
     // Register the chat's title as this process's peer-addressable name
     // (`~/.claude/sessions/<pid>.json`), so another agent on the machine can
@@ -169,8 +159,8 @@ fn claude_flag_args(
     // one argv element (POSIX path single-quotes it), so a title with spaces or
     // quotes can't split into flags.
     if let Some(name) = session_name {
-        args.push(ClaudeArg::Lit("--name"));
-        args.push(ClaudeArg::Val(name.to_string()));
+        args.push(CliArg::Lit("--name"));
+        args.push(CliArg::Val(name.to_string()));
     }
 
     // First turn / fresh session: pass no session flag — claude generates a
@@ -180,8 +170,8 @@ fn claude_flag_args(
     // `agent_session_id = id::text`, so existing chats keep using the same id
     // claude already knows about.
     if let Some(sid) = agent_session_id {
-        args.push(ClaudeArg::Lit("--resume"));
-        args.push(ClaudeArg::Val(sid.to_string()));
+        args.push(CliArg::Lit("--resume"));
+        args.push(CliArg::Val(sid.to_string()));
     }
 
     let mut sys = sys_leadin.map(|l| format!("{l}\n\n")).unwrap_or_default();
@@ -192,8 +182,8 @@ fn claude_flag_args(
     if worktree {
         // Use the chat_id prefix so the worktree directory name stays short.
         let worktree_name: String = chat_id.chars().take(8).collect();
-        args.push(ClaudeArg::Lit("--worktree"));
-        args.push(ClaudeArg::Val(worktree_name.clone()));
+        args.push(CliArg::Lit("--worktree"));
+        args.push(CliArg::Val(worktree_name.clone()));
         if let Some(pp) = project_path {
             let worktree_abs = format!(
                 "{}/.claude/worktrees/{}",
@@ -212,19 +202,19 @@ fn claude_flag_args(
     sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
     sys.push(' ');
     sys.push_str(PRUNE_SUMMARY_MOVE_INSTRUCTION);
-    args.push(ClaudeArg::Lit("--append-system-prompt"));
-    args.push(ClaudeArg::Val(sys));
+    args.push(CliArg::Lit("--append-system-prompt"));
+    args.push(CliArg::Val(sys));
     // Resident: read user/control turns from the held-open stdin pipe, and echo
     // each one back when consumed (`UserTurnConsumed` drives the session FSM).
     if resident {
-        args.push(ClaudeArg::Lit("--input-format"));
-        args.push(ClaudeArg::Lit("stream-json"));
-        args.push(ClaudeArg::Lit("--replay-user-messages"));
+        args.push(CliArg::Lit("--input-format"));
+        args.push(CliArg::Lit("stream-json"));
+        args.push(CliArg::Lit("--replay-user-messages"));
     }
-    args.push(ClaudeArg::Lit("--print"));
-    args.push(ClaudeArg::Lit("--verbose"));
-    args.push(ClaudeArg::Lit("--output-format"));
-    args.push(ClaudeArg::Lit("stream-json"));
+    args.push(CliArg::Lit("--print"));
+    args.push(CliArg::Lit("--verbose"));
+    args.push(CliArg::Lit("--output-format"));
+    args.push(CliArg::Lit("stream-json"));
     // Sender's `machine_users.is_sandboxed`. Non-sandboxed = bypass permission
     // gating; sandboxed = claude's default permission mode auto-denies tools
     // in `--print`, which is the actual sandboxing mechanism. The default mode
@@ -235,14 +225,14 @@ fn claude_flag_args(
     } else {
         "AskUserQuestion"
     };
-    args.push(ClaudeArg::Lit("--disallowedTools"));
-    args.push(ClaudeArg::Val(disallowed_tools.to_string()));
+    args.push(CliArg::Lit("--disallowedTools"));
+    args.push(CliArg::Val(disallowed_tools.to_string()));
     if !is_sandboxed {
-        args.push(ClaudeArg::Lit("--dangerously-skip-permissions"));
+        args.push(CliArg::Lit("--dangerously-skip-permissions"));
     }
     // The browser is signed into the owner's accounts, so an invitee never gets it.
     if chrome && !is_sandboxed {
-        args.push(ClaudeArg::Lit("--chrome"));
+        args.push(CliArg::Lit("--chrome"));
     }
     // Verbatim pass-through of `chats.model` (migration 0035). Empty / blank
     // values are already filtered to `None` at the construction site in
@@ -251,8 +241,8 @@ fn claude_flag_args(
     // prints a clean error if it doesn't recognize it, and the closed set drifts
     // per-release.
     if let Some(model) = model {
-        args.push(ClaudeArg::Lit("--model"));
-        args.push(ClaudeArg::Val(model.to_string()));
+        args.push(CliArg::Lit("--model"));
+        args.push(CliArg::Val(model.to_string()));
     }
     // Register a `PostToolUse` hook that nudges the agent to prune large tool
     // outputs once they're no longer needed (selective forgetting). The hook
@@ -280,34 +270,10 @@ fn claude_flag_args(
             }]
         }
     });
-    args.push(ClaudeArg::Lit("--settings"));
-    args.push(ClaudeArg::Val(settings.to_string()));
+    args.push(CliArg::Lit("--settings"));
+    args.push(CliArg::Val(settings.to_string()));
 
     args
-}
-
-/// Render the flag tokens into the historical POSIX shell string: a leading
-/// space before each token, `Lit` verbatim (unquoted), `Val` single-quoted via
-/// `shell_escape`. Byte-identical to the pre-refactor `append_claude_flags`.
-fn push_posix_flags(cmd: &mut String, args: &[ClaudeArg]) {
-    for a in args {
-        cmd.push(' ');
-        match a {
-            ClaudeArg::Lit(s) => cmd.push_str(s),
-            ClaudeArg::Val(s) => cmd.push_str(&shell_escape(s)),
-        }
-    }
-}
-
-/// Render the flag tokens into clean argv (one OS arg per token, no escaping)
-/// for the Windows-native shell-free spawn.
-fn flags_to_argv(args: Vec<ClaudeArg>) -> Vec<String> {
-    args.into_iter()
-        .map(|a| match a {
-            ClaudeArg::Lit(s) => s.to_string(),
-            ClaudeArg::Val(s) => s,
-        })
-        .collect()
 }
 
 impl AgentAdapter for ClaudeAdapter {
@@ -337,7 +303,7 @@ impl AgentAdapter for ClaudeAdapter {
             /* resident = */ false,
             claude_in_chrome_enabled(),
         );
-        push_posix_flags(&mut claude_cmd, &args);
+        push_posix_args(&mut claude_cmd, &args);
         Ok(claude_cmd)
     }
 
@@ -356,7 +322,7 @@ impl AgentAdapter for ClaudeAdapter {
         );
         Some(NativeSpawn {
             program: "claude".to_string(),
-            args: flags_to_argv(args),
+            args: cli_argv(args),
             cwd: ctx.project_path.map(std::path::PathBuf::from),
             prompt_stdin_file: Some(ctx.prompt_file.to_path_buf()),
         })
@@ -403,7 +369,7 @@ impl AgentAdapter for ClaudeAdapter {
             /* resident = */ true,
             claude_in_chrome_enabled(),
         );
-        push_posix_flags(&mut claude_cmd, &args);
+        push_posix_args(&mut claude_cmd, &args);
         Ok(claude_cmd)
     }
 
@@ -425,7 +391,7 @@ impl AgentAdapter for ClaudeAdapter {
         );
         Some(NativeSpawn {
             program: "claude".to_string(),
-            args: flags_to_argv(args),
+            args: cli_argv(args),
             cwd: ctx.project_path.map(std::path::PathBuf::from),
             prompt_stdin_file: None,
         })
@@ -2165,7 +2131,7 @@ mod tests {
                 true,
                 chrome,
             );
-            flags_to_argv(args).iter().any(|a| a == "--chrome")
+            cli_argv(args).iter().any(|a| a == "--chrome")
         };
         assert!(has_chrome(false, true));
         assert!(!has_chrome(false, false));

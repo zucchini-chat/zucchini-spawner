@@ -43,10 +43,10 @@ use smallvec::SmallVec;
 use tracing::{debug, warn};
 
 use crate::adapter::{
-    agent_capabilities_instructions, claude_assistant_envelope, claude_tool_use_envelope,
-    extract_json_type, parse_json_obj, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent,
-    AgentKind, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
-    PRUNE_CONTEXT_INSTRUCTION,
+    agent_capabilities_instructions, claude_assistant_envelope, claude_tool_use_envelope, cli_argv,
+    extract_json_type, parse_json_obj, push_posix_args, shell_escape, AdapterDescriptor,
+    AgentAdapter, AgentEvent, AgentKind, CliArg, NativeSpawn, TurnContext, WorktreeInstructions,
+    MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -139,6 +139,183 @@ impl Default for CursorAdapter {
     }
 }
 
+/// Deterministic `--worktree` name: an idempotent dir that survives `--resume`,
+/// which doesn't restore cwd.
+fn worktree_name(chat_id: &str) -> String {
+    let short: String = chat_id.chars().take(12).collect();
+    format!("zcm-{}", short)
+}
+
+/// Text fed to cursor-agent's stdin ahead of the prompt file, every turn.
+///
+/// cursor-agent has no `--append-system-prompt` (or any other system /
+/// prompt-prefix flag — confirmed against `cursor-agent --help` 2026.05), so
+/// the capabilities ride a short preamble before the user's prompt body.
+/// `agent_capabilities_instructions` bundles the attach-file how-to,
+/// schedule-message and worktree containment; we then append the prune-context
+/// standing order (cursor's selective-forgetting nudge — its reads run through
+/// `Read`, so the claude-shape `PRUNE_CONTEXT_INSTRUCTION` is the right
+/// variant, NOT the codex/gemini tool-name variants). The whole preamble rides
+/// every turn (not just the first, unlike codex/gemini's
+/// `first_turn_prompt_suffix`); cursor's `--resume` reconstructs history from
+/// the local store and drops our user-echo frame, so the preamble never
+/// persists and must be re-sent — hence `first_turn_prompt_suffix` stays
+/// `None`.
+fn stdin_preamble(ctx: &TurnContext<'_>) -> String {
+    // cursor-agent hardcodes the worktree dir at
+    // `~/.cursor/worktrees/<basename(project)>/<wt_name>` (see NOTE in
+    // `cursor_flag_args`). Wording via the shared `adapter::worktree_instructions`.
+    let worktree_info = ctx.worktree.then(|| {
+        let repo = ctx
+            .project_path
+            .map(|pp| pp.trim_end_matches('/').rsplit('/').next().unwrap_or(pp))
+            .unwrap_or("project");
+        let home = crate::home_dir();
+        let worktree_abs = format!(
+            "{}/.cursor/worktrees/{repo}/{}",
+            home.display(),
+            worktree_name(ctx.chat_id)
+        );
+        WorktreeInstructions {
+            worktree_abs,
+            parent_repo: ctx.project_path.unwrap_or(repo).to_string(),
+        }
+    });
+    format!(
+        "{}\n\n{}\n\n---\n\n",
+        agent_capabilities_instructions(worktree_info.as_ref()),
+        PRUNE_CONTEXT_INSTRUCTION
+    )
+}
+
+/// The cursor-agent flags, shared by the login-shell string
+/// (`prepare_command`) and the Windows-native argv (`prepare_native`).
+fn cursor_flag_args(ctx: &TurnContext<'_>) -> Vec<CliArg> {
+    // `--approve-mcps` is the headless equivalent of "user already clicked
+    // approve in interactive mode" — without it, any MCP server the user
+    // configured in `~/.cursor/` hangs waiting for a prompt that can't
+    // appear under `--print`. Not policy curation: we only unblock what
+    // the user already opted into.
+    let mut args = vec![
+        CliArg::Lit("--print"),
+        CliArg::Lit("--output-format"),
+        CliArg::Lit("stream-json"),
+        CliArg::Lit("--trust"),
+        CliArg::Lit("--approve-mcps"),
+    ];
+    // Sender's `machine_users.is_sandboxed`. Non-sandboxed = `--force`
+    // (aka `--yolo`) bypasses cursor's per-command permission gating;
+    // sandboxed = omit it so cursor falls back to its default deny path.
+    // Mirrors claude's `--dangerously-skip-permissions` gate. Note: this
+    // only covers per-command permissions — `--trust` (workspace trust)
+    // and `--approve-mcps` (MCP server approval) stay on for sandboxed
+    // users too, because without them headless cursor either hangs on a
+    // trust prompt or skips user-configured MCP servers.
+    if !ctx.is_sandboxed {
+        args.push(CliArg::Lit("--force"));
+    }
+    // No `--session-id` flag on cursor-agent — use the harvest path:
+    // omit `--resume` on first turn (cursor mints a session id and emits
+    // it in `system.init`); pass it on subsequent turns.
+    if let Some(sid) = ctx.agent_session_id {
+        args.push(CliArg::Lit("--resume"));
+        args.push(CliArg::Val(sid.to_string()));
+    }
+    // Verbatim pass-through of `chats.model` (migration 0035). Empty /
+    // blank values are already filtered to `None` at the construction
+    // site in `main.rs`, so any `Some` here is a non-empty model name
+    // the user picked in the composer's agent roster. Cursor's model
+    // labels look like "Composer 2.5 Fast" — spaces must survive as one
+    // argv element.
+    if let Some(model) = ctx.model {
+        args.push(CliArg::Lit("--model"));
+        args.push(CliArg::Val(model.to_string()));
+    }
+    if ctx.worktree {
+        args.push(CliArg::Lit("--worktree"));
+        args.push(CliArg::Val(worktree_name(ctx.chat_id)));
+        // NOTE: cursor-agent's `--worktree <name>` puts the directory at
+        // `~/.cursor/worktrees/<reponame>/<name>` (per `cursor-agent --help`)
+        // — NOT under the user's project tree like claude's --worktree
+        // does. The path is hardcoded inside cursor-agent and cannot be
+        // overridden from the CLI, so the same iOS Worktree toggle has
+        // two very different mental models depending on the agent kind.
+        // Users running `git status` in the project will see no changes;
+        // they need to look under `~/.cursor/worktrees/<reponame>/zcm-*`
+        // to find cursor's edits. iOS must surface this divergence in the
+        // Worktree pill / chat header, or refuse worktree=true for cursor
+        // entirely — anything user-facing is cross-file from here.
+    }
+    args
+}
+
+/// Cursor's Windows installer ships no binary bash could resolve — only
+/// `cursor-agent.cmd`/`.ps1` shims, the `.cmd` merely running Windows
+/// PowerShell 5.1 on the `.ps1`, which picks the newest installed version and
+/// runs its `node.exe index.js`. So on Windows the CLI is launched shell-free
+/// as `pwsh -File <cursor-agent.ps1> <args>`, keeping Cursor's own launcher
+/// logic; PowerShell 7 passes UTF-8 stdin/stdout, quoted args and the exit
+/// code through unchanged. `-ExecutionPolicy Bypass` mirrors the `.cmd`.
+const WINDOWS_LAUNCHER: &str = "pwsh";
+
+/// `cursor-agent.ps1` on PATH, else in the installer's default dir — a
+/// spawner started before the install still carries the PATH without it.
+fn cursor_launcher_script() -> Option<std::path::PathBuf> {
+    which::which("cursor-agent.ps1").ok().or_else(|| {
+        let local = std::env::var_os("LOCALAPPDATA")?;
+        let script = std::path::Path::new(&local)
+            .join("cursor-agent")
+            .join("cursor-agent.ps1");
+        script.is_file().then_some(script)
+    })
+}
+
+/// Both halves of the Windows launcher resolve: the probe's "installed".
+fn windows_launcher_installed() -> bool {
+    which::which(WINDOWS_LAUNCHER).is_ok() && cursor_launcher_script().is_some()
+}
+
+/// `pwsh -File <cursor-agent.ps1> <cursor_args>` as a [`NativeSpawn`]. A
+/// missing script still yields a spawn: pwsh then fails on stderr naming it,
+/// which surfaces in the chat (the probe already reports cursor uninstalled).
+fn windows_launcher_spawn(
+    cursor_args: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
+    prompt_stdin_file: Option<std::path::PathBuf>,
+) -> NativeSpawn {
+    let script = cursor_launcher_script()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cursor-agent.ps1".to_string());
+    let mut args: Vec<String> = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    args.push(script);
+    args.extend(cursor_args);
+    NativeSpawn {
+        program: WINDOWS_LAUNCHER.to_string(),
+        args,
+        cwd,
+        prompt_stdin_file,
+    }
+}
+
+/// Prepend `preamble` to the prompt file, so feeding the file as stdin
+/// delivers the same bytes as the login-shell path's `{ printf %s <preamble>;
+/// cat <file>; }`.
+fn prepend_to_file(path: &std::path::Path, preamble: &str) -> std::io::Result<()> {
+    let body = std::fs::read(path)?;
+    let mut bytes = preamble.as_bytes().to_vec();
+    bytes.extend_from_slice(&body);
+    std::fs::write(path, bytes)
+}
+
 impl AgentAdapter for CursorAdapter {
     fn kind(&self) -> AgentKind {
         AgentKind::Cursor
@@ -149,98 +326,24 @@ impl AgentAdapter for CursorAdapter {
         if let Some(pp) = ctx.project_path {
             cmd.push_str(&format!("cd {} && ", shell_escape(pp)));
         }
-        // Worktree containment, computed up front so the preamble below carries
-        // the "stay inside" rule. cursor-agent hardcodes the dir at
-        // `~/.cursor/worktrees/<basename(project)>/<wt_name>` (see NOTE at the flag
-        // site below). Wording via the shared `adapter::worktree_instructions`.
-        let worktree_info = ctx.worktree.then(|| {
-            let short: String = ctx.chat_id.chars().take(12).collect();
-            let wt_name = format!("zcm-{}", short);
-            let repo = ctx
-                .project_path
-                .map(|pp| pp.trim_end_matches('/').rsplit('/').next().unwrap_or(pp))
-                .unwrap_or("project");
-            let home = crate::home_dir();
-            let worktree_abs = format!("{}/.cursor/worktrees/{repo}/{wt_name}", home.display());
-            WorktreeInstructions {
-                worktree_abs,
-                parent_repo: ctx.project_path.unwrap_or(repo).to_string(),
-            }
-        });
-        // cursor-agent has no `--append-system-prompt` (or any other system /
-        // prompt-prefix flag — confirmed against `cursor-agent --help` 2026.05), so
-        // the capabilities ride a short preamble before the user's prompt body.
-        // `agent_capabilities_instructions` bundles the attach-file how-to,
-        // schedule-message and worktree containment; we then append the
-        // prune-context standing order (cursor's selective-forgetting nudge — its
-        // reads run through `Read`, so the claude-shape `PRUNE_CONTEXT_INSTRUCTION`
-        // is the right variant, NOT the codex/gemini tool-name variants). The whole
-        // preamble rides every turn (not just the first, unlike codex/gemini's
-        // `first_turn_prompt_suffix`); cursor's `--resume` reconstructs history from
-        // the local store and drops our user-echo frame, so the preamble never
-        // persists and must be re-sent — hence `first_turn_prompt_suffix` stays
-        // `None`.
-        let preamble = format!(
-            "{}\n\n{}\n\n---\n\n",
-            agent_capabilities_instructions(worktree_info.as_ref()),
-            PRUNE_CONTEXT_INSTRUCTION
-        );
         cmd.push_str(&format!(
             "{{ printf %s {}; cat {}; }} | cursor-agent",
-            shell_escape(&preamble),
+            shell_escape(&stdin_preamble(ctx)),
             shell_escape(&ctx.prompt_file.to_string_lossy())
         ));
-        // `--approve-mcps` is the headless equivalent of "user already clicked
-        // approve in interactive mode" — without it, any MCP server the user
-        // configured in `~/.cursor/` hangs waiting for a prompt that can't
-        // appear under `--print`. Not policy curation: we only unblock what
-        // the user already opted into.
-        cmd.push_str(" --print --output-format stream-json --trust --approve-mcps");
-        // Sender's `machine_users.is_sandboxed`. Non-sandboxed = `--force`
-        // (aka `--yolo`) bypasses cursor's per-command permission gating;
-        // sandboxed = omit it so cursor falls back to its default deny path.
-        // Mirrors claude's `--dangerously-skip-permissions` gate. Note: this
-        // only covers per-command permissions — `--trust` (workspace trust)
-        // and `--approve-mcps` (MCP server approval) stay on for sandboxed
-        // users too, because without them headless cursor either hangs on a
-        // trust prompt or skips user-configured MCP servers.
-        if !ctx.is_sandboxed {
-            cmd.push_str(" --force");
-        }
-        // No `--session-id` flag on cursor-agent — use the harvest path:
-        // omit `--resume` on first turn (cursor mints a session id and emits
-        // it in `system.init`); pass it on subsequent turns.
-        if let Some(sid) = ctx.agent_session_id {
-            cmd.push_str(&format!(" --resume {}", shell_escape(sid)));
-        }
-        // Verbatim pass-through of `chats.model` (migration 0035). Empty /
-        // blank values are already filtered to `None` at the construction
-        // site in `main.rs`, so any `Some` here is a non-empty model name
-        // the user picked in the composer's agent roster. Cursor's model
-        // labels look like "Composer 2.5 Fast" — keep the shell-escape so
-        // spaces survive into argv[].
-        if let Some(model) = ctx.model {
-            cmd.push_str(&format!(" --model {}", shell_escape(model)));
-        }
-        if ctx.worktree {
-            // Deterministic name = idempotent dir, persists across --resume
-            // because cursor's --resume doesn't restore cwd.
-            let short: String = ctx.chat_id.chars().take(12).collect();
-            let wt_name = format!("zcm-{}", short);
-            cmd.push_str(&format!(" --worktree {}", shell_escape(&wt_name)));
-            // NOTE: cursor-agent's `--worktree <name>` puts the directory at
-            // `~/.cursor/worktrees/<reponame>/<name>` (per `cursor-agent --help`)
-            // — NOT under the user's project tree like claude's --worktree
-            // does. The path is hardcoded inside cursor-agent and cannot be
-            // overridden from the CLI, so the same iOS Worktree toggle has
-            // two very different mental models depending on the agent kind.
-            // Users running `git status` in the project will see no changes;
-            // they need to look under `~/.cursor/worktrees/<reponame>/zcm-*`
-            // to find cursor's edits. iOS must surface this divergence in the
-            // Worktree pill / chat header, or refuse worktree=true for cursor
-            // entirely — anything user-facing is cross-file from here.
-        }
+        push_posix_args(&mut cmd, &cursor_flag_args(ctx));
         Ok(cmd)
+    }
+
+    fn prepare_native(&mut self, ctx: &TurnContext<'_>) -> Option<NativeSpawn> {
+        if let Err(e) = prepend_to_file(ctx.prompt_file, &stdin_preamble(ctx)) {
+            warn!(error = %e, "cursor-agent: failed to prepend the stdin preamble; sending the bare prompt");
+        }
+        Some(windows_launcher_spawn(
+            cli_argv(cursor_flag_args(ctx)),
+            ctx.project_path.map(std::path::PathBuf::from),
+            Some(ctx.prompt_file.to_path_buf()),
+        ))
     }
 
     fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
@@ -716,8 +819,8 @@ fn normalize_result_frame(obj: &Value) -> String {
 }
 
 /// Hard ceiling on the `cursor-agent status` shell-out. Includes the user's
-/// `-lic` rc load (asdf, nvm, slow prompt init) plus the cursor-agent process
-/// itself. 15s is comfortably above realistic shell-rc cold-starts (~1-3s) but
+/// `-lic` rc load (asdf, nvm, slow prompt init) — on Windows the pwsh startup
+/// — plus the cursor-agent process itself. 15s is comfortably above realistic shell-rc cold-starts (~1-3s) but
 /// well below the supervisor's 30s `AGENT_STARTUP_TIMEOUT` so a hang here can
 /// never starve the install-status report indefinitely.
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -737,7 +840,12 @@ const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// failure mode emits a distinctive `warn!` so a future cursor schema
 /// rename leaves a breadcrumb in the spawner log.
 pub async fn probe() -> (bool, bool) {
-    if !crate::shell::binary_on_path("cursor-agent").await {
+    let installed = if cfg!(windows) {
+        windows_launcher_installed()
+    } else {
+        crate::shell::binary_on_path("cursor-agent").await
+    };
+    if !installed {
         return (false, false);
     }
     (true, is_authenticated().await)
@@ -750,8 +858,21 @@ fn probe_boxed() -> futures::future::BoxFuture<'static, (bool, bool)> {
     Box::pin(probe())
 }
 
-/// Runs `cursor-agent status --format json` through the user's login shell so
-/// PATH/asdf/etc resolve the same way as the agent spawn. Returns `false` on
+/// `cursor-agent status --format json`, launched the way the agent spawn is:
+/// the Windows launcher there, the user's login shell elsewhere (so
+/// PATH/asdf/etc resolve the same way).
+fn status_command() -> std::io::Result<tokio::process::Command> {
+    if cfg!(windows) {
+        let args = ["status", "--format", "json"].map(String::from).to_vec();
+        crate::shell::native_command(&windows_launcher_spawn(args, None, None))
+    } else {
+        Ok(crate::sys::login_shell_command(
+            "cursor-agent status --format json",
+        ))
+    }
+}
+
+/// Runs [`status_command`] and parses its JSON. Returns `false` on
 /// any failure (binary missing under shell PATH, non-zero exit, unparseable
 /// JSON, timeout, or `isAuthenticated: false`).
 ///
@@ -761,7 +882,14 @@ fn probe_boxed() -> futures::future::BoxFuture<'static, (bool, bool)> {
 /// mode emits a distinctive `warn!` to leave a breadcrumb in the spawner
 /// log when cursor's schema drifts.
 async fn is_authenticated() -> bool {
-    let run = crate::sys::login_shell_command("cursor-agent status --format json")
+    let mut cmd = match status_command() {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            warn!(error = %e, "cursor-agent status: launcher not found");
+            return false;
+        }
+    };
+    let run = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2610,6 +2738,39 @@ mod tests {
         let ctx = TurnContext::for_test(&prompt_file, None, false, None);
         let cmd = a.prepare_command(&ctx).unwrap();
         assert!(cmd.contains("--force"), "got: {}", cmd);
+    }
+
+    #[test]
+    fn native_spawn_matches_login_shell_invocation() {
+        use crate::adapter::TurnContext;
+        let dir = std::env::temp_dir().join(format!("cursor-native-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt_file = dir.join("prompt.txt");
+        std::fs::write(&prompt_file, "Привет 🥒").unwrap();
+        let model = "Fake Model \"x\" 2.5";
+        let ctx = TurnContext {
+            worktree: true,
+            ..TurnContext::for_test(&prompt_file, Some("sess-1"), false, Some(model))
+        };
+        let spawn = CursorAdapter::new()
+            .prepare_native(&ctx)
+            .expect("native recipe");
+
+        assert_eq!(spawn.program, WINDOWS_LAUNCHER);
+        let file_at = spawn.args.iter().position(|a| a == "-File").unwrap();
+        assert!(spawn.args[file_at + 1].ends_with("cursor-agent.ps1"));
+        let cursor_args = &spawn.args[file_at + 2..];
+        assert_eq!(cursor_args, cli_argv(cursor_flag_args(&ctx)).as_slice());
+        assert!(cursor_args.windows(2).any(|w| w == ["--model", model]));
+        assert_eq!(spawn.cwd, Some(std::path::PathBuf::from("/tmp/proj")));
+
+        assert_eq!(
+            spawn.prompt_stdin_file.as_deref(),
+            Some(prompt_file.as_path())
+        );
+        let stdin = std::fs::read_to_string(&prompt_file).unwrap();
+        assert_eq!(stdin, format!("{}Привет 🥒", stdin_preamble(&ctx)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ===== Importer tests =====

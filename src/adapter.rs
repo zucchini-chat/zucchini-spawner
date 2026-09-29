@@ -666,6 +666,40 @@ pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// One token of an agent CLI invocation. `Lit` is emitted verbatim (unquoted in
+/// the shell string) — the constant flags/values that need no escaping. `Val`
+/// is a dynamic value: shell-escaped in the POSIX string, one argv element
+/// natively. Splitting them lets the POSIX renderer keep constant flags
+/// unquoted while the native renderer yields clean argv — one source of truth
+/// for an adapter's flag list across its login-shell and native spawn paths.
+pub(crate) enum CliArg {
+    Lit(&'static str),
+    Val(String),
+}
+
+/// Render flag tokens into a POSIX shell string: a leading space before each
+/// token, `Lit` verbatim, `Val` single-quoted via [`shell_escape`].
+pub(crate) fn push_posix_args(cmd: &mut String, args: &[CliArg]) {
+    for a in args {
+        cmd.push(' ');
+        match a {
+            CliArg::Lit(s) => cmd.push_str(s),
+            CliArg::Val(s) => cmd.push_str(&shell_escape(s)),
+        }
+    }
+}
+
+/// Render flag tokens into clean argv (one OS arg per token, no escaping) for
+/// a shell-free [`NativeSpawn`].
+pub(crate) fn cli_argv(args: Vec<CliArg>) -> Vec<String> {
+    args.into_iter()
+        .map(|a| match a {
+            CliArg::Lit(s) => s.to_string(),
+            CliArg::Val(s) => s,
+        })
+        .collect()
+}
+
 /// The command name when `prompt` starts with a slash command (`/compact`,
 /// `/plugin:cmd args`), else `None`. Only the first token of the first line is
 /// inspected: `/Users/...` does not match, its `/` disqualifying the name. A
