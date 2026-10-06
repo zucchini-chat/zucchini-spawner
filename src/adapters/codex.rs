@@ -1822,6 +1822,7 @@ mod tests {
             is_sandboxed: false,
             model: None,
             session_name: None,
+            user_system_prompt: None,
         }
     }
 

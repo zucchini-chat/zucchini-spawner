@@ -1,6 +1,6 @@
 //! In-memory mirror of the chats/projects rows streamed from PowerSync, plus the
 //! per-bucket sync cursors. Projects + cursors are persisted to `state.json`; of
-//! the chats only the always-on ones are (minus the plaintext title), so boot can
+//! the chats only the always-on ones are (minus the plaintext title and system prompt), so boot can
 //! start their residents although PowerSync resumes from the saved cursor.
 
 use std::collections::{HashMap, HashSet};
@@ -12,6 +12,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::adapter::AgentKind;
+use crate::user_prompt::UserSystemPrompt;
 
 /// Shared handle to `Mirror`. The control socket task (see `control.rs`) needs
 /// to read chat → user_id projections at the same time the main loop is
@@ -68,6 +69,46 @@ pub struct ChatState {
     /// `chats.auto_compact_tokens` (migration 0054): compact the resident once
     /// its context reaches this many tokens (`SessionState::after_turn`).
     pub auto_compact_tokens: Option<i64>,
+    /// `chats.system_prompt_files` and `chats.system_prompt` (migration 0055)
+    /// as synced: K_machine-sealed under the chat owner's key. Kept sealed so
+    /// state.json carries no plaintext, yet an always-on chat started at boot
+    /// (before its row re-streams) gets its prompt (`unseal_system_prompts`).
+    pub system_prompt_files: Option<String>,
+    pub system_prompt: Option<String>,
+    /// The two columns decrypted; a spawn knob, read through
+    /// `Mirror::user_system_prompt`. Empty for an adapter that
+    /// takes no user system prompt; a column that fails to decrypt marks it
+    /// `undecryptable`, which fails the spawn.
+    #[serde(skip)]
+    pub user_system_prompt: UserSystemPrompt,
+}
+
+impl ChatState {
+    fn unseal_system_prompt(&mut self, chat_id: &str, keys: &crate::crypto::KeyStore) {
+        if !self.agent_kind.make_adapter().takes_user_system_prompt() {
+            return;
+        }
+        let key = keys.get_existing(&self.user_id);
+        let mut undecryptable = false;
+        let mut unseal = |column: &str, sealed: &Option<String>| {
+            let sealed = sealed.as_deref().filter(|s| !s.is_empty())?;
+            let plain = key
+                .as_ref()
+                .and_then(|k| crate::crypto::decrypt_field_b64(k, sealed));
+            if plain.is_none() {
+                warn!(chat_id = %chat_id, column, "can't decrypt the chat's system prompt");
+                undecryptable = true;
+            }
+            plain.filter(|p| !p.trim().is_empty())
+        };
+        let files = unseal("system_prompt_files", &self.system_prompt_files);
+        let text = unseal("system_prompt", &self.system_prompt);
+        self.user_system_prompt = UserSystemPrompt {
+            files,
+            text,
+            undecryptable,
+        };
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -253,29 +294,39 @@ impl Mirror {
             self.flagged_chats.remove(&id);
         }
 
-        self.chats.insert(
-            id,
-            ChatState {
-                user_id,
-                project_id: project_id.to_string(),
-                worktree,
-                last_seq,
-                agent_session_id: incoming_agent_session_id,
-                agent_kind,
-                model,
-                title: v
-                    .get("title")
-                    .and_then(|x| x.as_str())
-                    .filter(|s| !s.is_empty())
-                    .and_then(|ct| {
-                        let key = keys.get_existing(&user_id)?;
-                        crate::crypto::decrypt_field_b64(&key, ct)
-                    }),
-                pinned: v.get("pinned_at").is_some_and(|p| !p.is_null()),
-                always_on: crate::json_pg_bool(v.get("always_on")),
-                auto_compact_tokens: v.get("auto_compact_tokens").and_then(crate::json_to_i64),
-            },
-        );
+        let sealed = |column: &str| v.get(column).and_then(|x| x.as_str()).map(str::to_string);
+        let mut chat = ChatState {
+            user_id,
+            project_id: project_id.to_string(),
+            worktree,
+            last_seq,
+            agent_session_id: incoming_agent_session_id,
+            agent_kind,
+            model,
+            title: v
+                .get("title")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .and_then(|ct| {
+                    let key = keys.get_existing(&user_id)?;
+                    crate::crypto::decrypt_field_b64(&key, ct)
+                }),
+            pinned: v.get("pinned_at").is_some_and(|p| !p.is_null()),
+            always_on: crate::json_pg_bool(v.get("always_on")),
+            auto_compact_tokens: v.get("auto_compact_tokens").and_then(crate::json_to_i64),
+            system_prompt_files: sealed("system_prompt_files"),
+            system_prompt: sealed("system_prompt"),
+            user_system_prompt: UserSystemPrompt::default(),
+        };
+        chat.unseal_system_prompt(&id, keys);
+        self.chats.insert(id, chat);
+    }
+
+    /// Decrypt the system prompts of the chats loaded from state.json.
+    pub fn unseal_system_prompts(&mut self, keys: &crate::crypto::KeyStore) {
+        for (id, chat) in &mut self.chats {
+            chat.unseal_system_prompt(id, keys);
+        }
     }
 
     /// Chats the user pinned; their warm residents are evicted last (`warm.rs`).
@@ -297,6 +348,20 @@ impl Mirror {
         self.chats
             .get(chat_id)
             .is_some_and(|c| c.always_on && self.is_owner(c.user_id))
+    }
+
+    /// The user system prompt `chat_id` spawns with. A sandboxed member's chat
+    /// gets none, like an adapter that takes none: the files are read with
+    /// the spawner's own access, outside claude's permission gating. A member
+    /// whose row hasn't synced counts as sandboxed.
+    pub fn user_system_prompt(&self, chat_id: &str) -> UserSystemPrompt {
+        self.chats
+            .get(chat_id)
+            .filter(|c| {
+                self.is_owner(c.user_id) || self.member_is_sandboxed(&c.user_id) == Some(false)
+            })
+            .map(|c| c.user_system_prompt.clone())
+            .unwrap_or_default()
     }
 
     /// True on the first call per process.

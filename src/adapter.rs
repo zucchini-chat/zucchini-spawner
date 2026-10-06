@@ -303,6 +303,10 @@ pub struct SessionContext<'a> {
     /// decrypt, non-claude adapter) ⇒ no flag, and the CLI picks its own
     /// derived name.
     pub session_name: Option<&'a str>,
+    /// The chat's user system prompt, rendered (`UserSystemPrompt::render`):
+    /// appended to the system prompt after the spawner's own instructions.
+    /// Always `None` for an adapter without `takes_user_system_prompt`.
+    pub user_system_prompt: Option<&'a str>,
 }
 
 /// A shell-free spawn recipe for an adapter that can launch its CLI directly
@@ -478,6 +482,13 @@ pub trait AgentAdapter: Send + Sync {
     /// codex's SIGTERM orphans the shell commands it runs in process groups of
     /// their own. Teardown then closes stdin and waits before signalling.
     fn exits_on_stdin_eof(&self) -> bool {
+        false
+    }
+
+    /// Resident: the adapter appends the chat's user system prompt
+    /// (`chats.system_prompt_files` + `chats.system_prompt`) to the CLI's
+    /// system prompt. `false`: the chat's fields are ignored.
+    fn takes_user_system_prompt(&self) -> bool {
         false
     }
 

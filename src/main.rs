@@ -19,6 +19,7 @@ mod state;
 mod sys;
 mod uninstall;
 mod updater;
+mod user_prompt;
 mod useragent;
 mod warm;
 mod writer;
@@ -477,11 +478,14 @@ async fn handle_sync_event(
                 }
             }
             let mut thresholds_set = Vec::new();
+            let mut chats_put = Vec::new();
             for (id, row) in staging.chats.drain() {
                 match row {
                     StagedRow::Put(json) => {
                         let old_threshold =
                             mirror.chats.get(&id).and_then(|c| c.auto_compact_tokens);
+                        let old_prompt =
+                            mirror.chats.get(&id).map(|c| c.user_system_prompt.clone());
                         // Preserve a locally-harvested session id across a
                         // checkpoint that re-delivers the row with
                         // agent_session_id=NULL (the harvest is set locally
@@ -516,6 +520,13 @@ async fn handle_sync_event(
                             {
                                 thresholds_set.push(id.clone());
                             }
+                            // A new prompt gets the full retry budget: the
+                            // old one may be what kept the resident from
+                            // starting.
+                            if old_prompt.is_some_and(|old| old != chat.user_system_prompt) {
+                                mirror.always_on_starts.remove(&id);
+                            }
+                            chats_put.push(id.clone());
                         }
                     }
                     StagedRow::Remove => delete_chat(&id, mirror, supervisor).await,
@@ -553,6 +564,12 @@ async fn handle_sync_event(
                 if supervisor.after_threshold_set(&chat_id, chat.auto_compact_tokens, timezone) {
                     publish_queued_turn(supervisor, write_tx, mirror, chat_id).await;
                 }
+            }
+
+            // After the messages: one that came with a new system prompt
+            // already respawned its chat.
+            for chat_id in chats_put {
+                retire_stale_prompt(&chat_id, mirror, supervisor, write_tx).await;
             }
 
             // After the messages: a client switches always-on off no later than
@@ -682,6 +699,10 @@ pub(crate) async fn handle_agent_response(
                     mirror.is_always_on(&topic),
                     mirror.member_timezone(&chat.user_id),
                 );
+            }
+            // Left with background tasks armed, the chat sends no idle edge.
+            if mirror.is_always_on(&topic) && supervisor.is_running(&topic) {
+                retire_stale_prompt(&topic, mirror, supervisor, write_tx).await;
             }
         }
     }
@@ -1335,6 +1356,7 @@ async fn handle_message_put(
         model,
         user_timezone,
         session_name,
+        user_system_prompt: mirror.user_system_prompt(&chat_id),
     };
 
     if is_resident {
@@ -1432,7 +1454,72 @@ fn chat_spawn_request(mirror: &Mirror, chat_id: &str, prompt: String) -> Option<
             .map(str::to_string),
         user_timezone: mirror.member_timezone(&chat.user_id).map(str::to_string),
         session_name: chat.title.as_deref().and_then(session_name::from_title),
+        user_system_prompt: mirror.user_system_prompt(chat_id),
     })
+}
+
+/// Tear down `chat_id`'s resident if it runs with another user system prompt
+/// than the chat has now and no turn would be cut. Its next spawn - the next
+/// message, or right here for an always-on chat - renders the current one. An
+/// always-on resident goes even with background tasks armed, once it can
+/// restart at once (nothing in the foreground): its restart notice has the
+/// agent re-arm them. Elsewhere they would die unnoticed, so that resident
+/// stays until it is idle or a message respawns it. A prompt that doesn't
+/// render retires nothing: the resident keeps working until a message's
+/// respawn reports the error.
+async fn retire_stale_prompt(
+    chat_id: &str,
+    mirror: &mut Mirror,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    let prompt = mirror.user_system_prompt(chat_id);
+    let always_on = mirror.is_always_on(chat_id);
+    let kill_tasks = always_on && !supervisor.any_in_foreground();
+    if !supervisor.has_retirable_stale_prompt(chat_id, &prompt, kill_tasks) {
+        return;
+    }
+    let Some(project_path) = mirror
+        .chats
+        .get(chat_id)
+        .and_then(|c| mirror.projects.get(&c.project_id))
+    else {
+        return;
+    };
+    if let Err(e) = prompt.render(Some(project_path)) {
+        warn!(chat_id = %chat_id, error = %e, "the new system prompt doesn't render, keeping the resident");
+        return;
+    }
+    let Some(was_running) = supervisor
+        .retire_stale_prompt(chat_id, &prompt, kill_tasks)
+        .await
+    else {
+        return;
+    };
+    info!(chat_id = %chat_id, "system prompt changed, resident torn down");
+    if was_running {
+        let _ = write_tx
+            .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
+            .await;
+    }
+    clear_live_tasks(write_tx, chat_id).await;
+    if always_on {
+        reconcile_always_on(mirror, supervisor);
+    }
+}
+
+/// The warm tick's always-on pass: an always-on resident whose stale prompt
+/// had to wait for the foreground to clear is retired now, then whatever is
+/// missing starts.
+async fn tend_always_on(
+    mirror: &mut Mirror,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    for chat_id in mirror.always_on_chats() {
+        retire_stale_prompt(&chat_id, mirror, supervisor, write_tx).await;
+    }
+    reconcile_always_on(mirror, supervisor);
 }
 
 /// The first turn of an always-on resident the spawner (re)starts.
@@ -1696,6 +1783,9 @@ async fn handle_run_state(
         }
     }
     send_run_state(write_tx, topic.to_string(), running).await;
+    if !running {
+        retire_stale_prompt(topic, &mut *mirror.write().await, supervisor, write_tx).await;
+    }
 }
 
 /// Keep this list narrower than `AgentKind::ALL`: new adapter kinds are not
@@ -2945,6 +3035,7 @@ async fn main() {
     let mut sync_rx = powersync::start(sync_config);
 
     let keys = Arc::new(KeyStore::new());
+    mirror.write().await.unseal_system_prompts(&keys);
 
     // Hoist dir creation here so per-message persist_user_key on the hot path
     // doesn't recheck it (heartbeat fan-out re-runs every machine_users PUT).
@@ -3297,7 +3388,7 @@ async fn main() {
             warm_idle_seen = idle_set(&supervisor);
         }
         if warm_due {
-            reconcile_always_on(&mut *mirror.write().await, &mut supervisor);
+            tend_always_on(&mut *mirror.write().await, &mut supervisor, &write_tx).await;
         }
         publish_alive_changes(&mut supervisor, &write_tx).await;
 
@@ -3747,6 +3838,7 @@ mod tests {
         // Pre-register a fake handle so we can observe `supervisor.remove`.
         supervisor.spawn_agent(SpawnRequest {
             session_name: None,
+            user_system_prompt: Default::default(),
             chat_id: chat_id.clone(),
             prompt: String::new(),
             project_path: None,
@@ -5077,6 +5169,7 @@ mod tests {
 
         let mk = |prompt: &str, model: Option<&str>, sid: Option<&str>| SpawnRequest {
             session_name: None,
+            user_system_prompt: Default::default(),
             chat_id: chat_id.clone(),
             prompt: prompt.to_string(),
             project_path: Some("/tmp/p".to_string()),
@@ -5642,6 +5735,403 @@ mod tests {
         assert!(c.mirror.always_on_chats().is_empty());
     }
 
+    /// `plain` as the clients seal a `chats` column.
+    fn sealed(c: &ResidentChat, plain: &str) -> serde_json::Value {
+        let key = c.keys.get(&c.user_id).expect("seeded key");
+        json!(crypto::encrypt_field_b64(&key, plain))
+    }
+
+    fn prompted_chat(c: &ResidentChat, last_seq: i64, text: &str) -> SyncEvent {
+        chat_with(c, last_seq, json!({ "system_prompt": sealed(c, text) }))
+    }
+
+    fn always_on_prompted_chat(c: &ResidentChat, last_seq: i64, text: &str) -> SyncEvent {
+        chat_with(
+            c,
+            last_seq,
+            json!({ "always_on": 1, "agent_session_id": "sid", "system_prompt": sealed(c, text) }),
+        )
+    }
+
+    fn spawned_prompt_texts(c: &ResidentChat) -> Vec<Option<String>> {
+        c.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.user_system_prompt.text.clone())
+            .collect()
+    }
+
+    /// The live session finished its turn: idle.
+    fn finish_turn(c: &ResidentChat) {
+        let s = c.session();
+        let mut st = s.lock().unwrap();
+        st.unconsumed.clear();
+        st.turn_in_flight = false;
+    }
+
+    fn arm_monitor(c: &ResidentChat) {
+        c.session()
+            .lock()
+            .unwrap()
+            .live_tasks
+            .push(agent::LiveTask {
+                id: "monitor".into(),
+                description: String::new(),
+                task_type: "bash".into(),
+                subagent_type: None,
+                started_at: 0,
+            });
+    }
+
+    #[tokio::test]
+    async fn a_chats_system_prompt_reaches_the_spawn_decrypted() {
+        let mut c = ResidentChat::new();
+        let chat = chat_with(
+            &c,
+            1,
+            json!({
+                "system_prompt": sealed(&c, "be terse"),
+                "system_prompt_files": sealed(&c, "docs/a.md, ~/b.md"),
+            }),
+        );
+        c.window(vec![c.project(), chat, c.message(1, "first")])
+            .await;
+        assert_eq!(
+            c.recorded.lock().unwrap()[0].user_system_prompt,
+            user_prompt::UserSystemPrompt {
+                files: Some("docs/a.md, ~/b.md".to_string()),
+                text: Some("be terse".to_string()),
+                undecryptable: false,
+            }
+        );
+
+        c.chat_id = Uuid::now_v7().to_string();
+        let undecryptable = chat_with(&c, 1, json!({ "system_prompt": "bm90IHNlYWxlZA==" }));
+        c.window(vec![undecryptable, c.message(1, "first")]).await;
+        assert_eq!(
+            c.recorded.lock().unwrap()[1].user_system_prompt,
+            user_prompt::UserSystemPrompt {
+                undecryptable: true,
+                ..Default::default()
+            },
+            "its spawn fails rather than run without the prompt"
+        );
+        c.chat_id = Uuid::now_v7().to_string();
+        let blank = chat_with(&c, 1, json!({ "system_prompt": sealed(&c, " \n") }));
+        c.window(vec![blank, c.message(1, "first")]).await;
+        c.chat_id = Uuid::now_v7().to_string();
+        let codex = chat_with(
+            &c,
+            1,
+            json!({ "system_prompt": sealed(&c, "be terse"), "agent_kind": "codex" }),
+        );
+        c.window(vec![codex, c.message(1, "first")]).await;
+        for unset in &c.recorded.lock().unwrap()[2..] {
+            assert_eq!(unset.user_system_prompt, Default::default());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_chat_gets_no_system_prompt() {
+        let mut c = ResidentChat::new();
+        invite(&mut c, "row");
+        c.window(vec![
+            c.project(),
+            prompted_chat(&c, 1, "be terse"),
+            c.message(1, "first"),
+        ])
+        .await;
+        assert_eq!(spawned_prompt_texts(&c), vec![Some("be terse".to_string())]);
+
+        finish_turn(&c);
+        c.mirror.upsert_member("row".into(), c.user_id, true);
+        c.window(vec![
+            prompted_chat(&c, 2, "be terse"),
+            c.message(2, "second"),
+        ])
+        .await;
+        let sandboxed = c.recorded.lock().unwrap()[1].clone();
+        assert!(sandboxed.is_sandboxed);
+        assert_eq!(sandboxed.user_system_prompt, Default::default());
+
+        finish_turn(&c);
+        let undecryptable = chat_with(&c, 2, json!({ "system_prompt": "bm90IHNlYWxlZA==" }));
+        c.window(vec![prompted_chat(&c, 2, "be verbose")]).await;
+        c.window(vec![undecryptable, c.message(3, "third")]).await;
+        assert_eq!(
+            c.spawned_prompts().len(),
+            2,
+            "its prompt columns change nothing: no retire, no respawn"
+        );
+        assert!(c.supervisor.has_agent(&c.chat_id));
+    }
+
+    #[tokio::test]
+    async fn a_message_after_a_system_prompt_change_respawns_with_the_new_one() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            prompted_chat(&c, 1, "be terse"),
+            c.message(1, "first"),
+        ])
+        .await;
+        finish_turn(&c);
+        c.window(vec![
+            prompted_chat(&c, 2, "be terse"),
+            c.message(2, "second"),
+        ])
+        .await;
+        assert_eq!(c.spawned_prompts(), vec!["first"], "same prompt: stdin");
+
+        c.window(vec![
+            prompted_chat(&c, 3, "be verbose"),
+            c.message(3, "third"),
+        ])
+        .await;
+        assert_eq!(c.spawned_prompts(), vec!["first", "second"]);
+        assert_eq!(c.unconsumed(), vec!["second", "third"]);
+        assert_eq!(
+            spawned_prompt_texts(&c),
+            vec![Some("be terse".to_string()), Some("be verbose".to_string())]
+        );
+        assert!(c.supervisor.has_agent(&c.chat_id), "not retired again");
+    }
+
+    #[tokio::test]
+    async fn a_system_prompt_change_retires_the_resident_once_it_is_idle() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            prompted_chat(&c, 1, "be terse"),
+            c.message(1, "first"),
+        ])
+        .await;
+        c.consume_first_turn();
+        c.window(vec![prompted_chat(&c, 1, "be verbose")]).await;
+        assert!(c.supervisor.is_running(&c.chat_id), "the turn is not cut");
+
+        finish_turn(&c);
+        c.writes();
+        let prunes = prune::PendingPrunes::default();
+        let chat_id = c.chat_id.clone();
+        let mirror = c.shared_mirror();
+        handle_run_state(
+            &chat_id,
+            false,
+            &prunes,
+            &mirror,
+            &mut c.supervisor,
+            &c.write_tx,
+        )
+        .await;
+        c.mirror = std::mem::take(&mut *mirror.write().await);
+        assert!(!c.supervisor.has_agent(&c.chat_id));
+        let writes = c.writes();
+        assert!(matches!(
+            writes[0],
+            WriteEvent::ChatRunning {
+                agent_running: false,
+                stopped_by_user: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            writes[1],
+            WriteEvent::ChatLiveTasks { tasks: None, .. }
+        ));
+        assert_eq!(writes.len(), 2);
+
+        c.window(vec![
+            prompted_chat(&c, 2, "be verbose"),
+            c.message(2, "second"),
+        ])
+        .await;
+        assert_eq!(
+            spawned_prompt_texts(&c),
+            vec![Some("be terse".to_string()), Some("be verbose".to_string())]
+        );
+        finish_turn(&c);
+        c.window(vec![prompted_chat(&c, 2, "be verbose")]).await;
+        assert!(
+            c.supervisor.has_agent(&c.chat_id),
+            "a re-stream changes nothing"
+        );
+
+        arm_monitor(&c);
+        c.window(vec![prompted_chat(&c, 2, "be brief")]).await;
+        assert!(c.supervisor.has_agent(&c.chat_id), "its monitor is spared");
+        c.session().lock().unwrap().live_tasks.clear();
+        c.window(vec![chat_with(&c, 2, json!({}))]).await;
+        assert!(!c.supervisor.has_agent(&c.chat_id), "idle: retired at once");
+        assert_eq!(
+            c.spawned_prompts().len(),
+            2,
+            "and left for the next message"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_always_on_chat_restarts_with_each_new_system_prompt() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_prompted_chat(&c, 1, "v0")])
+            .await;
+        let edits = ALWAYS_ON_RETRIES as usize + 2;
+        for edit in 1..=edits {
+            c.window(vec![always_on_prompted_chat(&c, 1, &format!("v{edit}"))])
+                .await;
+            assert_eq!(notices(&c), edit, "the notice turn is not cut");
+            finish_turn(&c);
+            c.respond(AgentResponse::TurnEnded {
+                topic: c.chat_id.clone(),
+            })
+            .await;
+            assert_eq!(
+                notices(&c),
+                edit,
+                "idle: left to the idle edge or the next row"
+            );
+            c.window(vec![always_on_prompted_chat(&c, 1, &format!("v{edit}"))])
+                .await;
+            assert_eq!(notices(&c), edit + 1);
+        }
+        let expected: Vec<_> = (0..=edits).map(|v| Some(format!("v{v}"))).collect();
+        assert_eq!(spawned_prompt_texts(&c), expected);
+
+        finish_turn(&c);
+        arm_monitor(&c);
+        c.writes();
+        c.window(vec![always_on_prompted_chat(&c, 1, "armed")])
+            .await;
+        assert_eq!(notices(&c), edits + 2, "restarted with its monitor armed");
+        assert!(c.writes().iter().any(|w| matches!(
+            w,
+            WriteEvent::ChatRunning {
+                agent_running: false,
+                stopped_by_user: true,
+                ..
+            }
+        )));
+
+        c.window(vec![always_on_prompted_chat(&c, 1, "mid-turn")])
+            .await;
+        finish_turn(&c);
+        arm_monitor(&c);
+        c.respond(AgentResponse::TurnEnded {
+            topic: c.chat_id.clone(),
+        })
+        .await;
+        assert_eq!(
+            notices(&c),
+            edits + 3,
+            "left waiting: restarted at the turn end"
+        );
+        assert_eq!(
+            spawned_prompt_texts(&c).last().unwrap().as_deref(),
+            Some("mid-turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_system_prompt_that_does_not_render_keeps_the_resident() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            prompted_chat(&c, 1, "be terse"),
+            c.message(1, "first"),
+        ])
+        .await;
+        finish_turn(&c);
+        let typo = chat_with(
+            &c,
+            1,
+            json!({
+                "system_prompt": sealed(&c, "be terse"),
+                "system_prompt_files": sealed(&c, "zucchini-no-such-file.md"),
+            }),
+        );
+        c.window(vec![typo]).await;
+        assert!(c.supervisor.has_agent(&c.chat_id), "a typo'd path");
+
+        let undecryptable = chat_with(&c, 1, json!({ "system_prompt": "bm90IHNlYWxlZA==" }));
+        c.window(vec![undecryptable]).await;
+        assert!(c.mirror.chats[&c.chat_id].user_system_prompt.undecryptable);
+        assert!(c.supervisor.has_agent(&c.chat_id));
+
+        c.window(vec![prompted_chat(&c, 1, "be terse")]).await;
+        assert!(
+            c.supervisor.has_agent(&c.chat_id),
+            "decrypted again and unchanged: nothing to retire"
+        );
+        c.window(vec![prompted_chat(&c, 1, "be verbose")]).await;
+        assert!(!c.supervisor.has_agent(&c.chat_id), "the one real change");
+        assert_eq!(c.spawned_prompts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_always_on_chat_with_tasks_armed_waits_for_the_foreground_to_clear() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_prompted_chat(&c, 1, "v0")])
+            .await;
+        finish_turn(&c);
+        arm_monitor(&c);
+        let always_on = c.chat_id.clone();
+        c.chat_id = Uuid::now_v7().to_string();
+        c.window(vec![c.chat(0, ""), c.message(1, "busy")]).await;
+        let busy = std::mem::replace(&mut c.chat_id, always_on);
+
+        c.window(vec![always_on_prompted_chat(&c, 1, "v1")]).await;
+        tend_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
+        assert!(
+            c.supervisor.has_agent(&c.chat_id),
+            "it couldn't restart yet, so its monitor lives"
+        );
+        assert_eq!(notices(&c), 1);
+
+        c.supervisor.abort_agent(&busy).await;
+        tend_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
+        assert_eq!(notices(&c), 2);
+        assert_eq!(
+            spawned_prompt_texts(&c).last().unwrap().as_deref(),
+            Some("v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fixed_system_prompt_gets_an_always_on_chat_its_retries_back() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_prompted_chat(&c, 1, "broken")])
+            .await;
+        for _ in 0..5 {
+            c.supervisor.abort_agent(&c.chat_id).await;
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+        }
+        assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
+        c.window(vec![always_on_prompted_chat(&c, 1, "broken")])
+            .await;
+        assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
+        c.window(vec![always_on_prompted_chat(&c, 1, "fixed")])
+            .await;
+        assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize + 1);
+    }
+
+    #[tokio::test]
+    async fn boot_restarts_an_always_on_chat_with_its_system_prompt() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            always_on_prompted_chat(&c, 1, "be terse"),
+        ])
+        .await;
+        assert!(!serde_json::to_string(&c.mirror)
+            .unwrap()
+            .contains("be terse"));
+        restart(&mut c);
+        c.mirror.unseal_system_prompts(&c.keys);
+        c.window(vec![]).await;
+        assert_eq!(spawned_prompt_texts(&c), vec![Some("be terse".to_string())]);
+    }
+
     #[test]
     fn a_saved_chat_missing_fields_still_loads() {
         let mirror: Mirror =
@@ -6202,6 +6692,7 @@ mod tests {
         for chat in ["busy", "idle-25h", "idle-24h", "no-edge", "idle-22h"] {
             sup.spawn_agent(SpawnRequest {
                 session_name: None,
+                user_system_prompt: Default::default(),
                 chat_id: chat.to_string(),
                 prompt: "hi".to_string(),
                 project_path: None,

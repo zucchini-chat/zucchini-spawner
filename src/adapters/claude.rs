@@ -145,6 +145,7 @@ fn claude_flag_args(
     is_sandboxed: bool,
     model: Option<&str>,
     session_name: Option<&str>,
+    user_system_prompt: Option<&str>,
     resident: bool,
     chrome: bool,
 ) -> Vec<CliArg> {
@@ -202,6 +203,10 @@ fn claude_flag_args(
     sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
     sys.push(' ');
     sys.push_str(PRUNE_SUMMARY_MOVE_INSTRUCTION);
+    if let Some(user) = user_system_prompt {
+        sys.push_str("\n\n");
+        sys.push_str(user);
+    }
     args.push(CliArg::Lit("--append-system-prompt"));
     args.push(CliArg::Val(sys));
     // Resident: read user/control turns from the held-open stdin pipe, and echo
@@ -300,6 +305,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.is_sandboxed,
             ctx.model,
             /* session_name = */ None,
+            /* user_system_prompt = */ None,
             /* resident = */ false,
             claude_in_chrome_enabled(),
         );
@@ -317,6 +323,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.is_sandboxed,
             ctx.model,
             /* session_name = */ None,
+            /* user_system_prompt = */ None,
             false,
             claude_in_chrome_enabled(),
         );
@@ -344,6 +351,10 @@ impl AgentAdapter for ClaudeAdapter {
         true
     }
 
+    fn takes_user_system_prompt(&self) -> bool {
+        true
+    }
+
     fn prepare_session_command(
         &mut self,
         ctx: &crate::adapter::SessionContext<'_>,
@@ -366,6 +377,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.is_sandboxed,
             ctx.model,
             ctx.session_name,
+            ctx.user_system_prompt,
             /* resident = */ true,
             claude_in_chrome_enabled(),
         );
@@ -386,6 +398,7 @@ impl AgentAdapter for ClaudeAdapter {
             ctx.is_sandboxed,
             ctx.model,
             ctx.session_name,
+            ctx.user_system_prompt,
             true,
             claude_in_chrome_enabled(),
         );
@@ -1889,6 +1902,7 @@ mod tests {
             agent_session_id: Some("sid-9"),
             is_sandboxed: false,
             model: Some("opus"),
+            user_system_prompt: None,
         }
     }
 
@@ -2128,6 +2142,7 @@ mod tests {
                 is_sandboxed,
                 None,
                 None,
+                None,
                 true,
                 chrome,
             );
@@ -2149,6 +2164,63 @@ mod tests {
             run(&mut a, line),
             vec!["PeerTurnConsumed(zucchini-9d: Probe question 2: what is 6 x 7? Reply to me via SendMessage.)"]
         );
+    }
+
+    fn system_prompt_arg(argv: &[String]) -> &str {
+        let i = argv
+            .iter()
+            .position(|s| s == "--append-system-prompt")
+            .unwrap();
+        &argv[i + 1]
+    }
+
+    #[test]
+    fn user_system_prompt_follows_our_instructions() {
+        let user = "The user set these instructions for this chat:\n\nIt's terse.";
+        let ours = format!("{PRUNE_CONTEXT_INSTRUCTION} {PRUNE_SUMMARY_MOVE_INSTRUCTION}");
+        let session = crate::adapter::SessionContext {
+            user_system_prompt: Some(user),
+            ..session_ctx()
+        };
+        let mut a = ClaudeAdapter::new();
+        let argv = a.prepare_session_native(&session).unwrap().args;
+        let with = system_prompt_arg(&argv);
+        assert!(with.ends_with(&format!("{ours}\n\n{user}")), "got: {with}");
+        let cmd = a.prepare_session_command(&session).unwrap();
+        assert!(cmd.contains(&shell_escape(with)), "got: {cmd}");
+
+        let argv = a.prepare_session_native(&session_ctx()).unwrap().args;
+        let without = system_prompt_arg(&argv);
+        assert!(without.ends_with(&ours), "got: {without}");
+    }
+
+    /// CreateProcess takes 32,767 chars, so `WINDOWS_MAX_BYTES` of user prompt
+    /// must fit next to the longest command of our own.
+    #[test]
+    fn a_full_user_prompt_fits_the_windows_command_line() {
+        use crate::user_prompt::{windows_arg_bytes, WINDOWS_MAX_BYTES};
+        let project = format!(r"C:\Users\someone\{}", "p".repeat(200));
+        let name = "n".repeat(40);
+        let ours = crate::adapter::SessionContext {
+            session_name: Some(&name),
+            chat_id: "abcdef01-2345-6789-abcd-ef0123456789",
+            project_path: Some(&project),
+            worktree: true,
+            agent_session_id: Some("abcdef01-2345-6789-abcd-ef0123456789"),
+            is_sandboxed: true,
+            model: Some("claude-opus-4-1-20250805[1m]"),
+            user_system_prompt: None,
+        };
+        let argv = ClaudeAdapter::new()
+            .prepare_session_native(&ours)
+            .unwrap()
+            .args;
+        // Per argument: its quotes and the separating space.
+        let ours: usize = argv.iter().map(|a| windows_arg_bytes(a) + 3).sum();
+        let program = 260 + 3;
+        let separator = "\n\n".len();
+        let total = program + ours + "--chrome ".len() + separator + WINDOWS_MAX_BYTES;
+        assert!(total <= 32_767, "{total} chars, {ours} of them our own");
     }
 
     /// Must stay byte-stable across respawns — see `AgentAdapter::turn_time_line`.

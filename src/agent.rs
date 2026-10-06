@@ -25,6 +25,7 @@ use crate::adapter::{AgentEvent, AgentKind, TurnContext};
 use crate::envelope::{EnvelopeAttachment, MessageEnvelope};
 use crate::prune::PendingPrunes;
 use crate::sys;
+use crate::user_prompt::UserSystemPrompt;
 
 /// Per-chat pending-attachments registry: the agent-side `attach-file` flow
 /// writes `EnvelopeAttachment`s through these unbounded senders, and the
@@ -283,6 +284,14 @@ impl SessionState {
         let commands = self.live_commands.iter().map(|(_, c)| c.clone());
         tasks.chain(commands).collect()
     }
+    fn subagent_armed(&self) -> bool {
+        self.live_tasks.iter().any(|t| t.task_type == "local_agent")
+    }
+    /// A restart would cut no turn: none runs or is queued and no subagent is
+    /// armed. Background shells and monitors may be.
+    fn between_turns(&self) -> bool {
+        !self.closed && !self.in_foreground() && !self.subagent_armed()
+    }
     /// Kept warm past its idle edge with nothing pending: evictable.
     fn warm_idle_since(&self) -> Option<tokio::time::Instant> {
         self.idle_since.filter(|_| !self.closed && self.is_idle())
@@ -330,7 +339,7 @@ impl SessionState {
             AutoCompact::Off => {
                 let due = threshold.is_some_and(|t| self.context_tokens.is_some_and(|n| n >= t))
                     && !self.user_queued()
-                    && !self.live_tasks.iter().any(|t| t.task_type == "local_agent");
+                    && !self.subagent_armed();
                 if !due {
                     return None;
                 }
@@ -872,6 +881,9 @@ pub struct SpawnRequest {
     /// every spawn, so a rename that missed the live process still lands on the
     /// next one. `None` for a blank/undecryptable title.
     pub session_name: Option<String>,
+    /// `ChatState::user_system_prompt`. Rendered (its files read) at spawn; a
+    /// render error fails the turn with the reason in the chat.
+    pub user_system_prompt: UserSystemPrompt,
 }
 
 /// Handles a resident spawn fn returns so the Supervisor can drive the session
@@ -895,6 +907,7 @@ struct SessionKnobs {
     worktree: bool,
     is_sandboxed: bool,
     model: Option<String>,
+    user_system_prompt: UserSystemPrompt,
 }
 
 impl SessionKnobs {
@@ -905,8 +918,22 @@ impl SessionKnobs {
             worktree: req.worktree,
             is_sandboxed: req.is_sandboxed,
             model: req.model.clone(),
+            user_system_prompt: req.user_system_prompt.clone(),
         }
     }
+}
+
+/// `Some(running)` for a session `Supervisor::retire_stale_prompt` may abort.
+fn stale_prompt_retirable(
+    knobs: &SessionKnobs,
+    st: &SessionState,
+    current: &UserSystemPrompt,
+    kill_tasks: bool,
+) -> Option<bool> {
+    let retirable = knobs.user_system_prompt != *current
+        && st.between_turns()
+        && (kill_tasks || st.live_tasks.is_empty());
+    retirable.then(|| st.running())
 }
 
 /// A live resident session for one chat. Held in `AgentEntry::Resident`.
@@ -1356,21 +1383,62 @@ impl Supervisor {
         idle
     }
 
-    /// Hard-abort an idle resident. `false` if it took a turn meanwhile: the
-    /// check and the kill share the lock the reader reduces under.
+    /// Hard-abort the chat's resident if `check` passes on its state, and hand
+    /// back what `check` returned. The check and the kill share the lock the
+    /// reader reduces under, so the resident can't take a turn in between.
+    async fn abort_resident_if<T>(
+        &mut self,
+        topic: &str,
+        check: impl FnOnce(&SessionKnobs, &SessionState) -> Option<T>,
+    ) -> Option<T> {
+        let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
+            return None;
+        };
+        let passed = {
+            let st = s.state.lock().expect("SessionState mutex");
+            let passed = check(&s.knobs, &st)?;
+            s.cancel.cancel();
+            passed
+        };
+        self.abort_agent(topic).await;
+        Some(passed)
+    }
+
+    /// Hard-abort an idle resident. `false` if it took a turn meanwhile.
     pub async fn evict_idle(&mut self, topic: &str) -> bool {
+        self.abort_resident_if(topic, |_, st| st.warm_idle_since().map(drop))
+            .await
+            .is_some()
+    }
+
+    /// `retire_stale_prompt` would tear the chat's resident down.
+    pub fn has_retirable_stale_prompt(
+        &self,
+        topic: &str,
+        current: &UserSystemPrompt,
+        kill_tasks: bool,
+    ) -> bool {
         let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
             return false;
         };
-        {
-            let st = s.state.lock().expect("SessionState mutex");
-            if st.warm_idle_since().is_none() {
-                return false;
-            }
-            s.cancel.cancel();
-        }
-        self.abort_agent(topic).await;
-        true
+        let st = s.state.lock().expect("SessionState mutex");
+        stale_prompt_retirable(&s.knobs, &st, current, kill_tasks).is_some()
+    }
+
+    /// Hard-abort the chat's resident if it was spawned with another user
+    /// system prompt than `current` and is between turns; its next spawn
+    /// renders the current one. With armed background tasks it goes only when
+    /// `kill_tasks`. `Some(was_running)` if torn down.
+    pub async fn retire_stale_prompt(
+        &mut self,
+        topic: &str,
+        current: &UserSystemPrompt,
+        kill_tasks: bool,
+    ) -> Option<bool> {
+        self.abort_resident_if(topic, |knobs, st| {
+            stale_prompt_retirable(knobs, st, current, kill_tasks)
+        })
+        .await
     }
 
     /// Rename the live resident to `name` (chat renamed in the app) with an
@@ -1596,6 +1664,8 @@ fn default_spawn_fn(
         model,
         user_timezone,
         session_name: _,
+        // Only resident adapters take one (`takes_user_system_prompt`).
+        user_system_prompt: _,
     } = req;
     let mut adapter = agent_kind.make_adapter();
 
@@ -1996,6 +2066,7 @@ fn default_resident_spawn_fn(
         model,
         user_timezone: _,
         session_name,
+        user_system_prompt,
     } = req;
 
     // Register the per-chat attachment mailbox before the spawn (same rationale
@@ -2042,6 +2113,16 @@ fn default_resident_spawn_fn(
             "spawning resident agent"
         );
 
+        let user_system_prompt = match user_system_prompt.render(project_path.as_deref()) {
+            Ok(rendered) => rendered,
+            Err(e) => {
+                error!(topic = %topic, "{}", e);
+                close_session(&state_for_reader);
+                fail_agent(&tx, &topic, e).await;
+                return;
+            }
+        };
+
         let ctx = crate::adapter::SessionContext {
             chat_id: &topic,
             project_path: project_path.as_deref(),
@@ -2050,6 +2131,7 @@ fn default_resident_spawn_fn(
             is_sandboxed,
             model: model.as_deref(),
             session_name: session_name.as_deref(),
+            user_system_prompt: user_system_prompt.as_deref(),
         };
         let native = if cfg!(windows) {
             lock_adapter(&adapter).prepare_session_native(&ctx)
@@ -3537,6 +3619,7 @@ mod live_session_tests {
     fn claude_req(chat_id: &str) -> SpawnRequest {
         SpawnRequest {
             session_name: None,
+            user_system_prompt: Default::default(),
             chat_id: chat_id.to_string(),
             prompt: "hi".to_string(),
             project_path: None,
@@ -3660,6 +3743,11 @@ mod live_session_tests {
             ..claude_req("chat")
         };
         assert!(!sup.send_user_turn(&other_model));
+        let other_prompt = SpawnRequest {
+            user_system_prompt: prompt_text("be terse"),
+            ..claude_req("chat")
+        };
+        assert!(!sup.send_user_turn(&other_prompt));
 
         let compact = SpawnRequest {
             prompt: "/compact".to_string(),
@@ -3687,6 +3775,68 @@ mod live_session_tests {
             sup.send_user_turn(&compact),
             "a turn of its own gets expanded"
         );
+    }
+
+    fn prompt_text(text: &str) -> UserSystemPrompt {
+        UserSystemPrompt {
+            text: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resident_with_a_stale_system_prompt_is_retired_between_turns() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        let spawned_with = prompt_text("be terse");
+        let current = prompt_text("be verbose");
+        let spawn = |sup: &mut Supervisor| {
+            sup.spawn_agent(SpawnRequest {
+                user_system_prompt: spawned_with.clone(),
+                ..claude_req("chat")
+            })
+        };
+        let state = |exposed: &Exposed| exposed.lock().unwrap()["chat"].clone();
+
+        spawn(&mut sup);
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &current, true).await,
+            None,
+            "its first turn is queued"
+        );
+        state(&exposed).lock().unwrap().unconsumed.clear();
+        state(&exposed).lock().unwrap().turn_in_flight = true;
+        assert_eq!(sup.retire_stale_prompt("chat", &current, true).await, None);
+
+        set_idle(&exposed, "chat");
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &spawned_with, true).await,
+            None,
+            "the prompt it runs with"
+        );
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &current, false).await,
+            Some(false)
+        );
+        assert!(!sup.has_agent("chat"));
+
+        spawn(&mut sup);
+        set_idle(&exposed, "chat");
+        state(&exposed).lock().unwrap().live_tasks = vec![live_task("monitor")];
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &current, false).await,
+            None,
+            "its monitor would die unnoticed"
+        );
+        let mut subagent = live_task("subagent");
+        subagent.task_type = "local_agent".to_string();
+        state(&exposed).lock().unwrap().live_tasks.push(subagent);
+        assert_eq!(sup.retire_stale_prompt("chat", &current, true).await, None);
+        state(&exposed).lock().unwrap().live_tasks.pop();
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &current, true).await,
+            Some(true)
+        );
+        assert!(!sup.has_agent("chat"));
     }
 
     /// A chats row re-streams on every writeback, so the rename is queued only
@@ -3927,6 +4077,7 @@ mod cli_smoke {
             model: None,
             user_timezone: Some("Asia/Bangkok".to_string()),
             session_name: None,
+            user_system_prompt: Default::default(),
         }
     }
 
