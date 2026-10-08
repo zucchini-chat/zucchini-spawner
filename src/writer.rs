@@ -67,6 +67,12 @@ pub enum WriteEvent {
         chat_id: String,
         agent_alive: bool,
     },
+    /// `chats.turn_running`: a turn is in flight or queued. Unlike
+    /// `agent_running` it is false while only background tasks are armed.
+    ChatTurnRunning {
+        chat_id: String,
+        turn_running: bool,
+    },
     /// What the chat's resident agent has armed right now (`chats.live_tasks`),
     /// E2E-encrypted like a message body. `tasks` is the plaintext blob from
     /// `agent::live_tasks_payload`; `None` writes SQL NULL — the teardown
@@ -327,6 +333,15 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
                 serde_json::json!({ "agent_alive": agent_alive }),
             )?
         }
+        WriteEvent::ChatTurnRunning {
+            chat_id,
+            turn_running,
+        } => {
+            if !BACKEND_HAS_TURN_RUNNING {
+                return None;
+            }
+            turn_running_patch(chat_id, *turn_running)?
+        }
         WriteEvent::ChatLiveTasks {
             chat_id,
             user_id,
@@ -513,6 +528,16 @@ pub(crate) fn live_tasks_patch(
     )
 }
 
+/// Split out of `encode_event` so the wire shape stays testable while
+/// `BACKEND_HAS_TURN_RUNNING` is false.
+pub(crate) fn turn_running_patch(chat_id: &str, turn_running: bool) -> Option<BatchOp> {
+    chats_patch(
+        chat_id,
+        "ChatTurnRunning",
+        serde_json::json!({ "turn_running": turn_running }),
+    )
+}
+
 fn machines_patch(machine_id: Uuid, data: serde_json::Value) -> BatchOp {
     BatchOp {
         op: "PATCH",
@@ -642,6 +667,11 @@ const BACKEND_HAS_AGENT_ALIVE: bool = true;
 /// prod since 2026-09-12), so the PATCH no longer poisons the queue.
 const BACKEND_HAS_LIVE_TASKS: bool = true;
 
+/// Same 4xx queue-poison guard, for `chats.turn_running`: stays `false` (the
+/// writes are dropped) until migration 0056 and the `turn_running` entry in
+/// `process_chat_patch`'s `machine_fields` are live in prod.
+const BACKEND_HAS_TURN_RUNNING: bool = true;
+
 async fn send_batch(
     http: &reqwest::Client,
     url: &str,
@@ -718,5 +748,32 @@ mod live_tasks_tests {
     fn a_gated_open_backend_ships_the_write() {
         let ev = WriteEvent::clear_live_tasks(Uuid::now_v7().to_string());
         assert!(encode_event(&ev, &KeyStore::new()).is_some());
+    }
+
+    #[test]
+    fn a_turn_running_patch_is_a_plaintext_bool() {
+        let chat_id = Uuid::now_v7().to_string();
+        let op = turn_running_patch(&chat_id, true).expect("op");
+        assert_eq!((op.op, op.table), ("PATCH", "chats"));
+        assert_eq!(
+            op.data.expect("data"),
+            serde_json::json!({ "turn_running": true })
+        );
+    }
+
+    /// Until the backend knows the column the write must not reach the queue:
+    /// an unknown field 4xx's the batch and blocks every write behind it.
+    #[test]
+    fn turn_running_ships_only_once_the_backend_has_the_column() {
+        for turn_running in [false, true] {
+            let ev = WriteEvent::ChatTurnRunning {
+                chat_id: Uuid::now_v7().to_string(),
+                turn_running,
+            };
+            assert_eq!(
+                encode_event(&ev, &KeyStore::new()).is_some(),
+                BACKEND_HAS_TURN_RUNNING
+            );
+        }
     }
 }

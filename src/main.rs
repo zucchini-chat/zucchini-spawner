@@ -691,6 +691,33 @@ pub(crate) async fn handle_agent_response(
             }
             send_live_tasks(write_tx, mirror, topic, tasks).await;
         }
+        // From a session a teardown replaced it is stale, like `LiveTasks`.
+        AgentResponse::TurnRunning {
+            topic,
+            session,
+            running,
+        } => {
+            if !supervisor.is_current_session(&topic, &session) {
+                return;
+            }
+            let now = {
+                let mut st = session.lock().expect("SessionState mutex");
+                let now = st.in_foreground();
+                if !running {
+                    st.published_turn_running = now;
+                }
+                now
+            };
+            // The backend releases queued messages on the false edge, so every
+            // turn end reaches it, even one the next turn has overtaken: false,
+            // then true again. A true edge whose turn is over writes nothing.
+            if !running {
+                send_turn_running(write_tx, topic.clone(), false).await;
+            }
+            if now {
+                send_turn_running(write_tx, topic, true).await;
+            }
+        }
         AgentResponse::TurnEnded { topic } => {
             if let Some(chat) = mirror.chats.get(&topic) {
                 supervisor.after_turn(
@@ -788,7 +815,21 @@ async fn publish_queued_turn(
     if let Some(tasks) = supervisor.live_tasks_change(&chat_id) {
         send_live_tasks(write_tx, mirror, chat_id.clone(), tasks).await;
     }
-    send_run_state(write_tx, chat_id, true).await;
+    send_run_state(write_tx, chat_id.clone(), true).await;
+    if let Some(running) = supervisor.turn_running_change(&chat_id) {
+        send_turn_running(write_tx, chat_id, running).await;
+    }
+}
+
+/// Write `chats.turn_running`. Only ever sent after the `agent_running` write
+/// of the same edge: the backend resets it whenever `agent_running` goes false.
+async fn send_turn_running(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String, running: bool) {
+    let _ = write_tx
+        .send(WriteEvent::ChatTurnRunning {
+            chat_id,
+            turn_running: running,
+        })
+        .await;
 }
 
 async fn send_run_state(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String, running: bool) {
@@ -1362,7 +1403,15 @@ async fn handle_message_put(
     if is_resident {
         // A live process spawned with the same knobs takes the turn on stdin;
         // claude answers it within the running turn or right after it.
-        if supervisor.send_user_turn(&req) {
+        // A message the backend promoted from the schedule can arrive mid-turn
+        // at any time: its slash command waits for the turn instead of
+        // cutting it.
+        let queued = if json_pg_bool(row.get("auto_sent")) {
+            supervisor.send_scheduled_turn(&req)
+        } else {
+            supervisor.send_user_turn(&req)
+        };
+        if queued {
             info!(chat_id = %chat_id, "queued user turn on the live resident session");
             publish_queued_turn(supervisor, write_tx, mirror, chat_id).await;
             return;
@@ -1407,6 +1456,9 @@ async fn handle_message_put(
                 .send(WriteEvent::chat_running(chat_id.clone(), true))
                 .await;
         }
+        // A one-shot's turn is its whole run. Written on every spawn: the
+        // chat may have been a resident's, left with tasks armed and no turn.
+        send_turn_running(write_tx, chat_id.clone(), true).await;
         // A fresh turn: anything parked is a torn-down session's (the resident
         // path's `abort_agent` drops it too).
         supervisor.pending_prunes().lock().await.remove(&chat_id);
@@ -5270,17 +5322,9 @@ mod tests {
         /// `chat`, plus the sealed `title` the clients write — which becomes
         /// `claude --name` and, on a change, the internal `/rename` turn.
         fn titled_chat(&self, last_seq: i64, title: &str) -> SyncEvent {
-            let SyncEvent::Put { table, id, data } = self.chat(last_seq, "") else {
-                unreachable!("chat() is a Put")
-            };
             let key = self.keys.get(&self.user_id).expect("seeded key");
-            let mut row: serde_json::Value = serde_json::from_str(&data).expect("chat row");
-            row["title"] = json!(crypto::encrypt_field_b64(&key, title));
-            SyncEvent::Put {
-                table,
-                id,
-                data: row.to_string(),
-            }
+            let title = crypto::encrypt_field_b64(&key, title);
+            put_with(self.chat(last_seq, ""), json!({ "title": title }))
         }
 
         fn message(&self, seq: i64, text: &str) -> SyncEvent {
@@ -5345,12 +5389,14 @@ mod tests {
         /// usage are still the rename's).
         async fn reader_line(&mut self, events: Vec<adapter::AgentEvent>) {
             let mut renaming = crate::agent::InternalLine::default();
+            let mut turn_edges = Vec::new();
             for ev in events {
                 let session = self.session();
                 let (swallow, live_tasks) = {
                     let mut st = session.lock().unwrap();
                     let swallow = renaming.swallows(st.internal_in_flight(), &ev);
                     crate::agent::reduce(&mut st, &ev);
+                    turn_edges.extend(st.observe_turn_running());
                     (swallow, st.observe_live_tasks())
                 };
                 let topic = self.chat_id.clone();
@@ -5373,6 +5419,14 @@ mod tests {
                     })
                     .await;
                 }
+            }
+            for running in turn_edges {
+                self.respond(AgentResponse::TurnRunning {
+                    topic: self.chat_id.clone(),
+                    session: self.session(),
+                    running,
+                })
+                .await;
             }
         }
 
@@ -5443,10 +5497,15 @@ mod tests {
 
     /// `c.chat(last_seq, "")` with `fields` overriding its columns.
     fn chat_with(c: &ResidentChat, last_seq: i64, fields: serde_json::Value) -> SyncEvent {
-        let SyncEvent::Put { table, id, data } = c.chat(last_seq, "") else {
-            unreachable!("chat() is a Put")
+        put_with(c.chat(last_seq, ""), fields)
+    }
+
+    /// The row PUT `put`, with `fields` set on it.
+    fn put_with(put: SyncEvent, fields: serde_json::Value) -> SyncEvent {
+        let SyncEvent::Put { table, id, data } = put else {
+            unreachable!("a row PUT")
         };
-        let mut row: serde_json::Value = serde_json::from_str(&data).expect("chat row");
+        let mut row: serde_json::Value = serde_json::from_str(&data).expect("row");
         for (k, v) in fields.as_object().expect("fields object") {
             row[k] = v.clone();
         }
@@ -6893,6 +6952,169 @@ mod tests {
             vec![None],
             "the last task finishing clears the column"
         );
+    }
+
+    /// The `chats.turn_running` writes in arrival order.
+    fn turn_running_writes(writes: &[WriteEvent]) -> Vec<bool> {
+        writes
+            .iter()
+            .filter_map(|w| match w {
+                WriteEvent::ChatTurnRunning { turn_running, .. } => Some(*turn_running),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const RESULT_LINE: &str =
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
+
+    /// A turn that leaves a task armed ends `turn_running` (after its result
+    /// row) while the chat stays `agent_running`; the continuation turn the
+    /// task's completion wakes raises it again.
+    #[tokio::test]
+    async fn turn_running_ends_with_the_turn_while_tasks_keep_the_agent_running() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.writes();
+        let uuid = c.session().lock().unwrap().unconsumed[0].uuid.clone();
+        c.reader_raw(
+            &json!({
+                "type": "user", "uuid": uuid, "isReplay": true,
+                "message": { "role": "user", "content": "first" }
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(turn_running_writes(&c.writes()), vec![true]);
+
+        c.reader_raw(r#"{"type":"system","subtype":"task_started","task_id":"t1","description":"build","task_type":"local_bash"}"#).await;
+        c.writes();
+        c.reader_raw(RESULT_LINE).await;
+        let writes = c.writes();
+        assert_eq!(turn_running_writes(&writes), vec![false]);
+        let result_row = writes
+            .iter()
+            .position(|w| matches!(w, WriteEvent::PutMessage { .. }))
+            .expect("the result row");
+        let edge = writes
+            .iter()
+            .position(|w| matches!(w, WriteEvent::ChatTurnRunning { .. }))
+            .expect("the edge");
+        assert!(result_row < edge, "{writes:?}");
+        assert!(c.supervisor.is_running(&c.chat_id), "the task is armed");
+
+        c.reader_raw(r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#).await;
+        c.reader_line(vec![adapter::AgentEvent::TurnStarted("woken".into())])
+            .await;
+        assert_eq!(turn_running_writes(&c.writes()), vec![true]);
+        c.reader_raw(RESULT_LINE).await;
+        assert_eq!(turn_running_writes(&c.writes()), vec![false]);
+    }
+
+    /// The reader captures a turn's end as it reduces the `result` and sends it
+    /// after that line's frames. A message the main loop queues in between
+    /// raises `turn_running` at the enqueue edge, and the captured false edge
+    /// still reaches the backend, which releases queued messages on it: false,
+    /// then true.
+    #[tokio::test]
+    async fn a_turn_end_overtaken_by_the_next_turn_still_reaches_the_backend() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.reader_line(vec![adapter::AgentEvent::ContextTokens(1)])
+            .await;
+        assert_eq!(turn_running_writes(&c.writes()), vec![true]);
+
+        let session = c.session();
+        let ended = {
+            let mut st = session.lock().unwrap();
+            let result = adapter::AgentEvent::Result {
+                origin_is_task: false,
+            };
+            crate::agent::reduce(&mut st, &result);
+            st.observe_turn_running().expect("the turn ended")
+        };
+        c.window(vec![c.chat(2, ""), c.message(2, "second")]).await;
+        assert_eq!(turn_running_writes(&c.writes()), vec![true]);
+        c.respond(AgentResponse::TurnRunning {
+            topic: c.chat_id.clone(),
+            session: session.clone(),
+            running: ended,
+        })
+        .await;
+        assert_eq!(turn_running_writes(&c.writes()), vec![false, true]);
+        assert_eq!(
+            c.session().lock().unwrap().observe_turn_running(),
+            None,
+            "the dedup holds what was written last"
+        );
+
+        // A busy edge whose turn is over by now is dropped: its false edge follows.
+        let started = {
+            let mut st = session.lock().unwrap();
+            st.unconsumed.clear();
+            st.observe_turn_running().expect("the queued turn is gone");
+            st.turn_in_flight = true;
+            let started = st.observe_turn_running().expect("a turn started");
+            st.turn_in_flight = false;
+            started
+        };
+        c.respond(AgentResponse::TurnRunning {
+            topic: c.chat_id.clone(),
+            session: session.clone(),
+            running: started,
+        })
+        .await;
+        assert!(turn_running_writes(&c.writes()).is_empty());
+
+        // Edges from a session a teardown replaced are dropped, a pulse included.
+        c.window(vec![c.chat(3, ""), c.message(3, "/stop")]).await;
+        c.window(vec![c.chat(4, ""), c.message(4, "third")]).await;
+        c.writes();
+        for running in [true, false] {
+            c.respond(AgentResponse::TurnRunning {
+                topic: c.chat_id.clone(),
+                session: session.clone(),
+                running,
+            })
+            .await;
+        }
+        assert!(turn_running_writes(&c.writes()).is_empty());
+    }
+
+    /// A per-turn adapter's turn is its whole run, and every spawn says so.
+    #[tokio::test]
+    async fn a_one_shot_spawn_writes_turn_running() {
+        let mut c = ResidentChat::new();
+        let cursor = |c: &ResidentChat, seq| chat_with(c, seq, json!({ "agent_kind": "cursor" }));
+        c.window(vec![c.project(), cursor(&c, 1), c.message(1, "first")])
+            .await;
+        assert_eq!(turn_running_writes(&c.writes()), vec![true]);
+    }
+
+    /// A scheduled slash command landing mid-turn is queued behind the turn; the
+    /// same command typed live cuts it.
+    #[tokio::test]
+    async fn a_scheduled_slash_command_never_cuts_a_running_turn() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.writes();
+
+        let scheduled = put_with(c.message(2, "/compact"), json!({ "auto_sent": 1 }));
+        c.window(vec![c.chat(2, ""), scheduled]).await;
+        assert_eq!(c.spawned_prompts(), vec!["first"], "no respawn");
+        assert_eq!(c.unconsumed(), vec!["/compact"]);
+        let writes = c.writes();
+        assert!(!writes.iter().any(is_interrupted), "{writes:?}");
+
+        c.window(vec![c.chat(3, ""), c.message(3, "/compact")])
+            .await;
+        assert_eq!(c.spawned_prompts(), vec!["first", "/compact"]);
+        assert!(c.writes().iter().any(is_interrupted));
     }
 
     /// A prune hard-restarts the resident, and `--resume` re-arms nothing: the

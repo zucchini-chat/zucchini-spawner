@@ -160,6 +160,11 @@ pub struct SessionState {
     /// enqueue edge too (`live_tasks_change`) — a second dedup would let each
     /// side re-publish what the other already wrote, or swallow a change.
     pub(crate) published_live_tasks: LiveTasksDedup,
+    /// What was last published as `chats.turn_running`; shared between the
+    /// reader and the enqueue edge like `published_live_tasks`. A fresh session
+    /// starts from false: the teardown before it cleared `agent_running`, and
+    /// the backend resets `turn_running` with it.
+    pub(crate) published_turn_running: bool,
     /// The context usage last reported, as the client's gauge shows it.
     pub(crate) context_tokens: Option<i64>,
     pub(crate) auto_compact: AutoCompact,
@@ -237,8 +242,18 @@ impl SessionState {
         self.in_foreground() || !self.live_tasks.is_empty()
     }
     /// A turn runs or one of the user's waits: busy beyond background tasks.
-    fn in_foreground(&self) -> bool {
+    /// This is `chats.turn_running`.
+    pub(crate) fn in_foreground(&self) -> bool {
         self.in_turn() || self.user_queued()
+    }
+    /// The `chats.turn_running` value to publish now, or `None` when it is
+    /// unchanged since the last publication.
+    pub(crate) fn observe_turn_running(&mut self) -> Option<bool> {
+        let now = self.in_foreground();
+        (self.published_turn_running != now).then(|| {
+            self.published_turn_running = now;
+            now
+        })
     }
     /// A turn of the USER's is queued. An internal `/rename` doesn't count: it
     /// is the spawner's own, so it doesn't make the session busy.
@@ -779,6 +794,15 @@ pub enum AgentResponse {
         session: Arc<StdMutex<SessionState>>,
         tasks: Option<String>,
     },
+    /// RESIDENT path only — `SessionState::in_foreground` changed
+    /// (`chats.turn_running`). Sent after the frames of the stdout line that
+    /// changed it, so a turn's `result` row is queued for the writer before
+    /// its false edge. `session` as in `LiveTasks`.
+    TurnRunning {
+        topic: String,
+        session: Arc<StdMutex<SessionState>>,
+        running: bool,
+    },
     /// RESIDENT path only — a turn ended with none in flight (background tasks
     /// may still be armed): the main loop's cue for `Supervisor::after_turn`.
     /// Sent before that `result`'s idle edge, so a turn it queues keeps the
@@ -799,6 +823,7 @@ impl AgentResponse {
             | AgentResponse::RunState { topic, .. }
             | AgentResponse::ToolResult { topic }
             | AgentResponse::TurnEnded { topic }
+            | AgentResponse::TurnRunning { topic, .. }
             | AgentResponse::LiveTasks { topic, .. } => topic,
         }
     }
@@ -1272,6 +1297,17 @@ impl Supervisor {
     /// until it can run on its own). A running `/compact` is never interrupted:
     /// the command waits for it.
     pub fn send_user_turn(&self, req: &SpawnRequest) -> bool {
+        self.deliver_turn(req, true)
+    }
+
+    /// `send_user_turn` for a message the backend promoted from the schedule
+    /// (`messages.auto_sent`): its slash command never interrupts a running
+    /// turn, the writer holds it until that turn's `result`.
+    pub fn send_scheduled_turn(&self, req: &SpawnRequest) -> bool {
+        self.deliver_turn(req, false)
+    }
+
+    fn deliver_turn(&self, req: &SpawnRequest, command_may_interrupt: bool) -> bool {
         let Some(AgentEntry::Resident(s)) = self.agents.get(&req.chat_id) else {
             return false;
         };
@@ -1283,7 +1319,11 @@ impl Supervisor {
             return false;
         }
         let adapter = req.agent_kind.make_adapter();
-        if in_flight && adapter.is_command_turn(&req.prompt) && adapter.command_interrupts_turn() {
+        if command_may_interrupt
+            && in_flight
+            && adapter.is_command_turn(&req.prompt)
+            && adapter.command_interrupts_turn()
+        {
             return false;
         }
         s.queue_turn(req.prompt.clone(), false, req.user_timezone.as_deref());
@@ -1349,6 +1389,18 @@ impl Supervisor {
             .lock()
             .expect("SessionState mutex")
             .observe_live_tasks()
+    }
+
+    /// The chat's `chats.turn_running` when it changed since the last
+    /// publication: the enqueue-edge twin of the reader's `TurnRunning`.
+    pub fn turn_running_change(&self, topic: &str) -> Option<bool> {
+        let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
+            return None;
+        };
+        s.state
+            .lock()
+            .expect("SessionState mutex")
+            .observe_turn_running()
     }
 
     /// `session` is the chat's live resident session.
@@ -2319,6 +2371,10 @@ fn default_resident_spawn_fn(
                                         ANY_AGENT_STARTED.store(true, Ordering::Relaxed);
                                     }
                                     let mut renaming = InternalLine::default();
+                                    // Captured with the event that caused them (a
+                                    // turn queued later can't hide a turn's end),
+                                    // sent after the line's frames.
+                                    let mut turn_edges = Vec::new();
                                     for ev in events {
                                         // Reduce the FSM and read back the resulting
                                         // `running` in one lock — the `match` below only
@@ -2339,6 +2395,7 @@ fn default_resident_spawn_fn(
                                             let r = st.running();
                                             let turn_ended = is_result && !internal && !st.in_turn();
                                             let live_tasks = st.observe_live_tasks();
+                                            turn_edges.extend(st.observe_turn_running());
                                             // [DIAG tasktrace] TEMPORARY — log every
                                             // state-bearing event with the resulting FSM
                                             // so we can see why live_tasks never empties.
@@ -2424,6 +2481,10 @@ fn default_resident_spawn_fn(
                                             let session = state_for_reader.clone();
                                             send_or_cancel!(AgentResponse::LiveTasks { topic: topic.clone(), session, tasks });
                                         }
+                                    }
+                                    for running in turn_edges {
+                                        let session = state_for_reader.clone();
+                                        send_or_cancel!(AgentResponse::TurnRunning { topic: topic.clone(), session, running });
                                     }
                                     // A response or notification may have made a
                                     // held frame sendable.
@@ -3212,6 +3273,69 @@ mod reduce_tests {
         assert_eq!(frames_to_write(&s, &mut written), vec!["next"]);
     }
 
+    /// `chats.turn_running` across a turn that leaves a task armed and the
+    /// continuation turn the task's completion wakes: false while the chat is
+    /// only Waiting (still `running`), true again for the continuation.
+    #[test]
+    fn turn_running_follows_turns_not_background_tasks() {
+        let mut s = SessionState::default();
+        assert_eq!(s.observe_turn_running(), None, "a fresh session is false");
+
+        s.unconsumed.push(queued("a"));
+        assert_eq!(s.observe_turn_running(), Some(true), "queued");
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
+        reduce(&mut s, &task_started("t1"));
+        assert_eq!(s.observe_turn_running(), None, "still the same turn");
+
+        reduce(&mut s, &RESULT);
+        assert_eq!(s.observe_turn_running(), Some(false), "turn ended");
+        assert!(s.running(), "the armed task keeps the agent running");
+
+        reduce(&mut s, &AgentEvent::TaskFinished("t1".into()));
+        assert_eq!(s.observe_turn_running(), None);
+        reduce(&mut s, &AgentEvent::TurnStarted("continuation".into()));
+        assert_eq!(s.observe_turn_running(), Some(true), "continuation turn");
+        reduce(
+            &mut s,
+            &AgentEvent::Result {
+                origin_is_task: true,
+            },
+        );
+        assert_eq!(s.observe_turn_running(), Some(false));
+        assert!(s.is_idle());
+    }
+
+    /// A user turn queued behind the running one keeps `turn_running` across
+    /// that turn's `result`; the spawner's own `/rename` never raises it.
+    #[test]
+    fn turn_running_counts_queued_user_turns_but_no_internal_rename() {
+        let mut s = renaming("r");
+        assert_eq!(s.observe_turn_running(), None, "queued rename");
+        reduce(&mut s, &AgentEvent::TurnStarted("r".into()));
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("r".into()));
+        assert_eq!(s.observe_turn_running(), None, "running rename");
+        reduce(&mut s, &RESULT);
+
+        s.unconsumed.push(queued("a"));
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
+        s.unconsumed.push(queued("b"));
+        assert_eq!(s.observe_turn_running(), Some(true));
+        reduce(&mut s, &RESULT);
+        assert_eq!(s.observe_turn_running(), None, "b is still queued");
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("b".into()));
+
+        // The turn's end has to be captured as the `result` is reduced: a turn
+        // queued before a later look would hide it.
+        reduce(&mut s, &RESULT);
+        let ended = s.observe_turn_running();
+        s.unconsumed.push(queued("b"));
+        assert_eq!(ended, Some(false));
+        assert_eq!(s.observe_turn_running(), Some(true), "the enqueue edge");
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("b".into()));
+        reduce(&mut s, &RESULT);
+        assert_eq!(s.observe_turn_running(), Some(false));
+    }
+
     #[test]
     fn auto_compaction_compacts_then_notices_always_on_chats_once() {
         let mut s = SessionState::default();
@@ -3762,6 +3886,28 @@ mod live_session_tests {
             .unwrap()
             .turn_in_flight = true;
         assert!(!sup.send_user_turn(&compact), "a turn is in flight");
+        assert!(
+            !sup.send_scheduled_turn(&other_model),
+            "other knobs respawn a scheduled turn too"
+        );
+        let queued_before = sup.unconsumed_prompts("chat").len();
+        assert!(
+            sup.send_scheduled_turn(&compact),
+            "a scheduled slash command waits for the turn instead of cutting it"
+        );
+        {
+            let sessions = exposed.lock().unwrap();
+            let mut st = sessions["chat"].lock().unwrap();
+            st.unconsumed.drain(..queued_before);
+            let mut written = HashSet::new();
+            assert!(
+                test_frames_to_write(&st, &mut written).is_empty(),
+                "held while the turn runs"
+            );
+            st.turn_in_flight = false;
+            assert_eq!(test_frames_to_write(&st, &mut written).len(), 1);
+            st.turn_in_flight = true;
+        }
         exposed.lock().unwrap()["chat"]
             .lock()
             .unwrap()
@@ -4096,6 +4242,7 @@ mod cli_smoke {
             AgentResponse::ToolResult { .. } => "ToolResult".to_string(),
             AgentResponse::LiveTasks { tasks, .. } => format!("LiveTasks {tasks:?}"),
             AgentResponse::TurnEnded { .. } => "TurnEnded".to_string(),
+            AgentResponse::TurnRunning { running, .. } => format!("TurnRunning {running}"),
         }
     }
 
