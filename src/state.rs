@@ -113,7 +113,7 @@ impl ChatState {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Mirror {
-    #[serde(default, serialize_with = "serialize_always_on_chats")]
+    #[serde(default, serialize_with = "serialize_kept_chats")]
     pub chats: HashMap<String, ChatState>,
     #[serde(default)]
     pub projects: HashMap<String, String>,
@@ -172,11 +172,16 @@ pub struct Mirror {
     pub always_on_starts: HashMap<String, u32>,
 }
 
-fn serialize_always_on_chats<S: serde::Serializer>(
+fn serialize_kept_chats<S: serde::Serializer>(
     chats: &HashMap<String, ChatState>,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    s.collect_map(chats.iter().filter(|(_, c)| c.always_on))
+    let watched = crate::watch::watched_chat_ids();
+    s.collect_map(
+        chats
+            .iter()
+            .filter(|(id, c)| c.always_on || watched.contains(*id)),
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -357,11 +362,29 @@ impl Mirror {
     pub fn user_system_prompt(&self, chat_id: &str) -> UserSystemPrompt {
         self.chats
             .get(chat_id)
-            .filter(|c| {
-                self.is_owner(c.user_id) || self.member_is_sandboxed(&c.user_id) == Some(false)
-            })
+            .filter(|_| self.is_unsandboxed(chat_id))
             .map(|c| c.user_system_prompt.clone())
             .unwrap_or_default()
+    }
+
+    /// The chat's agent runs with the spawner's own access: its user is the
+    /// owner or an unsandboxed member. An unknown chat, or a member whose row
+    /// hasn't synced, counts as sandboxed.
+    pub fn is_unsandboxed(&self, chat_id: &str) -> bool {
+        self.chats.get(chat_id).is_some_and(|c| {
+            self.is_owner(c.user_id) || self.member_is_sandboxed(&c.user_id) == Some(false)
+        })
+    }
+
+    /// The chat may own a watch, whose command runs unsandboxed: its user is
+    /// unsandboxed and still has a key here. A soft-revoked member keeps their
+    /// `machine_users` row, sandbox bit included, and loses only the key.
+    pub fn can_watch(&self, chat_id: &str, keys: &crate::crypto::KeyStore) -> bool {
+        self.is_unsandboxed(chat_id)
+            && self
+                .chats
+                .get(chat_id)
+                .is_some_and(|c| keys.get_existing(&c.user_id).is_some())
     }
 
     /// True on the first call per process.

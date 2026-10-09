@@ -36,8 +36,9 @@ use crate::blobs;
 use crate::crypto::KeyStore;
 use crate::envelope::EnvelopeAttachment;
 use crate::prune::{PendingPrunes, PruneRequest};
-use crate::state::SharedMirror;
+use crate::state::{Mirror, SharedMirror};
 use crate::sys;
+use crate::watch::WatchDef;
 use crate::writer::TokenFetcher;
 
 /// Where the daemon binds and the CLI connects. Lives under the same
@@ -104,6 +105,23 @@ pub enum ControlRequest {
     /// into another chat's schedule and an already-fired row reports as such
     /// instead of succeeding silently.
     CancelScheduledMessage { chat_id: String, id: String },
+    /// Start a watch (`watch.rs`) owned by `chat_id`: the daemon runs `cmd` in
+    /// `cwd` and turns its stdout lines into messages. Refused for a sandboxed
+    /// member's chat, since the command runs outside any sandbox.
+    CreateWatch {
+        chat_id: String,
+        cmd: String,
+        cwd: String,
+        ttl: String,
+        description: String,
+    },
+    /// The watches of `chat_id`; a chat never sees another chat's.
+    ListWatches { chat_id: String },
+    /// Stop and remove `chat_id`'s watch of that `description`.
+    DeleteWatch {
+        chat_id: String,
+        description: String,
+    },
 }
 
 /// One pending scheduled message as the CLI sees it. `deliver_at` is already in
@@ -154,6 +172,9 @@ pub struct ControlResponse {
     /// successful "nothing pending", distinct from `None` (not that handler).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_messages: Option<Vec<ScheduledMessageInfo>>,
+    /// Set by the watch handlers: the one created or deleted, or the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watches: Option<Vec<WatchDef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Per-item eligible-match counts, parallel to the request's `items` — set
@@ -186,6 +207,13 @@ impl ControlResponse {
         Self {
             ok: true,
             scheduled_messages: Some(messages),
+            ..Default::default()
+        }
+    }
+    fn watches(watches: Vec<WatchDef>) -> Self {
+        Self {
+            ok: true,
+            watches: Some(watches),
             ..Default::default()
         }
     }
@@ -348,6 +376,38 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                     ControlResponse::err(format!("{e:#}"))
                 }
             }
+        }
+        ControlRequest::CreateWatch {
+            chat_id,
+            cmd,
+            cwd,
+            ttl,
+            description,
+        } => watch_response(
+            create_watch(&chat_id, &cmd, &cwd, &ttl, &description, state)
+                .await
+                .map(|def| vec![def]),
+        ),
+        ControlRequest::ListWatches { chat_id } => {
+            watch_response(list_watches(&chat_id, state).await)
+        }
+        ControlRequest::DeleteWatch {
+            chat_id,
+            description,
+        } => watch_response(
+            delete_watch(&chat_id, &description, state)
+                .await
+                .map(|def| vec![def]),
+        ),
+    }
+}
+
+fn watch_response(result: Result<Vec<WatchDef>>) -> ControlResponse {
+    match result {
+        Ok(watches) => ControlResponse::watches(watches),
+        Err(e) => {
+            warn!(error = %e, "watch request failed");
+            ControlResponse::err(format!("{e:#}"))
         }
     }
 }
@@ -770,6 +830,59 @@ async fn schedule_message(
     Ok(id)
 }
 
+/// The owner of `chat_id`, for a chat allowed to run watches: the command runs
+/// as the spawner's OS user outside any sandbox, so a sandboxed member's chat
+/// gets none.
+fn watch_chat_owner(chat_id: &str, mirror: &Mirror, keys: &KeyStore) -> Result<uuid::Uuid> {
+    let chat = mirror
+        .chats
+        .get(chat_id)
+        .ok_or_else(|| anyhow!("no chat with id {chat_id} (unknown or not yet synced)"))?;
+    if !mirror.can_watch(chat_id, keys) {
+        return Err(anyhow!(
+            "watches are not available in this chat (it is sandboxed or its user's key is gone)"
+        ));
+    }
+    Ok(chat.user_id)
+}
+
+async fn create_watch(
+    chat_id: &str,
+    cmd: &str,
+    cwd: &str,
+    ttl: &str,
+    description: &str,
+    state: &ControlState,
+) -> Result<WatchDef> {
+    let watches = crate::watch::global()?;
+    // Exclusive until the watch is registered and state.json holds its chat's
+    // row: a revoke can't slip in between the access check and the watch it
+    // would cancel, and the main loop's own state.json save can't overlap
+    // this one. Without the row the next boot would remove the watch.
+    let mirror = state.mirror.write().await;
+    let user_id = watch_chat_owner(chat_id, &mirror, &state.keys)?;
+    let def = watches.create(chat_id, user_id, cmd, cwd, ttl, description)?;
+    if let Err(e) = mirror.save(&crate::state_path()) {
+        warn!(error = %e, "failed to persist state.json");
+    }
+    Ok(def)
+}
+
+async fn list_watches(chat_id: &str, state: &ControlState) -> Result<Vec<WatchDef>> {
+    watch_chat_owner(chat_id, &*state.mirror.read().await, &state.keys)?;
+    let mut watches = crate::watch::global()?.list();
+    watches.retain(|w| w.chat_id == chat_id);
+    Ok(watches)
+}
+
+async fn delete_watch(chat_id: &str, description: &str, state: &ControlState) -> Result<WatchDef> {
+    watch_chat_owner(chat_id, &*state.mirror.read().await, &state.keys)?;
+    let watches = crate::watch::global()?;
+    let missing = || anyhow!("this chat has no watch \"{description}\" (`watch list`)");
+    let id = watches.find(chat_id, description).ok_or_else(missing)?.id;
+    watches.remove(id, None).await.ok_or_else(missing)
+}
+
 /// Daemon-side handler for `ListScheduledMessages`: GET the chat's still-pending
 /// rows, decrypt each body with the owner's key and render `deliver_at` into that
 /// owner's local wall-clock. A row we can't decrypt is still returned (with
@@ -1116,9 +1229,82 @@ pub async fn cancel_scheduled_message_via_socket(chat_id: &str, id: &str) -> Res
         .ok_or_else(|| anyhow!("response missing scheduled_message_id"))
 }
 
+async fn watch_request(req: ControlRequest) -> Result<Vec<WatchDef>> {
+    send_control_request(&req)
+        .await?
+        .watches
+        .ok_or_else(|| anyhow!("response missing watches"))
+}
+
+/// Run one `watch create` RPC: the daemon starts the command and keeps it.
+pub async fn create_watch_via_socket(
+    chat_id: &str,
+    cmd: String,
+    cwd: String,
+    ttl: String,
+    description: String,
+) -> Result<WatchDef> {
+    let req = ControlRequest::CreateWatch {
+        chat_id: chat_id.to_string(),
+        cmd,
+        cwd,
+        ttl,
+        description,
+    };
+    watch_request(req)
+        .await?
+        .pop()
+        .ok_or_else(|| anyhow!("response missing the watch"))
+}
+
+pub async fn list_watches_via_socket(chat_id: &str) -> Result<Vec<WatchDef>> {
+    watch_request(ControlRequest::ListWatches {
+        chat_id: chat_id.to_string(),
+    })
+    .await
+}
+
+pub async fn delete_watch_via_socket(chat_id: &str, description: String) -> Result<WatchDef> {
+    watch_request(ControlRequest::DeleteWatch {
+        chat_id: chat_id.to_string(),
+        description,
+    })
+    .await?
+    .pop()
+    .ok_or_else(|| anyhow!("response missing the watch"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_watch_needs_an_unsandboxed_chat_whose_user_still_has_a_key() {
+        use uuid::Uuid;
+        let (owner, member) = (Uuid::now_v7(), Uuid::now_v7());
+        let keys = KeyStore::with_keys([(owner, [0u8; 32]), (member, [0u8; 32])]);
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(owner);
+        mirror.upsert_member("row".into(), member, false);
+        let chat_id = Uuid::now_v7().to_string();
+        let row = serde_json::json!({
+            "id": chat_id,
+            "project_id": Uuid::now_v7().to_string(),
+            "user_id": member.to_string(),
+            "last_seq": 0,
+            "agent_kind": "claude",
+            "worktree": false,
+        });
+        mirror.upsert_chat(chat_id.clone(), &row.to_string(), &keys);
+
+        assert_eq!(watch_chat_owner(&chat_id, &mirror, &keys).unwrap(), member);
+        assert!(watch_chat_owner("no-such-chat", &mirror, &keys).is_err());
+        // Soft-revoked: the member row stays unsandboxed, the key is gone.
+        let owner_only = KeyStore::with_keys([(owner, [0u8; 32])]);
+        assert!(watch_chat_owner(&chat_id, &mirror, &owner_only).is_err());
+        mirror.upsert_member("row".into(), member, true);
+        assert!(watch_chat_owner(&chat_id, &mirror, &keys).is_err());
+    }
 
     fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339(s)

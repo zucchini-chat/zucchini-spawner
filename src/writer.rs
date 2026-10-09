@@ -73,11 +73,11 @@ pub enum WriteEvent {
         chat_id: String,
         turn_running: bool,
     },
-    /// What the chat's resident agent has armed right now (`chats.live_tasks`),
-    /// E2E-encrypted like a message body. `tasks` is the plaintext blob from
-    /// `agent::live_tasks_payload`; `None` writes SQL NULL — the teardown
-    /// clear, since armed tasks die with the process. `user_id` picks the key
-    /// and is therefore only needed for a payload.
+    /// The chat's watches and what its resident agent has armed right now
+    /// (`chats.live_tasks`), E2E-encrypted like a message body. `tasks` is the
+    /// plaintext blob from `agent::live_tasks_with_watches`; `None` writes SQL
+    /// NULL. `user_id` picks the key and is therefore only needed for a
+    /// payload.
     ChatLiveTasks {
         chat_id: String,
         user_id: Option<Uuid>,
@@ -199,17 +199,6 @@ impl WriteEvent {
         WriteEvent::ChatAlive {
             chat_id,
             agent_alive,
-        }
-    }
-
-    /// Armed tasks die with the process, so every teardown clears the column —
-    /// otherwise the chat shows phantom tasks forever. No key needed to write
-    /// NULL.
-    pub fn clear_live_tasks(chat_id: String) -> Self {
-        WriteEvent::ChatLiveTasks {
-            chat_id,
-            user_id: None,
-            tasks: None,
         }
     }
 }
@@ -746,7 +735,11 @@ mod live_tasks_tests {
     /// stop reporting live tasks, which is a feature outage, not a safety net.
     #[test]
     fn a_gated_open_backend_ships_the_write() {
-        let ev = WriteEvent::clear_live_tasks(Uuid::now_v7().to_string());
+        let ev = WriteEvent::ChatLiveTasks {
+            chat_id: Uuid::now_v7().to_string(),
+            user_id: None,
+            tasks: None,
+        };
         assert!(encode_event(&ev, &KeyStore::new()).is_some());
     }
 

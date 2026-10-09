@@ -39,6 +39,21 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// SIGTERM the process group `pgid`, then SIGKILL what is left of it after
+/// `grace`. For a group whose leader may be gone already; a no-op on Windows,
+/// where closing the job kills its survivors.
+pub async fn stop_process_group(pgid: u32, grace: std::time::Duration) {
+    terminate_process_group(pgid);
+    let deadline = tokio::time::Instant::now() + grace;
+    while process_group_exists(pgid) {
+        if tokio::time::Instant::now() >= deadline {
+            kill_process_group(pgid);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// `root` and every descendant in `(pid, ppid)` rows. Walks ppid links rather
 /// than the process group / job: Playwright's browser runs in a group of its own.
 fn tree_pids(rows: &[(u32, u32)], root: u32) -> Vec<u32> {

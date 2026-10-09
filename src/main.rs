@@ -22,6 +22,7 @@ mod updater;
 mod user_prompt;
 mod useragent;
 mod warm;
+mod watch;
 mod writer;
 mod x25519;
 
@@ -536,11 +537,14 @@ async fn handle_sync_event(
             // Boot: clear the run flags no agent backs anymore, before any
             // message below spawns one. Stopped-by-user: no "finished" push.
             if mirror.first_checkpoint() {
+                // A watch's command runs unsandboxed: one whose chat is gone or
+                // lost that access while the spawner was down must not start.
+                // Before the reset, which keeps a chat with an admitted watch
+                // busy and lists it in `live_tasks`.
+                watch::admit_restored(|w| mirror.can_watch(&w.chat_id, keys));
                 for chat_id in mirror.flagged_chat_ids() {
                     info!(chat_id = %chat_id, "resetting stale agent_running/agent_alive/live_tasks");
-                    let _ = write_tx
-                        .send(WriteEvent::chat_stopped_by_user(chat_id.clone()))
-                        .await;
+                    send_agent_idle(write_tx, chat_id.clone(), true).await;
                     let _ = write_tx
                         .send(WriteEvent::chat_alive(chat_id.clone(), false))
                         .await;
@@ -746,6 +750,7 @@ fn is_deleted_chat(mirror: &Mirror, chat_id: &str) -> bool {
 /// row is gone server-side (see `is_deleted_chat`).
 async fn delete_chat(chat_id: &str, mirror: &mut Mirror, supervisor: &mut Supervisor) {
     mirror.remove_chat(chat_id);
+    watch::chat_deleted(chat_id);
     supervisor.abort_agent(chat_id).await;
     supervisor.forget_alive(chat_id);
 }
@@ -761,6 +766,7 @@ async fn abort_member_agents(
     supervisor: &mut Supervisor,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
+    watch::member_restricted(user_id);
     for chat_id in mirror.chat_ids(|c| c.user_id == user_id) {
         let running = supervisor.is_running(&chat_id);
         let torn_down = supervisor.has_agent(&chat_id);
@@ -833,24 +839,45 @@ async fn send_turn_running(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String,
 }
 
 async fn send_run_state(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String, running: bool) {
-    let _ = write_tx
-        .send(WriteEvent::chat_running(chat_id, running))
-        .await;
+    if running {
+        let _ = write_tx.send(WriteEvent::chat_running(chat_id, true)).await;
+    } else {
+        send_agent_idle(write_tx, chat_id, false).await;
+    }
 }
 
-/// Clear `chats.live_tasks`. Armed tasks live inside the agent process, so
-/// every teardown has to write NULL — a `--resume` does not re-arm them and
-/// PowerSync won't re-stream the row, so a stale blob would show phantom tasks
-/// forever. Called from each teardown that keeps the row (a deleted chat and a
-/// revoked member get no writes at all).
+/// The chat's agent is idle or gone: `agent_running=false`. Every such write
+/// comes through here, because a running watch keeps the chat busy like an
+/// armed background task: then only the turn's end is written, which the
+/// backend otherwise takes from `agent_running` going false.
+async fn send_agent_idle(
+    write_tx: &mpsc::Sender<WriteEvent>,
+    chat_id: String,
+    stopped_by_user: bool,
+) {
+    if !watch::running_in(&chat_id).is_empty() {
+        send_turn_running(write_tx, chat_id, false).await;
+        return;
+    }
+    let idle = if stopped_by_user {
+        WriteEvent::chat_stopped_by_user(chat_id)
+    } else {
+        WriteEvent::chat_running(chat_id, false)
+    };
+    let _ = write_tx.send(idle).await;
+}
+
+/// Clear the agent's part of `chats.live_tasks`. Armed tasks live inside the
+/// agent process, so every teardown has to drop them — a `--resume` does not
+/// re-arm them and PowerSync won't re-stream the row, so a stale blob would
+/// show phantom tasks forever. Called from each teardown that keeps the row (a
+/// deleted chat and a revoked member get no writes at all).
 async fn clear_live_tasks(write_tx: &mpsc::Sender<WriteEvent>, chat_id: &str) {
-    let _ = write_tx
-        .send(WriteEvent::clear_live_tasks(chat_id.to_string()))
-        .await;
+    write_live_tasks(write_tx, chat_id.to_string(), None, None).await;
 }
 
-/// Write `chats.live_tasks` (the plaintext blob; the writer encrypts it under
-/// the chat owner's key). `None` clears the column.
+/// Write `chats.live_tasks` for the session blob `tasks` (`None`: nothing
+/// armed or queued).
 async fn send_live_tasks(
     write_tx: &mpsc::Sender<WriteEvent>,
     mirror: &Mirror,
@@ -858,6 +885,22 @@ async fn send_live_tasks(
     tasks: Option<String>,
 ) {
     let user_id = mirror.chats.get(&chat_id).map(|c| c.user_id);
+    write_live_tasks(write_tx, chat_id, user_id, tasks).await;
+}
+
+/// The one writer of `chats.live_tasks`: the session's blob with the chat's
+/// watches ahead of it (plaintext; the writer encrypts it under the chat
+/// owner's key), NULL when both are empty.
+async fn write_live_tasks(
+    write_tx: &mpsc::Sender<WriteEvent>,
+    chat_id: String,
+    user_id: Option<Uuid>,
+    session_tasks: Option<String>,
+) {
+    let watches = watch::running_in(&chat_id);
+    // A clear names no user; a watch carries its chat's.
+    let user_id = user_id.or(watches.first().map(|w| w.user_id));
+    let tasks = agent::live_tasks_with_watches(session_tasks, &watches);
     let _ = write_tx
         .send(WriteEvent::ChatLiveTasks {
             chat_id,
@@ -865,6 +908,32 @@ async fn send_live_tasks(
             tasks,
         })
         .await;
+}
+
+/// A chat's watches changed: rewrite its `chats.live_tasks` from its resident's
+/// session, if it has one, and the watches it has now, and `agent_running`
+/// unless its agent holds it true anyway.
+async fn publish_watch_change(
+    chat_id: &str,
+    mirror: &Mirror,
+    keys: &KeyStore,
+    supervisor: &Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    let Some(chat) = mirror.chats.get(chat_id) else {
+        return;
+    };
+    // Before the first checkpoint the row may be gone server-side; a revoked
+    // member gets no writes.
+    if !mirror.booted() || keys.get_existing(&chat.user_id).is_none() {
+        return;
+    }
+    let tasks = supervisor.live_tasks(chat_id);
+    send_live_tasks(write_tx, mirror, chat_id.to_string(), tasks).await;
+    if !supervisor.is_running(chat_id) {
+        let watched = !watch::running_in(chat_id).is_empty();
+        send_run_state(write_tx, chat_id.to_string(), watched).await;
+    }
 }
 
 /// Write `agent_alive` for every chat whose resident process appeared or went
@@ -1121,7 +1190,8 @@ async fn shutdown_and_flush(
 
 /// `/stop` (and `/kill`, its alias for older clients): kill the chat's agent
 /// process group, background tasks included. The transcript stays, so the
-/// next message resumes it.
+/// next message resumes it. The chat's watches go too; the agent learns of
+/// that from a note on its next turn (`start_turn`).
 async fn stop_agent(
     chat_id: &str,
     user_id: Uuid,
@@ -1132,11 +1202,10 @@ async fn stop_agent(
     if supervisor.is_working(chat_id) {
         publish_interrupted(write_tx, chat_id, user_id).await;
     }
+    let watched = watch::chat_stopped(chat_id);
     supervisor.abort_agent(chat_id).await;
-    if running {
-        let _ = write_tx
-            .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
-            .await;
+    if running || watched {
+        send_agent_idle(write_tx, chat_id.to_string(), true).await;
     }
     clear_live_tasks(write_tx, chat_id).await;
     // Written even with no process: the row may be stale.
@@ -1400,16 +1469,49 @@ async fn handle_message_put(
         user_system_prompt: mirror.user_system_prompt(&chat_id),
     };
 
-    if is_resident {
+    // A message the backend promoted from the schedule can arrive mid-turn at
+    // any time: its slash command waits for the turn instead of cutting it.
+    let command_may_interrupt = !json_pg_bool(row.get("auto_sent"));
+    start_turn(
+        req,
+        command_may_interrupt,
+        was_running,
+        user_id,
+        mirror,
+        supervisor,
+        write_tx,
+    )
+    .await;
+}
+
+/// Give `req`'s prompt to its chat's agent as a turn: on a live resident's
+/// stdin, else in a fresh process. `was_running` is the chat's run state
+/// before a one-shot agent was aborted for this turn.
+async fn start_turn(
+    mut req: SpawnRequest,
+    command_may_interrupt: bool,
+    was_running: bool,
+    user_id: Uuid,
+    mirror: &Mirror,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    let chat_id = req.chat_id.clone();
+    let agent_kind = req.agent_kind;
+    let adapter = agent_kind.make_adapter();
+    // A command turn ships verbatim, so the note waits for the next one.
+    if !adapter.is_command_turn(&req.prompt) {
+        if let Some(note) = watch::take_stop_note(&chat_id) {
+            req.prompt = format!("{note}\n\n{}", req.prompt);
+        }
+    }
+    if adapter.is_resident() {
         // A live process spawned with the same knobs takes the turn on stdin;
         // claude answers it within the running turn or right after it.
-        // A message the backend promoted from the schedule can arrive mid-turn
-        // at any time: its slash command waits for the turn instead of
-        // cutting it.
-        let queued = if json_pg_bool(row.get("auto_sent")) {
-            supervisor.send_scheduled_turn(&req)
-        } else {
+        let queued = if command_may_interrupt {
             supervisor.send_user_turn(&req)
+        } else {
+            supervisor.send_scheduled_turn(&req)
         };
         if queued {
             info!(chat_id = %chat_id, "queued user turn on the live resident session");
@@ -1464,6 +1566,53 @@ async fn handle_message_put(
         supervisor.pending_prunes().lock().await.remove(&chat_id);
         supervisor.spawn_agent(req);
     }
+}
+
+/// A watch's message (`watch.rs`): a system row in its chat, then a turn with
+/// the same text. An error leaves it in the watch's outbox to be offered again.
+async fn deliver_watch_message(
+    out: watch::Outgoing,
+    mirror: &Mirror,
+    keys: &KeyStore,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) -> anyhow::Result<()> {
+    let chat_id = &out.watch.chat_id;
+    if out.cancelled.is_cancelled() {
+        anyhow::bail!("the watch was stopped");
+    }
+    // Before the first checkpoint the chat's run flags are still to be reset.
+    if !mirror.booted() {
+        anyhow::bail!("not synced yet");
+    }
+    // Also a message queued before its watch was cancelled by a revoke.
+    if !mirror.can_watch(chat_id, keys) {
+        anyhow::bail!("chat {chat_id} is not synced, is sandboxed or has no key");
+    }
+    let prompt = format!("{}\n{}", out.watch.label(), out.text);
+    let req = chat_spawn_request(mirror, chat_id, prompt)
+        .ok_or_else(|| anyhow::anyhow!("chat {chat_id} can't spawn yet"))?;
+    // A one-shot agent would be cut by a new turn; the message waits for it.
+    let was_running = supervisor.is_running(chat_id);
+    if was_running && !req.agent_kind.make_adapter().is_resident() {
+        anyhow::bail!("the chat's agent is busy");
+    }
+    let user_id = out.watch.user_id;
+    let row = agent::peer_message_frame_json(&out.watch.sender_name(), &out.text);
+    let _ = write_tx
+        .send(WriteEvent::agent_line(chat_id.clone(), user_id, row))
+        .await;
+    start_turn(
+        req,
+        false,
+        was_running,
+        user_id,
+        mirror,
+        supervisor,
+        write_tx,
+    )
+    .await;
+    Ok(())
 }
 
 /// `chat_id`'s spawn with `prompt`, resolved from the `Mirror` with
@@ -1550,9 +1699,7 @@ async fn retire_stale_prompt(
     };
     info!(chat_id = %chat_id, "system prompt changed, resident torn down");
     if was_running {
-        let _ = write_tx
-            .send(WriteEvent::chat_stopped_by_user(chat_id.to_string()))
-            .await;
+        send_agent_idle(write_tx, chat_id.to_string(), true).await;
     }
     clear_live_tasks(write_tx, chat_id).await;
     if always_on {
@@ -2842,6 +2989,97 @@ async fn run_delete_scheduled_message_cli(args: &[String]) {
     }
 }
 
+const WATCH_USAGE: &str = "usage: zucchini-spawner watch <command>
+commands:
+  create --cmd <SHELL COMMAND> --ttl <30m|12h|7d|2w|forever> --description <TEXT>
+                      run the command in the current directory until it exits or
+                      the TTL passes; each stdout line becomes a message into this
+                      chat. Any exit (whatever the code) ends and removes the watch,
+                      and the chat is told how it ended. All three flags are required.
+                      The command is started again after a spawner restart; it gets
+                      $ZUCCHINI_WATCH_STATE_DIR, a directory that survives that, to
+                      keep its cursor in. The description names the watch, so
+                      it is unique within the chat.
+  list                this chat's watches
+  delete --description <TEXT>
+                      stop and remove this chat's watch of that description";
+
+fn watch_usage_and_exit(code: i32) -> ! {
+    if code == 0 {
+        println!("{WATCH_USAGE}");
+    } else {
+        eprintln!("{WATCH_USAGE}");
+    }
+    std::process::exit(code);
+}
+
+/// `watch` subcommand: the agent's create/list/delete of daemon-run watches
+/// (`watch.rs`). Each is one RPC over the control socket.
+async fn run_watch_cli(args: &[String]) {
+    let Some(command) = args.first().map(String::as_str) else {
+        watch_usage_and_exit(2);
+    };
+    let (mut cmd, mut ttl, mut description) = (None, None, None);
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let s = a.as_str();
+        if s == "-h" || s == "--help" {
+            watch_usage_and_exit(0);
+        } else if let Some(v) = take_flag(s, "--cmd", &mut it) {
+            cmd = Some(v);
+        } else if let Some(v) = take_flag(s, "--ttl", &mut it) {
+            ttl = Some(v);
+        } else if let Some(v) = take_flag(s, "--description", &mut it) {
+            description = Some(v);
+        } else {
+            watch_usage_and_exit(2);
+        }
+    }
+    let Some(chat_id) = env_chat_id() else {
+        watch_usage_and_exit(2);
+    };
+    let result = match (command, cmd, description) {
+        ("delete", None, Some(description)) => {
+            control::delete_watch_via_socket(&chat_id, description)
+                .await
+                .map(|w| println!("deleted watch \"{}\"", w.description))
+        }
+        ("create", cmd, description) => {
+            let required = |value: Option<String>, flag: &str| {
+                value.unwrap_or_else(|| {
+                    eprintln!("watch create: {flag} is required");
+                    watch_usage_and_exit(2)
+                })
+            };
+            let cmd = required(cmd, "--cmd");
+            let ttl = required(ttl, "--ttl");
+            let description = required(description, "--description");
+            let cwd = std::env::current_dir()
+                .map(|d| d.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            control::create_watch_via_socket(&chat_id, cmd, cwd, ttl, description)
+                .await
+                .map(|w| println!("created watch\n{}", w.summary()))
+        }
+        ("list", None, None) => control::list_watches_via_socket(&chat_id)
+            .await
+            .map(|watches| {
+                if watches.is_empty() {
+                    println!("no watches");
+                }
+                for w in watches {
+                    println!("{}", w.summary());
+                }
+            }),
+        ("-h" | "--help", ..) => watch_usage_and_exit(0),
+        _ => watch_usage_and_exit(2),
+    };
+    if let Err(e) = result {
+        eprintln!("watch {command} failed: {e:#}");
+        std::process::exit(1);
+    }
+}
+
 /// `prune-reminder-hook` subcommand: claude's match-all `PostToolUse` hook
 /// trampoline. Reads the hook JSON payload from stdin, delegates the size gate
 /// to the pure [`crate::prune::prune_reminder_output`], and prints the
@@ -2870,6 +3108,7 @@ async fn run_uninstall(
     heartbeat_cancel: &CancellationToken,
     writer: &Writer,
 ) {
+    watch::shutdown().await;
     supervisor.shutdown_all().await;
     heartbeat_cancel.cancel();
     let _ = wait_for_writer_idle(writer).await;
@@ -2948,6 +3187,10 @@ async fn main() {
             run_scheduled_messages_cli(&raw_args[1..]).await;
             return;
         }
+        if first == "watch" {
+            run_watch_cli(&raw_args[1..]).await;
+            return;
+        }
         // Legacy spelling: conversations started before `scheduled-messages`
         // still carry the old instruction and resume with it.
         if first == "schedule-message" {
@@ -2985,7 +3228,7 @@ async fn main() {
         let is_help = first == "--help" || first == "-h";
         eprintln!(
             "zucchini-spawner — run with NO arguments to start the daemon.\n\
-             subcommands: attach-file, prune-context, prune-reminder-hook, scheduled-messages, hermes-turn\n\
+             subcommands: attach-file, prune-context, prune-reminder-hook, scheduled-messages, watch, hermes-turn\n\
              flags: --version|-V, --help|-h"
         );
         std::process::exit(if is_help { 0 } else { 2 });
@@ -3196,6 +3439,26 @@ async fn main() {
     let (response_tx, mut response_rx) = mpsc::channel::<AgentResponse>(256);
     let mut supervisor = Supervisor::new(response_tx);
 
+    // Watches hand their messages to the main loop, the only owner of the
+    // supervisor, and learn from the reply whether the chat took them.
+    type WatchDelivery = (
+        watch::Outgoing,
+        tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    );
+    let (watch_tx, mut watch_rx) = mpsc::channel::<WatchDelivery>(16);
+    let (watched_chat_tx, mut watched_chat_rx) = mpsc::unbounded_channel::<String>();
+    if _instance_lock.is_some() {
+        let deliver: watch::Deliver = Box::new(move |out| {
+            let watch_tx = watch_tx.clone();
+            Box::pin(async move {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                watch_tx.send((out, reply_tx)).await?;
+                reply_rx.await?
+            })
+        });
+        watch::start(deliver, watched_chat_tx);
+    }
+
     // Prune-context: the control task does the read-only lookup + transcript
     // pre-scan, then parks the request in this shared table so the main loop
     // (sole owner of `supervisor`) can abort the agent, rewrite the jsonl, and
@@ -3276,6 +3539,7 @@ async fn main() {
             }
             _ = shutdown.recv() => {
                 info!("received OS shutdown signal, shutting down");
+                watch::shutdown().await;
                 shutdown_and_flush(&mut supervisor, &mut response_rx, &mirror, &write_tx, &heartbeat_cancel, &writer).await;
                 break;
             }
@@ -3427,6 +3691,14 @@ async fn main() {
             Some(resp) = response_rx.recv() => {
                 route_agent_response(resp, &pending_prunes, &mirror, &mut supervisor, &write_tx).await;
             }
+            Some((out, reply)) = watch_rx.recv() => {
+                let delivered =
+                    deliver_watch_message(out, &*mirror.read().await, &keys, &mut supervisor, &write_tx).await;
+                let _ = reply.send(delivered);
+            }
+            Some(chat_id) = watched_chat_rx.recv() => {
+                publish_watch_change(&chat_id, &*mirror.read().await, &keys, &supervisor, &write_tx).await;
+            }
         }
 
         if warm_due || idle_set(&supervisor) != warm_idle_seen {
@@ -3466,6 +3738,9 @@ async fn main() {
                 .await;
                 match updater::download_and_replace(new_version).await {
                     Ok(()) => {
+                        // Only now: after a failed download the daemon runs
+                        // on, and so do its watches.
+                        watch::shutdown().await;
                         info!("binary replaced, exiting for restart");
                         break 'main_loop;
                     }
@@ -5599,6 +5874,66 @@ mod tests {
         assert_eq!(c.unconsumed().len(), 1, "already compacting");
     }
 
+    #[tokio::test]
+    async fn a_watch_message_is_a_system_row_and_a_turn() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(0, "")]).await;
+        c.writes();
+        let message = |chat_id: &str| watch::Outgoing {
+            watch: watch::WatchDef {
+                id: Uuid::nil(),
+                ..watch::WatchDef::for_test(chat_id, c.user_id, "mail")
+            },
+            text: "new_mail id=1".into(),
+            cancelled: Default::default(),
+        };
+
+        let stopped = message(&c.chat_id);
+        stopped.cancelled.cancel();
+        let refused =
+            deliver_watch_message(stopped, &c.mirror, &c.keys, &mut c.supervisor, &c.write_tx);
+        assert!(
+            refused.await.is_err(),
+            "queued before its watch was stopped"
+        );
+
+        // An unknown chat, and one whose user's key is gone (a revoked member).
+        let revoked = KeyStore::new();
+        for (chat_id, keys) in [("no-such-chat", &c.keys), (c.chat_id.as_str(), &revoked)] {
+            let out = message(chat_id);
+            let refused =
+                deliver_watch_message(out, &c.mirror, keys, &mut c.supervisor, &c.write_tx).await;
+            assert!(refused.is_err(), "stays in the outbox");
+        }
+        assert!(c.spawned_prompts().is_empty());
+
+        let out = message(&c.chat_id);
+        deliver_watch_message(out, &c.mirror, &c.keys, &mut c.supervisor, &c.write_tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            c.spawned_prompts(),
+            vec!["[zucchini watch \"mail\"]\nnew_mail id=1".to_string()]
+        );
+        let rows: Vec<serde_json::Value> = c
+            .writes()
+            .into_iter()
+            .filter_map(|w| match w {
+                WriteEvent::PutMessage { content, .. } => serde_json::from_str(&content).ok(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![json!({
+                "type": "system",
+                "subtype": "peer_message",
+                "name": "watch \"mail\"",
+                "body": "new_mail id=1",
+            })]
+        );
+    }
+
     fn notices(c: &ResidentChat) -> usize {
         c.spawned_prompts()
             .iter()
@@ -6881,6 +7216,133 @@ mod tests {
         assert_eq!(alive_writes(&writes), vec![false]);
     }
 
+    fn watch_in(c: &ResidentChat) -> String {
+        let def = watch::WatchDef::for_test(&c.chat_id, c.user_id, "mail");
+        watch::register_idle(def.clone());
+        def.id.to_string()
+    }
+
+    /// The task ids of each `chats.live_tasks` write, watches included.
+    fn live_task_ids(writes: &[WriteEvent]) -> Vec<Vec<String>> {
+        let ids = |blob: Option<String>| {
+            let blob: serde_json::Value =
+                serde_json::from_str(&blob.unwrap_or("{}".into())).expect("valid JSON");
+            let tasks = blob["t"].as_array().cloned().unwrap_or_default();
+            tasks
+                .iter()
+                .map(|t| t["i"].as_str().expect("id").to_string())
+                .collect()
+        };
+        live_task_blobs(writes).into_iter().map(ids).collect()
+    }
+
+    #[tokio::test]
+    async fn stop_removes_the_chats_watches_and_the_agents_next_turn_says_so() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        let watch = watch_in(&c);
+        c.writes();
+        c.reader_raw(r#"{"type":"system","subtype":"task_started","task_id":"t-7","description":"deploy","task_type":"local_bash"}"#).await;
+        assert_eq!(
+            live_task_ids(&c.writes()),
+            vec![vec![watch, "t-7".to_string()]],
+            "the watch leads the agent's tasks"
+        );
+
+        c.window(vec![c.chat(2, ""), c.message(2, "/stop")]).await;
+        assert!(watch::running_in(&c.chat_id).is_empty());
+        let writes = c.writes();
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
+        assert_eq!(live_task_blobs(&writes), vec![None]);
+        assert_eq!(
+            c.spawned_prompts(),
+            vec!["first"],
+            "the stop starts no turn"
+        );
+
+        // A command turn ships verbatim; the note rides the first turn after.
+        let note = "[zucchini] The user pressed Stop, which also removed this chat's watches: \
+                    \"mail\" (true). They are not running any more.";
+        for (seq, text) in [(3, "/compact"), (4, "second"), (5, "third")] {
+            c.window(vec![c.chat(seq, ""), c.message(seq, text)]).await;
+        }
+        assert_eq!(c.spawned_prompts(), vec!["first", "/compact"]);
+        assert_eq!(
+            c.unconsumed(),
+            vec![
+                "/compact".to_string(),
+                format!("{note}\n\nsecond"),
+                "third".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_on_a_chat_with_only_watches_clears_its_run_flag() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(0, "")]).await;
+        watch_in(&c);
+        c.writes();
+        c.window(vec![c.chat(1, ""), c.message(1, "/stop")]).await;
+        let writes = c.writes();
+        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
+        assert_eq!(live_task_blobs(&writes), vec![None]);
+    }
+
+    fn run_flags(writes: &[WriteEvent]) -> Vec<(&'static str, bool)> {
+        writes
+            .iter()
+            .filter_map(|w| match w {
+                WriteEvent::ChatRunning { agent_running, .. } => Some(("agent", *agent_running)),
+                WriteEvent::ChatTurnRunning { turn_running, .. } => Some(("turn", *turn_running)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_watch_keeps_its_chat_running_until_the_last_one_is_gone() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(0, "")]).await;
+        let watch = watch_in(&c);
+        c.writes();
+
+        let revoked = KeyStore::new();
+        publish_watch_change(&c.chat_id, &c.mirror, &revoked, &c.supervisor, &c.write_tx).await;
+        publish_watch_change("deleted", &c.mirror, &c.keys, &c.supervisor, &c.write_tx).await;
+        assert!(c.writes().is_empty());
+
+        publish_watch_change(&c.chat_id, &c.mirror, &c.keys, &c.supervisor, &c.write_tx).await;
+        let writes = c.writes();
+        assert_eq!(live_task_ids(&writes), vec![vec![watch.clone()]]);
+        assert_eq!(run_flags(&writes), vec![("agent", true)]);
+
+        // A turn ends: the watch holds `agent_running`, the turn's end is told.
+        c.window(vec![c.chat(1, ""), c.message(1, "first")]).await;
+        c.consume_first_turn();
+        finish_turn(&c);
+        c.writes();
+        c.respond(AgentResponse::RunState {
+            topic: c.chat_id.clone(),
+            running: false,
+        })
+        .await;
+        assert_eq!(run_flags(&c.writes()), vec![("turn", false)]);
+
+        let removed = watch::global()
+            .unwrap()
+            .remove(watch.parse().unwrap(), None);
+        removed.await.expect("registered");
+        publish_watch_change(&c.chat_id, &c.mirror, &c.keys, &c.supervisor, &c.write_tx).await;
+        let writes = c.writes();
+        assert_eq!(live_task_blobs(&writes), vec![None]);
+        assert_eq!(run_flags(&writes), vec![("agent", false)]);
+        assert!(!writes.iter().any(is_stopped_by_user), "an ordinary finish");
+    }
+
     #[tokio::test]
     async fn stop_with_a_queued_turn_drops_it() {
         let mut c = ResidentChat::new();
@@ -7572,5 +8034,26 @@ mod tests {
         c.window(vec![]).await;
         let writes = c.writes();
         assert_eq!(live_tasks_reset_chats(&writes), [chat_id.as_str()].into());
+    }
+
+    #[tokio::test]
+    async fn boot_keeps_a_watched_chat_running_with_its_watches_listed() {
+        let mut c = ResidentChat::new();
+        let was_in_a_turn = json!({
+            "project_id": c.project_id,
+            "user_id": c.user_id.to_string(),
+            "agent_running": 1,
+            "live_tasks": "cipher",
+        })
+        .to_string();
+        c.mirror
+            .upsert_chat(c.chat_id.clone(), &was_in_a_turn, &c.keys);
+        let watch = watch_in(&c);
+        c.mirror = restarted(&c.mirror);
+
+        c.window(vec![]).await;
+        let writes = c.writes();
+        assert_eq!(run_flags(&writes), vec![("turn", false)]);
+        assert_eq!(live_task_ids(&writes), vec![vec![watch]]);
     }
 }

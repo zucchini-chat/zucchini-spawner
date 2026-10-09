@@ -26,6 +26,7 @@ use crate::envelope::{EnvelopeAttachment, MessageEnvelope};
 use crate::prune::PendingPrunes;
 use crate::sys;
 use crate::user_prompt::UserSystemPrompt;
+use crate::watch::WatchDef;
 
 /// Per-chat pending-attachments registry: the agent-side `attach-file` flow
 /// writes `EnvelopeAttachment`s through these unbounded senders, and the
@@ -496,6 +497,36 @@ pub fn live_tasks_payload(state: &SessionState) -> Option<String> {
     Some(serde_json::Value::Object(blob).to_string())
 }
 
+/// `session`'s blob (`None`: no agent process, or nothing armed or queued in
+/// it) with the chat's watches listed ahead of its tasks, under the same cap.
+/// The daemon runs them, so they stay listed through every teardown.
+pub fn live_tasks_with_watches(session: Option<String>, watches: &[WatchDef]) -> Option<String> {
+    if watches.is_empty() {
+        return session;
+    }
+    let mut blob: serde_json::Map<String, serde_json::Value> = session
+        .and_then(|blob| serde_json::from_str(&blob).ok())
+        .unwrap_or_default();
+    let mut tasks: Vec<serde_json::Value> = watches
+        .iter()
+        .map(|w| {
+            live_task_json(&LiveTask {
+                id: w.id.to_string(),
+                description: w.description.clone(),
+                task_type: "watch".to_string(),
+                subagent_type: None,
+                started_at: w.created_at.saturating_mul(1000),
+            })
+        })
+        .collect();
+    if let Some(serde_json::Value::Array(armed)) = blob.remove("t") {
+        tasks.extend(armed);
+    }
+    tasks.truncate(MAX_LIVE_TASKS);
+    blob.insert("t".to_string(), serde_json::Value::Array(tasks));
+    Some(serde_json::Value::Object(blob).to_string())
+}
+
 fn live_task_json(task: &LiveTask) -> serde_json::Value {
     let kind = match task.task_type.as_str() {
         "local_bash" => "bash",
@@ -545,9 +576,10 @@ impl LiveTasksDedup {
     }
 }
 
-/// Spawner-synthesized message row for a turn another claude session started
-/// via `SendMessage`. Older clients hide unknown system subtypes.
-fn peer_message_frame_json(name: &str, body: &str) -> String {
+/// Spawner-synthesized message row for a turn the user didn't send: another
+/// claude session's `SendMessage`, or a watch (`watch.rs`). Older clients hide
+/// unknown system subtypes.
+pub fn peer_message_frame_json(name: &str, body: &str) -> String {
     serde_json::json!({
         "type": "system",
         "subtype": "peer_message",
@@ -1389,6 +1421,15 @@ impl Supervisor {
             .lock()
             .expect("SessionState mutex")
             .observe_live_tasks()
+    }
+
+    /// The chat's resident's `live_tasks` blob as it is now, whatever was
+    /// last published.
+    pub fn live_tasks(&self, topic: &str) -> Option<String> {
+        let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
+            return None;
+        };
+        live_tasks_payload(&s.state.lock().expect("SessionState mutex"))
     }
 
     /// The chat's `chats.turn_running` when it changed since the last
@@ -2944,9 +2985,9 @@ fn test_frames_to_write(st: &SessionState, written: &mut HashSet<String>) -> Vec
 #[cfg(test)]
 mod reduce_tests {
     use super::{
-        internal_turn_swallows, live_task, live_tasks_payload, peer_message_frame_json, reduce,
-        task_started, test_frames_to_write as frames_to_write, AgentEvent, LiveTask,
-        LiveTasksDedup, QueuedTurn, SessionState,
+        internal_turn_swallows, live_task, live_tasks_payload, live_tasks_with_watches,
+        peer_message_frame_json, reduce, task_started, test_frames_to_write as frames_to_write,
+        AgentEvent, LiveTask, LiveTasksDedup, QueuedTurn, SessionState, WatchDef,
     };
     use std::collections::HashSet;
 
@@ -3149,6 +3190,46 @@ mod reduce_tests {
         assert_eq!(tasks[0]["i"], "t0", "the oldest survive the cap");
         assert_eq!(tasks[19]["i"], "t19");
         assert_eq!(tasks[0]["d"].as_str().expect("string").chars().count(), 200);
+    }
+
+    fn watch_def(description: &str) -> WatchDef {
+        WatchDef::for_test("chat", uuid::Uuid::nil(), description)
+    }
+
+    #[test]
+    fn watches_lead_the_blob_and_share_its_cap() {
+        assert_eq!(live_tasks_with_watches(None, &[]), None);
+        let session = Some(r#"{"q":2}"#.to_string());
+        assert_eq!(live_tasks_with_watches(session.clone(), &[]), session);
+
+        let watch = watch_def(&"x".repeat(500));
+        let alone = live_tasks_with_watches(None, std::slice::from_ref(&watch)).expect("a blob");
+        let blob: serde_json::Value = serde_json::from_str(&alone).expect("valid JSON");
+        assert_eq!(
+            blob,
+            serde_json::json!({"t": [{
+                "i": watch.id.to_string(),
+                "d": "x".repeat(200),
+                "k": "watch",
+                "s0": 1_800_000_000_000_i64,
+            }]})
+        );
+
+        let mut s = SessionState::default();
+        for i in 0..25 {
+            s.live_tasks.push(live_task(&format!("t{i}")));
+        }
+        s.unconsumed.push(queued("user-1"));
+        let watches = [watch_def("mail"), watch_def("deploys")];
+        let merged = live_tasks_with_watches(live_tasks_payload(&s), &watches).expect("a blob");
+        let blob: serde_json::Value = serde_json::from_str(&merged).expect("valid JSON");
+        let tasks = blob["t"].as_array().expect("array");
+        assert_eq!(tasks.len(), 20);
+        assert_eq!(tasks[0]["d"], "mail");
+        assert_eq!(tasks[1]["d"], "deploys");
+        assert_eq!(tasks[2]["i"], "t0");
+        assert_eq!(tasks[19]["i"], "t17");
+        assert_eq!(blob["q"], 1);
     }
 
     /// The reader publishes only CHANGES — an unchanged payload writes nothing,
