@@ -1,7 +1,7 @@
 //! In-memory mirror of the chats/projects rows streamed from PowerSync, plus the
 //! per-bucket sync cursors. Projects + cursors are persisted to `state.json`; of
-//! the chats only the always-on ones are (minus the plaintext title and system prompt), so boot can
-//! start their residents although PowerSync resumes from the saved cursor.
+//! the chats only the always-on and watched ones are (title and system prompt sealed as synced), so
+//! boot can start their residents although PowerSync resumes from the saved cursor.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -51,12 +51,14 @@ pub struct ChatState {
     /// stay `if let Some(m) = ctx.model { ... }`). Column absent → `None`,
     /// same as NULL.
     pub model: Option<String>,
-    /// `chats.title`, DECRYPTED (the column is K_machine-sealed under the chat
-    /// OWNER's key, like `messages.body`). `None` when the chat has no title or
-    /// the owner's key isn't unsealed yet — a chats row re-streams on every
-    /// writeback, so a miss heals on the next one. Never persisted, so no
-    /// plaintext reaches state.json. Feeds
-    /// `claude --name` via `session_name::from_title`.
+    /// `chats.title` as synced: K_machine-sealed under the chat OWNER's key,
+    /// like `messages.body`. Kept sealed so state.json carries no plaintext, yet
+    /// a chat started at boot (before its row re-streams) gets its name.
+    pub sealed_title: Option<String>,
+    /// `sealed_title` decrypted. `None` when the chat has no title or the
+    /// owner's key isn't unsealed yet — a chats row re-streams on every
+    /// writeback, so a miss heals on the next one. Feeds `claude --name` via
+    /// `session_name::from_title`.
     #[serde(skip)]
     pub title: Option<String>,
     /// `chats.pinned_at` (migration 0014) is non-NULL: the user pinned this chat
@@ -72,7 +74,7 @@ pub struct ChatState {
     /// `chats.system_prompt_files` and `chats.system_prompt` (migration 0055)
     /// as synced: K_machine-sealed under the chat owner's key. Kept sealed so
     /// state.json carries no plaintext, yet an always-on chat started at boot
-    /// (before its row re-streams) gets its prompt (`unseal_system_prompts`).
+    /// (before its row re-streams) gets its prompt (`unseal_loaded_chats`).
     pub system_prompt_files: Option<String>,
     pub system_prompt: Option<String>,
     /// The two columns decrypted; a spawn knob, read through
@@ -84,6 +86,13 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    fn unseal_title(&mut self, keys: &crate::crypto::KeyStore) {
+        self.title = self.sealed_title.as_deref().and_then(|sealed| {
+            let key = keys.get_existing(&self.user_id)?;
+            crate::crypto::decrypt_field_b64(&key, sealed)
+        });
+    }
+
     fn unseal_system_prompt(&mut self, chat_id: &str, keys: &crate::crypto::KeyStore) {
         if !self.agent_kind.make_adapter().takes_user_system_prompt() {
             return;
@@ -308,14 +317,8 @@ impl Mirror {
             agent_session_id: incoming_agent_session_id,
             agent_kind,
             model,
-            title: v
-                .get("title")
-                .and_then(|x| x.as_str())
-                .filter(|s| !s.is_empty())
-                .and_then(|ct| {
-                    let key = keys.get_existing(&user_id)?;
-                    crate::crypto::decrypt_field_b64(&key, ct)
-                }),
+            sealed_title: sealed("title").filter(|s| !s.is_empty()),
+            title: None,
             pinned: v.get("pinned_at").is_some_and(|p| !p.is_null()),
             always_on: crate::json_pg_bool(v.get("always_on")),
             auto_compact_tokens: v.get("auto_compact_tokens").and_then(crate::json_to_i64),
@@ -323,13 +326,15 @@ impl Mirror {
             system_prompt: sealed("system_prompt"),
             user_system_prompt: UserSystemPrompt::default(),
         };
+        chat.unseal_title(keys);
         chat.unseal_system_prompt(&id, keys);
         self.chats.insert(id, chat);
     }
 
-    /// Decrypt the system prompts of the chats loaded from state.json.
-    pub fn unseal_system_prompts(&mut self, keys: &crate::crypto::KeyStore) {
+    /// Decrypt the titles and system prompts of the chats loaded from state.json.
+    pub fn unseal_loaded_chats(&mut self, keys: &crate::crypto::KeyStore) {
         for (id, chat) in &mut self.chats {
+            chat.unseal_title(keys);
             chat.unseal_system_prompt(id, keys);
         }
     }

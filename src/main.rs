@@ -578,7 +578,7 @@ async fn handle_sync_event(
 
             // After the messages: a client switches always-on off no later than
             // its `/stop`, and a chat a message spawned already has its agent.
-            reconcile_always_on(mirror, supervisor);
+            reconcile_always_on(mirror, supervisor, write_tx).await;
 
             // One-shot agents seed — driven here because the owner row only
             // arrives via sync; the set flag persists with the cursor at the
@@ -1662,10 +1662,9 @@ fn chat_spawn_request(mirror: &Mirror, chat_id: &str, prompt: String) -> Option<
 /// Tear down `chat_id`'s resident if it runs with another user system prompt
 /// than the chat has now and no turn would be cut. Its next spawn - the next
 /// message, or right here for an always-on chat - renders the current one. An
-/// always-on resident goes even with background tasks armed, once it can
-/// restart at once (nothing in the foreground): its restart notice has the
-/// agent re-arm them. Elsewhere they would die unnoticed, so that resident
-/// stays until it is idle or a message respawns it. A prompt that doesn't
+/// always-on resident goes even with background tasks armed: its restart
+/// notice has the agent re-arm them. Elsewhere they would die unnoticed, so
+/// that resident stays until it is idle or a message respawns it. A prompt that doesn't
 /// render retires nothing: the resident keeps working until a message's
 /// respawn reports the error.
 async fn retire_stale_prompt(
@@ -1676,8 +1675,7 @@ async fn retire_stale_prompt(
 ) {
     let prompt = mirror.user_system_prompt(chat_id);
     let always_on = mirror.is_always_on(chat_id);
-    let kill_tasks = always_on && !supervisor.any_in_foreground();
-    if !supervisor.has_retirable_stale_prompt(chat_id, &prompt, kill_tasks) {
+    if !supervisor.has_retirable_stale_prompt(chat_id, &prompt, always_on) {
         return;
     }
     let Some(project_path) = mirror
@@ -1692,7 +1690,7 @@ async fn retire_stale_prompt(
         return;
     }
     let Some(was_running) = supervisor
-        .retire_stale_prompt(chat_id, &prompt, kill_tasks)
+        .retire_stale_prompt(chat_id, &prompt, always_on)
         .await
     else {
         return;
@@ -1703,12 +1701,12 @@ async fn retire_stale_prompt(
     }
     clear_live_tasks(write_tx, chat_id).await;
     if always_on {
-        reconcile_always_on(mirror, supervisor);
+        reconcile_always_on(mirror, supervisor, write_tx).await;
     }
 }
 
 /// The warm tick's always-on pass: an always-on resident whose stale prompt
-/// had to wait for the foreground to clear is retired now, then whatever is
+/// had to wait for its turn to end is retired now, then whatever is
 /// missing starts.
 async fn tend_always_on(
     mirror: &mut Mirror,
@@ -1718,57 +1716,64 @@ async fn tend_always_on(
     for chat_id in mirror.always_on_chats() {
         retire_stale_prompt(&chat_id, mirror, supervisor, write_tx).await;
     }
-    reconcile_always_on(mirror, supervisor);
+    reconcile_always_on(mirror, supervisor, write_tx).await;
 }
 
 /// The first turn of an always-on resident the spawner (re)starts.
-const RESTART_NOTICE: &str = "[Zucchini] Your process was (re)started with this session resumed \
+const RESTART_NOTICE: &str = "Your process was (re)started with this session resumed \
 (spawner restart, machine reboot, always-on switched on, or a crash). Background tasks, monitors, \
 dev servers, watchers and scheduled loops you started may have stopped. Check what is still \
 running before restarting anything that should be; if nothing should be, reply in one line.";
 
+/// The notice's system row: clients show "Message from Zucchini: …".
+const RESTART_NOTICE_SENDER: &str = "Zucchini";
+
+fn restart_notice_turn() -> String {
+    format!("[{RESTART_NOTICE_SENDER}] {RESTART_NOTICE}")
+}
+
 /// How many starts of an always-on resident `reconcile_always_on` makes
-/// before a pass sees it alive.
+/// before a pass sees it through its notice turn.
 const ALWAYS_ON_RETRIES: u32 = 3;
 
-/// Start the resident of the next always-on chat that has a session to resume,
-/// a resident adapter and no agent, with `RESTART_NOTICE` as its turn. One
-/// at a time and only while no agent is busy, so a boot doesn't run several
-/// agents at once past the clients' free-tier gate. A chat whose starts no
-/// pass saw alive `ALWAYS_ON_RETRIES` times is left alone.
-fn reconcile_always_on(mirror: &mut Mirror, supervisor: &mut Supervisor) {
+/// Start the resident of every always-on chat that has a session to resume,
+/// a resident adapter and no agent, with `RESTART_NOTICE` as its turn and as
+/// a system row in the chat. A chat whose starts no pass saw through the
+/// notice turn `ALWAYS_ON_RETRIES` times is left alone.
+async fn reconcile_always_on(
+    mirror: &mut Mirror,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
     if !mirror.booted() {
         return;
     }
     let always_on = mirror.always_on_chats();
-    // Switching always-on off resets the count, even while another chat is busy.
-    mirror
-        .always_on_starts
-        .retain(|id, _| always_on.contains(id));
-    if supervisor.any_in_foreground() {
-        return;
-    }
-    // Past the foreground gate an open resident has finished its notice turn;
-    // a closed one is still dying and must keep its count.
-    mirror
-        .always_on_starts
-        .retain(|id, _| !supervisor.has_open_resident(id));
-    let next = always_on
-        .into_iter()
-        .filter(|id| {
-            let chat = &mirror.chats[id];
-            chat.agent_session_id.is_some()
-                && chat.agent_kind.make_adapter().is_resident()
-                && !supervisor.has_agent(id)
-                && mirror.always_on_starts.get(id).copied().unwrap_or(0) < ALWAYS_ON_RETRIES
-        })
-        .min();
-    let Some(chat_id) = next else {
-        return;
-    };
-    *mirror.always_on_starts.entry(chat_id.clone()).or_default() += 1;
-    if let Some(req) = chat_spawn_request(mirror, &chat_id, RESTART_NOTICE.to_string()) {
+    // A resident that is over its notice turn has started; one still in it,
+    // or closed and dying, keeps its count.
+    mirror.always_on_starts.retain(|id, _| {
+        always_on.contains(id)
+            && (!supervisor.has_open_resident(id) || supervisor.in_foreground(id))
+    });
+    for chat_id in always_on {
+        let chat = &mirror.chats[&chat_id];
+        let startable = chat.agent_session_id.is_some()
+            && chat.agent_kind.make_adapter().is_resident()
+            && !supervisor.has_agent(&chat_id)
+            && mirror.always_on_starts.get(&chat_id).copied().unwrap_or(0) < ALWAYS_ON_RETRIES;
+        if !startable {
+            continue;
+        }
+        let user_id = chat.user_id;
+        *mirror.always_on_starts.entry(chat_id.clone()).or_default() += 1;
+        let Some(req) = chat_spawn_request(mirror, &chat_id, restart_notice_turn()) else {
+            continue;
+        };
         info!(chat_id = %chat_id, "starting always-on resident");
+        let row = agent::peer_message_frame_json(RESTART_NOTICE_SENDER, RESTART_NOTICE);
+        let _ = write_tx
+            .send(WriteEvent::agent_line(chat_id.clone(), user_id, row))
+            .await;
         supervisor.spawn_agent(req);
     }
 }
@@ -3330,7 +3335,7 @@ async fn main() {
     let mut sync_rx = powersync::start(sync_config);
 
     let keys = Arc::new(KeyStore::new());
-    mirror.write().await.unseal_system_prompts(&keys);
+    mirror.write().await.unseal_loaded_chats(&keys);
 
     // Hoist dir creation here so per-message persist_user_key on the hot path
     // doesn't recheck it (heartbeat fan-out re-runs every machine_users PUT).
@@ -5749,6 +5754,18 @@ mod tests {
             }
             writes
         }
+
+        fn message_rows(&mut self) -> Vec<serde_json::Value> {
+            self.writes()
+                .into_iter()
+                .filter_map(|w| match w {
+                    WriteEvent::PutMessage { content, .. } => {
+                        Some(serde_json::from_str(&content).expect("message row is JSON"))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     fn is_interrupted(w: &WriteEvent) -> bool {
@@ -5915,16 +5932,8 @@ mod tests {
             c.spawned_prompts(),
             vec!["[zucchini watch \"mail\"]\nnew_mail id=1".to_string()]
         );
-        let rows: Vec<serde_json::Value> = c
-            .writes()
-            .into_iter()
-            .filter_map(|w| match w {
-                WriteEvent::PutMessage { content, .. } => serde_json::from_str(&content).ok(),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            rows,
+            c.message_rows(),
             vec![json!({
                 "type": "system",
                 "subtype": "peer_message",
@@ -5937,7 +5946,7 @@ mod tests {
     fn notices(c: &ResidentChat) -> usize {
         c.spawned_prompts()
             .iter()
-            .filter(|p| *p == RESTART_NOTICE)
+            .filter(|p| **p == restart_notice_turn())
             .count()
     }
 
@@ -5947,16 +5956,19 @@ mod tests {
         c.window(vec![c.project()]).await;
         c.writes();
         c.window(vec![always_on_chat(&c, 1, true)]).await;
-        assert_eq!(c.spawned_prompts(), vec![RESTART_NOTICE.to_string()]);
+        assert_eq!(c.spawned_prompts(), vec![restart_notice_turn()]);
         assert_eq!(
             c.recorded.lock().unwrap()[0].agent_session_id.as_deref(),
             Some("sid")
         );
-        assert!(
-            !c.writes()
-                .iter()
-                .any(|w| matches!(w, WriteEvent::PutMessage { .. })),
-            "the notice is no message row"
+        assert_eq!(
+            c.message_rows(),
+            vec![json!({
+                "type": "system",
+                "subtype": "peer_message",
+                "name": "Zucchini",
+                "body": RESTART_NOTICE,
+            })]
         );
 
         c.window(vec![always_on_chat(&c, 2, false), c.message(2, "/stop")])
@@ -6037,7 +6049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn always_on_chats_start_one_at_a_time() {
+    async fn always_on_chats_start_together_and_while_another_chat_is_busy() {
         let mut c = ResidentChat::new();
         c.window(vec![c.project(), always_on_chat(&c, 1, true)])
             .await;
@@ -6045,25 +6057,11 @@ mod tests {
         c.window(vec![always_on_chat(&c, 1, true)]).await;
         restart(&mut c);
         c.window(vec![]).await;
-        assert_eq!(notices(&c), 1);
+        assert_eq!(notices(&c), 2, "both start at boot");
 
-        for session in c.supervisor.live_sessions().lock().unwrap().values() {
-            let mut st = session.lock().unwrap();
-            st.unconsumed.clear();
-            st.live_tasks.push(agent::LiveTask {
-                id: "monitor".into(),
-                description: String::new(),
-                task_type: "bash".into(),
-                subagent_type: None,
-                started_at: 0,
-            });
-        }
-        reconcile_always_on(&mut c.mirror, &mut c.supervisor);
-        assert_eq!(
-            notices(&c),
-            2,
-            "the second starts once the first's turn is done, its monitor still armed"
-        );
+        c.chat_id = Uuid::now_v7().to_string();
+        c.window(vec![always_on_chat(&c, 1, true)]).await;
+        assert_eq!(notices(&c), 3, "a third starts while the two are in a turn");
     }
 
     #[tokio::test]
@@ -6073,31 +6071,22 @@ mod tests {
             .await;
         for _ in 0..5 {
             c.supervisor.abort_agent(&c.chat_id).await;
-            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
         }
         assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
     }
 
     #[tokio::test]
-    async fn toggling_always_on_while_another_chat_is_busy_resets_the_start_count() {
+    async fn toggling_always_on_resets_the_start_count() {
         let mut c = ResidentChat::new();
         c.window(vec![c.project(), always_on_chat(&c, 1, true)])
             .await;
-        for _ in 0..ALWAYS_ON_RETRIES {
+        for _ in 0..5 {
             c.supervisor.abort_agent(&c.chat_id).await;
-            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
         }
-        let exhausted = c.chat_id.clone();
-        c.chat_id = Uuid::now_v7().to_string();
-        c.window(vec![c.chat(0, ""), c.message(1, "busy")]).await;
-        let busy = c.chat_id.clone();
-        c.chat_id = exhausted;
         c.window(vec![always_on_chat(&c, 2, false)]).await;
         c.window(vec![always_on_chat(&c, 3, true)]).await;
-        assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
-
-        c.supervisor.abort_agent(&busy).await;
-        reconcile_always_on(&mut c.mirror, &mut c.supervisor);
         assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize + 1);
     }
 
@@ -6112,9 +6101,9 @@ mod tests {
                 st.unconsumed.clear();
                 st.closed = true;
             }
-            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
             c.supervisor.abort_agent(&c.chat_id).await;
-            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
         }
         assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
     }
@@ -6463,7 +6452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_always_on_chat_with_tasks_armed_waits_for_the_foreground_to_clear() {
+    async fn an_always_on_chat_with_tasks_armed_restarts_while_another_chat_is_busy() {
         let mut c = ResidentChat::new();
         c.window(vec![c.project(), always_on_prompted_chat(&c, 1, "v0")])
             .await;
@@ -6472,18 +6461,9 @@ mod tests {
         let always_on = c.chat_id.clone();
         c.chat_id = Uuid::now_v7().to_string();
         c.window(vec![c.chat(0, ""), c.message(1, "busy")]).await;
-        let busy = std::mem::replace(&mut c.chat_id, always_on);
+        c.chat_id = always_on;
 
         c.window(vec![always_on_prompted_chat(&c, 1, "v1")]).await;
-        tend_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
-        assert!(
-            c.supervisor.has_agent(&c.chat_id),
-            "it couldn't restart yet, so its monitor lives"
-        );
-        assert_eq!(notices(&c), 1);
-
-        c.supervisor.abort_agent(&busy).await;
-        tend_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
         assert_eq!(notices(&c), 2);
         assert_eq!(
             spawned_prompt_texts(&c).last().unwrap().as_deref(),
@@ -6498,7 +6478,7 @@ mod tests {
             .await;
         for _ in 0..5 {
             c.supervisor.abort_agent(&c.chat_id).await;
-            reconcile_always_on(&mut c.mirror, &mut c.supervisor);
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
         }
         assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
         c.window(vec![always_on_prompted_chat(&c, 1, "broken")])
@@ -6521,9 +6501,28 @@ mod tests {
             .unwrap()
             .contains("be terse"));
         restart(&mut c);
-        c.mirror.unseal_system_prompts(&c.keys);
+        c.mirror.unseal_loaded_chats(&c.keys);
         c.window(vec![]).await;
         assert_eq!(spawned_prompt_texts(&c), vec![Some("be terse".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn boot_restarts_an_always_on_chat_under_its_title() {
+        let mut c = ResidentChat::new();
+        let key = c.keys.get(&c.user_id).expect("seeded key");
+        let title = crypto::encrypt_field_b64(&key, "cover letters writer");
+        let chat = put_with(always_on_chat(&c, 1, true), json!({ "title": title }));
+        c.window(vec![c.project(), chat]).await;
+        restart(&mut c);
+        c.mirror.unseal_loaded_chats(&c.keys);
+        c.window(vec![]).await;
+        let recorded = c.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].prompt, restart_notice_turn());
+        assert_eq!(
+            recorded[0].session_name.as_deref(),
+            Some("cover letters writer")
+        );
     }
 
     #[test]
@@ -6536,7 +6535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_always_on_chats_persist_and_without_their_title() {
+    async fn only_always_on_chats_persist_and_with_a_sealed_title() {
         let mut c = ResidentChat::new();
         let key = c.keys.get(&c.user_id).expect("seeded key");
         for (id, on) in [("on", true), ("off", false)] {
@@ -6551,10 +6550,12 @@ mod tests {
         assert_eq!(c.mirror.chats["on"].title.as_deref(), Some("secret"));
         let json = serde_json::to_string(&c.mirror).unwrap();
         assert!(!json.contains("secret"));
-        let loaded: Mirror = serde_json::from_str(&json).unwrap();
+        let mut loaded: Mirror = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.always_on_chats(), HashSet::from(["on".to_string()]));
         assert_eq!(loaded.chats["on"].agent_session_id.as_deref(), Some("sid"));
         assert!(loaded.chats["on"].title.is_none());
+        loaded.unseal_loaded_chats(&c.keys);
+        assert_eq!(loaded.chats["on"].title.as_deref(), Some("secret"));
     }
 
     #[tokio::test]

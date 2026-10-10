@@ -1270,15 +1270,15 @@ impl Supervisor {
         self.agents.keys().any(|topic| self.is_running(topic))
     }
 
-    /// Like `any_running`, minus residents that only host background tasks.
-    pub fn any_in_foreground(&self) -> bool {
-        self.agents.values().any(|entry| match entry {
-            AgentEntry::OneShot { handle, .. } => !handle.is_finished(),
-            AgentEntry::Resident(s) => {
-                let st = s.state.lock().expect("SessionState mutex");
-                !s.reader.is_finished() && !st.closed && st.in_foreground()
+    /// The chat's resident has a turn running or queued. Armed background
+    /// tasks don't count.
+    pub fn in_foreground(&self, topic: &str) -> bool {
+        match self.agents.get(topic) {
+            Some(AgentEntry::Resident(s)) => {
+                s.state.lock().expect("SessionState mutex").in_foreground()
             }
-        })
+            _ => false,
+        }
     }
 
     /// Drop the chat's entry on its `Done`. For a resident only the session
