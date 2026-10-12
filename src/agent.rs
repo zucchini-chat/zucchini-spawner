@@ -181,12 +181,14 @@ pub(crate) enum AutoCompact {
     Noticing,
 }
 
-const AUTO_COMPACT_INSTRUCTIONS: &str = "Preserve your standing instructions and duties, \
-every armed background task and its purpose, and any open commitments.";
+const AUTO_COMPACT_INSTRUCTIONS: &str = "Your system prompt and CLAUDE.md files stay in context: \
+do not restate anything from them, in any section. Keep only what is nowhere else: the user's \
+instructions from this conversation (verbatim), which background tasks are armed, and open \
+commitments.";
 
 const AUTO_COMPACT_NOTICE: &str = "[Zucchini] Your context was just auto-compacted. \
-Re-read your standing instructions (CLAUDE.md etc.), check that your armed background tasks \
-still match them, then continue.";
+Re-read the files your instructions point to, check that your armed background tasks still \
+match them, then continue.";
 
 /// One armed background task, as the client lists it when the user taps the
 /// Thinking/Waiting pill (`chats.live_tasks`). Claude's `task_started` frame
