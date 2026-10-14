@@ -36,8 +36,9 @@ use crate::blobs;
 use crate::crypto::KeyStore;
 use crate::envelope::EnvelopeAttachment;
 use crate::prune::{PendingPrunes, PruneRequest};
-use crate::state::{Mirror, SharedMirror};
+use crate::state::{ChatState, Mirror, SharedMirror};
 use crate::sys;
+use crate::user_prompt::UserSystemPrompt;
 use crate::watch::WatchDef;
 use crate::writer::TokenFetcher;
 
@@ -122,6 +123,22 @@ pub enum ControlRequest {
         chat_id: String,
         description: String,
     },
+    /// The user system prompt of `chat_id` (`user_prompt.rs`), decrypted.
+    GetSystemPrompt { chat_id: String },
+    /// Replace the text of `chat_id`'s user system prompt (`chats.system_prompt`)
+    /// with `text`, plaintext here; blank clears it. The file list stays the
+    /// user's. Refused where the spawner ignores the prompt.
+    SetSystemPrompt { chat_id: String, text: String },
+}
+
+/// A chat's user system prompt as the CLI sees it: both fields decrypted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SystemPromptInfo {
+    pub files: Option<String>,
+    pub text: Option<String>,
+    /// A `set` was saved but hasn't synced back: `show` still has the old text.
+    #[serde(default)]
+    pub sync_pending: bool,
 }
 
 /// One pending scheduled message as the CLI sees it. `deliver_at` is already in
@@ -175,6 +192,9 @@ pub struct ControlResponse {
     /// Set by the watch handlers: the one created or deleted, or the list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watches: Option<Vec<WatchDef>>,
+    /// Set by the system prompt handlers: the prompt read, or as just written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<SystemPromptInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Per-item eligible-match counts, parallel to the request's `items` — set
@@ -399,6 +419,26 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                 .await
                 .map(|def| vec![def]),
         ),
+        ControlRequest::GetSystemPrompt { chat_id } => {
+            system_prompt_response(get_system_prompt(&chat_id, state).await)
+        }
+        ControlRequest::SetSystemPrompt { chat_id, text } => {
+            system_prompt_response(set_system_prompt(&chat_id, &text, state).await)
+        }
+    }
+}
+
+fn system_prompt_response(result: Result<SystemPromptInfo>) -> ControlResponse {
+    match result {
+        Ok(prompt) => ControlResponse {
+            ok: true,
+            system_prompt: Some(prompt),
+            ..Default::default()
+        },
+        Err(e) => {
+            warn!(error = %e, "system prompt request failed");
+            ControlResponse::err(format!("{e:#}"))
+        }
     }
 }
 
@@ -805,6 +845,13 @@ async fn schedule_message(
         },
     });
 
+    post_write(op, state).await?;
+    info!(chat_id, %id, deliver_at = ?deliver_at, "scheduled message via /api/writes");
+    Ok(id)
+}
+
+/// One op to `/api/writes`, inline: the caller's answer is the backend's.
+async fn post_write(op: serde_json::Value, state: &ControlState) -> Result<()> {
     let url = format!("{}/api/writes", state.api_base_url.trim_end_matches('/'));
     let token = (state.fetch_token)()
         .await
@@ -820,14 +867,136 @@ async fn schedule_message(
             .send(),
     )
     .await
-    .context("POST /api/writes (schedule_message)")?;
+    .context("POST /api/writes")?;
     let status = resp.status();
     if !status.is_success() {
         let body = crate::net::capture_response_failure("POST", &url, resp).await;
         return Err(anyhow!("POST /api/writes {}: {}", status, body));
     }
-    info!(chat_id, %id, deliver_at = ?deliver_at, "scheduled message via /api/writes");
-    Ok(id)
+    Ok(())
+}
+
+/// `chat_id`'s row, for a chat whose spawns take the user system prompt
+/// (`Mirror::user_system_prompt`).
+fn system_prompt_chat<'a>(chat_id: &str, mirror: &'a Mirror) -> Result<&'a ChatState> {
+    let chat = mirror
+        .chats
+        .get(chat_id)
+        .ok_or_else(|| anyhow!("no chat with id {chat_id} (unknown or not yet synced)"))?;
+    if !chat.agent_kind.make_adapter().takes_user_system_prompt() || !mirror.is_unsandboxed(chat_id)
+    {
+        return Err(anyhow!(
+            "this chat takes no system prompt (it is sandboxed or its agent has none)"
+        ));
+    }
+    if chat.user_system_prompt.undecryptable {
+        return Err(anyhow!("can't decrypt the chat's system prompt"));
+    }
+    Ok(chat)
+}
+
+async fn get_system_prompt(chat_id: &str, state: &ControlState) -> Result<SystemPromptInfo> {
+    let mirror = state.mirror.read().await;
+    let prompt = &system_prompt_chat(chat_id, &mirror)?.user_system_prompt;
+    Ok(SystemPromptInfo {
+        files: prompt.files.clone(),
+        text: prompt.text.clone(),
+        sync_pending: false,
+    })
+}
+
+/// `chat_id`'s prompt with its text replaced by `text` (trimmed, blank = none),
+/// the chat's owner and its project path.
+fn prompt_with_text(
+    chat_id: &str,
+    text: &str,
+    mirror: &Mirror,
+) -> Result<(uuid::Uuid, UserSystemPrompt, Option<String>)> {
+    let text = Some(text.trim().to_string()).filter(|t| !t.is_empty());
+    let size = text.as_deref().map_or(0, str::len);
+    if size > crate::user_prompt::MAX_TEXT_BYTES {
+        return Err(anyhow!(
+            "the text takes {size} bytes, the limit is {}; move long instructions to a file",
+            crate::user_prompt::MAX_TEXT_BYTES
+        ));
+    }
+    let chat = system_prompt_chat(chat_id, mirror)?;
+    let prompt = UserSystemPrompt {
+        files: chat.user_system_prompt.files.clone(),
+        text,
+        undecryptable: false,
+    };
+    let project_path = mirror.projects.get(&chat.project_id).cloned();
+    Ok((chat.user_id, prompt, project_path))
+}
+
+/// How long `set` waits for its write to sync back into the mirror.
+const SYSTEM_PROMPT_SYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits until the mirror holds `sealed` as `chat_id`'s `system_prompt`: from
+/// then on `show` returns the new text. `false` when it didn't within
+/// `SYSTEM_PROMPT_SYNC_WAIT`; an error when the chat is gone, as the backend
+/// drains a write to a deleted row without saying so.
+async fn await_synced_system_prompt(
+    chat_id: &str,
+    sealed: Option<&str>,
+    mirror: &SharedMirror,
+) -> Result<bool> {
+    let synced = async {
+        loop {
+            match mirror.read().await.chats.get(chat_id) {
+                None => return Err(anyhow!("the chat was deleted, nothing was saved")),
+                Some(chat) if chat.system_prompt.as_deref() == sealed => return Ok(()),
+                Some(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    match tokio::time::timeout(SYSTEM_PROMPT_SYNC_WAIT, synced).await {
+        Ok(synced) => synced.map(|()| true),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Seals `text` under the chat owner's key and patches `chats.system_prompt`.
+/// The row syncing back is what the mirror and the resident's retire act on
+/// (`main.rs::retire_stale_prompt`). A prompt that wouldn't render is refused:
+/// it would fail the chat's every spawn.
+async fn set_system_prompt(
+    chat_id: &str,
+    text: &str,
+    state: &ControlState,
+) -> Result<SystemPromptInfo> {
+    let (user_id, prompt, project_path) =
+        prompt_with_text(chat_id, text, &*state.mirror.read().await)?;
+    prompt
+        .render(project_path.as_deref())
+        .map_err(|e| anyhow!(e))?;
+    let size = prompt.text.as_deref().map_or(0, str::len);
+    let sealed = match &prompt.text {
+        Some(text) => {
+            let key = state
+                .keys
+                .get(&user_id)
+                .with_context(|| format!("no key for user {user_id}"))?;
+            Some(crate::crypto::encrypt_field_b64(&key, text))
+        }
+        None => None,
+    };
+    let op = serde_json::json!({
+        "op": "PATCH",
+        "table": "chats",
+        "id": chat_id,
+        "data": { "system_prompt": sealed },
+    });
+    post_write(op, state).await?;
+    info!(chat_id, size, "system prompt text set by the agent");
+    let synced = await_synced_system_prompt(chat_id, sealed.as_deref(), &state.mirror).await?;
+    Ok(SystemPromptInfo {
+        files: prompt.files,
+        text: prompt.text,
+        sync_pending: !synced,
+    })
 }
 
 /// The owner of `chat_id`, for a chat allowed to run watches: the command runs
@@ -1274,6 +1443,28 @@ pub async fn delete_watch_via_socket(chat_id: &str, description: String) -> Resu
     .ok_or_else(|| anyhow!("response missing the watch"))
 }
 
+async fn system_prompt_request(req: ControlRequest) -> Result<SystemPromptInfo> {
+    send_control_request(&req)
+        .await?
+        .system_prompt
+        .ok_or_else(|| anyhow!("response missing the system prompt"))
+}
+
+pub async fn get_system_prompt_via_socket(chat_id: &str) -> Result<SystemPromptInfo> {
+    system_prompt_request(ControlRequest::GetSystemPrompt {
+        chat_id: chat_id.to_string(),
+    })
+    .await
+}
+
+pub async fn set_system_prompt_via_socket(chat_id: &str, text: String) -> Result<SystemPromptInfo> {
+    system_prompt_request(ControlRequest::SetSystemPrompt {
+        chat_id: chat_id.to_string(),
+        text,
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1304,6 +1495,81 @@ mod tests {
         assert!(watch_chat_owner(&chat_id, &mirror, &owner_only).is_err());
         mirror.upsert_member("row".into(), member, true);
         assert!(watch_chat_owner(&chat_id, &mirror, &keys).is_err());
+    }
+
+    #[test]
+    fn a_system_prompt_needs_an_unsandboxed_claude_chat() {
+        use uuid::Uuid;
+        let (owner, member) = (Uuid::now_v7(), Uuid::now_v7());
+        let keys = KeyStore::with_keys([(owner, [0u8; 32]), (member, [0u8; 32])]);
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(owner);
+        mirror.upsert_member("row".into(), member, true);
+        let mut chat = |user: Uuid, agent_kind: &str| {
+            let chat_id = Uuid::now_v7().to_string();
+            let row = serde_json::json!({
+                "id": chat_id,
+                "project_id": Uuid::now_v7().to_string(),
+                "user_id": user.to_string(),
+                "last_seq": 0,
+                "agent_kind": agent_kind,
+                "worktree": false,
+            });
+            mirror.upsert_chat(chat_id.clone(), &row.to_string(), &keys);
+            chat_id
+        };
+        let (claude, codex, sandboxed) = (
+            chat(owner, "claude"),
+            chat(owner, "codex"),
+            chat(member, "claude"),
+        );
+
+        assert_eq!(system_prompt_chat(&claude, &mirror).unwrap().user_id, owner);
+        assert!(system_prompt_chat(&codex, &mirror).is_err());
+        assert!(system_prompt_chat(&sandboxed, &mirror).is_err());
+        assert!(system_prompt_chat("no-such-chat", &mirror).is_err());
+
+        let (user, prompt, _) = prompt_with_text(&claude, "  be terse \n", &mirror).unwrap();
+        assert_eq!((user, prompt.text.as_deref()), (owner, Some("be terse")));
+        assert_eq!(
+            prompt_with_text(&claude, " \n", &mirror).unwrap().1.text,
+            None
+        );
+        let cap = crate::user_prompt::MAX_TEXT_BYTES;
+        assert!(prompt_with_text(&claude, &"x".repeat(cap), &mirror).is_ok());
+        assert!(prompt_with_text(&claude, &"x".repeat(cap + 1), &mirror).is_err());
+        assert!(prompt_with_text(&sandboxed, "be terse", &mirror).is_err());
+    }
+
+    #[test]
+    fn a_set_text_keeps_the_files_and_needs_them_decrypted() {
+        use uuid::Uuid;
+        let owner = Uuid::now_v7();
+        let key = [7u8; 32];
+        let keys = KeyStore::with_keys([(owner, key)]);
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(owner);
+        let mut chat = |files: &str| {
+            let chat_id = Uuid::now_v7().to_string();
+            let row = serde_json::json!({
+                "id": chat_id,
+                "project_id": Uuid::now_v7().to_string(),
+                "user_id": owner.to_string(),
+                "last_seq": 0,
+                "agent_kind": "claude",
+                "worktree": false,
+                "system_prompt_files": files,
+            });
+            mirror.upsert_chat(chat_id.clone(), &row.to_string(), &keys);
+            chat_id
+        };
+        let sealed_files = crate::crypto::encrypt_field_b64(&keys.get(&owner).unwrap(), "rules.md");
+        let with_files = chat(&sealed_files);
+        let undecryptable = chat("not a ciphertext");
+
+        let (_, prompt, _) = prompt_with_text(&with_files, "be terse", &mirror).unwrap();
+        assert_eq!(prompt.files.as_deref(), Some("rules.md"));
+        assert!(prompt_with_text(&undecryptable, "be terse", &mirror).is_err());
     }
 
     fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {

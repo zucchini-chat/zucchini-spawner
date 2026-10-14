@@ -21,6 +21,10 @@ pub const MAX_BYTES: usize = if cfg!(windows) {
     UNIX_MAX_BYTES
 };
 
+/// Cap on the text an agent sets (`system-prompt set`), the clients' cap on
+/// what the user types: its ciphertext must stay under the backend's limit.
+pub const MAX_TEXT_BYTES: usize = 8000;
+
 /// Both fields as the user typed them. A spawn knob: the rendered prompt is
 /// baked into the process, so a change respawns the resident.
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -151,11 +151,10 @@ fn worktree_name(chat_id: &str) -> String {
 /// cursor-agent has no `--append-system-prompt` (or any other system /
 /// prompt-prefix flag — confirmed against `cursor-agent --help` 2026.05), so
 /// the capabilities ride a short preamble before the user's prompt body.
-/// `agent_capabilities_instructions` bundles the attach-file how-to,
-/// schedule-message and worktree containment; we then append the prune-context
-/// standing order (cursor's selective-forgetting nudge — its reads run through
-/// `Read`, so the claude-shape `PRUNE_CONTEXT_INSTRUCTION` is the right
-/// variant, NOT the codex/gemini tool-name variants). The whole preamble rides
+/// `agent_capabilities_instructions` bundles the Zucchini tools list, with the
+/// prune-context item (cursor's reads run through `Read`, so the claude-shape
+/// `PRUNE_CONTEXT_INSTRUCTION` is the right variant, NOT the codex/gemini
+/// tool-name variants), and worktree containment. The whole preamble rides
 /// every turn (not just the first, unlike codex/gemini's
 /// `first_turn_prompt_suffix`); cursor's `--resume` reconstructs history from
 /// the local store and drops our user-echo frame, so the preamble never
@@ -182,9 +181,8 @@ fn stdin_preamble(ctx: &TurnContext<'_>) -> String {
         }
     });
     format!(
-        "{}\n\n{}\n\n---\n\n",
-        agent_capabilities_instructions(worktree_info.as_ref()),
-        PRUNE_CONTEXT_INSTRUCTION
+        "{}\n\n---\n\n",
+        agent_capabilities_instructions(&[PRUNE_CONTEXT_INSTRUCTION], worktree_info.as_ref())
     )
 }
 
@@ -2667,7 +2665,7 @@ mod tests {
         // Stdin preamble carries capabilities + (worktree on) the worktree rule
         // naming cursor's `~/.cursor/worktrees/<repo>/<name>` dir.
         assert!(cmd.contains("attach-file"), "got: {}", cmd);
-        assert!(cmd.contains("scheduled-messages create"), "got: {}", cmd);
+        assert!(cmd.contains("`scheduled-messages`"), "got: {}", cmd);
         assert!(cmd.contains("Worktree:"), "worktree rule present: {}", cmd);
         assert!(
             cmd.contains(".cursor/worktrees/proj/zcm-abcdef012345"),
@@ -2686,7 +2684,7 @@ mod tests {
         let cmd = a.prepare_command(&ctx).unwrap();
         // Capabilities always present; worktree rule only when worktree is on.
         assert!(cmd.contains("attach-file"), "got: {}", cmd);
-        assert!(cmd.contains("scheduled-messages create"), "got: {}", cmd);
+        assert!(cmd.contains("`scheduled-messages`"), "got: {}", cmd);
         assert!(
             !cmd.contains("Worktree:"),
             "worktree off → no rule: {}",

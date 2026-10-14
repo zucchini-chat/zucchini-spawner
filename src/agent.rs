@@ -1325,7 +1325,8 @@ impl Supervisor {
 
     /// Deliver `req` as a new user turn to the chat's live resident process via
     /// stdin. `false` — the caller respawns instead — when there's no live
-    /// session, its spawn knobs differ, or it's a claude slash command while a
+    /// session, its spawn knobs differ (another user system prompt only once
+    /// no turn would be cut), or it's a claude slash command while a
     /// turn is in flight (that one interrupts, as before; a command queued
     /// behind other turns — or any codex `/compact` — is held by the writer
     /// until it can run on its own). A running `/compact` is never interrupted:
@@ -1345,11 +1346,21 @@ impl Supervisor {
         let Some(AgentEntry::Resident(s)) = self.agents.get(&req.chat_id) else {
             return false;
         };
-        let (closed, in_flight) = {
+        let (closed, in_flight, between_turns) = {
             let st = s.state.lock().expect("SessionState mutex");
-            (st.closed, st.in_turn() && !st.command_in_flight)
+            (
+                st.closed,
+                st.in_turn() && !st.command_in_flight,
+                st.between_turns(),
+            )
         };
-        if closed || s.reader.is_finished() || s.knobs != SessionKnobs::of(req) {
+        let mut knobs = SessionKnobs::of(req);
+        if !between_turns {
+            // A stale prompt alone never cuts a turn: `retire_stale_prompt`
+            // applies it once this one is over.
+            knobs.user_system_prompt = s.knobs.user_system_prompt.clone();
+        }
+        if closed || s.reader.is_finished() || s.knobs != knobs {
             return false;
         }
         let adapter = req.agent_kind.make_adapter();
@@ -3954,7 +3965,15 @@ mod live_session_tests {
             user_system_prompt: prompt_text("be terse"),
             ..claude_req("chat")
         };
-        assert!(!sup.send_user_turn(&other_prompt));
+        assert!(
+            sup.send_user_turn(&other_prompt),
+            "another prompt waits for the queued turn instead of cutting it"
+        );
+        let other_prompt_and_model = SpawnRequest {
+            model: Some("opus".to_string()),
+            ..other_prompt.clone()
+        };
+        assert!(!sup.send_user_turn(&other_prompt_and_model));
 
         let compact = SpawnRequest {
             prompt: "/compact".to_string(),
@@ -3969,6 +3988,10 @@ mod live_session_tests {
             .unwrap()
             .turn_in_flight = true;
         assert!(!sup.send_user_turn(&compact), "a turn is in flight");
+        assert!(
+            sup.send_user_turn(&other_prompt),
+            "another prompt doesn't cut the running turn either"
+        );
         assert!(
             !sup.send_scheduled_turn(&other_model),
             "other knobs respawn a scheduled turn too"

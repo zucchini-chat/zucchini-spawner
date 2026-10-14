@@ -730,81 +730,60 @@ pub(crate) fn slash_command_name(prompt: &str) -> Option<&str> {
     valid.then_some(name)
 }
 
-/// Instruction telling the agent how to attach a local file to its next message
-/// via the `zucchini-spawner attach-file` CLI. Chat id and binary path stay in
-/// env vars (`ZUCCHINI_CHAT_ID`, `ZUCCHINI_SPAWNER_BIN`) exported on every spawn,
-/// so the text is chat-agnostic and cacheable. Tool name is left
-/// unspecified ("run the command"): every coding agent has a shell-exec facility.
-pub const ATTACH_FILE_INSTRUCTION: &str =
-    "To send a file to the user, run the command `\"$ZUCCHINI_SPAWNER_BIN\" attach-file <absolute-path>` before writing the message that should accompany the attachment.";
+/// Heads the list of `zucchini-spawner` commands the agent may run. The prompt
+/// names each command and when to use it; the syntax lives in each command's
+/// `--help` (`main.rs`), read on first use. Chat id and binary path stay in env
+/// vars (`ZUCCHINI_CHAT_ID`, `ZUCCHINI_SPAWNER_BIN`) exported on every spawn,
+/// so the text is chat-agnostic and cacheable.
+pub const ZUCCHINI_TOOLS_INTRO: &str =
+    "Zucchini tools: run `\"$ZUCCHINI_SPAWNER_BIN\" <command> --help` before a command's first use.";
 
-/// Body of the prune-context nudge with a per-adapter `$example` clause spliced
-/// in. The shared text lives here EXACTLY ONCE; only the worked example varies
-/// (claude/gemini name tools the same way the matcher's claude-shape aliases do;
-/// codex needs a different example — see `PRUNE_CONTEXT_INSTRUCTION_CODEX`).
+pub const ATTACH_FILE_INSTRUCTION: &str =
+    "- `attach-file`: send the user a file; run it before the message that goes with it.";
+
+/// The prune-context item with a per-adapter `$note` appended: how `--tool-name`
+/// maps onto the agent's own tool names, and claude's summary placement.
 macro_rules! prune_context_instruction {
-    ($toolname_frag:literal, $example:literal) => {
+    ($note:literal) => {
         concat!(
-            "Reclaim context as you go: once you've extracted what you need from a tool output, prune it — noisy grep, an already-answered file, a large file you've already edited and moved past, junk: prune with `\"$ZUCCHINI_SPAWNER_BIN\" prune-context ",
-            $toolname_frag,
-            "--args \"<value glob>\" --summary \"<1-line digest of what you're keeping — the key takeaway from this tool result>\"`. --args is a glob (supports *) over the call's argument VALUES, not key names, and selects which calls match — each prune blanks only the MOST RECENT matching call, so repeat the command to prune older ones. Pass --args \"\" for a call you made with no arguments. To forget several outputs at once, repeat the flags in ONE call (one --summary per output, which closes that target; --tool-name is per-target, so repeat it on each — an omitted one falls back to matching any tool) — they apply as a single batch. E.g. ",
-            $example,
-            ". Run prune-context alone, never alongside other tool calls."
+            "- `prune-context`: drop tool outputs you no longer need, each with a one-line summary of what to keep. A large context dilutes your attention and weakens your reasoning, every turn rereads it at the cost of the user's usage limits, and it brings the next compaction (which loses detail) closer, so prune as you go. Applying a prune restarts your process, so call it in a message of its own, never alongside other tool calls.",
+            $note
         )
     };
 }
 
-/// Instruction telling the agent to proactively reclaim context by permanently
-/// forgetting tool outputs it no longer needs. Delivered via
-/// `--append-system-prompt` (claude) or appended to the first user message
-/// (gemini, which lacks that hook — see `first_turn_prompt_suffix`). Codex uses
-/// `PRUNE_CONTEXT_INSTRUCTION_CODEX` instead (its tool names differ). Same
-/// env-var convention as `ATTACH_FILE_INSTRUCTION`, so it's chat-agnostic and
-/// cacheable. The spawner aborts + respawns the agent with a "continue" prompt
-/// after a prune, so the instruction doesn't tell the agent to stop.
-pub const PRUNE_CONTEXT_INSTRUCTION: &str = prune_context_instruction!(
-    "--tool-name <ToolName> ",
-    "`--tool-name \"Read\" --args \"src/main.ts\" --summary \"main.ts: initApp() wires routes then listens on PORT — entry point confirmed\" --tool-name Read --args \"build.log\" --summary \"build: passed, nothing relevant\"`"
+/// For adapters whose tool names match the pruner's claude-shape aliases (pi,
+/// cursor). The spawner aborts + respawns the agent with a "continue" prompt
+/// after a prune, so the text doesn't tell the agent to stop.
+pub const PRUNE_CONTEXT_INSTRUCTION: &str = prune_context_instruction!("");
+
+/// Claude's pruner moves each summary into the pruned tool result.
+pub const PRUNE_CONTEXT_INSTRUCTION_CLAUDE: &str = prune_context_instruction!(
+    " Each --summary takes the pruned output's place, so write it to stand on its own."
 );
 
-/// Codex variant. Codex has no `Read`/`Grep`/`Edit` tools — file reads, greps,
-/// and edits ALL run through two generic shell tools (`shell`/`exec_command`), so
-/// no single native tool name targets a given file op (and naming one shell tool
-/// misses the other). Rather than force a claude-shape `Bash` alias the agent
-/// never actually emitted, the codex example OMITS `--tool-name` entirely — the
-/// empty selector prunes on the `--args` path alone, which already disambiguates.
-/// (Gemini keeps native names because its reads/greps/edits land on distinct,
-/// self-describing tools; codex has no such per-op name.)
+/// Codex has no `Read`/`Grep`/`Edit` tools — file reads, greps and edits ALL run
+/// through generic shell tools, so no tool name targets a given file op; the
+/// empty selector prunes on the `--args` path alone.
 pub const PRUNE_CONTEXT_INSTRUCTION_CODEX: &str = prune_context_instruction!(
-    "",
-    "`--args \"src/main.ts\" --summary \"main.ts: initApp() wires routes then listens on PORT — entry point confirmed\" --args \"build.log\" --summary \"build: passed, nothing relevant\"` (omit --tool-name on codex)"
+    " Omit --tool-name: your reads and greps all run through shell tools."
 );
 
-/// Gemini variant. The matcher DOES alias claude-shape `Read`→`read_file`, so the
-/// shared `Read` example technically works — but a gemini agent sees its own tool
-/// calls named `read_file`/`list_directory`/`replace`/`grep_search` in its
-/// transcript, and the `Read` example invites it to guess wrong variants
-/// (`ReadFile`, `List`, …) that literal-compare to nothing and fail. The example
-/// here uses gemini's native names so `--tool-name` matches what the agent sees.
+/// A gemini agent sees its own tool names in its transcript; claude's `Read`
+/// invites guesses (`ReadFile`, …) that match nothing.
 pub const PRUNE_CONTEXT_INSTRUCTION_GEMINI: &str = prune_context_instruction!(
-    "--tool-name <ToolName> ",
-    "`--tool-name \"read_file\" --args \"src/main.ts\" --summary \"main.ts: initApp() wires routes then listens on PORT — entry point confirmed\" --tool-name read_file --args \"build.log\" --summary \"build: passed, nothing relevant\"` (use your own tool names — `read_file`, `list_directory`, `replace`, `grep_search`, … — not claude's `Read`/`Edit`/`Grep`)"
+    " --tool-name takes your own tool names (`read_file`, `grep_search`, `replace`, …), not claude's `Read`/`Grep`/`Edit`."
 );
 
-/// How the agent schedules a follow-up via `zucchini-spawner scheduled-messages`.
-/// Same env-var contract as `ATTACH_FILE_INSTRUCTION` (`ZUCCHINI_CHAT_ID`,
-/// `ZUCCHINI_SPAWNER_BIN`) so it stays chat-agnostic and cacheable.
-///
-/// The agent emits a NAIVE local wall-clock (no offset/`Z`); the spawner anchors
-/// it in the user's timezone (`normalize_deliver_at`) so the agent never does
-/// offset/DST math (which it gets wrong).
+/// The agent passes `--at` as a NAIVE local wall-clock (`scheduled-messages
+/// --help`); the spawner anchors it in the user's timezone
+/// (`normalize_deliver_at`) so the agent never does offset/DST math.
 pub const SCHEDULE_MESSAGE_INSTRUCTION: &str =
-    "To schedule a follow-up message to yourself in this chat for a specific future time, run the command `\"$ZUCCHINI_SPAWNER_BIN\" scheduled-messages create --body \"<text>\" --at <local-datetime>`. Pass `--at` as a naive local datetime — the user's wall-clock time (e.g. \"2026-06-07T09:00:00\" for 9am). `list` and `delete`: see `scheduled-messages --help`. ALWAYS use this command for any scheduling, reminder, or self-follow-up request — it is the only mechanism that reliably delivers a message back into this chat. Do NOT use your own built-in scheduling tools (the `/schedule` skill, ScheduleWakeup, CronCreate, etc.): `/schedule` runs in a context the user never sees here, and in-session timers are lost whenever this process restarts, which happens routinely (idle eviction, context pruning, updates).";
+    "- `scheduled-messages`: a message to yourself at a set time, for reminders and follow-ups. Prefer it over your own timers (ScheduleWakeup, CronCreate): those die with your process, which Zucchini restarts routinely (idle eviction, updates, laptop sleep), while a scheduled message arrives whenever the machine is back. Not the `/schedule` skill: it runs outside this chat.";
 
-/// How the agent arms a daemon-run watch (`watch.rs`) via `zucchini-spawner
-/// watch`. Same env-var contract as `ATTACH_FILE_INSTRUCTION`.
+/// A daemon-run watch (`watch.rs`).
 pub const WATCH_INSTRUCTION: &str =
-    "To arm a long-running monitor that outlives your own process (hours, days or with no end; it survives restarts of you and of the spawner), run the command `\"$ZUCCHINI_SPAWNER_BIN\" watch create --cmd \"<shell command>\" --ttl <30m|12h|7d|forever> --description \"<text>\"`. The spawner runs the command in your current directory until it exits or the TTL passes: each stdout line arrives as a message in this chat, and when the command exits (any exit code) or the TTL passes, the watch is removed and this chat is told how it ended. The command is started again after a spawner restart, so keep a cursor of what it has already reported in the directory `$ZUCCHINI_WATCH_STATE_DIR`. Every line is a full turn for you and is read as trusted input, so print one short line per real event with ids and event types only - never raw subjects, comment bodies or other third-party text (fetch those yourself once woken); a watch that floods is stopped. `list` and `delete`: see `watch --help`.";
+    "- `watch`: use it instead of Monitor or a background shell for anything that runs for hours or days. The spawner runs your shell command outside your process and starts it again after its own restarts; each line the command prints reaches you as a message. Print one short line per event with ids only, never third-party text.";
 
 /// Per-turn current-local-time line for the agent prompt, from the sender's IANA
 /// timezone (`machine_users.timezone`, migration 0040). `None` when `iana_tz` is
@@ -847,18 +826,30 @@ pub fn worktree_instructions(worktree_abs: &str, parent_repo: &str) -> String {
     )
 }
 
-/// The capability instructions every adapter conveys — attach-file,
-/// schedule-message, and (when `worktree` is `Some`) the worktree rule. One
-/// helper so the texts can't drift across conveyance mechanisms: claude's
+/// The capability instructions every adapter conveys — the Zucchini tools list
+/// (attach-file, scheduled-messages, watch, then the adapter's `more_tools`
+/// items) and (when `worktree` is `Some`) the worktree rule. One helper so the
+/// texts can't drift across conveyance mechanisms: claude's
 /// `--append-system-prompt`, cursor's stdin preamble, and the first-message
 /// prepend (codex/gemini/hermes, no system-prompt injection point). `worktree`
 /// is `Some` only when the turn runs in a worktree the agent must stay inside;
 /// `None` omits the rule. The volatile time line is NOT part of this block — see
 /// [`AgentAdapter::turn_time_line`].
-pub fn agent_capabilities_instructions(worktree: Option<&WorktreeInstructions>) -> String {
-    let mut out = format!(
-        "{ATTACH_FILE_INSTRUCTION}\n\n{SCHEDULE_MESSAGE_INSTRUCTION}\n\n{WATCH_INSTRUCTION}"
-    );
+pub fn agent_capabilities_instructions(
+    more_tools: &[&str],
+    worktree: Option<&WorktreeInstructions>,
+) -> String {
+    let mut out = [
+        ZUCCHINI_TOOLS_INTRO,
+        ATTACH_FILE_INSTRUCTION,
+        SCHEDULE_MESSAGE_INSTRUCTION,
+        WATCH_INSTRUCTION,
+    ]
+    .iter()
+    .chain(more_tools)
+    .copied()
+    .collect::<Vec<_>>()
+    .join("\n");
     if let Some(wt) = worktree {
         out.push_str("\n\n");
         out.push_str(&worktree_instructions(&wt.worktree_abs, &wt.parent_repo));
@@ -876,7 +867,7 @@ pub fn first_message_capabilities_preamble(ctx: &TurnContext<'_>) -> Option<Stri
     if ctx.agent_session_id.is_some() {
         return None;
     }
-    Some(agent_capabilities_instructions(None))
+    Some(agent_capabilities_instructions(&[], None))
 }
 
 /// Already-resolved absolute worktree path + parent repo for
@@ -1377,11 +1368,8 @@ mod tests {
         let first = TurnContext::for_test(&prompt_file, None, false, None);
         let preamble = first_message_capabilities_preamble(&first).expect("first turn → Some");
         assert!(preamble.contains("attach-file"), "got: {preamble}");
-        assert!(
-            preamble.contains("scheduled-messages create"),
-            "got: {preamble}"
-        );
-        assert!(preamble.contains("watch create"), "got: {preamble}");
+        assert!(preamble.contains("`scheduled-messages`"), "got: {preamble}");
+        assert!(preamble.contains("`watch`"), "got: {preamble}");
         assert!(!preamble.contains("Worktree:"), "got: {preamble}");
 
         let resume = TurnContext::for_test(&prompt_file, Some("sid"), false, None);

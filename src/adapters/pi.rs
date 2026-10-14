@@ -273,11 +273,8 @@ impl AgentAdapter for PiAdapter {
         // make cwd obvious) is unnecessary for pi. The CLAUDE-shape
         // `PRUNE_CONTEXT_INSTRUCTION` is correct here: pi maps its tool names to
         // claude names on the wire AND the prune CLI takes claude-shape
-        // `--tool-name`, so the Read/Bash examples match what the user types — the
-        // nudge is appended after, exactly like claude.
-        let mut sys = agent_capabilities_instructions(None);
-        sys.push_str("\n\n");
-        sys.push_str(PRUNE_CONTEXT_INSTRUCTION);
+        // `--tool-name`.
+        let sys = agent_capabilities_instructions(&[PRUNE_CONTEXT_INSTRUCTION], None);
         cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(&sys)));
 
         Ok(cmd)

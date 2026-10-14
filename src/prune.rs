@@ -642,7 +642,12 @@ pub const PRUNE_REMINDER_TEXT: &str =
 /// SERIALIZED `tool_response` is larger than this many bytes/chars. Small
 /// results aren't worth a prune, so we stay quiet below the threshold to avoid
 /// spamming a `<system-reminder>` after every trivial tool call.
-pub const PRUNE_REMINDER_MIN_TOOL_RESPONSE_BYTES: usize = 1500;
+pub const PRUNE_REMINDER_MIN_TOOL_RESPONSE_BYTES: usize = 4000;
+
+/// Tools whose `tool_response` carries the file they wrote (`originalFile`,
+/// `structuredPatch`, `content`) while the agent itself reads only a one-line
+/// ack, so the size gate would fire on every edit.
+const FILE_WRITE_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
 
 /// Pure core of the `prune-reminder-hook` subcommand. Parses a claude
 /// `PostToolUse` hook JSON `payload` from stdin, measures the SERIALIZED length
@@ -679,8 +684,12 @@ pub fn prune_reminder_output(payload: &str) -> Option<String> {
     // of its own. The Skill call is our only handle, so nudge unconditionally; it's
     // reclaimable via `prune-context --tool-name Skill` (which blanks the linked body
     // too, see `adapters/claude.rs::blank_claude_entry`).
-    if parsed.get("tool_name").and_then(|t| t.as_str()) == Some("Skill") {
+    let tool_name = parsed.get("tool_name").and_then(|t| t.as_str());
+    if tool_name == Some("Skill") {
         return Some(prune_reminder_json());
+    }
+    if tool_name.is_some_and(|t| FILE_WRITE_TOOLS.contains(&t)) {
+        return None;
     }
     let len = match parsed.get("tool_response") {
         None | Some(serde_json::Value::Null) => 0,
@@ -1145,6 +1154,20 @@ mod tests {
         assert!(
             prune_reminder_output(&sub).is_none(),
             "sub-agent Skill call must stay silent"
+        );
+    }
+
+    #[test]
+    fn prune_reminder_skips_file_writes() {
+        let file = "x".repeat(PRUNE_REMINDER_MIN_TOOL_RESPONSE_BYTES + 1);
+        let edit = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_response": { "filePath": "/p/a.rs", "originalFile": file },
+        })
+        .to_string();
+        assert!(
+            prune_reminder_output(&edit).is_none(),
+            "the agent reads only the edit's ack"
         );
     }
 

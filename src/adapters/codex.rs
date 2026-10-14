@@ -387,7 +387,7 @@ impl AgentAdapter for CodexAdapter {
     /// every resume of every older thread), so capabilities ride the first
     /// user message; worktree ignored.
     fn session_first_turn_preamble(&self) -> Option<String> {
-        Some(agent_capabilities_instructions(None))
+        Some(agent_capabilities_instructions(&[], None))
     }
 
     /// No `--append-system-prompt` either, so the prune nudge rides in on the

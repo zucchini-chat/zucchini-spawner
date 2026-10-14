@@ -2636,26 +2636,23 @@ fn skip_legacy_chat_id<'a>(arg: &str, it: &mut impl Iterator<Item = &'a String>)
 /// success, 1 on any failure. The CLI itself does no crypto or HTTP — the
 /// daemon owns the JWT and K_user.
 async fn run_attach_file_cli(args: &[String]) {
-    fn usage_and_exit() -> ! {
-        eprintln!("usage: zucchini-spawner attach-file <absolute-path>");
-        std::process::exit(2);
-    }
+    const USAGE: &str = "usage: zucchini-spawner attach-file <absolute-path>\n  Attaches the file to your next message in this chat; run it before writing that message.";
 
     let mut path: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let s = a.as_str();
         if s == "-h" || s == "--help" {
-            usage_and_exit();
+            usage_and_exit(USAGE, 0);
         } else if skip_legacy_chat_id(s, &mut it) {
         } else if path.is_none() {
             path = Some(s.to_string());
         } else {
-            usage_and_exit();
+            usage_and_exit(USAGE, 2);
         }
     }
     let (Some(chat_id), Some(path)) = (env_chat_id(), path) else {
-        usage_and_exit();
+        usage_and_exit(USAGE, 2);
     };
 
     match control::attach_file_via_socket(&chat_id, &path).await {
@@ -2774,20 +2771,18 @@ fn parse_prune_args(args: &[String]) -> Result<(bool, Vec<control::PruneItem>), 
 /// daemon aborts the agent right after replying, so a post-send connection-reset
 /// is expected — the prune proceeds regardless.
 async fn run_prune_context_cli(args: &[String]) {
-    fn usage_and_exit() -> ! {
-        eprintln!(
-            "usage: zucchini-spawner prune-context [--tool-name <ToolName>] --args \"<glob>\" --summary \"<digest>\" [... repeat per output ...] [--force]\n  Prune one or more tool outputs in a single call: each --summary CLOSES the target made of the --tool-name/--args before it, so repeat the triple to forget several outputs at once (one restart for the whole batch). --tool-name is optional per target — omit it to match on --args alone. --summary is the takeaway from that output you still need going forward — the slice that matters for the task at hand, NOT a recap of the whole output (--reason accepted as a legacy alias). --args is a glob (supports *) over the call's argument VALUES, not key names; blanks only the most recent matching call (repeat to prune older ones). Use --args \"\" to prune a call you made with no arguments. --force prunes even while background tasks/monitors are running (the restart terminates them); without it, prune-context errors so you can wait for them to finish."
-        );
-        std::process::exit(2);
-    }
+    const USAGE: &str = "usage: zucchini-spawner prune-context [--tool-name <ToolName>] --args \"<glob>\" --summary \"<digest>\" [... repeat per output ...] [--force]\n  Prune one or more tool outputs in a single call: each --summary CLOSES the target made of the --tool-name/--args before it, so repeat the triple to forget several outputs at once (one restart for the whole batch). --tool-name is optional per target — omit it to match on --args alone. --summary is the takeaway from that output you still need going forward — the slice that matters for the task at hand, NOT a recap of the whole output (--reason accepted as a legacy alias). --args is a glob (supports *) over the call's argument VALUES, not key names; blanks only the most recent matching call (repeat to prune older ones). Use --args \"\" to prune a call you made with no arguments. --force prunes even while background tasks/monitors are running (the restart terminates them); without it, prune-context errors so you can wait for them to finish.\n  E.g. --tool-name Read --args \"src/main.ts\" --summary \"main.ts: initApp() wires routes then listens on PORT\" --args \"*build.log*\" --summary \"build: passed, nothing relevant\"";
 
+    if args.first().is_some_and(|a| a == "-h" || a == "--help") {
+        usage_and_exit(USAGE, 0);
+    }
     // `--reason` is the legacy alias for `--summary` (older binary mid-turn keeps
     // parsing across a hot-reload); both feed the same wire field `reason`.
     let Ok((force, items)) = parse_prune_args(args) else {
-        usage_and_exit();
+        usage_and_exit(USAGE, 2);
     };
     let Some(chat_id) = env_chat_id() else {
-        usage_and_exit();
+        usage_and_exit(USAGE, 2);
     };
 
     // Record the CLI INVOCATION itself — written here, at the top of the
@@ -2849,20 +2844,27 @@ async fn run_prune_context_cli(args: &[String]) {
     }
 }
 
+/// Prints `usage` and exits with `code`: to stdout for an asked-for `--help`
+/// (0), to stderr for a misuse.
+fn usage_and_exit(usage: &str, code: i32) -> ! {
+    if code == 0 {
+        println!("{usage}");
+    } else {
+        eprintln!("{usage}");
+    }
+    std::process::exit(code);
+}
+
 const SCHEDULED_MESSAGES_USAGE: &str = "usage: zucchini-spawner scheduled-messages <command>
 commands:
   create --body <TEXT> --at <local datetime, e.g. 2026-06-07T09:00:00>
-                      schedule a message into this chat
+                      schedule a message into this chat. --at is the user's
+                      wall-clock time, without an offset or Z
   list                list this chat's pending messages (delivered ones are gone)
   delete --id <UUID>  cancel a pending message";
 
 fn scheduled_messages_usage_and_exit(code: i32) -> ! {
-    if code == 0 {
-        println!("{SCHEDULED_MESSAGES_USAGE}");
-    } else {
-        eprintln!("{SCHEDULED_MESSAGES_USAGE}");
-    }
-    std::process::exit(code);
+    usage_and_exit(SCHEDULED_MESSAGES_USAGE, code)
 }
 
 /// `scheduled-messages` subcommand: the agent's create/list/delete of this
@@ -3001,21 +3003,21 @@ commands:
                       the TTL passes; each stdout line becomes a message into this
                       chat. Any exit (whatever the code) ends and removes the watch,
                       and the chat is told how it ended. All three flags are required.
-                      The command is started again after a spawner restart; it gets
-                      $ZUCCHINI_WATCH_STATE_DIR, a directory that survives that, to
-                      keep its cursor in. The description names the watch, so
-                      it is unique within the chat.
+                      The command is started again after a spawner restart, so it
+                      must be safe to run twice. It gets $ZUCCHINI_WATCH_STATE_DIR,
+                      a directory that survives that, to keep its cursor in. The
+                      description names the watch, so it is unique within the chat.
+                      Every line is a full turn for the agent and is read as
+                      trusted input: print one short line per real event with ids
+                      and event types only, never raw subjects, comment bodies or
+                      other third-party text (fetch those once woken). A watch
+                      that floods is stopped.
   list                this chat's watches
   delete --description <TEXT>
                       stop and remove this chat's watch of that description";
 
 fn watch_usage_and_exit(code: i32) -> ! {
-    if code == 0 {
-        println!("{WATCH_USAGE}");
-    } else {
-        eprintln!("{WATCH_USAGE}");
-    }
-    std::process::exit(code);
+    usage_and_exit(WATCH_USAGE, code)
 }
 
 /// `watch` subcommand: the agent's create/list/delete of daemon-run watches
@@ -3081,6 +3083,77 @@ async fn run_watch_cli(args: &[String]) {
     };
     if let Err(e) = result {
         eprintln!("watch {command} failed: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+const SYSTEM_PROMPT_USAGE: &str = "usage: zucchini-spawner system-prompt <command>
+commands:
+  show                print this chat's system prompt: the text, and the files the
+                      user listed (their contents are part of the prompt; edit a
+                      file itself to change what it says)
+  set --text <TEXT>   replace the text with TEXT (at most 8000 bytes; empty clears it).
+                      The whole text is replaced, so include what `show` printed
+                      and should stay. Keep it short. The user sees and edits
+                      the same text in the app. It applies from the next start
+                      of the agent process; on an always-on chat that start
+                      comes right after this turn and ends background tasks.";
+
+fn system_prompt_usage_and_exit(code: i32) -> ! {
+    usage_and_exit(SYSTEM_PROMPT_USAGE, code)
+}
+
+/// `system-prompt` subcommand: the agent's read and rewrite of its chat's user
+/// system prompt text (`user_prompt.rs`). Each is one RPC over the control socket.
+async fn run_system_prompt_cli(args: &[String]) {
+    let Some(command) = args.first().map(String::as_str) else {
+        system_prompt_usage_and_exit(2);
+    };
+    let mut text = None;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let s = a.as_str();
+        if s == "-h" || s == "--help" {
+            system_prompt_usage_and_exit(0);
+        } else if let Some(v) = take_flag(s, "--text", &mut it) {
+            text = Some(v);
+        } else {
+            system_prompt_usage_and_exit(2);
+        }
+    }
+    if matches!(command, "-h" | "--help") {
+        system_prompt_usage_and_exit(0);
+    }
+    let Some(chat_id) = env_chat_id() else {
+        system_prompt_usage_and_exit(2);
+    };
+    let result = match (command, text) {
+        ("show", None) => control::get_system_prompt_via_socket(&chat_id)
+            .await
+            .map(|prompt| {
+                if let Some(files) = prompt.files {
+                    println!("files: {files}");
+                }
+                match prompt.text {
+                    Some(text) => println!("text:\n{text}"),
+                    None => println!("no text"),
+                }
+            }),
+        ("set", Some(text)) => control::set_system_prompt_via_socket(&chat_id, text)
+            .await
+            .map(|prompt| {
+                match prompt.text {
+                    Some(_) => println!("system prompt text replaced"),
+                    None => println!("system prompt text cleared"),
+                }
+                if prompt.sync_pending {
+                    println!("saved, but not synced back yet: `show` may still print the old text for a while, so don't build the next `set` on it");
+                }
+            }),
+        _ => system_prompt_usage_and_exit(2),
+    };
+    if let Err(e) = result {
+        eprintln!("system-prompt {command} failed: {e:#}");
         std::process::exit(1);
     }
 }
@@ -3196,6 +3269,10 @@ async fn main() {
             run_watch_cli(&raw_args[1..]).await;
             return;
         }
+        if first == "system-prompt" {
+            run_system_prompt_cli(&raw_args[1..]).await;
+            return;
+        }
         // Legacy spelling: conversations started before `scheduled-messages`
         // still carry the old instruction and resume with it.
         if first == "schedule-message" {
@@ -3233,7 +3310,7 @@ async fn main() {
         let is_help = first == "--help" || first == "-h";
         eprintln!(
             "zucchini-spawner — run with NO arguments to start the daemon.\n\
-             subcommands: attach-file, prune-context, prune-reminder-hook, scheduled-messages, watch, hermes-turn\n\
+             subcommands: attach-file, prune-context, prune-reminder-hook, scheduled-messages, watch, system-prompt, hermes-turn\n\
              flags: --version|-V, --help|-h"
         );
         std::process::exit(if is_help { 0 } else { 2 });
@@ -6272,8 +6349,20 @@ mod tests {
             c.message(3, "third"),
         ])
         .await;
-        assert_eq!(c.spawned_prompts(), vec!["first", "second"]);
+        assert_eq!(
+            c.spawned_prompts(),
+            vec!["first"],
+            "the queued turn is not cut: stdin"
+        );
         assert_eq!(c.unconsumed(), vec!["second", "third"]);
+
+        finish_turn(&c);
+        c.window(vec![
+            prompted_chat(&c, 4, "be verbose"),
+            c.message(4, "fourth"),
+        ])
+        .await;
+        assert_eq!(c.spawned_prompts(), vec!["first", "fourth"]);
         assert_eq!(
             spawned_prompt_texts(&c),
             vec![Some("be terse".to_string()), Some("be verbose".to_string())]
