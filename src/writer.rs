@@ -668,15 +668,12 @@ async fn send_batch(
     ops: &[BatchOp],
 ) -> Result<(), anyhow::Error> {
     let token = fetch_token().await?;
-    let resp = crate::net::send_reporting(
-        "POST",
-        url,
-        http.post(url)
-            .bearer_auth(token)
-            .json(&BatchReq { ops })
-            .send(),
-    )
-    .await?;
+    let resp = http
+        .post(url)
+        .bearer_auth(token)
+        .json(&BatchReq { ops })
+        .send()
+        .await?;
     let status = resp.status();
     if status.is_success() {
         return Ok(());

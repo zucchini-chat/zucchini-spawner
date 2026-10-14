@@ -67,16 +67,13 @@ impl AuthClient {
             }
         }
 
-        let resp = crate::net::send_reporting(
-            "POST",
-            &self.endpoint,
-            self.http
-                .post(&self.endpoint)
-                .bearer_auth(&self.spawner_token)
-                .send(),
-        )
-        .await
-        .context("POST /auth/token")?;
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.spawner_token)
+            .send()
+            .await
+            .context("POST /auth/token")?;
         let status = resp.status();
         if status == StatusCode::GONE {
             // 410 is a normal revocation signal, not a fault — don't report it to

@@ -856,18 +856,14 @@ async fn post_write(op: serde_json::Value, state: &ControlState) -> Result<()> {
     let token = (state.fetch_token)()
         .await
         .context("fetch JWT for /api/writes")?;
-    let resp = crate::net::send_reporting(
-        "POST",
-        &url,
-        state
-            .http
-            .post(&url)
-            .bearer_auth(token)
-            .json(&serde_json::json!({ "ops": [op] }))
-            .send(),
-    )
-    .await
-    .context("POST /api/writes")?;
+    let resp = state
+        .http
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "ops": [op] }))
+        .send()
+        .await
+        .context("POST /api/writes")?;
     let status = resp.status();
     if !status.is_success() {
         let body = crate::net::capture_response_failure("POST", &url, resp).await;
@@ -1081,10 +1077,13 @@ async fn list_scheduled_messages(
     let token = (state.fetch_token)()
         .await
         .context("fetch JWT for /api/scheduled")?;
-    let resp =
-        crate::net::send_reporting("GET", &url, state.http.get(&url).bearer_auth(token).send())
-            .await
-            .context("GET /api/scheduled")?;
+    let resp = state
+        .http
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("GET /api/scheduled")?;
     let status = resp.status();
     if !status.is_success() {
         let body = crate::net::capture_response_failure("GET", &url, resp).await;
@@ -1168,13 +1167,13 @@ async fn cancel_scheduled_message(chat_id: &str, id: &str, state: &ControlState)
     let token = (state.fetch_token)()
         .await
         .context("fetch JWT for /api/scheduled")?;
-    let resp = crate::net::send_reporting(
-        "DELETE",
-        &url,
-        state.http.delete(&url).bearer_auth(token).send(),
-    )
-    .await
-    .context("DELETE /api/scheduled")?;
+    let resp = state
+        .http
+        .delete(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("DELETE /api/scheduled")?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(not_pending_error(id));

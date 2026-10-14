@@ -1,9 +1,10 @@
 //! Central Sentry reporting for failed outbound HTTP requests.
 //!
 //! Every outbound request in the spawner (backend `/api/writes`, `/auth/token`,
-//! blob presign, R2 PUT/GET, sync stream) funnels its failure branch through
-//! [`send_reporting`] (transport failures) and [`capture_response_failure`]
-//! (non-2xx responses), so no request fails silently. The event shape is
+//! blob presign, R2 PUT/GET, sync stream) reports a non-2xx response through
+//! [`capture_response_failure`]. Transport failures (offline, timeout, DNS) are
+//! not reported: retry loops on a sleeping laptop turned them into thousands of
+//! events. The event shape is
 //! kept byte-for-byte in step with the Qt client (`native-qt/src/Net/
 //! SentryClient.cpp`) and the iOS/Android reporters so all platforms group into
 //! the same issues in the shared `app` Sentry project.
@@ -19,104 +20,48 @@ use sentry::protocol::{Event, Level, Value};
 /// Longest response-body prefix we attach to the event.
 const BODY_SNIPPET_LEN: usize = 500;
 
-/// The two real failure shapes a request can fail with.
-enum Failure<'a> {
-    /// No HTTP status was ever received (connect/DNS/TLS/timeout).
-    Transport(&'a str),
-    /// A completed but non-2xx response.
-    Response { status: u16, body: &'a str },
-}
-
-/// Report a failed HTTP request to Sentry. No-op when the SDK isn't enabled.
-///
-/// Trigger (per the shared cross-platform contract): any non-2xx response OR a
-/// transport failure. Call once, at the lowest shared layer, per failure.
-fn capture_http_failure(method: &str, url: &str, failure: Failure) {
+/// Report a failed HTTP *response* (non-2xx) to Sentry and return its body.
+/// Reads the body itself (consuming the response) and clamps the snippet. No-op
+/// reporting when the SDK isn't enabled.
+pub async fn capture_response_failure(method: &str, url: &str, resp: reqwest::Response) -> String {
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
     let (host, norm_path) = split_host_and_normalized_path(url);
     let host_path = format!("{host}{norm_path}");
 
-    let level = match failure {
-        Failure::Transport(_) => Level::Error,
-        Failure::Response { status, .. } if status >= 500 => Level::Error,
-        Failure::Response { .. } => Level::Warning,
-    };
-
-    let message = match failure {
-        Failure::Transport(err) => format!("HTTP {method} {host_path} — {err}"),
-        Failure::Response { status, .. } => format!("HTTP {status} {method} {host_path}"),
-    };
-
     let mut tags = sentry::protocol::Map::new();
     tags.insert("http.method".to_string(), method.to_string());
-    tags.insert("http.host".to_string(), host.clone());
-    if let Failure::Response { status, .. } = failure {
-        tags.insert("http.status".to_string(), status.to_string());
-    }
+    tags.insert("http.host".to_string(), host);
+    tags.insert("http.status".to_string(), status.to_string());
 
-    let fingerprint_status: Cow<str> = match failure {
-        Failure::Transport(_) => Cow::Borrowed("transport"),
-        Failure::Response { status, .. } => Cow::Owned(status.to_string()),
-    };
     let fingerprint = vec![
         Cow::Borrowed("http"),
         Cow::Owned(method.to_string()),
         Cow::Owned(host_path.clone()),
-        fingerprint_status,
+        Cow::Owned(status.to_string()),
     ];
 
     let mut extra = sentry::protocol::Map::new();
     extra.insert("method".to_string(), Value::from(method));
-    extra.insert("url".to_string(), Value::from(host_path));
-    match failure {
-        Failure::Transport(err) => {
-            extra.insert("transport_error".to_string(), Value::from(err));
-        }
-        Failure::Response { status, body } => {
-            extra.insert("status_code".to_string(), Value::from(status));
-            extra.insert(
-                "body".to_string(),
-                Value::from(body.chars().take(BODY_SNIPPET_LEN).collect::<String>()),
-            );
-        }
-    }
+    extra.insert("url".to_string(), Value::from(host_path.clone()));
+    extra.insert("status_code".to_string(), Value::from(status));
+    extra.insert(
+        "body".to_string(),
+        Value::from(body.chars().take(BODY_SNIPPET_LEN).collect::<String>()),
+    );
 
     sentry::capture_event(Event {
-        level,
-        message: Some(message),
+        level: if status >= 500 {
+            Level::Error
+        } else {
+            Level::Warning
+        },
+        message: Some(format!("HTTP {status} {method} {host_path}")),
         fingerprint: Cow::Owned(fingerprint),
         tags,
         extra,
         ..Default::default()
     });
-}
-
-/// Await a request future, reporting a transport failure to Sentry before
-/// returning it. Collapses the duplicated `match … { Err(e) => { report; return
-/// } }` boilerplate — the caller adds its own `?`/`.context(…)`.
-pub async fn send_reporting(
-    method: &str,
-    url: &str,
-    fut: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
-) -> reqwest::Result<reqwest::Response> {
-    fut.await.inspect_err(|e| {
-        capture_http_failure(method, url, Failure::Transport(&e.to_string()));
-    })
-}
-
-/// Report a failed HTTP *response* (non-2xx). Reads the body itself (consuming
-/// the response) and clamps the snippet — the one call needed by every
-/// "presign / write returned non-2xx" branch.
-pub async fn capture_response_failure(method: &str, url: &str, resp: reqwest::Response) -> String {
-    let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    capture_http_failure(
-        method,
-        url,
-        Failure::Response {
-            status,
-            body: &body,
-        },
-    );
     body
 }
 

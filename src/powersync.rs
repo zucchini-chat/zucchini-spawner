@@ -21,7 +21,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::power::WakeSignal;
 
@@ -245,7 +245,7 @@ async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
                     info!(error = %e, "sync stream stopping (spawner revoked)");
                     return;
                 }
-                error!(error = %e, ?backoff, "sync stream failed, backing off");
+                warn!(error = %e, ?backoff, "sync stream failed, backing off");
             }
         }
 
@@ -289,26 +289,18 @@ async fn connect_and_stream(
     let url = format!("{}/sync/stream", config.base_url.trim_end_matches('/'));
     debug!(%url, buckets = body.buckets.len(), "opening sync stream");
 
-    // A transport error or 410 during revocation is expected teardown, not a
-    // fault — the run loop already suppresses those, so skip Sentry to avoid the
-    // same spam.
-    let report = !config.revoked.is_cancelled();
-
-    let req = http
+    let resp = http
         .post(&url)
         .header("Authorization", format!("Token {}", token))
         .header("Accept", "application/x-ndjson")
         .json(&body)
-        .send();
-    let resp = if report {
-        crate::net::send_reporting("POST", &url, req).await?
-    } else {
-        req.await?
-    };
+        .send()
+        .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = if report {
+        // A 410 during revocation is expected teardown, not a fault.
+        let text = if !config.revoked.is_cancelled() {
             crate::net::capture_response_failure("POST", &url, resp).await
         } else {
             resp.text().await.unwrap_or_default()
