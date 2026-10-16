@@ -74,6 +74,25 @@ pub fn atomic_write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// `create_dir_all` whose new last component survives a crash.
+pub fn create_dir_durably(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir)?;
+    sync_parent(dir)
+}
+
+/// Parent-dir fsync makes a mkdir or rename durable on Linux (no-op on macOS; not available on Windows).
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Sibling tmp path that *appends* `.tmp` to the full filename rather than
 /// replacing the extension — `state.json` → `state.json.tmp`, not `state.tmp`
 /// — so recovery scanners keep the "half-written X" hint.

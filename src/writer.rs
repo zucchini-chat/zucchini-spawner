@@ -75,7 +75,7 @@ pub enum WriteEvent {
     },
     /// The chat's watches and what its resident agent has armed right now
     /// (`chats.live_tasks`), E2E-encrypted like a message body. `tasks` is the
-    /// plaintext blob from `agent::live_tasks_with_watches`; `None` writes SQL
+    /// plaintext blob from `agent::live_tasks_with_daemon_tasks`; `None` writes SQL
     /// NULL. `user_id` picks the key and is therefore only needed for a
     /// payload.
     ChatLiveTasks {

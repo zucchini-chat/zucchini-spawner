@@ -185,7 +185,8 @@ fn serialize_kept_chats<S: serde::Serializer>(
     chats: &HashMap<String, ChatState>,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    let watched = crate::watch::watched_chat_ids();
+    let mut watched = crate::watch::watched_chat_ids();
+    watched.extend(crate::tunnel::tunnel_chat_ids());
     s.collect_map(
         chats
             .iter()

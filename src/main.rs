@@ -17,6 +17,7 @@ mod session_name;
 mod shell;
 mod state;
 mod sys;
+mod tunnel;
 mod uninstall;
 mod updater;
 mod user_prompt;
@@ -542,6 +543,7 @@ async fn handle_sync_event(
                 // Before the reset, which keeps a chat with an admitted watch
                 // busy and lists it in `live_tasks`.
                 watch::admit_restored(|w| mirror.can_watch(&w.chat_id, keys));
+                tunnel::admit_restored(|t| mirror.can_watch(&t.chat_id, keys));
                 for chat_id in mirror.flagged_chat_ids() {
                     info!(chat_id = %chat_id, "resetting stale agent_running/agent_alive/live_tasks");
                     send_agent_idle(write_tx, chat_id.clone(), true).await;
@@ -751,6 +753,7 @@ fn is_deleted_chat(mirror: &Mirror, chat_id: &str) -> bool {
 async fn delete_chat(chat_id: &str, mirror: &mut Mirror, supervisor: &mut Supervisor) {
     mirror.remove_chat(chat_id);
     watch::chat_deleted(chat_id);
+    tunnel::chat_deleted(chat_id);
     supervisor.abort_agent(chat_id).await;
     supervisor.forget_alive(chat_id);
 }
@@ -767,6 +770,7 @@ async fn abort_member_agents(
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
     watch::member_restricted(user_id);
+    tunnel::member_restricted(user_id);
     for chat_id in mirror.chat_ids(|c| c.user_id == user_id) {
         let running = supervisor.is_running(&chat_id);
         let torn_down = supervisor.has_agent(&chat_id);
@@ -846,16 +850,22 @@ async fn send_run_state(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String, ru
     }
 }
 
+/// A running watch or an open tunnel keeps the chat busy like an armed
+/// background task.
+fn has_daemon_tasks(chat_id: &str) -> bool {
+    !watch::running_in(chat_id).is_empty() || !tunnel::running_in(chat_id).is_empty()
+}
+
 /// The chat's agent is idle or gone: `agent_running=false`. Every such write
-/// comes through here, because a running watch keeps the chat busy like an
-/// armed background task: then only the turn's end is written, which the
-/// backend otherwise takes from `agent_running` going false.
+/// comes through here, because of [`has_daemon_tasks`]: then only the turn's
+/// end is written, which the backend otherwise takes from `agent_running`
+/// going false.
 async fn send_agent_idle(
     write_tx: &mpsc::Sender<WriteEvent>,
     chat_id: String,
     stopped_by_user: bool,
 ) {
-    if !watch::running_in(&chat_id).is_empty() {
+    if has_daemon_tasks(&chat_id) {
         send_turn_running(write_tx, chat_id, false).await;
         return;
     }
@@ -889,8 +899,8 @@ async fn send_live_tasks(
 }
 
 /// The one writer of `chats.live_tasks`: the session's blob with the chat's
-/// watches ahead of it (plaintext; the writer encrypts it under the chat
-/// owner's key), NULL when both are empty.
+/// tunnels and watches ahead of it (plaintext; the writer encrypts it under
+/// the chat owner's key), NULL when all are empty.
 async fn write_live_tasks(
     write_tx: &mpsc::Sender<WriteEvent>,
     chat_id: String,
@@ -898,9 +908,12 @@ async fn write_live_tasks(
     session_tasks: Option<String>,
 ) {
     let watches = watch::running_in(&chat_id);
-    // A clear names no user; a watch carries its chat's.
-    let user_id = user_id.or(watches.first().map(|w| w.user_id));
-    let tasks = agent::live_tasks_with_watches(session_tasks, &watches);
+    let tunnels = tunnel::running_in(&chat_id);
+    // A clear names no user; a watch or tunnel carries its chat's.
+    let user_id = user_id
+        .or(watches.first().map(|w| w.user_id))
+        .or(tunnels.first().map(|t| t.user_id));
+    let tasks = agent::live_tasks_with_daemon_tasks(session_tasks, &tunnels, &watches);
     let _ = write_tx
         .send(WriteEvent::ChatLiveTasks {
             chat_id,
@@ -910,9 +923,9 @@ async fn write_live_tasks(
         .await;
 }
 
-/// A chat's watches changed: rewrite its `chats.live_tasks` from its resident's
-/// session, if it has one, and the watches it has now, and `agent_running`
-/// unless its agent holds it true anyway.
+/// A chat's watches or tunnels changed: rewrite its `chats.live_tasks` from its
+/// resident's session, if it has one, and the watches and tunnels it has now,
+/// and `agent_running` unless its agent holds it true anyway.
 async fn publish_watch_change(
     chat_id: &str,
     mirror: &Mirror,
@@ -931,8 +944,7 @@ async fn publish_watch_change(
     let tasks = supervisor.live_tasks(chat_id);
     send_live_tasks(write_tx, mirror, chat_id.to_string(), tasks).await;
     if !supervisor.is_running(chat_id) {
-        let watched = !watch::running_in(chat_id).is_empty();
-        send_run_state(write_tx, chat_id.to_string(), watched).await;
+        send_run_state(write_tx, chat_id.to_string(), has_daemon_tasks(chat_id)).await;
     }
 }
 
@@ -1190,8 +1202,8 @@ async fn shutdown_and_flush(
 
 /// `/stop` (and `/kill`, its alias for older clients): kill the chat's agent
 /// process group, background tasks included. The transcript stays, so the
-/// next message resumes it. The chat's watches go too; the agent learns of
-/// that from a note on its next turn (`start_turn`).
+/// next message resumes it. The chat's watches and tunnels go too; the agent
+/// learns of that from a note on its next turn (`start_turn`).
 async fn stop_agent(
     chat_id: &str,
     user_id: Uuid,
@@ -1202,7 +1214,7 @@ async fn stop_agent(
     if supervisor.is_working(chat_id) {
         publish_interrupted(write_tx, chat_id, user_id).await;
     }
-    let watched = watch::chat_stopped(chat_id);
+    let watched = watch::chat_stopped(chat_id) | tunnel::chat_stopped(chat_id);
     supervisor.abort_agent(chat_id).await;
     if running || watched {
         send_agent_idle(write_tx, chat_id.to_string(), true).await;
@@ -1501,7 +1513,13 @@ async fn start_turn(
     let adapter = agent_kind.make_adapter();
     // A command turn ships verbatim, so the note waits for the next one.
     if !adapter.is_command_turn(&req.prompt) {
-        if let Some(note) = watch::take_stop_note(&chat_id) {
+        for note in [
+            watch::take_stop_note(&chat_id),
+            tunnel::take_stop_note(&chat_id),
+        ]
+        .into_iter()
+        .flatten()
+        {
             req.prompt = format!("{note}\n\n{}", req.prompt);
         }
     }
@@ -1577,9 +1595,29 @@ async fn deliver_watch_message(
     supervisor: &mut Supervisor,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) -> anyhow::Result<()> {
-    let chat_id = &out.watch.chat_id;
+    let notice = tunnel::Notice {
+        chat_id: out.watch.chat_id.clone(),
+        user_id: out.watch.user_id,
+        sender: out.watch.sender_name(),
+        label: out.watch.label(),
+        text: out.text,
+        cancelled: out.cancelled,
+    };
+    deliver_daemon_message(notice, mirror, keys, supervisor, write_tx).await
+}
+
+/// A message from a watch or tunnel: a system row in its chat naming the
+/// sender, then a turn with the text under its label.
+async fn deliver_daemon_message(
+    out: tunnel::Notice,
+    mirror: &Mirror,
+    keys: &KeyStore,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) -> anyhow::Result<()> {
+    let chat_id = &out.chat_id;
     if out.cancelled.is_cancelled() {
-        anyhow::bail!("the watch was stopped");
+        anyhow::bail!("it was stopped");
     }
     // Before the first checkpoint the chat's run flags are still to be reset.
     if !mirror.booted() {
@@ -1589,7 +1627,7 @@ async fn deliver_watch_message(
     if !mirror.can_watch(chat_id, keys) {
         anyhow::bail!("chat {chat_id} is not synced, is sandboxed or has no key");
     }
-    let prompt = format!("{}\n{}", out.watch.label(), out.text);
+    let prompt = format!("{}\n{}", out.label, out.text);
     let req = chat_spawn_request(mirror, chat_id, prompt)
         .ok_or_else(|| anyhow::anyhow!("chat {chat_id} can't spawn yet"))?;
     // A one-shot agent would be cut by a new turn; the message waits for it.
@@ -1597,8 +1635,8 @@ async fn deliver_watch_message(
     if was_running && !req.agent_kind.make_adapter().is_resident() {
         anyhow::bail!("the chat's agent is busy");
     }
-    let user_id = out.watch.user_id;
-    let row = agent::peer_message_frame_json(&out.watch.sender_name(), &out.text);
+    let user_id = out.user_id;
+    let row = agent::peer_message_frame_json(&out.sender, &out.text);
     let _ = write_tx
         .send(WriteEvent::agent_line(chat_id.clone(), user_id, row))
         .await;
@@ -3087,6 +3125,97 @@ async fn run_watch_cli(args: &[String]) {
     }
 }
 
+const TUNNEL_USAGE: &str = "usage: zucchini-spawner tunnel <command>
+commands:
+  create --port <PORT> [--auth token|basic] [--keep-host] [--no-queue]
+                      give localhost:<PORT> a public HTTPS URL (printed) for webhooks,
+                      OAuth callbacks or previews. The URL survives spawner restarts;
+                      the tunnel lasts until deleted or the user presses Stop. At
+                      most 10 per chat. Without --auth anyone with the URL gets in.
+    --auth token      require a generated token: `Authorization: Bearer <token>`,
+                      or `?zt=<token>` in the URL (browsers, WebSocket)
+    --auth basic      require a generated user and password (browsers prompt)
+    --keep-host       pass the Host header through; by default it becomes
+                      localhost:<PORT> and the original goes in X-Forwarded-Host
+    --no-queue        answer 503 while offline instead of queueing
+                      While the spawner or the local server is down (nothing accepts
+                      connections on the port), POST/PUT/PATCH/DELETE get 200 and are
+                      queued for up to 7 days, GET/HEAD get 503. Queued requests are
+                      replayed once it is back, with `X-Zucchini-Replayed: 1` and
+                      `X-Zucchini-Arrived: <unix ms>`. They may arrive days late or
+                      twice, so handle them idempotently; time-bound signatures
+                      (Slack: 5 min) fail on replay.
+  list                this chat's tunnels, with their credentials
+  delete <ID>         close the tunnel; its URL stops working";
+
+fn tunnel_usage_and_exit(code: i32) -> ! {
+    usage_and_exit(TUNNEL_USAGE, code)
+}
+
+/// `tunnel` subcommand: the agent's create/list/delete of daemon-held tunnels
+/// (`tunnel.rs`). Each is one RPC over the control socket.
+async fn run_tunnel_cli(args: &[String]) {
+    let Some(command) = args.first().map(String::as_str) else {
+        tunnel_usage_and_exit(2);
+    };
+    let (mut port, mut auth, mut keep_host, mut no_queue, mut id) =
+        (None, None, false, false, None);
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        let s = a.as_str();
+        if s == "-h" || s == "--help" {
+            tunnel_usage_and_exit(0);
+        } else if let Some(v) = take_flag(s, "--port", &mut it) {
+            port = Some(v.parse::<u16>().unwrap_or_else(|_| {
+                eprintln!("tunnel create: invalid --port {v:?}");
+                tunnel_usage_and_exit(2)
+            }));
+        } else if let Some(v) = take_flag(s, "--auth", &mut it) {
+            auth = Some(v);
+        } else if s == "--keep-host" {
+            keep_host = true;
+        } else if s == "--no-queue" {
+            no_queue = true;
+        } else if !s.starts_with('-') && id.is_none() {
+            id = Some(s.to_string());
+        } else {
+            tunnel_usage_and_exit(2);
+        }
+    }
+    let Some(chat_id) = env_chat_id() else {
+        tunnel_usage_and_exit(2);
+    };
+    let result = match (command, id) {
+        ("create", None) => {
+            let Some(port) = port else {
+                eprintln!("tunnel create: --port is required");
+                tunnel_usage_and_exit(2)
+            };
+            control::create_tunnel_via_socket(&chat_id, port, auth, keep_host, no_queue)
+                .await
+                .map(|t| println!("created tunnel\n{}", t.summary()))
+        }
+        ("list", None) => control::list_tunnels_via_socket(&chat_id)
+            .await
+            .map(|tunnels| {
+                if tunnels.is_empty() {
+                    println!("no tunnels");
+                }
+                for t in tunnels {
+                    println!("{}", t.summary());
+                }
+            }),
+        ("delete", Some(id)) => control::delete_tunnel_via_socket(&chat_id, id)
+            .await
+            .map(|t| println!("deleted tunnel {}", t.url)),
+        _ => tunnel_usage_and_exit(2),
+    };
+    if let Err(e) = result {
+        eprintln!("tunnel {command} failed: {e:#}");
+        std::process::exit(1);
+    }
+}
+
 const SYSTEM_PROMPT_USAGE: &str = "usage: zucchini-spawner system-prompt <command>
 commands:
   show                print this chat's system prompt: the text, and the files the
@@ -3187,6 +3316,7 @@ async fn run_uninstall(
     writer: &Writer,
 ) {
     watch::shutdown().await;
+    tunnel::uninstall().await;
     supervisor.shutdown_all().await;
     heartbeat_cancel.cancel();
     let _ = wait_for_writer_idle(writer).await;
@@ -3269,6 +3399,10 @@ async fn main() {
             run_watch_cli(&raw_args[1..]).await;
             return;
         }
+        if first == "tunnel" {
+            run_tunnel_cli(&raw_args[1..]).await;
+            return;
+        }
         if first == "system-prompt" {
             run_system_prompt_cli(&raw_args[1..]).await;
             return;
@@ -3310,7 +3444,7 @@ async fn main() {
         let is_help = first == "--help" || first == "-h";
         eprintln!(
             "zucchini-spawner — run with NO arguments to start the daemon.\n\
-             subcommands: attach-file, prune-context, prune-reminder-hook, scheduled-messages, watch, system-prompt, hermes-turn\n\
+             subcommands: attach-file, prune-context, prune-reminder-hook, scheduled-messages, watch, tunnel, system-prompt, hermes-turn\n\
              flags: --version|-V, --help|-h"
         );
         std::process::exit(if is_help { 0 } else { 2 });
@@ -3529,6 +3663,11 @@ async fn main() {
     );
     let (watch_tx, mut watch_rx) = mpsc::channel::<WatchDelivery>(16);
     let (watched_chat_tx, mut watched_chat_rx) = mpsc::unbounded_channel::<String>();
+    type TunnelDelivery = (
+        tunnel::Notice,
+        tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    );
+    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<TunnelDelivery>(16);
     if _instance_lock.is_some() {
         let deliver: watch::Deliver = Box::new(move |out| {
             let watch_tx = watch_tx.clone();
@@ -3538,7 +3677,7 @@ async fn main() {
                 reply_rx.await?
             })
         });
-        watch::start(deliver, watched_chat_tx);
+        watch::start(deliver, watched_chat_tx.clone());
     }
 
     // Prune-context: the control task does the read-only lookup + transcript
@@ -3559,7 +3698,7 @@ async fn main() {
     // main loop holds) for chat → user_id lookups — no parallel projection.
     {
         let (api_base_url, api_token) = base_and_token(prod.as_ref(), DEV_API_BASE_URL);
-        let control_state = control::ControlState {
+        let backend = tunnel::Backend {
             http: reqwest::Client::builder()
                 .user_agent(crate::useragent::user_agent())
                 .timeout(Duration::from_secs(60))
@@ -3567,6 +3706,23 @@ async fn main() {
                 .expect("control http client"),
             api_base_url,
             fetch_token: Arc::new(api_token),
+        };
+        if _instance_lock.is_some() {
+            let deliver: tunnel::Deliver = Box::new(move |notice| {
+                let tunnel_tx = tunnel_tx.clone();
+                Box::pin(async move {
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    tunnel_tx.send((notice, reply_tx)).await?;
+                    reply_rx.await?
+                })
+            });
+            let owner = mirror.read().await.user_id;
+            tunnel::start(backend.clone(), deliver, watched_chat_tx, owner);
+        }
+        let control_state = control::ControlState {
+            http: backend.http,
+            api_base_url: backend.api_base_url,
+            fetch_token: backend.fetch_token,
             keys: keys.clone(),
             pending: supervisor.pending_attachments(),
             mirror: mirror.clone(),
@@ -3622,6 +3778,7 @@ async fn main() {
             _ = shutdown.recv() => {
                 info!("received OS shutdown signal, shutting down");
                 watch::shutdown().await;
+                tunnel::shutdown().await;
                 shutdown_and_flush(&mut supervisor, &mut response_rx, &mirror, &write_tx, &heartbeat_cancel, &writer).await;
                 break;
             }
@@ -3778,6 +3935,11 @@ async fn main() {
                     deliver_watch_message(out, &*mirror.read().await, &keys, &mut supervisor, &write_tx).await;
                 let _ = reply.send(delivered);
             }
+            Some((notice, reply)) = tunnel_rx.recv() => {
+                let delivered =
+                    deliver_daemon_message(notice, &*mirror.read().await, &keys, &mut supervisor, &write_tx).await;
+                let _ = reply.send(delivered);
+            }
             Some(chat_id) = watched_chat_rx.recv() => {
                 publish_watch_change(&chat_id, &*mirror.read().await, &keys, &supervisor, &write_tx).await;
             }
@@ -3823,6 +3985,7 @@ async fn main() {
                         // Only now: after a failed download the daemon runs
                         // on, and so do its watches.
                         watch::shutdown().await;
+                        tunnel::shutdown().await;
                         info!("binary replaced, exiting for restart");
                         break 'main_loop;
                     }
@@ -7380,6 +7543,41 @@ mod tests {
         let writes = c.writes();
         assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
         assert_eq!(live_task_blobs(&writes), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_is_listed_first_keeps_the_chat_running_and_goes_with_stop() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(0, "")]).await;
+        let watch = watch_in(&c);
+        let def = tunnel::TunnelDef::for_test(&c.chat_id, c.user_id);
+        tunnel::register_idle(def.clone());
+        c.writes();
+
+        publish_watch_change(&c.chat_id, &c.mirror, &c.keys, &c.supervisor, &c.write_tx).await;
+        let writes = c.writes();
+        assert_eq!(live_task_ids(&writes), vec![vec![def.id.clone(), watch]]);
+        assert_eq!(run_flags(&writes), vec![("agent", true)]);
+        let blob: serde_json::Value =
+            serde_json::from_str(live_task_blobs(&writes)[0].as_deref().unwrap()).unwrap();
+        assert_eq!(blob["t"][0]["k"], "tunnel");
+        assert_eq!(blob["t"][0]["u"], def.url());
+        assert_eq!(blob["t"][0]["d"], format!("8080 → {}", def.url()));
+
+        c.window(vec![c.chat(1, ""), c.message(1, "/stop")]).await;
+        assert!(tunnel::running_in(&c.chat_id).is_empty());
+        let writes = c.writes();
+        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
+        assert_eq!(live_task_blobs(&writes), vec![None]);
+
+        c.window(vec![c.chat(2, ""), c.message(2, "next")]).await;
+        let prompt = c.spawned_prompts().pop().unwrap();
+        assert!(
+            prompt.starts_with(&format!(
+                "[zucchini] The user pressed Stop, which also removed this chat's tunnels: {} (port 8080)."
+            , def.url())),
+            "{prompt}"
+        );
     }
 
     fn run_flags(writes: &[WriteEvent]) -> Vec<(&'static str, bool)> {

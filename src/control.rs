@@ -38,6 +38,7 @@ use crate::envelope::EnvelopeAttachment;
 use crate::prune::{PendingPrunes, PruneRequest};
 use crate::state::{ChatState, Mirror, SharedMirror};
 use crate::sys;
+use crate::tunnel::TunnelInfo;
 use crate::user_prompt::UserSystemPrompt;
 use crate::watch::WatchDef;
 use crate::writer::TokenFetcher;
@@ -123,6 +124,19 @@ pub enum ControlRequest {
         chat_id: String,
         description: String,
     },
+    /// Open a tunnel (`tunnel.rs`) for `chat_id` to `localhost:<port>`.
+    /// `auth` = "token" | "basic"; refused where watches are.
+    CreateTunnel {
+        chat_id: String,
+        port: u16,
+        auth: Option<String>,
+        keep_host: bool,
+        no_queue: bool,
+    },
+    /// The tunnels of `chat_id`; a chat never sees another chat's.
+    ListTunnels { chat_id: String },
+    /// Close `chat_id`'s tunnel `id`.
+    DeleteTunnel { chat_id: String, id: String },
     /// The user system prompt of `chat_id` (`user_prompt.rs`), decrypted.
     GetSystemPrompt { chat_id: String },
     /// Replace the text of `chat_id`'s user system prompt (`chats.system_prompt`)
@@ -192,6 +206,9 @@ pub struct ControlResponse {
     /// Set by the watch handlers: the one created or deleted, or the list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watches: Option<Vec<WatchDef>>,
+    /// Set by the tunnel handlers: the one created or deleted, or the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnels: Option<Vec<TunnelInfo>>,
     /// Set by the system prompt handlers: the prompt read, or as just written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<SystemPromptInfo>,
@@ -419,6 +436,26 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                 .await
                 .map(|def| vec![def]),
         ),
+        ControlRequest::CreateTunnel {
+            chat_id,
+            port,
+            auth,
+            keep_host,
+            no_queue,
+        } => tunnel_response(
+            create_tunnel(&chat_id, port, auth.as_deref(), keep_host, no_queue, state)
+                .await
+                .map(|t| vec![t]),
+        ),
+        ControlRequest::ListTunnels { chat_id } => tunnel_response(
+            watch_chat_owner(&chat_id, &*state.mirror.read().await, &state.keys)
+                .and_then(|_| Ok(crate::tunnel::global()?.list(&chat_id))),
+        ),
+        ControlRequest::DeleteTunnel { chat_id, id } => tunnel_response(
+            watch_chat_owner(&chat_id, &*state.mirror.read().await, &state.keys)
+                .and_then(|_| crate::tunnel::global()?.delete(&chat_id, &id))
+                .map(|t| vec![t]),
+        ),
         ControlRequest::GetSystemPrompt { chat_id } => {
             system_prompt_response(get_system_prompt(&chat_id, state).await)
         }
@@ -437,6 +474,20 @@ fn system_prompt_response(result: Result<SystemPromptInfo>) -> ControlResponse {
         },
         Err(e) => {
             warn!(error = %e, "system prompt request failed");
+            ControlResponse::err(format!("{e:#}"))
+        }
+    }
+}
+
+fn tunnel_response(result: Result<Vec<TunnelInfo>>) -> ControlResponse {
+    match result {
+        Ok(tunnels) => ControlResponse {
+            ok: true,
+            tunnels: Some(tunnels),
+            ..Default::default()
+        },
+        Err(e) => {
+            warn!(error = %e, "tunnel request failed");
             ControlResponse::err(format!("{e:#}"))
         }
     }
@@ -995,9 +1046,10 @@ async fn set_system_prompt(
     })
 }
 
-/// The owner of `chat_id`, for a chat allowed to run watches: the command runs
-/// as the spawner's OS user outside any sandbox, so a sandboxed member's chat
-/// gets none.
+/// The owner of `chat_id`, for a chat allowed to run watches and tunnels: a
+/// watch's command runs as the spawner's OS user outside any sandbox, and a
+/// tunnel opens a local port to the internet, so a sandboxed member's chat
+/// gets neither.
 fn watch_chat_owner(chat_id: &str, mirror: &Mirror, keys: &KeyStore) -> Result<uuid::Uuid> {
     let chat = mirror
         .chats
@@ -1005,7 +1057,7 @@ fn watch_chat_owner(chat_id: &str, mirror: &Mirror, keys: &KeyStore) -> Result<u
         .ok_or_else(|| anyhow!("no chat with id {chat_id} (unknown or not yet synced)"))?;
     if !mirror.can_watch(chat_id, keys) {
         return Err(anyhow!(
-            "watches are not available in this chat (it is sandboxed or its user's key is gone)"
+            "watches and tunnels are not available in this chat (it is sandboxed or its user's key is gone)"
         ));
     }
     Ok(chat.user_id)
@@ -1031,6 +1083,38 @@ async fn create_watch(
         warn!(error = %e, "failed to persist state.json");
     }
     Ok(def)
+}
+
+async fn create_tunnel(
+    chat_id: &str,
+    port: u16,
+    auth: Option<&str>,
+    keep_host: bool,
+    no_queue: bool,
+    state: &ControlState,
+) -> Result<TunnelInfo> {
+    let tunnels = crate::tunnel::global()?;
+    let auth = auth.map(crate::tunnel::Auth::generate).transpose()?;
+    let user_id = watch_chat_owner(chat_id, &*state.mirror.read().await, &state.keys)?;
+    let prepared = tunnels
+        .prepare(chat_id, user_id, port, auth, keep_host, no_queue)
+        .await?;
+    // Like `create_watch`: the access re-check (the ticket took a while), the
+    // registration and the state.json save that keeps the chat's row are one
+    // step against a revoke and the main loop's own saves.
+    let id = {
+        let mirror = state.mirror.write().await;
+        watch_chat_owner(chat_id, &mirror, &state.keys)?;
+        let id = tunnels.register(prepared)?;
+        // Without the chat's row on disk the next boot would remove the
+        // tunnel and purge its queue.
+        if let Err(e) = mirror.save(&crate::state_path()) {
+            let _ = tunnels.delete(chat_id, &id);
+            return Err(e).context("could not save state.json, the tunnel was removed");
+        }
+        id
+    };
+    tunnels.wait_connected(&id).await
 }
 
 async fn list_watches(chat_id: &str, state: &ControlState) -> Result<Vec<WatchDef>> {
@@ -1440,6 +1524,49 @@ pub async fn delete_watch_via_socket(chat_id: &str, description: String) -> Resu
     .await?
     .pop()
     .ok_or_else(|| anyhow!("response missing the watch"))
+}
+
+async fn tunnel_request(req: ControlRequest) -> Result<Vec<TunnelInfo>> {
+    send_control_request(&req)
+        .await?
+        .tunnels
+        .ok_or_else(|| anyhow!("response missing tunnels"))
+}
+
+pub async fn create_tunnel_via_socket(
+    chat_id: &str,
+    port: u16,
+    auth: Option<String>,
+    keep_host: bool,
+    no_queue: bool,
+) -> Result<TunnelInfo> {
+    tunnel_request(ControlRequest::CreateTunnel {
+        chat_id: chat_id.to_string(),
+        port,
+        auth,
+        keep_host,
+        no_queue,
+    })
+    .await?
+    .pop()
+    .ok_or_else(|| anyhow!("response missing the tunnel"))
+}
+
+pub async fn list_tunnels_via_socket(chat_id: &str) -> Result<Vec<TunnelInfo>> {
+    tunnel_request(ControlRequest::ListTunnels {
+        chat_id: chat_id.to_string(),
+    })
+    .await
+}
+
+pub async fn delete_tunnel_via_socket(chat_id: &str, id: String) -> Result<TunnelInfo> {
+    tunnel_request(ControlRequest::DeleteTunnel {
+        chat_id: chat_id.to_string(),
+        id,
+    })
+    .await?
+    .pop()
+    .ok_or_else(|| anyhow!("response missing the tunnel"))
 }
 
 async fn system_prompt_request(req: ControlRequest) -> Result<SystemPromptInfo> {
