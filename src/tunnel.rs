@@ -1499,8 +1499,8 @@ async fn connect_local(port: u16) -> Option<tokio::net::TcpStream> {
 
 enum Authorized {
     No,
-    /// `set_cookie`: the token came in the query, so the browser keeps it for
-    /// the page's other requests.
+    /// `set_cookie`: the credential came in the query or Basic auth, so the
+    /// browser keeps a cookie for the page's other requests.
     Yes {
         set_cookie: Option<HeaderValue>,
     },
@@ -1544,15 +1544,26 @@ fn authorize_parts(
         .to_string();
     match auth {
         Auth::Basic { user, password } => {
-            let expected = format!("Basic {}", STANDARD.encode(format!("{user}:{password}")));
-            if !ct_eq(&authorization, &expected) {
+            let pair = format!("{user}:{password}");
+            let expected = format!("Basic {}", STANDARD.encode(&pair));
+            // Safari never sends Basic credentials on a WebSocket handshake
+            // (WebKit bug 80362), only cookies.
+            let cookie_value = base32_lower(&Sha256::digest(format!("zucchini-basic|{pair}")));
+            let by_header = ct_eq(&authorization, &expected);
+            let by_cookie = strip_cookie_token(headers)
+                .iter()
+                .any(|t| ct_eq(t, &cookie_value));
+            if !(by_header || by_cookie) {
                 return Authorized::No;
             }
             if cross_origin_write(headers, method, origin) {
                 return Authorized::CrossOrigin;
             }
-            headers.remove(header::AUTHORIZATION);
-            Authorized::Yes { set_cookie: None }
+            if by_header {
+                headers.remove(header::AUTHORIZATION);
+            }
+            let set_cookie = (by_header && !by_cookie).then(|| token_cookie(&cookie_value));
+            Authorized::Yes { set_cookie }
         }
         Auth::Token { token } => {
             let by_header = authorization
@@ -1569,18 +1580,20 @@ fn authorize_parts(
             if !(by_header || by_query) && cross_origin_write(headers, method, origin) {
                 return Authorized::CrossOrigin;
             }
-            let set_cookie = (by_query && !by_cookie).then(|| {
-                HeaderValue::from_str(&format!(
-                    "{TOKEN_PARAM}={token}; Path=/; HttpOnly; Secure; SameSite=Lax"
-                ))
-                .expect("base32 token")
-            });
+            let set_cookie = (by_query && !by_cookie).then(|| token_cookie(token));
             if by_query && !by_header && top_level_navigation(headers, method) {
                 return Authorized::Login { set_cookie };
             }
             Authorized::Yes { set_cookie }
         }
     }
+}
+
+fn token_cookie(value: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{TOKEN_PARAM}={value}; Path=/; HttpOnly; Secure; SameSite=Lax"
+    ))
+    .expect("base32 token")
 }
 
 /// A non-GET/HEAD/OPTIONS request or a WebSocket upgrade that a browser sent
@@ -2099,11 +2112,23 @@ mod tests {
             password: "pw".into(),
         };
         let good = format!("Basic {}", STANDARD.encode("zucchini:pw"));
-        let (ok, headers, _, _) = check(&auth, &[("authorization", &good)], "/");
-        assert!(ok);
+        let (authorized, headers, _) = check_method(&auth, "GET", &[("authorization", &good)], "/");
+        let Authorized::Yes {
+            set_cookie: Some(cookie),
+        } = authorized
+        else {
+            panic!("no cookie set");
+        };
         assert!(headers.get("authorization").is_none());
         let bad = format!("Basic {}", STANDARD.encode("zucchini:px"));
         assert!(!check(&auth, &[("authorization", &bad)], "/").0);
+
+        // The cookie alone lets a WebSocket in: Safari sends no Basic there.
+        let cookie = cookie.to_str().unwrap().split(';').next().unwrap();
+        let (ok, headers, _, set) = check(&auth, &[("cookie", cookie)], "/");
+        assert!(ok && !set);
+        assert!(headers.get("cookie").is_none());
+        assert!(!check(&auth, &[("cookie", "zt=wrong")], "/").0);
         assert!(unauthorized(Some(&auth))
             .headers()
             .contains_key(header::WWW_AUTHENTICATE));
