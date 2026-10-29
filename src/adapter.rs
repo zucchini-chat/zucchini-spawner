@@ -789,6 +789,10 @@ pub const WATCH_INSTRUCTION: &str =
 pub const TUNNEL_INSTRUCTION: &str =
     "- `tunnel`: a public HTTPS URL for a local port, for webhooks, OAuth callbacks and previews. It stays up across restarts until deleted or Stop; see `tunnel create --help` for auth and how offline requests are queued.";
 
+/// An agent-suggested chat (`suggest_chat.rs`).
+pub const SUGGEST_CHAT_INSTRUCTION: &str =
+    "- `suggest-chat`: offer the user a new chat for a separate task (its own context, maybe another project or agent); they decide, nothing starts until they accept.";
+
 /// Per-turn current-local-time line for the agent prompt, from the sender's IANA
 /// timezone (`machine_users.timezone`, migration 0040). `None` when `iana_tz` is
 /// absent or unknown — the caller omits the line (`SCHEDULE_MESSAGE_INSTRUCTION`
@@ -831,7 +835,7 @@ pub fn worktree_instructions(worktree_abs: &str, parent_repo: &str) -> String {
 }
 
 /// The capability instructions every adapter conveys — the Zucchini tools list
-/// (attach-file, scheduled-messages, watch, tunnel, then the adapter's `more_tools`
+/// (attach-file, scheduled-messages, watch, tunnel, suggest-chat, then the adapter's `more_tools`
 /// items) and (when `worktree` is `Some`) the worktree rule. One helper so the
 /// texts can't drift across conveyance mechanisms: claude's
 /// `--append-system-prompt`, cursor's stdin preamble, and the first-message
@@ -849,6 +853,7 @@ pub fn agent_capabilities_instructions(
         SCHEDULE_MESSAGE_INSTRUCTION,
         WATCH_INSTRUCTION,
         TUNNEL_INSTRUCTION,
+        SUGGEST_CHAT_INSTRUCTION,
     ]
     .iter()
     .chain(more_tools)

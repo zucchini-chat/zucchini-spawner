@@ -34,7 +34,7 @@ pub struct MessageEnvelope {
 /// `size` matches the iOS-side `MessageEnvelope.Attachment.size` (plaintext
 /// byte length). `#[serde(default)]` for inbound decode tolerates older user
 /// messages that didn't carry the field; outbound encode always writes it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvelopeAttachment {
     pub blob_key: Uuid,
     #[serde(default)]

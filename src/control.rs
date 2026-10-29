@@ -34,14 +34,14 @@ use tracing::{debug, error, info, warn};
 use crate::agent::PendingAttachments;
 use crate::blobs;
 use crate::crypto::KeyStore;
-use crate::envelope::EnvelopeAttachment;
 use crate::prune::{PendingPrunes, PruneRequest};
 use crate::state::{ChatState, Mirror, SharedMirror};
+use crate::suggest_chat::{ChatSuggestion, SuggestChatRequest};
 use crate::sys;
 use crate::tunnel::TunnelInfo;
 use crate::user_prompt::UserSystemPrompt;
 use crate::watch::WatchDef;
-use crate::writer::TokenFetcher;
+use crate::writer::{TokenFetcher, WriteEvent};
 
 /// Where the daemon binds and the CLI connects. Lives under the same
 /// `~/.zucchini-spawner` dir whose perms we already lock to 0o700 in
@@ -143,6 +143,11 @@ pub enum ControlRequest {
     /// with `text`, plaintext here; blank clears it. The file list stays the
     /// user's. Refused where the spawner ignores the prompt.
     SetSystemPrompt { chat_id: String, text: String },
+    /// Write a `chat_suggestion` row into `chat_id` (`suggest_chat.rs`).
+    SuggestChat {
+        chat_id: String,
+        suggestion: SuggestChatRequest,
+    },
 }
 
 /// A chat's user system prompt as the CLI sees it: both fields decrypted.
@@ -212,6 +217,9 @@ pub struct ControlResponse {
     /// Set by the system prompt handlers: the prompt read, or as just written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<SystemPromptInfo>,
+    /// Set by `suggest_chat`: the suggestion as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_suggestion: Option<ChatSuggestion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Per-item eligible-match counts, parallel to the request's `items` — set
@@ -294,6 +302,10 @@ pub struct ControlState {
     /// call's `tool_result` frame. The push completing before this RPC returns is
     /// what guarantees the request is visible before that cue can fire.
     pub pending_prunes: PendingPrunes,
+    /// The writer queue, for rows a command writes into its chat.
+    pub write_tx: tokio::sync::mpsc::Sender<WriteEvent>,
+    /// Which agents this machine has, once the boot probes are in.
+    pub probe_statuses: crate::ProbeStatusesCache,
 }
 
 /// Bind the listener and spawn the accept loop. Stale-socket cleanup + the
@@ -462,6 +474,20 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
         ControlRequest::SetSystemPrompt { chat_id, text } => {
             system_prompt_response(set_system_prompt(&chat_id, &text, state).await)
         }
+        ControlRequest::SuggestChat {
+            chat_id,
+            suggestion,
+        } => match suggest_chat(&chat_id, &suggestion, state).await {
+            Ok(suggestion) => ControlResponse {
+                ok: true,
+                chat_suggestion: Some(suggestion),
+                ..Default::default()
+            },
+            Err(e) => {
+                warn!(chat_id = %chat_id, error = %e, "suggest_chat failed");
+                ControlResponse::err(format!("{e:#}"))
+            }
+        },
     }
 }
 
@@ -676,42 +702,13 @@ async fn attach_file(
             .ok_or_else(|| anyhow!("no running agent for chat {chat_id} (start a turn first)"))?
     };
 
-    let path_buf = Path::new(path).to_path_buf();
-    // Per task spec: NO path confinement. The user (or their agent) asked
-    // for this file; the daemon already runs as that user. UI / agent prompt
-    // is responsible for not asking for sensitive paths.
-    //
-    // Mint the presigned PUT URL synchronously — fast (one stat + one
-    // backend RTT) and the only step that produces `blob_key` + `name`
-    // (what the CLI prints + iOS renders on the pill). The slow R2 PUT
-    // (encrypt + body bytes over the network) is deferred to a detached
-    // task below so the CLI / shell tool / LLM all unblock ~immediately.
-    let minted = blobs::mint_url(
-        &state.http,
-        &state.api_base_url,
-        state.fetch_token.as_ref(),
-        &path_buf,
-    )
-    .await
-    .with_context(|| format!("mint upload-url for {}", path_buf.display()))?;
-
-    let blobs::MintedUpload {
-        blob_key,
-        presigned_url,
-        name,
-        plaintext_size,
-    } = minted;
+    let minted = mint_upload(Path::new(path), state).await?;
 
     // Push the envelope into the per-chat mailbox before the upload starts.
     // `agent.rs::attach_followup_for` drains this on the next assistant text
     // frame and emits a follow-up attachment row; we want the envelope queued
     // by then, not stuck behind a 200 MB R2 PUT.
-    let att = EnvelopeAttachment {
-        blob_key,
-        size: plaintext_size,
-        name: name.clone(),
-    };
-    if attach_tx.send(att).is_err() {
+    if attach_tx.send(minted.attachment()).is_err() {
         // Agent exited between the lock-section above and now. Vanishingly
         // unlikely (microseconds) but possible. The presigned URL is
         // already minted; nothing on R2 will reference it. Surface a
@@ -720,81 +717,25 @@ async fn attach_file(
             "agent on chat {chat_id} exited before envelope could be queued"
         ));
     }
+    let blobs::MintedUpload {
+        blob_key,
+        presigned_url,
+        name,
+        plaintext_size,
+    } = minted;
     debug!(chat_id, %blob_key, name = %name, "queued attachment for next assistant frame");
 
-    // Detached upload. `crypto::encrypt` is sync CPU-bound — wrap it in
-    // `spawn_blocking` so it doesn't stall a worker thread on multi-hundred-MB
-    // files. The HTTP client clones cheaply (internal Arc); `key` is already
-    // `Arc<KUser>` so its `.clone()` is a refcount bump, not a key copy.
+    // Detached upload, so the CLI / shell tool / LLM all unblock
+    // ~immediately. A failure is only reported: the envelope was already
+    // pushed, and the iOS retry-on-404 loop (BlobClient.swift) will
+    // eventually surface it as a permanent 404 to the user, which is the
+    // agreed UX per the task spec.
     let http = state.http.clone();
-    let key_for_task: Arc<crate::crypto::KUser> = Arc::clone(&key);
     let chat_id_for_task = chat_id.to_string();
-    let path_for_task = path_buf.clone();
+    let path_for_task = Path::new(path).to_path_buf();
     let name_for_task = name.clone();
     tokio::spawn(async move {
-        // Read the file from inside the detached task: even tokio::fs::read
-        // for a 200 MB file takes real wall-clock, and we want the control
-        // reply out ASAP. The pre-mint stat already validated readability;
-        // a races-with-deletion error here is logged but otherwise dropped
-        // (iOS's retry-on-404 surfaces as permanent unavailable to the user).
-        let read_res = tokio::fs::read(&path_for_task).await;
-        let plaintext = match read_res {
-            Ok(b) => b,
-            Err(e) => {
-                error!(
-                    chat_id = %chat_id_for_task,
-                    %blob_key,
-                    path = %path_for_task.display(),
-                    error = %e,
-                    "background attach-file read failed"
-                );
-                sentry::with_scope(
-                    |scope| {
-                        scope.set_tag("chat_id", &chat_id_for_task);
-                        scope.set_tag("blob_key", blob_key.to_string());
-                        scope.set_tag("path", path_for_task.display().to_string());
-                    },
-                    || {
-                        sentry::capture_message(
-                            &format!("attach-file read failed: {e}"),
-                            sentry::Level::Error,
-                        );
-                    },
-                );
-                return;
-            }
-        };
-
-        // CPU-bound; offload so we don't stall a tokio worker.
-        let cipher_res =
-            tokio::task::spawn_blocking(move || crate::crypto::encrypt(&key_for_task, &plaintext))
-                .await;
-        let ciphertext = match cipher_res {
-            Ok(c) => c,
-            Err(e) => {
-                error!(
-                    chat_id = %chat_id_for_task,
-                    %blob_key,
-                    error = %e,
-                    "background attach-file encrypt task panicked"
-                );
-                sentry::with_scope(
-                    |scope| {
-                        scope.set_tag("chat_id", &chat_id_for_task);
-                        scope.set_tag("blob_key", blob_key.to_string());
-                    },
-                    || {
-                        sentry::capture_message(
-                            &format!("attach-file encrypt panicked: {e}"),
-                            sentry::Level::Error,
-                        );
-                    },
-                );
-                return;
-            }
-        };
-
-        match blobs::put_ciphertext(&http, &presigned_url, ciphertext).await {
+        match upload(http, key, path_for_task.clone(), presigned_url).await {
             Ok(()) => {
                 info!(
                     chat_id = %chat_id_for_task,
@@ -820,20 +761,123 @@ async fn attach_file(
                     },
                     || {
                         sentry::capture_message(
-                            &format!("attach-file R2 PUT failed: {e:#}"),
+                            &format!("attach-file {e:#}"),
                             sentry::Level::Error,
                         );
                     },
                 );
-                // Nothing to retract — the envelope was already pushed to
-                // iOS. The iOS retry-on-404 loop (BlobClient.swift) will
-                // eventually surface the failure as a permanent 404 to the
-                // user, which is the agreed UX per the task spec.
             }
         }
     });
 
     Ok((blob_key, name))
+}
+
+/// Mints the presigned PUT URL for `path` — fast (one stat + one backend RTT)
+/// and the only step that produces `blob_key` + `name` (what the CLI prints +
+/// iOS renders on the pill). Per task spec: NO path confinement. The user (or
+/// their agent) asked for this file; the daemon already runs as that user. UI
+/// / agent prompt is responsible for not asking for sensitive paths.
+async fn mint_upload(path: &Path, state: &ControlState) -> Result<blobs::MintedUpload> {
+    blobs::mint_url(
+        &state.http,
+        &state.api_base_url,
+        state.fetch_token.as_ref(),
+        path,
+    )
+    .await
+    .with_context(|| format!("mint upload-url for {}", path.display()))
+}
+
+/// Reads `path`, seals it under `key` and PUTs it to the minted URL. The file
+/// is read here, not at the mint: a 200 MB read takes real wall-clock.
+async fn upload(
+    http: reqwest::Client,
+    key: Arc<crate::crypto::KUser>,
+    path: std::path::PathBuf,
+    presigned_url: String,
+) -> Result<()> {
+    let plaintext = tokio::fs::read(&path).await.context("read failed")?;
+    // `crypto::encrypt` is sync CPU-bound — offload so we don't stall a
+    // tokio worker on multi-hundred-MB files.
+    let ciphertext = tokio::task::spawn_blocking(move || crate::crypto::encrypt(&key, &plaintext))
+        .await
+        .context("encrypt panicked")?;
+    blobs::put_ciphertext(&http, &presigned_url, ciphertext)
+        .await
+        .context("R2 PUT failed")
+}
+
+/// How long `suggest-chat` waits for the boot probes (a few seconds after start).
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The agent kinds the boot probes found installed.
+async fn installed_agents(
+    probes: &crate::ProbeStatusesCache,
+) -> Result<Vec<crate::adapter::AgentKind>> {
+    let statuses = tokio::time::timeout(PROBE_WAIT, async {
+        loop {
+            if let Some(statuses) = probes.get() {
+                return statuses;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow!("the spawner is still checking which agents are installed; try again in a minute")
+    })?;
+    Ok(statuses
+        .iter()
+        .filter(|(_, (installed, _))| *installed)
+        .map(|(kind, _)| *kind)
+        .collect())
+}
+
+/// Validates the suggestion, uploads its attachments and then queues its row.
+/// The row is the user's to act on; nothing else changes.
+async fn suggest_chat(
+    chat_id: &str,
+    req: &SuggestChatRequest,
+    state: &ControlState,
+) -> Result<ChatSuggestion> {
+    // Before any await: a turn that ends while the call waits must fail it.
+    let slot = crate::suggest_chat::take_turn_slot(chat_id)?;
+    let installed = installed_agents(&state.probe_statuses).await?;
+    let (user_id, mut suggestion) =
+        crate::suggest_chat::validate(req, chat_id, &*state.mirror.read().await, &installed)?;
+    let (checked, attach) = (suggestion.clone(), req.attach.clone());
+    tokio::task::spawn_blocking(move || crate::suggest_chat::check_files(&checked, &attach))
+        .await
+        .context("checking the files panicked")??;
+    let key = state
+        .keys
+        .get(&user_id)
+        .with_context(|| format!("no key for user {user_id}"))?;
+    // Uploaded before the row is written: the new chat's first message
+    // references the blobs as they are, and nothing re-fetches them.
+    for path in req.attach.iter().map(Path::new) {
+        let minted = mint_upload(path, state).await?;
+        let attachment = minted.attachment();
+        upload(
+            state.http.clone(),
+            Arc::clone(&key),
+            path.to_path_buf(),
+            minted.presigned_url,
+        )
+        .await
+        .with_context(|| format!("--attach {}", path.display()))?;
+        suggestion.attachments.push(attachment);
+    }
+    let row = WriteEvent::agent_line(chat_id.to_string(), user_id, suggestion.frame_json());
+    let permit = state
+        .write_tx
+        .reserve()
+        .await
+        .map_err(|_| anyhow!("the spawner is shutting down; nothing was suggested"))?;
+    slot.commit(|| permit.send(row))?;
+    info!(chat_id, agent = %suggestion.agent_kind, n_attachments = suggestion.attachments.len(), "chat suggested");
+    Ok(suggestion)
 }
 
 /// `chat_id → (owner, owner's IANA zone)`. The read guard spans a couple of map
@@ -930,8 +974,7 @@ fn system_prompt_chat<'a>(chat_id: &str, mirror: &'a Mirror) -> Result<&'a ChatS
         .chats
         .get(chat_id)
         .ok_or_else(|| anyhow!("no chat with id {chat_id} (unknown or not yet synced)"))?;
-    if !chat.agent_kind.make_adapter().takes_user_system_prompt() || !mirror.is_unsandboxed(chat_id)
-    {
+    if !mirror.takes_user_system_prompt(chat_id, chat.agent_kind) {
         return Err(anyhow!(
             "this chat takes no system prompt (it is sandboxed or its agent has none)"
         ));
@@ -959,14 +1002,7 @@ fn prompt_with_text(
     text: &str,
     mirror: &Mirror,
 ) -> Result<(uuid::Uuid, UserSystemPrompt, Option<String>)> {
-    let text = Some(text.trim().to_string()).filter(|t| !t.is_empty());
-    let size = text.as_deref().map_or(0, str::len);
-    if size > crate::user_prompt::MAX_TEXT_BYTES {
-        return Err(anyhow!(
-            "the text takes {size} bytes, the limit is {}; move long instructions to a file",
-            crate::user_prompt::MAX_TEXT_BYTES
-        ));
-    }
+    let text = crate::user_prompt::agent_text(text).map_err(|e| anyhow!(e))?;
     let chat = system_prompt_chat(chat_id, mirror)?;
     let prompt = UserSystemPrompt {
         files: chat.user_system_prompt.files.clone(),
@@ -1591,6 +1627,19 @@ pub async fn set_system_prompt_via_socket(chat_id: &str, text: String) -> Result
     .await
 }
 
+pub async fn suggest_chat_via_socket(
+    chat_id: &str,
+    suggestion: SuggestChatRequest,
+) -> Result<ChatSuggestion> {
+    send_control_request(&ControlRequest::SuggestChat {
+        chat_id: chat_id.to_string(),
+        suggestion,
+    })
+    .await?
+    .chat_suggestion
+    .ok_or_else(|| anyhow!("response missing the suggestion"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1696,6 +1745,28 @@ mod tests {
         let (_, prompt, _) = prompt_with_text(&with_files, "be terse", &mirror).unwrap();
         assert_eq!(prompt.files.as_deref(), Some("rules.md"));
         assert!(prompt_with_text(&undecryptable, "be terse", &mirror).is_err());
+    }
+
+    /// A CLI older or newer than the daemon may omit or add flags.
+    #[test]
+    fn a_suggest_chat_request_survives_the_socket() {
+        let line = r#"{"action":"suggest_chat","chat_id":"c","suggestion":{"message":"m","attach":["/a"],"always_on":true,"later_flag":1}}"#;
+        let Ok(ControlRequest::SuggestChat {
+            chat_id,
+            suggestion,
+        }) = serde_json::from_str(line)
+        else {
+            panic!("not a suggest_chat request");
+        };
+        assert_eq!(
+            (
+                chat_id.as_str(),
+                suggestion.message.as_str(),
+                suggestion.attach
+            ),
+            ("c", "m", vec!["/a".to_string()])
+        );
+        assert!(suggestion.always_on && suggestion.project.is_none());
     }
 
     fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {

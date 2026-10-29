@@ -25,6 +25,22 @@ pub const MAX_BYTES: usize = if cfg!(windows) {
 /// what the user types: its ciphertext must stay under the backend's limit.
 pub const MAX_TEXT_BYTES: usize = 8000;
 
+/// Cap on the file list an agent suggests (`suggest-chat`), the clients' cap
+/// on the field, for the same reason.
+pub const MAX_FILES_BYTES: usize = 4000;
+
+/// The text as an agent sets it: trimmed, blank = none, at most `MAX_TEXT_BYTES`.
+pub fn agent_text(text: &str) -> Result<Option<String>, String> {
+    let text = Some(text.trim().to_string()).filter(|t| !t.is_empty());
+    let size = text.as_deref().map_or(0, str::len);
+    if size > MAX_TEXT_BYTES {
+        return Err(format!(
+            "the text takes {size} bytes, the limit is {MAX_TEXT_BYTES}; move long instructions to a file"
+        ));
+    }
+    Ok(text)
+}
+
 /// Both fields as the user typed them. A spawn knob: the rendered prompt is
 /// baked into the process, so a change respawns the resident.
 #[derive(Clone, Debug, Default, PartialEq)]

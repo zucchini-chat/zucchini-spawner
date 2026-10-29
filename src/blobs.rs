@@ -69,6 +69,16 @@ pub struct MintedUpload {
     pub plaintext_size: i64,
 }
 
+impl MintedUpload {
+    pub fn attachment(&self) -> EnvelopeAttachment {
+        EnvelopeAttachment {
+            blob_key: self.blob_key,
+            size: self.plaintext_size,
+            name: self.name.clone(),
+        }
+    }
+}
+
 /// Stat the file, mint a presigned R2 PUT URL via
 /// `POST /api/blobs/upload-url`, and return everything iOS needs to render
 /// the attachment pill (`blob_key` + `name` + `plaintext_size`) plus the URL

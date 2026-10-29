@@ -373,6 +373,12 @@ impl Mirror {
             .unwrap_or_default()
     }
 
+    /// A `kind` agent in `chat_id`'s place would spawn with a user system
+    /// prompt (`user_system_prompt`).
+    pub fn takes_user_system_prompt(&self, chat_id: &str, kind: AgentKind) -> bool {
+        kind.make_adapter().takes_user_system_prompt() && self.is_unsandboxed(chat_id)
+    }
+
     /// The chat's agent runs with the spawner's own access: its user is the
     /// owner or an unsandboxed member. An unknown chat, or a member whose row
     /// hasn't synced, counts as sandboxed.

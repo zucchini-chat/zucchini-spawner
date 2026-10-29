@@ -16,6 +16,7 @@ mod prune;
 mod session_name;
 mod shell;
 mod state;
+mod suggest_chat;
 mod sys;
 mod tunnel;
 mod uninstall;
@@ -799,6 +800,7 @@ async fn abort_member_agents(
 /// interrupt-then-send) and the one-shot abort arm so the frame is emitted
 /// identically from all three.
 async fn publish_interrupted(write_tx: &mpsc::Sender<WriteEvent>, chat_id: &str, user_id: Uuid) {
+    suggest_chat::agent_row_written(chat_id, INTERRUPTED_RESULT);
     let _ = write_tx
         .send(WriteEvent::agent_line(
             chat_id.to_string(),
@@ -2595,6 +2597,7 @@ async fn send_agent_line(
     chat_id: &str,
     content: String,
 ) {
+    suggest_chat::agent_row_written(chat_id, &content);
     match mirror.chats.get(chat_id).map(|c| c.user_id) {
         Some(user_id) => {
             let _ = write_tx
@@ -3287,6 +3290,107 @@ async fn run_system_prompt_cli(args: &[String]) {
     }
 }
 
+const SUGGEST_CHAT_USAGE: &str =
+    "usage: zucchini-spawner suggest-chat --message <TEXT> [--project <PATH>]
+         [--agent <KIND>] [--model <MODEL>] [--worktree] [--title <TEXT>]
+         [--system-prompt <TEXT>] [--system-prompt-files <a,b>]
+         [--always-on] [--background] [--auto-compact <20k-2M>]
+         [--attach <PATH>]...
+Suggest a new chat to the user: the app shows it at once and, if they accept,
+opens the new-chat screen filled with these values, which they can edit
+before sending. Nothing starts without them, and you won't hear back.
+  --message       the first message. Make it self-contained: the new agent
+                  sees nothing of this conversation
+  --project       the full path of the directory to start the agent in
+                  (default: this chat's); one that isn't a project on this
+                  machine fails and lists them
+  --agent         an agent kind installed on this machine, e.g. claude or
+                  codex (default: this chat's); one not installed fails and
+                  lists the installed ones
+  --model         the model, as that agent takes it (default: this chat's
+                  when --agent is omitted, else the agent's default); the app
+                  picks the user's agent of that kind with this model
+  --worktree      run it in its own git worktree
+  --title         chat title (default: from the message)
+  --system-prompt, --system-prompt-files
+                  system prompt (claude only); files must exist
+  --always-on     keep the agent running between turns (claude/codex,
+                  machine owner only)
+  --background    start it in Background
+  --auto-compact  compact when the context passes this size (claude/codex)
+  --attach        a file for the first message, repeatable";
+
+fn suggest_chat_usage_and_exit(code: i32) -> ! {
+    usage_and_exit(SUGGEST_CHAT_USAGE, code)
+}
+
+/// `suggest-chat` subcommand: one RPC over the control socket, which checks
+/// the values and writes the suggestion into this chat (`suggest_chat.rs`).
+async fn run_suggest_chat_cli(args: &[String]) {
+    let mut req = suggest_chat::SuggestChatRequest::default();
+    let mut message = None;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let s = a.as_str();
+        if s == "-h" || s == "--help" {
+            suggest_chat_usage_and_exit(0);
+        } else if s == "--worktree" {
+            req.worktree = true;
+        } else if s == "--always-on" {
+            req.always_on = true;
+        } else if s == "--background" {
+            req.background = true;
+        } else if let Some(v) = take_flag(s, "--message", &mut it) {
+            message = Some(v);
+        } else if let Some(v) = take_flag(s, "--project", &mut it) {
+            req.project = Some(v);
+        } else if let Some(v) = take_flag(s, "--agent", &mut it) {
+            req.agent = Some(v);
+        } else if let Some(v) = take_flag(s, "--model", &mut it) {
+            req.model = Some(v);
+        } else if let Some(v) = take_flag(s, "--title", &mut it) {
+            req.title = Some(v);
+        } else if let Some(v) = take_flag(s, "--system-prompt", &mut it) {
+            req.system_prompt = Some(v);
+        } else if let Some(v) = take_flag(s, "--system-prompt-files", &mut it) {
+            req.system_prompt_files = Some(v);
+        } else if let Some(v) = take_flag(s, "--auto-compact", &mut it) {
+            req.auto_compact = Some(v);
+        } else if let Some(v) = take_flag(s, "--attach", &mut it) {
+            // The daemon runs elsewhere, so a relative path is resolved here.
+            req.attach.push(cwd.join(v).to_string_lossy().into_owned());
+        } else {
+            suggest_chat_usage_and_exit(2);
+        }
+    }
+    let Some(chat_id) = env_chat_id() else {
+        suggest_chat_usage_and_exit(2);
+    };
+    let Some(message) = message else {
+        eprintln!("suggest-chat: --message is required");
+        suggest_chat_usage_and_exit(2)
+    };
+    req.message = message;
+    match control::suggest_chat_via_socket(&chat_id, req).await {
+        Ok(s) => {
+            println!(
+                "suggested a new chat: the user sees it now, and nothing starts unless they accept"
+            );
+            println!("project: {}", s.project_path);
+            match s.model {
+                Some(model) => println!("agent: {}, model {model}", s.agent_kind),
+                None => println!("agent: {}, default model", s.agent_kind),
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("suggest-chat failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `prune-reminder-hook` subcommand: claude's match-all `PostToolUse` hook
 /// trampoline. Reads the hook JSON payload from stdin, delegates the size gate
 /// to the pure [`crate::prune::prune_reminder_output`], and prints the
@@ -3405,6 +3509,10 @@ async fn main() {
         }
         if first == "system-prompt" {
             run_system_prompt_cli(&raw_args[1..]).await;
+            return;
+        }
+        if first == "suggest-chat" {
+            run_suggest_chat_cli(&raw_args[1..]).await;
             return;
         }
         // Legacy spelling: conversations started before `scheduled-messages`
@@ -3728,6 +3836,8 @@ async fn main() {
             mirror: mirror.clone(),
             live_sessions: supervisor.live_sessions(),
             pending_prunes: pending_prunes.clone(),
+            write_tx: write_tx.clone(),
+            probe_statuses: probe_statuses_cache.clone(),
         };
         if let Err(e) = control::start(control_state).await {
             warn!(error = %e, "failed to start control socket — `zucchini-spawner attach-file` will be unavailable");
