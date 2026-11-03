@@ -661,7 +661,7 @@ pub fn harden_dir(path: &Path) -> io::Result<()> {
 /// can't do the unix in-place rename. But Windows DOES allow *renaming* a
 /// running .exe out of the way (the open image handle survives the rename), so:
 /// rename the live exe to `<exe>.old`, then move the new one into its place. The
-/// Scheduled Task's keep-alive trigger ([`ensure_supervisor_keepalive`])
+/// Scheduled Task's keep-alive trigger ([`ensure_supervisor_task`])
 /// respawns from the new file within a minute of our exit; the leftover
 /// `<exe>.old` is best-effort-deleted at startup by [`sweep_stale_exe`].
 pub fn replace_running_exe(new_exe: &Path, current_exe: &Path) -> io::Result<()> {
@@ -679,28 +679,41 @@ pub fn replace_running_exe(new_exe: &Path, current_exe: &Path) -> io::Result<()>
 /// / systemd `Restart=always` behavior the self-update exit relies on. Task
 /// Scheduler has no restart-on-exit (`RestartCount` covers only a failure to
 /// launch), and `MultipleInstances=IgnoreNew` turns every tick into a no-op
-/// while the launcher is still running. Done here rather than in `install.ps1`
-/// so tasks registered by older installers gain it on their next start, and so
-/// it applies to the task instance that's already running. No-op when the
-/// trigger exists or the task doesn't (a dev run).
-const ENSURE_KEEPALIVE_TRIGGER_PS1: &str = r#"
+/// while the launcher is still running. Also moves an older installer's
+/// `powershell.exe -WindowStyle Hidden` launch under `conhost.exe --headless`:
+/// with Windows Terminal as the default terminal the hidden style is ignored, an
+/// empty terminal window shows, and closing it kills us. The new action applies
+/// from the next launch. Done here rather than in `install.ps1` so tasks
+/// registered by older installers are fixed on their next start, and so the
+/// trigger applies to the task instance that's already running. No-op when both
+/// are in place or the task doesn't exist (a dev run).
+const ENSURE_SUPERVISOR_TASK_PS1: &str = r#"
 $ErrorActionPreference = 'Stop'
 $name = 'chat.zucchini.spawner'
 $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
 if (-not $task) { exit 0 }
-if ($task.Triggers | Where-Object { $_.Repetition.Interval }) { exit 0 }
-$keepAlive = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
-Set-ScheduledTask -TaskName $name -Trigger (@($task.Triggers) + $keepAlive) | Out-Null
+$triggers = @($task.Triggers)
+$actions = @($task.Actions)
+$changed = $false
+if (-not ($triggers | Where-Object { $_.Repetition.Interval })) {
+  $triggers += New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
+  $changed = $true
+}
+if ($actions[0].Execute -eq 'powershell.exe') {
+  $actions[0] = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument "--headless powershell.exe $($actions[0].Arguments)"
+  $changed = $true
+}
+if ($changed) { Set-ScheduledTask -TaskName $name -Trigger $triggers -Action $actions | Out-Null }
 "#;
 
-pub fn ensure_supervisor_keepalive() {
+pub fn ensure_supervisor_task() {
     let mut cmd = tokio::process::Command::new("powershell.exe");
     cmd.args([
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
-        ENSURE_KEEPALIVE_TRIGGER_PS1,
+        ENSURE_SUPERVISOR_TASK_PS1,
     ])
     .creation_flags(SPAWN_CREATION_FLAGS)
     .stdin(std::process::Stdio::null());

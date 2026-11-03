@@ -399,7 +399,7 @@ pub fn sweep_stale_exe() {}
 
 /// launchd `KeepAlive` / systemd `Restart=always` already respawn us after any
 /// exit; only the Windows Scheduled Task needs this set up at runtime.
-pub fn ensure_supervisor_keepalive() {}
+pub fn ensure_supervisor_task() {}
 
 // ---------------------------------------------------------------------------
 // Local IPC — Unix domain sockets (windows: named pipes, step 6)

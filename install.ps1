@@ -172,8 +172,12 @@ Set-Content -LiteralPath $launcherPath -Value $launcher -Encoding ascii
 # ---------- register the logon Scheduled Task ----------
 
 Write-Host 'Registering logon Scheduled Task...'
-$action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
-  -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcherPath`""
+# `conhost --headless`, not `powershell -WindowStyle Hidden`: with Windows
+# Terminal as the default terminal (Windows 11) the hidden style is ignored and
+# an empty terminal window shows; closing it kills the spawner. Tasks registered
+# by older installers are migrated at spawner startup (`ensure_supervisor_task`).
+$action  = New-ScheduledTaskAction -Execute 'conhost.exe' `
+  -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$launcherPath`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 # RunLevel MUST stay Limited (the default) — this is an unelevated per-user
 # logon agent (the launchd LaunchAgent / `systemctl --user` analogue). Asking
@@ -186,7 +190,7 @@ $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" 
 # Never auto-expire, allow start on battery. RestartCount only covers a failure
 # to launch — relaunch after the spawner exits (self-update, crash; the launchd
 # KeepAlive / systemd Restart=always analogue) comes from a once-a-minute trigger
-# the spawner adds to this task at startup (`ensure_supervisor_keepalive` in
+# the spawner adds to this task at startup (`ensure_supervisor_task` in
 # src/sys/windows.rs), which also upgrades tasks registered by older installers.
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `

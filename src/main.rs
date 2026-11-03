@@ -3583,7 +3583,7 @@ async fn main() {
     let _instance_lock = acquire_single_instance_lock();
     if _instance_lock.is_some() {
         orphans::sweep();
-        sys::ensure_supervisor_keepalive();
+        sys::ensure_supervisor_task();
     }
 
     let prod = load_prod_config();
