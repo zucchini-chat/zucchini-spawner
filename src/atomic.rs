@@ -59,7 +59,7 @@ pub fn atomic_write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     // (K_machine files are unrecoverable if the rename evaporates on crash).
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        match std::fs::File::open(parent) {
+        match fs::File::open(parent) {
             Ok(dir) => {
                 if let Err(e) = dir.sync_all() {
                     warn!(error = %e, parent = %parent.display(), "parent-dir fsync failed; durability not guaranteed");
@@ -84,7 +84,10 @@ pub fn create_dir_durably(dir: &Path) -> io::Result<()> {
 }
 
 /// Parent-dir fsync makes a mkdir or rename durable on Linux (no-op on macOS; not available on Windows).
-#[cfg_attr(not(unix), allow(unused_variables))]
+#[cfg_attr(
+    not(unix),
+    expect(unused_variables, reason = "only unix fsyncs the parent")
+)]
 pub fn sync_parent(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {

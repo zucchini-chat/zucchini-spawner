@@ -83,7 +83,7 @@ impl Drop for KUser {
 }
 
 impl KUser {
-    fn load_from(path: &std::path::Path) -> Result<Self> {
+    fn load_from(path: &Path) -> Result<Self> {
         let bytes =
             read_b64_32(path).with_context(|| format!("read key file {}", path.display()))?;
         // `*bytes` deref-copies the [u8;32] out of `Zeroizing` into a fresh
@@ -143,7 +143,7 @@ impl KeyStore {
             return entry.clone();
         }
         let key = Arc::new(KUser::load_from(&user_key_path(user_id)).ok()?);
-        cache.insert(*user_id, Some(key.clone()));
+        cache.insert(*user_id, Some(Arc::clone(&key)));
         Some(key)
     }
 
@@ -162,7 +162,7 @@ impl KeyStore {
         match KUser::load_from(&per_user) {
             Ok(k) => {
                 let arc = Arc::new(k);
-                cache.insert(*user_id, Some(arc.clone()));
+                cache.insert(*user_id, Some(Arc::clone(&arc)));
                 Ok(arc)
             }
             Err(e) => {
@@ -185,7 +185,7 @@ impl KeyStore {
                 if try_migrate_legacy_key(user_id, &per_user)? {
                     let k = KUser::load_from(&per_user)?;
                     let arc = Arc::new(k);
-                    cache.insert(*user_id, Some(arc.clone()));
+                    cache.insert(*user_id, Some(Arc::clone(&arc)));
                     return Ok(arc);
                 }
                 cache.insert(*user_id, None);

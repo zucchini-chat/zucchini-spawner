@@ -232,7 +232,7 @@ impl Writer {
 pub fn start(config: WriterConfig, keys: Arc<KeyStore>) -> Writer {
     let (tx, rx) = mpsc::channel::<WriteEvent>(1024);
     let pending = Arc::new(AtomicUsize::new(0));
-    let pending_for_task = pending.clone();
+    let pending_for_task = Arc::clone(&pending);
     tokio::spawn(async move {
         run(config, keys, rx, pending_for_task).await;
     });
@@ -568,9 +568,9 @@ async fn run(
     let mut backoff = INITIAL_BACKOFF;
     let mut channel_closed = false;
 
-    let enqueue = |ev: WriteEvent, pending: &mut VecDeque<BatchOp>| {
+    let enqueue = |ev: WriteEvent, queue: &mut VecDeque<BatchOp>| {
         if let Some(op) = encode_event(&ev, &keys) {
-            pending.push_back(op);
+            queue.push_back(op);
             pending_counter.fetch_add(1, Ordering::Relaxed);
         }
     };

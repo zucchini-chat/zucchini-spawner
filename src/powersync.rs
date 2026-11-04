@@ -250,14 +250,14 @@ async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
         }
 
         tokio::select! {
-            _ = tokio::time::sleep(backoff) => {
+            () = tokio::time::sleep(backoff) => {
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
-            _ = config.wake_signal.notified() => {
+            () = config.wake_signal.notified() => {
                 info!("wake signal during backoff, reconnecting immediately");
                 backoff = INITIAL_BACKOFF;
             }
-            _ = config.revoked.cancelled() => {
+            () = config.revoked.cancelled() => {
                 info!("sync stream stopping (spawner revoked) during backoff");
                 return;
             }
@@ -322,7 +322,7 @@ async fn connect_and_stream(
     loop {
         let line = tokio::select! {
             biased;
-            _ = &mut wake => return Ok(ConnectExit::Wake),
+            () = &mut wake => return Ok(ConnectExit::Wake),
             // Bound the wait for the next frame. On a healthy link a keepalive
             // (or our 60s heartbeat's round-trip checkpoint) always lands inside
             // FRAME_IDLE_TIMEOUT; exceeding it means the read half has stalled,

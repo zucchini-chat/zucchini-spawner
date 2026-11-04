@@ -233,12 +233,18 @@ fn installed_agent(agent: &str, installed: &[AgentKind]) -> Result<AgentKind> {
 }
 
 /// `200000`, `200k`, `1.5M`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the cast saturates and the range check right after rejects what it clamped"
+)]
 fn parse_auto_compact(value: &str) -> Result<i64> {
     let value = value.trim();
-    let (number, unit) = match value.char_indices().last() {
-        Some((i, 'k' | 'K')) => (&value[..i], 1e3),
-        Some((i, 'm' | 'M')) => (&value[..i], 1e6),
-        _ => (value, 1.0),
+    let (number, unit) = if let Some(n) = value.strip_suffix(['k', 'K']) {
+        (n, 1e3)
+    } else if let Some(n) = value.strip_suffix(['m', 'M']) {
+        (n, 1e6)
+    } else {
+        (value, 1.0)
     };
     number
         .parse::<f64>()
@@ -470,8 +476,11 @@ mod tests {
             agent: Some("codex".to_string()),
             ..message("m")
         };
-        let s = f.validate(&chat, other_agent).unwrap();
-        assert_eq!((s.agent_kind.as_str(), s.model), ("codex", None));
+        let on_codex = f.validate(&chat, other_agent).unwrap();
+        assert_eq!(
+            (on_codex.agent_kind.as_str(), on_codex.model),
+            ("codex", None)
+        );
     }
 
     #[test]
@@ -678,10 +687,10 @@ mod tests {
         drop(under_way);
         assert!(!turn_counts().contains_key(&chat));
         suggest(&chat);
-        let under_way: Vec<TurnSlot> = (1..MAX_PER_TURN)
+        let to_commit: Vec<TurnSlot> = (1..MAX_PER_TURN)
             .map(|_| take_turn_slot(&chat).unwrap())
             .collect();
-        for slot in under_way {
+        for slot in to_commit {
             slot.commit(|| {}).unwrap();
         }
         assert!(take_turn_slot(&chat).is_err());

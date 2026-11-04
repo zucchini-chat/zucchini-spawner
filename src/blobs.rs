@@ -98,7 +98,7 @@ pub async fn mint_url(
     let meta = tokio::fs::metadata(file_path)
         .await
         .with_context(|| format!("stat attachment {}", file_path.display()))?;
-    let plaintext_size = meta.len() as i64;
+    let plaintext_size = i64::try_from(meta.len()).context("attachment too large")?;
     let ciphertext_size = plaintext_size + AEAD_OVERHEAD;
 
     let token = fetch_token().await?;
@@ -145,10 +145,9 @@ pub async fn put_ciphertext(
     presigned_url: &str,
     ciphertext: Vec<u8>,
 ) -> Result<()> {
-    let ciphertext_size = ciphertext.len() as i64;
     let put = http
         .put(presigned_url)
-        .header("content-length", ciphertext_size.to_string())
+        .header("content-length", ciphertext.len().to_string())
         .body(ciphertext)
         .send()
         .await

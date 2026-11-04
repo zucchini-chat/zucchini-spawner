@@ -218,7 +218,8 @@ impl LiveTask {
 fn now_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
         .unwrap_or_default()
 }
 
@@ -339,9 +340,9 @@ impl SessionState {
     fn close_internal_window(&mut self) {
         self.internal_running = None;
     }
-    /// The `chats.live_tasks` blob to publish now, or `None` when it is
-    /// unchanged since the last publication (see `LiveTasksDedup`).
-    pub fn observe_live_tasks(&mut self) -> Option<Option<String>> {
+    /// The `chats.live_tasks` blob to publish now, if it changed since the
+    /// last publication (see `LiveTasksDedup`).
+    pub fn observe_live_tasks(&mut self) -> LiveTasksChange {
         let payload = live_tasks_payload(self);
         self.published_live_tasks.observe(payload)
     }
@@ -557,7 +558,7 @@ fn live_task_json(task: &LiveTask) -> serde_json::Value {
 
 /// Change detection for `chats.live_tasks`, the same shape as
 /// `LastTokensDedup`: the blob is recomputed after every event and only a
-/// CHANGED payload is published (`Some(None)` = clear the column). The reader
+/// CHANGED payload is published (`Changed(None)` = clear the column). The reader
 /// has to be one of the observers — a task edge publishes no frame, so a
 /// main-loop diff à la `alive_changes` would not run until the next 60s
 /// eviction pass. Lives in `SessionState` because queueing a turn changes the
@@ -568,18 +569,24 @@ pub struct LiveTasksDedup {
 }
 
 impl LiveTasksDedup {
-    /// `Some(payload)` when it differs from what was last published (`Some(None)`
-    /// = clear the column), `None` when nothing changed. A fresh session starts
-    /// from NULL — the teardown that preceded it cleared the column — so an
-    /// empty payload publishes nothing until something is actually armed (an
-    /// internal `/rename` turn must write nothing at all).
-    pub fn observe(&mut self, payload: Option<String>) -> Option<Option<String>> {
+    /// `Changed(payload)` when it differs from what was last published. A
+    /// fresh session starts from NULL — the teardown that preceded it cleared
+    /// the column — so an empty payload publishes nothing until something is
+    /// actually armed (an internal `/rename` turn must write nothing at all).
+    pub fn observe(&mut self, payload: Option<String>) -> LiveTasksChange {
         if self.last == payload {
-            return None;
+            return LiveTasksChange::Unchanged;
         }
         self.last = payload.clone();
-        Some(payload)
+        LiveTasksChange::Changed(payload)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LiveTasksChange {
+    Unchanged,
+    /// The new `chats.live_tasks` value; `None` clears the column.
+    Changed(Option<String>),
 }
 
 /// Spawner-synthesized message row for a turn the user didn't send: another
@@ -1183,17 +1190,17 @@ impl Supervisor {
     /// registry so it can route `attach-file` RPC results to the right
     /// per-chat mailbox. Cheap `Arc` clone — same shared state.
     pub fn pending_attachments(&self) -> PendingAttachments {
-        self.pending.clone()
+        Arc::clone(&self.pending)
     }
 
     /// Hand the control-socket task a clone of the live-sessions directory so a
     /// `prune-context` RPC can read a chat's live-task count. Cheap `Arc` clone.
     pub fn live_sessions(&self) -> LiveSessions {
-        self.live_sessions.clone()
+        Arc::clone(&self.live_sessions)
     }
 
     pub fn pending_prunes(&self) -> PendingPrunes {
-        self.pending_prunes.clone()
+        Arc::clone(&self.pending_prunes)
     }
 
     /// The background tasks / monitors live in the chat's resident session right
@@ -1425,14 +1432,14 @@ impl Supervisor {
         true
     }
 
-    /// The chat's `chats.live_tasks` blob when it changed since the last
-    /// publication, `None` when it didn't (or the chat has no resident). Called
+    /// The chat's `chats.live_tasks` blob if it changed since the last
+    /// publication (`Unchanged` when the chat has no resident). Called
     /// right after `send_user_turn` so the queued count reaches the clients at
     /// the enqueue edge — the reader publishes only on adapter events, and a
     /// queued turn produces none until the CLI echoes it.
-    pub fn live_tasks_change(&self, topic: &str) -> Option<Option<String>> {
+    pub fn live_tasks_change(&self, topic: &str) -> LiveTasksChange {
         let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
-            return None;
+            return LiveTasksChange::Unchanged;
         };
         s.state
             .lock()
@@ -1657,7 +1664,7 @@ impl Supervisor {
             req,
             self.response_tx.clone(),
             cancel.clone(),
-            self.pending.clone(),
+            Arc::clone(&self.pending),
         );
         self.agents
             .insert(topic, AgentEntry::OneShot { handle, cancel });
@@ -1674,7 +1681,7 @@ impl Supervisor {
             req.clone(),
             self.response_tx.clone(),
             cancel.clone(),
-            self.pending.clone(),
+            Arc::clone(&self.pending),
         );
         let session = ResidentSession {
             wake: handles.wake,
@@ -1695,7 +1702,7 @@ impl Supervisor {
         self.live_sessions
             .lock()
             .expect("LiveSessions mutex")
-            .insert(topic.clone(), session.state.clone());
+            .insert(topic.clone(), Arc::clone(&session.state));
         self.agents.insert(topic, AgentEntry::Resident(session));
     }
 
@@ -1954,8 +1961,8 @@ fn default_spawn_fn(
             let stderr_handle = child.stderr.take().map(|stderr| {
                 spawn_stderr_reader(
                     stderr,
-                    agent_started.clone(),
-                    stderr_seen.clone(),
+                    Arc::clone(&agent_started),
+                    Arc::clone(&stderr_seen),
                     topic_clone.clone(),
                 )
             });
@@ -1975,7 +1982,7 @@ fn default_spawn_fn(
                 let mut cancelled_mid_send = false;
                 loop {
                     tokio::select! {
-                        _ = token_clone.cancelled() => {
+                        () = token_clone.cancelled() => {
                             warn!(topic = %topic_clone, "agent cancelled, tearing down process group");
                             group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
                             let _ = tokio::fs::remove_file(&prompt_file).await;
@@ -1983,7 +1990,7 @@ fn default_spawn_fn(
                             // already removed our entry from the map.
                             return;
                         }
-                        _ = tokio::time::sleep_until(startup_deadline), if !agent_started.load(Ordering::Relaxed) => {
+                        () = tokio::time::sleep_until(startup_deadline), if !agent_started.load(Ordering::Relaxed) => {
                             group.kill(&mut child).await;
                             if startup_retry_allowed(attempt, &stderr_seen) {
                                 warn!(topic = %topic_clone, "agent produced no output within {:?}, retrying once", startup_timeout);
@@ -2031,8 +2038,8 @@ fn default_spawn_fn(
                                         // assistant text frame with queued attachments. Held
                                         // over the original send so cancellation between the two
                                         // emits drops both cleanly.
-                                        let followup = if let AgentResponse::Line { topic, content } = &resp {
-                                            attach_followup_for(topic, content, &mut attach_rx)
+                                        let followup = if let AgentResponse::Line { content, .. } = &resp {
+                                            attach_followup_for(&topic_clone, content, &mut attach_rx)
                                         } else {
                                             None
                                         };
@@ -2042,7 +2049,7 @@ fn default_spawn_fn(
                                         // drain. `biased` keeps cancel polled first.
                                         tokio::select! {
                                             biased;
-                                            _ = token_clone.cancelled() => {
+                                            () = token_clone.cancelled() => {
                                                 cancelled_mid_send = true;
                                                 break;
                                             }
@@ -2059,7 +2066,7 @@ fn default_spawn_fn(
                                         if let Some(followup) = followup {
                                             tokio::select! {
                                                 biased;
-                                                _ = token_clone.cancelled() => {
+                                                () = token_clone.cancelled() => {
                                                     cancelled_mid_send = true;
                                                     break;
                                                 }
@@ -2162,8 +2169,8 @@ fn default_resident_spawn_fn(
     // `spawn_resident` queues the first turn right after this returns.
     let state = Arc::new(StdMutex::new(SessionState::default()));
 
-    let state_for_reader = state.clone();
-    let wake_for_writer = wake.clone();
+    let state_for_reader = Arc::clone(&state);
+    let wake_for_writer = Arc::clone(&wake);
 
     let SpawnRequest {
         chat_id: topic,
@@ -2317,9 +2324,9 @@ fn default_resident_spawn_fn(
             let writer_handle = child.stdin.take().map(|stdin| {
                 spawn_stdin_writer(
                     stdin,
-                    state_for_reader.clone(),
-                    adapter.clone(),
-                    wake_for_writer.clone(),
+                    Arc::clone(&state_for_reader),
+                    Arc::clone(&adapter),
+                    Arc::clone(&wake_for_writer),
                     cancel.clone(),
                 )
             });
@@ -2329,8 +2336,8 @@ fn default_resident_spawn_fn(
             let stderr_handle = child.stderr.take().map(|stderr| {
                 spawn_stderr_reader(
                     stderr,
-                    agent_started.clone(),
-                    stderr_seen.clone(),
+                    Arc::clone(&agent_started),
+                    Arc::clone(&stderr_seen),
                     topic.clone(),
                 )
             });
@@ -2374,7 +2381,7 @@ fn default_resident_spawn_fn(
                     }
                     tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => {
+                        () = cancel.cancelled() => {
                             warn!(topic = %topic, "resident session cancelled, tearing down process group");
                             cancelled = true;
                             if exits_on_stdin_eof {
@@ -2393,7 +2400,7 @@ fn default_resident_spawn_fn(
                             group.terminate(&mut child, AGENT_SIGTERM_GRACE).await;
                             break 'read;
                         }
-                        _ = tokio::time::sleep_until(startup_deadline), if !agent_started.load(Ordering::Relaxed) => {
+                        () = tokio::time::sleep_until(startup_deadline), if !agent_started.load(Ordering::Relaxed) => {
                             group.kill(&mut child).await;
                             if startup_retry_allowed(attempt, &stderr_seen) {
                                 warn!(topic = %topic, "resident agent produced no output within {:?}, retrying once", startup_timeout);
@@ -2535,13 +2542,13 @@ fn default_resident_spawn_fn(
                                         // deferred to a turn boundary — the point is to
                                         // show the task list while the turn is over and
                                         // the chat is Waiting.
-                                        if let Some(tasks) = live_tasks {
-                                            let session = state_for_reader.clone();
+                                        if let LiveTasksChange::Changed(tasks) = live_tasks {
+                                            let session = Arc::clone(&state_for_reader);
                                             send_or_cancel!(AgentResponse::LiveTasks { topic: topic.clone(), session, tasks });
                                         }
                                     }
                                     for running in turn_edges {
-                                        let session = state_for_reader.clone();
+                                        let session = Arc::clone(&state_for_reader);
                                         send_or_cancel!(AgentResponse::TurnRunning { topic: topic.clone(), session, running });
                                     }
                                     // A response or notification may have made a
@@ -2711,8 +2718,8 @@ fn spawn_stdin_writer(
                 return;
             }
             tokio::select! {
-                _ = wake.notified() => {}
-                _ = cancel.cancelled() => return,
+                () = wake.notified() => {}
+                () = cancel.cancelled() => return,
             }
         }
     })
@@ -3004,7 +3011,7 @@ mod reduce_tests {
     use super::{
         internal_turn_swallows, live_task, live_tasks_payload, live_tasks_with_daemon_tasks,
         peer_message_frame_json, reduce, task_started, test_frames_to_write as frames_to_write,
-        AgentEvent, LiveTask, LiveTasksDedup, QueuedTurn, SessionState, WatchDef,
+        AgentEvent, LiveTask, LiveTasksChange, LiveTasksDedup, QueuedTurn, SessionState, WatchDef,
     };
     use std::collections::HashSet;
 
@@ -3244,14 +3251,14 @@ mod reduce_tests {
         let watches = [watch_def("mail"), watch_def("deploys")];
         let merged =
             live_tasks_with_daemon_tasks(live_tasks_payload(&s), &[], &watches).expect("a blob");
-        let blob: serde_json::Value = serde_json::from_str(&merged).expect("valid JSON");
-        let tasks = blob["t"].as_array().expect("array");
+        let merged_blob: serde_json::Value = serde_json::from_str(&merged).expect("valid JSON");
+        let tasks = merged_blob["t"].as_array().expect("array");
         assert_eq!(tasks.len(), 20);
         assert_eq!(tasks[0]["d"], "mail");
         assert_eq!(tasks[1]["d"], "deploys");
         assert_eq!(tasks[2]["i"], "t0");
         assert_eq!(tasks[19]["i"], "t17");
-        assert_eq!(blob["q"], 1);
+        assert_eq!(merged_blob["q"], 1);
     }
 
     /// The reader publishes only CHANGES — an unchanged payload writes nothing,
@@ -3262,23 +3269,25 @@ mod reduce_tests {
         let mut s = SessionState::default();
         assert_eq!(
             dedup.observe(live_tasks_payload(&s)),
-            None,
+            LiveTasksChange::Unchanged,
             "a fresh session starts from a cleared column and publishes nothing"
         );
 
         reduce(&mut s, &task_started("a"));
-        let armed = dedup.observe(live_tasks_payload(&s)).expect("a change");
-        assert!(armed.expect("a blob").contains("\"a\""));
+        let LiveTasksChange::Changed(Some(armed)) = dedup.observe(live_tasks_payload(&s)) else {
+            panic!("arming a task publishes a blob");
+        };
+        assert!(armed.contains("\"a\""));
         assert_eq!(
             dedup.observe(live_tasks_payload(&s)),
-            None,
+            LiveTasksChange::Unchanged,
             "an unrelated event does not re-write an unchanged set"
         );
 
         reduce(&mut s, &AgentEvent::TaskFinished("a".into()));
         assert_eq!(
             dedup.observe(live_tasks_payload(&s)),
-            Some(None),
+            LiveTasksChange::Changed(None),
             "the last task finishing clears the column"
         );
     }
@@ -3822,12 +3831,12 @@ mod live_session_tests {
     /// until cancelled (so `abort_agent` can join it).
     fn supervisor_with_exposed_sessions() -> (Supervisor, Exposed) {
         let exposed: Exposed = Arc::new(StdMutex::new(HashMap::new()));
-        let exp = exposed.clone();
+        let exp = Arc::clone(&exposed);
         let resident_fn: ResidentSpawnFn = Arc::new(move |req, _tx, cancel, _pending| {
             let state = Arc::new(StdMutex::new(SessionState::default()));
             exp.lock()
                 .unwrap()
-                .insert(req.chat_id.clone(), state.clone());
+                .insert(req.chat_id.clone(), Arc::clone(&state));
             let reader = tokio::spawn(async move { cancel.cancelled().await });
             ResidentHandles {
                 wake: Arc::new(Notify::new()),
@@ -3846,7 +3855,7 @@ mod live_session_tests {
     fn claude_req(chat_id: &str) -> SpawnRequest {
         SpawnRequest {
             session_name: None,
-            user_system_prompt: Default::default(),
+            user_system_prompt: UserSystemPrompt::default(),
             chat_id: chat_id.to_string(),
             prompt: "hi".to_string(),
             project_path: None,
@@ -3915,7 +3924,7 @@ mod live_session_tests {
     async fn send_user_turn_queues_on_the_live_session() {
         let (mut sup, exposed) = supervisor_with_exposed_sessions();
         sup.spawn_agent(claude_req("chat"));
-        let first_state = exposed.lock().unwrap()["chat"].clone();
+        let first_state = Arc::clone(&exposed.lock().unwrap()["chat"]);
 
         let next = SpawnRequest {
             prompt: "second".to_string(),
@@ -4050,13 +4059,13 @@ mod live_session_tests {
         let (mut sup, exposed) = supervisor_with_exposed_sessions();
         let spawned_with = prompt_text("be terse");
         let current = prompt_text("be verbose");
-        let spawn = |sup: &mut Supervisor| {
-            sup.spawn_agent(SpawnRequest {
+        let spawn = |supervisor: &mut Supervisor| {
+            supervisor.spawn_agent(SpawnRequest {
                 user_system_prompt: spawned_with.clone(),
                 ..claude_req("chat")
             })
         };
-        let state = |exposed: &Exposed| exposed.lock().unwrap()["chat"].clone();
+        let state = |sessions: &Exposed| Arc::clone(&sessions.lock().unwrap()["chat"]);
 
         spawn(&mut sup);
         assert_eq!(
@@ -4135,7 +4144,7 @@ mod live_session_tests {
 
         // It is a slash command, so the writer holds it until it heads the
         // queue with no turn in flight.
-        let session = exposed.lock().unwrap()["chat"].clone();
+        let session = Arc::clone(&exposed.lock().unwrap()["chat"]);
         assert_eq!(
             session.lock().unwrap().internal.len(),
             2,
@@ -4338,7 +4347,7 @@ mod cli_smoke {
             model: None,
             user_timezone: Some("Asia/Bangkok".to_string()),
             session_name: None,
-            user_system_prompt: Default::default(),
+            user_system_prompt: UserSystemPrompt::default(),
         }
     }
 
@@ -4431,44 +4440,41 @@ mod cli_smoke {
             "Also append the word SECOND to your final reply.",
             Some(sid.clone()),
         )));
-        let seen = until(&mut rx, idle).await;
-        let text = text_of(&seen);
+        let joined = until(&mut rx, idle).await;
+        let text = text_of(&joined);
         assert!(
             text.contains("FIRST") && text.contains("SECOND"),
-            "{seen:#?}"
+            "{joined:#?}"
         );
         assert_eq!(session_pid(&sup), Some(pid), "same process");
 
         eprintln!("== 3. /compact, a message right behind it runs after it");
         assert!(sup.send_user_turn(&req("/compact", Some(sid.clone()))));
         assert!(sup.send_user_turn(&req("Reply with the single word AFTER.", Some(sid.clone()),)));
-        let seen = until(&mut rx, idle).await;
-        let boundary = seen
+        let compacted = until(&mut rx, idle).await;
+        let boundary = compacted
             .iter()
             .position(|d| d.starts_with("CompactBoundary"))
-            .unwrap_or_else(|| panic!("{seen:#?}"));
-        let after = seen
+            .unwrap_or_else(|| panic!("{compacted:#?}"));
+        let after = compacted
             .iter()
             .position(|d| d.contains("\"type\":\"assistant\"") && d.contains("AFTER"))
-            .unwrap_or_else(|| panic!("{seen:#?}"));
-        assert!(boundary < after, "{seen:#?}");
+            .unwrap_or_else(|| panic!("{compacted:#?}"));
+        assert!(boundary < after, "{compacted:#?}");
 
         eprintln!("== 4. teardown by stdin EOF, respawn with resume");
         sup.abort_agent(CHAT).await;
-        assert!(
-            !crate::sys::process_group_exists(pid),
-            "the whole group exited"
-        );
+        assert!(!sys::process_group_exists(pid), "the whole group exited");
         sup.spawn_agent(req(
             "What single word did you reply with in your very first answer in this conversation?",
             Some(sid.clone()),
         ));
-        let seen = until(&mut rx, idle).await;
+        let resumed = until(&mut rx, idle).await;
         assert!(
-            seen.contains(&format!("SessionIdHarvested {sid}")),
-            "same thread: {seen:#?}"
+            resumed.contains(&format!("SessionIdHarvested {sid}")),
+            "same thread: {resumed:#?}"
         );
-        assert!(text_of(&seen).contains("PONG"), "{seen:#?}");
+        assert!(text_of(&resumed).contains("PONG"), "{resumed:#?}");
         sup.shutdown_all().await;
     }
 
@@ -4524,12 +4530,12 @@ mod cli_smoke {
             "Do not use any tools. Which emoji was in my previous message? Reply with just it.",
             Some(sid.clone()),
         ));
-        let seen = until(&mut rx, done).await;
+        let resumed = until(&mut rx, done).await;
         assert!(
-            seen.contains(&"Done has_result=true".to_string()),
-            "{seen:#?}"
+            resumed.contains(&"Done has_result=true".to_string()),
+            "{resumed:#?}"
         );
-        assert!(text_of(&seen).contains("🥒"), "{seen:#?}");
+        assert!(text_of(&resumed).contains("🥒"), "{resumed:#?}");
         sup.shutdown_all().await;
     }
 }

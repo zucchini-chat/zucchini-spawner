@@ -1081,12 +1081,12 @@ async fn import_session(
     // per-row PutMessage emit itself is shared via `emit_chat`.
     let messages: Vec<ImportedMessage> = emitted
         .into_iter()
-        .enumerate()
-        .map(|(seq, (ts, sender, body))| ImportedMessage {
+        .zip(0..)
+        .map(|((ts, sender, body), seq)| ImportedMessage {
             id: None,
             sender,
             body,
-            created_at: ts + ChronoDuration::milliseconds(seq as i64),
+            created_at: ts + ChronoDuration::milliseconds(seq),
         })
         .collect();
 
@@ -1242,7 +1242,7 @@ fn gemini_reconstructed_session_id(path: &std::path::Path) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
         let Some(obj) = v.as_object() else {
@@ -1320,7 +1320,7 @@ fn claude_to_gemini_tool_names(claude_name: &str) -> Vec<&'static str> {
 /// the empty-args selector (`prune::args_value_is_empty`).
 fn gemini_tool_call_matches(
     name: &str,
-    args: Option<&serde_json::Value>,
+    args: Option<&Value>,
     tool_name: &str,
     needle: &str,
 ) -> bool {
@@ -1337,18 +1337,15 @@ fn gemini_tool_call_matches(
 /// `value` (recursing objects + arrays). The shape-agnostic basis for the
 /// pruner — see the module header for why we walk every node, not named
 /// containers.
-fn walk_objects<F: FnMut(&serde_json::Map<String, serde_json::Value>)>(
-    value: &serde_json::Value,
-    visit: &mut F,
-) {
+fn walk_objects<F: FnMut(&serde_json::Map<String, Value>)>(value: &Value, visit: &mut F) {
     match value {
-        serde_json::Value::Object(map) => {
+        Value::Object(map) => {
             visit(map);
             for v in map.values() {
                 walk_objects(v, visit);
             }
         }
-        serde_json::Value::Array(arr) => {
+        Value::Array(arr) => {
             for v in arr {
                 walk_objects(v, visit);
             }
@@ -1359,18 +1356,18 @@ fn walk_objects<F: FnMut(&serde_json::Map<String, serde_json::Value>)>(
 
 /// Mutable twin of `walk_objects`: visits each object by `&mut`, then descends
 /// into the (possibly-mutated) node's children.
-fn walk_objects_mut<F: FnMut(&mut serde_json::Map<String, serde_json::Value>)>(
-    value: &mut serde_json::Value,
+fn walk_objects_mut<F: FnMut(&mut serde_json::Map<String, Value>)>(
+    value: &mut Value,
     visit: &mut F,
 ) {
     match value {
-        serde_json::Value::Object(map) => {
+        Value::Object(map) => {
             visit(map);
             for v in map.values_mut() {
                 walk_objects_mut(v, visit);
             }
         }
-        serde_json::Value::Array(arr) => {
+        Value::Array(arr) => {
             for v in arr.iter_mut() {
                 walk_objects_mut(v, visit);
             }
@@ -1383,7 +1380,7 @@ fn walk_objects_mut<F: FnMut(&mut serde_json::Map<String, serde_json::Value>)>(
 /// `id`, a string `name`, and an `args` value. (A `functionResponse` has `id` +
 /// `name` but NO `args`, so the two predicates are disjoint — a functionResponse
 /// is never collected as a tool call.)
-fn gemini_object_is_tool_call(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+fn gemini_object_is_tool_call(obj: &serde_json::Map<String, Value>) -> bool {
     obj.get("id").and_then(|v| v.as_str()).is_some()
         && obj.get("name").and_then(|v| v.as_str()).is_some()
         && obj.contains_key("args")
@@ -1422,12 +1419,7 @@ fn eligible_matches(
 /// depths/lines — so we de-dup to FIRST-seen document order (skip ids already
 /// pushed). That makes "last" mean the last DISTINCT call, matching the
 /// `HashSet`-dedup semantics the old count had.
-fn gemini_collect_matched(
-    entry: &serde_json::Value,
-    tool_name: &str,
-    needle: &str,
-    matched: &mut Vec<String>,
-) {
+fn gemini_collect_matched(entry: &Value, tool_name: &str, needle: &str, matched: &mut Vec<String>) {
     walk_objects(entry, &mut |obj| {
         if !gemini_object_is_tool_call(obj) {
             return;
@@ -1451,10 +1443,7 @@ fn gemini_collect_matched(
 /// `prune_batch_gemini_jsonl` (same call sites as [`gemini_collect_matched`]). Marks a
 /// call ineligible from ANY of its (possibly many) functionResponse copies whose
 /// `response.output` is already the `[pruned]` placeholder.
-fn gemini_collect_pruned(
-    entry: &serde_json::Value,
-    already_pruned: &mut std::collections::HashSet<String>,
-) {
+fn gemini_collect_pruned(entry: &Value, already_pruned: &mut HashSet<String>) {
     walk_objects(entry, &mut |obj| {
         let Some(id) = obj.get("id").and_then(|v| v.as_str()) else {
             return;
@@ -1501,9 +1490,9 @@ fn count_gemini_matches(
 /// nothing, so `results_blanked` reflects work done, not ids matched (mirrors
 /// codex).
 fn blank_gemini_outputs(
-    entry: &mut serde_json::Value,
+    entry: &mut Value,
     pruned_ids: &crate::prune::ChosenTargets,
-    outputs_blanked: &mut std::collections::HashSet<String>,
+    outputs_blanked: &mut HashSet<String>,
 ) -> usize {
     let mut freed = 0usize;
     walk_objects_mut(entry, &mut |obj| {
@@ -1546,10 +1535,7 @@ fn blank_gemini_outputs(
 /// still present and is NOT the `[pruned]` placeholder — i.e. a leaked un-pruned
 /// copy. Used after blanking to assert the prune was total; a non-zero count
 /// means a copy at some unexpected shape survived (a silent context leak).
-fn count_leaked_gemini_outputs(
-    entry: &serde_json::Value,
-    pruned_ids: &std::collections::HashSet<String>,
-) -> usize {
+fn count_leaked_gemini_outputs(entry: &Value, pruned_ids: &HashSet<String>) -> usize {
     let mut leaked = 0usize;
     walk_objects(entry, &mut |obj| {
         let id_pruned = obj
@@ -1565,7 +1551,7 @@ fn count_leaked_gemini_outputs(
         };
         match resp.get("output") {
             None => {}
-            Some(serde_json::Value::String(s)) if s == crate::prune::PRUNED_PLACEHOLDER => {}
+            Some(Value::String(s)) if s == crate::prune::PRUNED_PLACEHOLDER => {}
             Some(_) => leaked += 1,
         }
     });
@@ -1601,7 +1587,7 @@ fn prune_batch_gemini_jsonl(
     // The ids actually blanked this batch (≤ targets.len(), the last-only targets
     // the driver picked) — captured from the blank closure so the fail-closed
     // re-scan can key on the EXACT set the driver acted on, with no separate read.
-    let mut blanked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut blanked_ids: HashSet<String> = HashSet::new();
     let (stats, final_entries) = crate::prune::rewrite_jsonl_batch_last_only(
         path,
         targets,
@@ -1654,6 +1640,7 @@ fn prune_batch_gemini_jsonl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::{ignore_progress, TEST_HOME_LOCK};
     use std::path::PathBuf;
 
     /// Maps a turn's emitted events to human-readable tags + payload for easy
@@ -2469,7 +2456,7 @@ mod tests {
         std::fs::write(chats_dir.join(name), body).unwrap();
     }
 
-    fn temp_home() -> std::path::PathBuf {
+    fn temp_home() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
             "zucchini_gemini_import_home_{}_{}",
@@ -2546,20 +2533,15 @@ mod tests {
         );
 
         let (tx, mut rx) = mpsc::channel::<WriteEvent>(64);
+        let _home_lock = TEST_HOME_LOCK.lock().await;
         let prev_home = std::env::var_os("HOME");
-        // SAFETY: env mutation is single-threaded per test process.
+        // SAFETY: TEST_HOME_LOCK keeps the other tests that set HOME out, and
+        // std's env lock orders this against env reads on other test threads.
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        let result = import(
-            Uuid::nil(),
-            Uuid::nil(),
-            tx,
-            Box::new(|_| Box::pin(async {}) as futures::future::BoxFuture<'static, ()>)
-                as ImportProgress,
-        )
-        .await;
-        // SAFETY: restore before assertions.
+        let result = import(Uuid::nil(), Uuid::nil(), tx, ignore_progress()).await;
+        // SAFETY: as above, still under TEST_HOME_LOCK.
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("HOME", v),
@@ -3394,9 +3376,9 @@ mod tests {
             // Second prune: the older one (r1).
             let second = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
             assert_eq!(second.results_blanked, 1);
-            let lines = read_lines(f.path());
+            let after = read_lines(f.path());
             assert_eq!(
-                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                after[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
                 "[pruned]"
             );
 
@@ -3479,9 +3461,9 @@ mod tests {
             );
 
             prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
-            let lines = read_lines(f.path());
+            let after = read_lines(f.path());
             assert_eq!(
-                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                after[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
                 "[pruned]"
             );
             assert_eq!(
@@ -3519,9 +3501,9 @@ mod tests {
             );
 
             prune_gemini_jsonl(f.path(), "Bash", "").unwrap();
-            let lines = read_lines(f.path());
+            let after = read_lines(f.path());
             assert_eq!(
-                lines[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
+                after[0]["toolCalls"][0]["result"][0]["functionResponse"]["response"]["output"],
                 "[pruned]"
             );
             assert_eq!(count_gemini_matches(f.path(), "Bash", "").unwrap(), 0);
@@ -3584,10 +3566,10 @@ mod tests {
             // Second prune blanks s1 — and ALL its copies (incremental + snapshot).
             let second = prune_gemini_jsonl(f.path(), "Read", "junk.rs").unwrap();
             assert_eq!(second.results_blanked, 1);
-            let raw = std::fs::read_to_string(f.path()).unwrap();
+            let after_second = std::fs::read_to_string(f.path()).unwrap();
             assert!(
-                !raw.contains(old_body),
-                "every copy of s1 (incl. the snapshot) must be pruned: {raw}"
+                !after_second.contains(old_body),
+                "every copy of s1 (incl. the snapshot) must be pruned: {after_second}"
             );
             assert_eq!(
                 count_gemini_matches(f.path(), "Read", "junk.rs").unwrap(),

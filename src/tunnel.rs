@@ -291,7 +291,7 @@ impl Backend {
             .await
             .context("POST /api/tunnel/ticket")?;
         let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
+        if status == StatusCode::NOT_FOUND {
             bail!("the Zucchini backend doesn't support tunnels yet");
         }
         if !status.is_success() {
@@ -358,7 +358,7 @@ fn base32_lower(bytes: &[u8]) -> String {
     let mut out = String::new();
     let (mut acc, mut bits) = (0u32, 0);
     for &b in bytes {
-        acc = (acc << 8) | b as u32;
+        acc = (acc << 8) | u32::from(b);
         bits += 8;
         while bits >= 5 {
             bits -= 5;
@@ -804,9 +804,9 @@ impl Inner {
         }
         let cancel = CancellationToken::new();
         let connected = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(self.clone().run(
+        let task = tokio::spawn(Arc::clone(self).run(
             def.clone(),
-            connected.clone(),
+            Arc::clone(&connected),
             cancel.clone(),
             wait_for_admission,
         ));
@@ -814,7 +814,7 @@ impl Inner {
             def.id.clone(),
             Entry {
                 def,
-                connected: connected.clone(),
+                connected: Arc::clone(&connected),
                 cancel,
                 task,
             },
@@ -917,7 +917,7 @@ impl Inner {
             info!(id = %def.id, "tunnel connected");
             let new = Connection::start(ws, &def, cancel);
             let stop = cancel.child_token();
-            hellos.start(stop.clone(), self.clone().hello(def.clone(), stop));
+            hellos.start(stop.clone(), Arc::clone(self).hello(def.clone(), stop));
             if let Some(old) = current.replace(new) {
                 old.retire.cancel();
             }
@@ -1061,7 +1061,7 @@ impl Inner {
         def: TunnelDef,
         after: Option<tokio::task::JoinHandle<()>>,
     ) {
-        let inner = self.clone();
+        let inner = Arc::clone(self);
         let task = tokio::spawn(async move { inner.purge(def, after).await });
         let mut tasks = self.purge_tasks.lock().expect("tunnel purges mutex");
         tasks.retain(|t| !t.is_finished());
@@ -1308,11 +1308,12 @@ async fn serve(
         let Some(Ok(stream)) = next else {
             return;
         };
-        let (local, requests) = (local.clone(), in_flight.clone());
+        let (local, requests) = (Arc::clone(&local), Arc::clone(&in_flight));
         let busy = in_flight.enter();
         in_flight.spawn(async move {
-            let service =
-                hyper::service::service_fn(move |req| proxy(req, local.clone(), requests.clone()));
+            let service = hyper::service::service_fn(move |req| {
+                proxy(req, Arc::clone(&local), Arc::clone(&requests))
+            });
             let served = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream.compat()), service)
                 .with_upgrades()
@@ -1340,7 +1341,7 @@ struct InFlight {
 impl InFlight {
     fn enter(self: &Arc<Self>) -> Busy {
         self.count.fetch_add(1, Ordering::SeqCst);
-        Busy(self.clone())
+        Busy(Arc::clone(self))
     }
 
     fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
@@ -1825,7 +1826,7 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 impl TunnelDef {
     pub fn for_test(chat_id: &str, user_id: Uuid) -> Self {
-        let id = random_base32(16)[..26].to_string();
+        let id = random_base32(16);
         Self {
             ticket: Ticket {
                 ticket: String::new(),
@@ -1915,7 +1916,7 @@ mod tests {
         let mut map = hyper::HeaderMap::new();
         for (k, v) in headers {
             map.append(
-                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
                 HeaderValue::from_str(v).unwrap(),
             );
         }
@@ -2003,42 +2004,51 @@ mod tests {
         let auth = Auth::Token {
             token: "secret".into(),
         };
-        let (ok, headers, _, cookie) = check(&auth, &[("authorization", "Bearer secret")], "/a");
-        assert!(ok && !cookie);
-        assert!(headers.get("authorization").is_none());
-
-        let (ok, _, uri, cookie) = check(&auth, &[], "/a?x=1&zt=secret&y=2");
-        assert!(ok && cookie);
-        assert_eq!(uri.to_string(), "/a?x=1&y=2");
-
-        let (ok, headers, _, cookie) = check(&auth, &[("cookie", "a=1; zt=secret; b=2")], "/a");
-        assert!(ok && !cookie);
-        assert_eq!(headers.get("cookie").unwrap(), "a=1; b=2");
-
-        let (ok, headers, uri, _) = check(
-            &auth,
-            &[("authorization", "Bearer wrong"), ("cookie", "zt=wrong")],
-            "/a?zt=wrong",
-        );
-        assert!(!ok);
-        assert!(headers.get("cookie").is_none() && uri.query().is_none());
-        assert!(!check(&auth, &[], "/a").0);
-
+        {
+            let (ok, headers, _, cookie) =
+                check(&auth, &[("authorization", "Bearer secret")], "/a");
+            assert!(ok && !cookie);
+            assert!(headers.get("authorization").is_none());
+        }
+        {
+            let (ok, _, uri, cookie) = check(&auth, &[], "/a?x=1&zt=secret&y=2");
+            assert!(ok && cookie);
+            assert_eq!(uri.to_string(), "/a?x=1&y=2");
+        }
+        {
+            let (ok, headers, _, cookie) = check(&auth, &[("cookie", "a=1; zt=secret; b=2")], "/a");
+            assert!(ok && !cookie);
+            assert_eq!(headers.get("cookie").unwrap(), "a=1; b=2");
+        }
+        {
+            let (ok, headers, uri, _) = check(
+                &auth,
+                &[("authorization", "Bearer wrong"), ("cookie", "zt=wrong")],
+                "/a?zt=wrong",
+            );
+            assert!(!ok);
+            assert!(headers.get("cookie").is_none() && uri.query().is_none());
+            assert!(!check(&auth, &[], "/a").0);
+        }
         // Several `zt`s: any match lets it in, none is forwarded.
-        let (ok, headers, _, _) = check(
-            &auth,
-            &[("cookie", "zt=old; a=1"), ("cookie", "zt=secret; zt=other")],
-            "/a",
-        );
-        assert!(ok);
-        assert_eq!(
-            headers.get_all("cookie").iter().collect::<Vec<_>>(),
-            ["a=1"]
-        );
-        let (ok, _, uri, _) = check(&auth, &[], "/a?zt=old&zt=secret&x=1");
-        assert!(ok);
-        assert_eq!(uri.to_string(), "/a?x=1");
-        assert!(!check(&auth, &[("authorization", "Bearer secretx")], "/a").0);
+        {
+            let (ok, headers, _, _) = check(
+                &auth,
+                &[("cookie", "zt=old; a=1"), ("cookie", "zt=secret; zt=other")],
+                "/a",
+            );
+            assert!(ok);
+            assert_eq!(
+                headers.get_all("cookie").iter().collect::<Vec<_>>(),
+                ["a=1"]
+            );
+        }
+        {
+            let (ok, _, uri, _) = check(&auth, &[], "/a?zt=old&zt=secret&x=1");
+            assert!(ok);
+            assert_eq!(uri.to_string(), "/a?x=1");
+            assert!(!check(&auth, &[("authorization", "Bearer secretx")], "/a").0);
+        }
     }
 
     #[test]
@@ -2050,8 +2060,9 @@ mod tests {
             ("sec-fetch-mode", "navigate"),
             ("sec-fetch-dest", "document"),
         ];
-        let (authorized, _, uri) = check_method(&auth, "GET", &page, "/p?a=1&zt=secret&b=2");
-        let Authorized::Login { set_cookie } = authorized else {
+        let (Authorized::Login { set_cookie }, _, uri) =
+            check_method(&auth, "GET", &page, "/p?a=1&zt=secret&b=2")
+        else {
             panic!("not redirected");
         };
         let origin = "https://victim.zuc.run";
@@ -2065,23 +2076,27 @@ mod tests {
             .to_str()
             .unwrap()
             .starts_with("zt=secret;"));
-        let (authorized, _, uri) = check_method(&auth, "HEAD", &page, "/?zt=secret");
-        assert!(matches!(authorized, Authorized::Login { .. }));
-        let location =
-            |uri: &hyper::Uri| login_redirect(origin, uri, None).headers()["location"].clone();
-        assert_eq!(location(&uri), "https://victim.zuc.run/");
+        let location = |method, path| {
+            let (authorized, _, stripped) = check_method(&auth, method, &page, path);
+            assert!(
+                matches!(authorized, Authorized::Login { .. }),
+                "{method} {path}"
+            );
+            login_redirect(origin, &stripped, None).headers()["location"].clone()
+        };
+        assert_eq!(location("HEAD", "/?zt=secret"), "https://victim.zuc.run/");
         // Never off the tunnel: a scheme-relative path stays a path.
         for path in ["//evil.example/?zt=secret", "/\\evil.example/?zt=secret"] {
-            let (authorized, _, uri) = check_method(&auth, "GET", &page, path);
-            assert!(matches!(authorized, Authorized::Login { .. }), "{path}");
-            assert!(location(&uri)
+            assert!(location("GET", path)
                 .to_str()
                 .unwrap()
                 .starts_with("https://victim.zuc.run/"));
         }
         let with_cookie = [&page[..], &[("cookie", "zt=secret")]].concat();
-        let (authorized, _, _) = check_method(&auth, "GET", &with_cookie, "/?zt=secret");
-        assert!(matches!(authorized, Authorized::Login { set_cookie: None }));
+        assert!(matches!(
+            check_method(&auth, "GET", &with_cookie, "/?zt=secret").0,
+            Authorized::Login { set_cookie: None }
+        ));
 
         // Everything else is served as before: API clients, webhooks, an
         // iframe, a WebSocket, a form post, a request that also has a Bearer.
@@ -2125,9 +2140,9 @@ mod tests {
 
         // The cookie alone lets a WebSocket in: Safari sends no Basic there.
         let cookie = cookie.to_str().unwrap().split(';').next().unwrap();
-        let (ok, headers, _, set) = check(&auth, &[("cookie", cookie)], "/");
+        let (ok, forwarded, _, set) = check(&auth, &[("cookie", cookie)], "/");
         assert!(ok && !set);
-        assert!(headers.get("cookie").is_none());
+        assert!(forwarded.get("cookie").is_none());
         assert!(!check(&auth, &[("cookie", "zt=wrong")], "/").0);
         assert!(unauthorized(Some(&auth))
             .headers()
@@ -2174,12 +2189,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let got: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
-        let seen = got.clone();
+        let seen = Arc::clone(&got);
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let (seen, body) = (seen.clone(), body.clone());
+                let (seen, body) = (Arc::clone(&seen), body.clone());
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                    let (seen, body) = (seen.clone(), body.clone());
+                    let (seen, body) = (Arc::clone(&seen), body.clone());
                     async move {
                         let bytes = req.into_body().collect().await.unwrap().to_bytes();
                         seen.lock()
@@ -2250,7 +2265,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay = format!("ws://{}", listener.local_addr().unwrap());
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = hits.clone();
+        let counted = Arc::clone(&hits);
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 counted.fetch_add(1, Ordering::Relaxed);
@@ -2272,7 +2287,7 @@ mod tests {
 
     fn recorded_notices() -> (Deliver, Notices) {
         let notices: Notices = Arc::default();
-        let got = notices.clone();
+        let got = Arc::clone(&notices);
         let deliver: Deliver = Box::new(move |n| {
             got.lock().unwrap().push((n.sender, n.text));
             Box::pin(async { Ok(()) })
@@ -2319,14 +2334,14 @@ mod tests {
     #[tokio::test]
     async fn a_create_meets_the_caps_and_a_stop_under_the_lock() {
         let t = admitted_tunnels(fresh_root("caps"), recorded_notices().0);
-        let fresh = |t: &Tunnels| {
+        let fresh = || {
             let stops = t.0.stops("chat");
             t.0.launch(TunnelDef::for_test("chat", Uuid::nil()), Some(stops), false)
         };
         for _ in 0..MAX_PER_CHAT {
-            fresh(&t).unwrap();
+            fresh().unwrap();
         }
-        assert!(fresh(&t).is_err(), "over the per-chat cap");
+        assert!(fresh().is_err(), "over the per-chat cap");
         t.0.launch(TunnelDef::for_test("other", Uuid::nil()), Some(0), false)
             .unwrap();
 
@@ -2426,10 +2441,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay = format!("ws://{}", listener.local_addr().unwrap());
         let purges = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = purges.clone();
+        let counted = Arc::clone(&purges);
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let counted = counted.clone();
+                let counted = Arc::clone(&counted);
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let purge =
                         req.method() == hyper::Method::DELETE && req.uri().path() == "/queue";
@@ -2484,19 +2499,19 @@ mod tests {
         t.uninstall(Duration::from_secs(10)).await;
         assert_eq!(purges.load(Ordering::Relaxed), 2, "both queues purged");
 
-        let t = admitted_tunnels(fresh_root("uninstall-offline"), recorded_notices().0);
-        let mut def = TunnelDef::for_test("chat", Uuid::nil());
-        def.ticket.relay = "ws://127.0.0.1:1".into();
-        t.0.launch(def, None, false).unwrap();
+        let offline = admitted_tunnels(fresh_root("uninstall-offline"), recorded_notices().0);
+        let mut unreachable = TunnelDef::for_test("chat", Uuid::nil());
+        unreachable.ticket.relay = "ws://127.0.0.1:1".into();
+        offline.0.launch(unreachable, None, false).unwrap();
         let begun = std::time::Instant::now();
         let uninstall = tokio::spawn({
-            let t = t.clone();
-            async move { t.uninstall(Duration::from_millis(300)).await }
+            let offline = offline.clone();
+            async move { offline.uninstall(Duration::from_millis(300)).await }
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         let late = TunnelDef::for_test("chat", Uuid::nil());
         assert!(
-            t.0.launch(late, Some(0), false).is_err(),
+            offline.0.launch(late, Some(0), false).is_err(),
             "no create registers during the purge wait"
         );
         uninstall.await.unwrap();
@@ -2532,22 +2547,22 @@ mod tests {
         t.shutdown().await;
         std::fs::remove_dir_all(blocker).unwrap();
 
-        let t = start();
-        assert_eq!(t.list("chat").len(), 1, "reopened, not forgotten");
+        let restarted = start();
+        assert_eq!(restarted.list("chat").len(), 1, "reopened, not forgotten");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode =
                 |m| std::fs::set_permissions(&root, std::fs::Permissions::from_mode(m)).unwrap();
             mode(0o300);
-            let unsynced = t.delete("chat", &def.id);
+            let unsynced = restarted.delete("chat", &def.id);
             mode(0o700);
             assert!(
                 unsynced.is_err(),
                 "a rename whose dir fsync failed is not saved"
             );
         }
-        t.shutdown().await;
+        restarted.shutdown().await;
     }
 
     type RelayLog = Arc<Mutex<Vec<&'static str>>>;
@@ -2563,8 +2578,8 @@ mod tests {
     ) -> (String, RelayLog) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay = format!("ws://{}", listener.local_addr().unwrap());
-        let log: RelayLog = Arc::default();
-        let logged = log.clone();
+        let relay_log: RelayLog = Arc::default();
+        let logged = Arc::clone(&relay_log);
         tokio::spawn(async move {
             let mut upstreams = 0;
             while let Ok((tcp, _)) = listener.accept().await {
@@ -2588,9 +2603,9 @@ mod tests {
                     });
                     continue;
                 }
-                let log = logged.clone();
+                let log = Arc::clone(&logged);
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                    let log = log.clone();
+                    let log = Arc::clone(&log);
                     async move {
                         let mut resp = Response::new(Full::new(Bytes::new()));
                         if req.method() == hyper::Method::DELETE {
@@ -2612,7 +2627,7 @@ mod tests {
                 );
             }
         });
-        (relay, log)
+        (relay, relay_log)
     }
 
     #[tokio::test]
@@ -2690,11 +2705,11 @@ mod tests {
         assert!(path.exists(), "unlink refused");
         t.shutdown().await;
 
-        let t = start();
-        assert!(t.running_in("chat").is_empty(), "not reopened");
+        let restarted = start();
+        assert!(restarted.running_in("chat").is_empty(), "not reopened");
         poll_until(20, || !path.exists()).await;
         assert!(!path.exists(), "purge done");
-        t.shutdown().await;
+        restarted.shutdown().await;
     }
 
     /// Status and `x-zucchini-tunnel` of a POST proxied to `port`.
@@ -2709,8 +2724,9 @@ mod tests {
         });
         tokio::spawn(async move {
             let (tcp, _) = front.accept().await.unwrap();
-            let service =
-                hyper::service::service_fn(move |req| proxy(req, local.clone(), Arc::default()));
+            let service = hyper::service::service_fn(move |req| {
+                proxy(req, Arc::clone(&local), Arc::default())
+            });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(tcp), service)
                 .await;
@@ -2778,11 +2794,11 @@ mod tests {
         CancellationToken,
         tokio::task::JoinHandle<()>,
     ) {
-        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", relay.local_addr().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
         let (spawner_side, relay_side) =
             tokio::join!(tokio_tungstenite::connect_async(url), async {
-                let (tcp, _) = relay.accept().await.unwrap();
+                let (tcp, _) = listener.accept().await.unwrap();
                 let tcp = tokio_tungstenite::MaybeTlsStream::Plain(tcp);
                 tokio_tungstenite::accept_async(tcp).await.unwrap()
             });
@@ -2919,26 +2935,29 @@ mod tests {
 
     #[tokio::test]
     async fn a_retired_connection_serves_an_open_websocket_until_it_closes_or_the_grace_ends() {
-        let (mut ws, retire, served) = websocket_through_serve(Duration::from_secs(30)).await;
-        echoes(&mut ws).await;
-        retire.cancel();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!served.is_finished(), "retired with a WebSocket open");
-        echoes(&mut ws).await;
-        ws.close(None).await.unwrap();
-        drop(ws);
-        tokio::time::timeout(Duration::from_secs(5), served)
-            .await
-            .expect("closes once the WebSocket did")
-            .unwrap();
-
-        let (mut ws, retire, served) = websocket_through_serve(Duration::from_secs(1)).await;
-        echoes(&mut ws).await;
-        retire.cancel();
-        tokio::time::timeout(Duration::from_secs(5), served)
-            .await
-            .expect("closes when the grace ends, the WebSocket still open")
-            .unwrap();
+        {
+            let (mut ws, retire, served) = websocket_through_serve(Duration::from_secs(30)).await;
+            echoes(&mut ws).await;
+            retire.cancel();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!served.is_finished(), "retired with a WebSocket open");
+            echoes(&mut ws).await;
+            ws.close(None).await.unwrap();
+            drop(ws);
+            tokio::time::timeout(Duration::from_secs(5), served)
+                .await
+                .expect("closes once the WebSocket did")
+                .unwrap();
+        }
+        {
+            let (mut ws, retire, served) = websocket_through_serve(Duration::from_secs(1)).await;
+            echoes(&mut ws).await;
+            retire.cancel();
+            tokio::time::timeout(Duration::from_secs(5), served)
+                .await
+                .expect("closes when the grace ends, the WebSocket still open")
+                .unwrap();
+        }
     }
 
     #[test]
@@ -3000,7 +3019,7 @@ mod relay_smoke {
     async fn fake_backend(query: &str) {
         reqwest::get(format!("{FAKE_BACKEND}/control?{query}"))
             .await
-            .unwrap();
+            .expect("fake ticket backend control");
     }
 
     /// An HTTP server that records each request and answers it with its JSON;
@@ -3010,10 +3029,10 @@ mod relay_smoke {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
-            let seen = seen.clone();
+            let seen = Arc::clone(&seen);
             tokio::spawn(async move {
                 let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                    let seen = seen.clone();
+                    let seen = Arc::clone(&seen);
                     async move {
                         let headers: serde_json::Map<String, serde_json::Value> = req
                             .headers()
@@ -3031,7 +3050,7 @@ mod relay_smoke {
                         let record = serde_json::json!({
                             "method": method, "uri": uri, "headers": headers, "body": String::from_utf8_lossy(&body),
                         });
-                        seen.lock().unwrap().push(record.clone());
+                        seen.lock().expect("seen mutex").push(record.clone());
                         if uri == "/sse" {
                             let (tx, rx) = futures::channel::mpsc::channel::<
                                 Result<hyper::body::Frame<Bytes>, Infallible>,
@@ -3092,22 +3111,24 @@ mod relay_smoke {
     }
 
     async fn create(t: &Tunnels, port: u16, auth: Option<&str>) -> TunnelInfo {
-        let auth = auth.map(|a| Auth::generate(a).unwrap());
+        let auth = auth.map(|a| Auth::generate(a).expect("auth kind"));
         let prepared = t
             .prepare("chat", Uuid::nil(), port, auth, false, false)
             .await
-            .unwrap();
-        let id = t.register(prepared).unwrap();
-        let info = t.wait_connected(&id).await.unwrap();
+            .expect("prepare the tunnel");
+        let id = t.register(prepared).expect("register the tunnel");
+        let info = t.wait_connected(&id).await.expect("wait for the tunnel");
         assert!(info.connected, "{} did not connect", info.id);
         info
     }
 
     async fn serve_local() -> (u16, Seen, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the local server");
+        let port = listener.local_addr().expect("local server address").port();
         let seen: Seen = Arc::default();
-        let server = tokio::spawn(local_server(listener, seen.clone()));
+        let server = tokio::spawn(local_server(listener, Arc::clone(&seen)));
         (port, seen, server)
     }
 
@@ -3170,8 +3191,8 @@ mod relay_smoke {
 
         // --auth token / basic.
         assert_eq!(get(&token, "/").send().await.unwrap().status(), 401);
-        let echo = json(get(&token, "/").bearer_auth(&tok).send().await.unwrap()).await;
-        assert!(echo["headers"].get("authorization").is_none());
+        let bearer_echo = json(get(&token, "/").bearer_auth(&tok).send().await.unwrap()).await;
+        assert!(bearer_echo["headers"].get("authorization").is_none());
         let resp = get(&token, &format!("/p?zt={tok}&b=2"))
             .send()
             .await
@@ -3179,7 +3200,7 @@ mod relay_smoke {
         let cookie = resp.headers()["set-cookie"].to_str().unwrap().to_string();
         assert!(cookie.ends_with("; Path=/; HttpOnly; Secure; SameSite=Lax"));
         assert_eq!(json(resp).await["uri"], "/p?b=2");
-        let echo = json(
+        let cookie_echo = json(
             get(&token, "/")
                 .header("cookie", format!("zt={tok}; a=1"))
                 .send()
@@ -3187,10 +3208,10 @@ mod relay_smoke {
                 .unwrap(),
         )
         .await;
-        assert_eq!(echo["headers"]["cookie"], "a=1");
-        let resp = get(&basic, "/").send().await.unwrap();
-        assert_eq!(resp.status(), 401);
-        assert!(resp.headers().contains_key("www-authenticate"));
+        assert_eq!(cookie_echo["headers"]["cookie"], "a=1");
+        let challenge = get(&basic, "/").send().await.unwrap();
+        assert_eq!(challenge.status(), 401);
+        assert!(challenge.headers().contains_key("www-authenticate"));
         json(
             get(&basic, "/")
                 .basic_auth(user, Some(password))
@@ -3213,7 +3234,7 @@ mod relay_smoke {
         }
         assert!(String::from_utf8_lossy(&rest).contains("data: 2"));
         assert!(
-            started.elapsed() - first_at >= Duration::from_millis(500),
+            started.elapsed().checked_sub(first_at).unwrap() >= Duration::from_millis(500),
             "streamed, not buffered"
         );
         println!("ok: SSE streamed (first event after {first_at:?})");
@@ -3231,10 +3252,16 @@ mod relay_smoke {
         server.abort();
         let _ = server.await;
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let resp = get(&open, "/").send().await.unwrap();
-        let headers = format!("{:?}", resp.headers());
-        let status = resp.status();
-        let body: String = resp.text().await.unwrap().chars().take(300).collect();
+        let upstream_down = get(&open, "/").send().await.unwrap();
+        let headers = format!("{:?}", upstream_down.headers());
+        let status = upstream_down.status();
+        let body: String = upstream_down
+            .text()
+            .await
+            .unwrap()
+            .chars()
+            .take(300)
+            .collect();
         // The relay turns our upstream-down 502 into its own 503, which
         // Cloudflare passes through (it replaces a 502 with its own page).
         assert_eq!(status, 503, "{headers} {body}");
@@ -3243,16 +3270,16 @@ mod relay_smoke {
             "{body}"
         );
         println!("upstream-down GET: 503 {body:?}");
-        let resp = http
+        let queued = http
             .post(format!("{}/hook", open.url))
             .body("event-1")
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "queued");
+        assert_eq!(queued.status(), 200, "queued");
         let before = seen.lock().unwrap().len();
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
-        let server = tokio::spawn(local_server(listener, seen.clone()));
+        let restarted_server = tokio::spawn(local_server(listener, Arc::clone(&seen)));
         until("the queued request is replayed", 45, || {
             seen.lock().unwrap().len() > before
         })
@@ -3268,14 +3295,14 @@ mod relay_smoke {
 
         // Restart: the tunnels come back under the same URLs.
         t.shutdown().await;
-        let t = tunnels(&root, Timing::default());
-        assert_eq!(t.list("chat").len(), 4);
+        let restored = tunnels(&root, Timing::default());
+        assert_eq!(restored.list("chat").len(), 4);
         until("restored", 30, || {
-            t.list("chat").iter().all(|i| i.connected)
+            restored.list("chat").iter().all(|i| i.connected)
         })
         .await;
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let echo = json(
+        let again = json(
             get(&token, "/again")
                 .bearer_auth(&tok)
                 .send()
@@ -3283,19 +3310,19 @@ mod relay_smoke {
                 .unwrap(),
         )
         .await;
-        assert_eq!(echo["uri"], "/again");
+        assert_eq!(again["uri"], "/again");
         println!("ok: restored after a restart");
 
         // Delete with a request in the relay's queue: once the DELETE /queue
         // landed the relay knows the id no more, so it answers 404 to any
         // request. A 503 would mean it still knows the id, disconnected, and
         // a POST would be queued (200).
-        server.abort();
-        let _ = server.await;
-        let resp = http.post(format!("{}/hook", open.url)).body("pending");
-        assert_eq!(resp.send().await.unwrap().status(), 200, "queued");
-        for info in t.list("chat") {
-            t.delete("chat", &info.id).unwrap();
+        restarted_server.abort();
+        let _ = restarted_server.await;
+        let pending = http.post(format!("{}/hook", open.url)).body("pending");
+        assert_eq!(pending.send().await.unwrap().status(), 200, "queued");
+        for info in restored.list("chat") {
+            restored.delete("chat", &info.id).unwrap();
         }
         until("the queues are purged", 60, || json_files(&root).is_empty()).await;
         for info in [&open, &token, &basic, &ws] {
@@ -3306,12 +3333,16 @@ mod relay_smoke {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             assert_eq!(get(info, "/").send().await.unwrap().status(), 404);
-            let resp = http.post(format!("{}/hook", info.url)).body("late");
-            let status = resp.send().await.unwrap().status();
-            assert_eq!(status, 404, "relay kept {}", info.id);
+            let late = http.post(format!("{}/hook", info.url)).body("late");
+            assert_eq!(
+                late.send().await.unwrap().status(),
+                404,
+                "relay kept {}",
+                info.id
+            );
         }
         println!("ok: deleted, relay forgot the ids (404, POST not queued)");
-        t.shutdown().await;
+        restored.shutdown().await;
     }
 
     /// Deletes what earlier (failed) runs left in their temp roots, so the
@@ -3363,7 +3394,7 @@ mod relay_smoke {
         ));
         let stop = CancellationToken::new();
         let stream = {
-            let (sent, stop, url) = (sent.clone(), stop.clone(), info.url.clone());
+            let (sent, stop, url) = (Arc::clone(&sent), stop.clone(), info.url.clone());
             tokio::spawn(async move {
                 let http = reqwest::Client::new();
                 for n in 0u32.. {
@@ -3390,15 +3421,15 @@ mod relay_smoke {
                 }
             })
         };
-        let connected = |t: &Tunnels| t.list("chat").first().is_some_and(|i| i.connected);
-        let fetched = |t: &Tunnels| t.running_in("chat")[0].ticket.fetched_at;
+        let connected = || t.list("chat").first().is_some_and(|i| i.connected);
+        let fetched = || t.running_in("chat")[0].ticket.fetched_at;
 
         // Two refreshes with their make-before-break hand-over.
         let mut refreshes = 0;
-        let mut last = fetched(&t);
+        let mut last = fetched();
         while refreshes < 2 {
-            until("a refresh", 90, || fetched(&t) != last).await;
-            last = fetched(&t);
+            until("a refresh", 90, || fetched() != last).await;
+            last = fetched();
             refreshes += 1;
             println!("refresh {refreshes} done");
         }
@@ -3407,12 +3438,12 @@ mod relay_smoke {
         // Refresh fails: piko cuts the connection at the ticket's exp.
         fake_backend("fail=1").await;
         let exp = t.running_in("chat")[0].ticket.exp;
-        until("piko disconnects at exp", 200, || !connected(&t)).await;
+        until("piko disconnects at exp", 200, || !connected()).await;
         let cut_at = std::time::Instant::now();
         println!("disconnected {}s after exp", unix_now() - exp);
         tokio::time::sleep(Duration::from_secs(5)).await;
         fake_backend("fail=0").await;
-        until("reconnected", 120, || connected(&t)).await;
+        until("reconnected", 120, connected).await;
         println!("reconnected");
         tokio::time::sleep(Duration::from_secs(10)).await;
         stop.cancel();

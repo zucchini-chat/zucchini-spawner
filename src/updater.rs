@@ -157,7 +157,7 @@ pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn run_update_loop(update_tx: mpsc::Sender<String>) {
+pub async fn run_update_loop(update_tx: mpsc::Sender<String>) -> ! {
     let base = base_url();
     let interval = check_interval();
     let mut last = last_applied_version();

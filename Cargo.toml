@@ -101,3 +101,68 @@ windows-sys = { version = "0.59", features = [
 # See the note on `tokio` above — enables the pausable test clock for the
 # idle-reaper tests only.
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints.rust]
+unused_qualifications = "warn"
+elided_lifetimes_in_paths = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+ambiguous_negative_literals = "warn"
+non_ascii_idents = "warn"
+unit_bindings = "warn"
+if_let_rescope = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+# shadowing and naming
+shadow_unrelated = "warn"
+used_underscore_binding = "warn"
+used_underscore_items = "warn"
+same_name_method = "warn"
+wildcard_imports = "warn"
+enum_glob_use = "warn"
+# hidden types and casts
+default_trait_access = "warn"
+clone_on_ref_ptr = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+cast_lossless = "warn"
+as_underscore = "warn"
+as_pointer_underscore = "warn"
+borrow_as_ptr = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+fn_to_numeric_cast_any = "warn"
+option_option = "warn"
+fn_params_excessive_bools = "warn"
+precedence_bits = "warn"
+literal_string_with_formatting_args = "warn"
+# silent fallibility and hidden panics
+unwrap_used = "warn"
+string_slice = "warn"
+unused_result_ok = "warn"
+fallible_impl_from = "warn"
+match_wild_err_arm = "warn"
+unchecked_time_subtraction = "warn"
+path_buf_push_overwrite = "warn"
+should_panic_without_expect = "warn"
+ignore_without_reason = "warn"
+# hidden control flow and drops
+match_wildcard_for_single_variants = "warn"
+ignored_unit_patterns = "warn"
+significant_drop_in_scrutinee = "warn"
+unused_async = "warn"
+infinite_loop = "warn"
+mem_forget = "warn"
+debug_assert_with_mut_call = "warn"
+mixed_read_write_in_expression = "warn"
+needless_bitwise_bool = "warn"
+try_err = "warn"
+undocumented_unsafe_blocks = "warn"
+# lint hygiene and leftovers
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

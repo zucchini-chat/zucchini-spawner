@@ -272,8 +272,11 @@ mod tests {
             err.starts_with("system prompt file `missing.md`: "),
             "{err}"
         );
-        let err = d.render("binary.bin", "").unwrap_err();
-        assert_eq!(err, "system prompt file `binary.bin`: not UTF-8 text");
+        let binary_err = d.render("binary.bin", "").unwrap_err();
+        assert_eq!(
+            binary_err,
+            "system prompt file `binary.bin`: not UTF-8 text"
+        );
     }
 
     #[test]
@@ -289,6 +292,7 @@ mod tests {
         let d = Dirs::new();
         let fifo = d.root.join("project/fifo");
         let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
         for special in ["fifo", "/dev/zero"] {
             let err = d.render(special, "").unwrap_err();
@@ -323,10 +327,10 @@ mod tests {
         assert!(d.render("half.md", "short").is_ok());
         let err = d.render("half.md", &"y".repeat(MAX_BYTES / 2)).unwrap_err();
         assert!(err.contains("the limit is"), "{err}");
-        let err = d.render("big.md", "").unwrap_err();
+        let big_err = d.render("big.md", "").unwrap_err();
         assert!(
-            err.starts_with("system prompt file `big.md`: over the "),
-            "{err}"
+            big_err.starts_with("system prompt file `big.md`: over the "),
+            "{big_err}"
         );
     }
 

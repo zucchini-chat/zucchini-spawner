@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use nix::errno::Errno;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -109,7 +110,7 @@ impl ProcessGroup {
             .id()
             .ok_or_else(|| io::Error::other("child has no pid (already reaped)"))?;
         Ok(ProcessGroup {
-            pgid: Pid::from_raw(pid as i32),
+            pgid: nix_pid(pid)?,
         })
     }
 
@@ -152,17 +153,19 @@ impl ProcessGroup {
 /// which is macOS-only: on Linux systemd kills the service's whole cgroup.
 #[cfg(target_os = "macos")]
 pub fn process_start_time(pid: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: `proc_bsdinfo` is integers and byte arrays, so all-zero is valid.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        )
-    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "proc_bsdinfo is a few hundred bytes"
+    )]
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable `proc_bsdinfo` of `size` bytes, the buffer
+    // `PROC_PIDTBSDINFO` fills; the kernel writes at most `size` bytes.
+    let n =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
     (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
@@ -171,24 +174,32 @@ pub fn process_start_time(_pid: u32) -> Option<u64> {
     None
 }
 
+/// `pid` as a `pid_t`; past its range no process can exist (`ESRCH`), and a
+/// wrapped negative pid would make `kill` signal a whole group or every process.
+fn nix_pid(pid: u32) -> nix::Result<Pid> {
+    i32::try_from(pid)
+        .map(Pid::from_raw)
+        .map_err(|_| Errno::ESRCH)
+}
+
 /// A process with this pid exists (zombies included).
 pub fn process_exists(pid: u32) -> bool {
-    signal::kill(Pid::from_raw(pid as i32), None) != Err(nix::errno::Errno::ESRCH)
+    nix_pid(pid).and_then(|pid| signal::kill(pid, None)) != Err(Errno::ESRCH)
 }
 
 /// SIGTERM the process group `pgid`.
 pub fn terminate_process_group(pgid: u32) {
-    let _ = signal::killpg(Pid::from_raw(pgid as i32), Signal::SIGTERM);
+    let _ = nix_pid(pgid).and_then(|pgid| signal::killpg(pgid, Signal::SIGTERM));
 }
 
 /// SIGKILL the process group `pgid`.
 pub fn kill_process_group(pgid: u32) {
-    let _ = signal::killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+    let _ = nix_pid(pgid).and_then(|pgid| signal::killpg(pgid, Signal::SIGKILL));
 }
 
 /// The process group `pgid` has a member (zombies included).
 pub fn process_group_exists(pgid: u32) -> bool {
-    signal::killpg(Pid::from_raw(pgid as i32), None) != Err(nix::errno::Errno::ESRCH)
+    nix_pid(pgid).and_then(|pgid| signal::killpg(pgid, None)) != Err(Errno::ESRCH)
 }
 
 // ---------------------------------------------------------------------------
@@ -248,14 +259,13 @@ fn parse_ps(out: &str) -> Vec<(u32, u32)> {
 /// once per process.
 #[cfg(target_os = "macos")]
 fn footprint_kb(pid: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: `rusage_info_v2` is all integers, so all-zero is valid.
     let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::proc_pid_rusage(
-            pid as libc::c_int,
-            libc::RUSAGE_INFO_V2,
-            (&mut info as *mut libc::rusage_info_v2).cast(),
-        )
-    };
+    // SAFETY: `info` is a writable `rusage_info_v2`, the struct the
+    // `RUSAGE_INFO_V2` flavor fills (libc types the buffer as `*mut
+    // rusage_info_t`, but the kernel writes the struct itself).
+    let rc = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V2, (&raw mut info).cast()) };
     (rc == 0).then_some(info.ri_phys_footprint / 1024)
 }
 
@@ -263,8 +273,8 @@ fn footprint_kb(pid: u32) -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn footprint_kb(pid: u32) -> Option<u64> {
     let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
-    let line = rollup.lines().find(|l| l.starts_with("Pss:"))?;
-    line["Pss:".len()..].split_whitespace().next()?.parse().ok()
+    let pss = rollup.lines().find_map(|l| l.strip_prefix("Pss:"))?;
+    pss.split_whitespace().next()?.parse().ok()
 }
 
 /// Total RAM, and pressure at the kernel's warn level or worse (the level
@@ -272,28 +282,32 @@ fn footprint_kb(pid: u32) -> Option<u64> {
 #[cfg(target_os = "macos")]
 pub fn memory() -> Option<crate::warm::Memory> {
     const PRESSURE_WARN: i32 = 2;
-    let total_bytes: u64 = sysctl_value(c"hw.memsize")?;
-    let level: i32 = sysctl_value(c"kern.memorystatus_vm_pressure_level")?;
+    let total_bytes = u64::from_ne_bytes(sysctl_value(c"hw.memsize")?);
+    let level = i32::from_ne_bytes(sysctl_value(c"kern.memorystatus_vm_pressure_level")?);
     Some(crate::warm::Memory {
         total_kb: total_bytes / 1024,
         pressure: level >= PRESSURE_WARN,
     })
 }
 
+/// The value of sysctl `name`, if it is exactly `N` bytes.
 #[cfg(target_os = "macos")]
-fn sysctl_value<T: Default>(name: &std::ffi::CStr) -> Option<T> {
-    let mut value = T::default();
-    let mut size = std::mem::size_of::<T>();
+fn sysctl_value<const N: usize>(name: &std::ffi::CStr) -> Option<[u8; N]> {
+    let mut value = [0u8; N];
+    let mut size = N;
+    // SAFETY: `name` is NUL-terminated; `value` is a writable buffer of `size`
+    // bytes, of which the kernel writes at most `size` and reports the count
+    // back in `size`; a null new value makes this a read.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
-            (&mut value as *mut T).cast(),
-            &mut size,
+            value.as_mut_ptr().cast(),
+            &raw mut size,
             std::ptr::null_mut(),
             0,
         )
     };
-    (rc == 0 && size == std::mem::size_of::<T>()).then_some(value)
+    (rc == 0 && size == N).then_some(value)
 }
 
 /// Total RAM, and pressure below 10% `MemAvailable`. `None` if unreadable.
@@ -301,8 +315,8 @@ fn sysctl_value<T: Default>(name: &std::ffi::CStr) -> Option<T> {
 pub fn memory() -> Option<crate::warm::Memory> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let field = |name: &str| -> Option<u64> {
-        let line = meminfo.lines().find(|l| l.starts_with(name))?;
-        line[name.len()..].split_whitespace().next()?.parse().ok()
+        let value = meminfo.lines().find_map(|l| l.strip_prefix(name))?;
+        value.split_whitespace().next()?.parse().ok()
     };
     let total_kb = field("MemTotal:")?;
     let available_kb = field("MemAvailable:")?;
@@ -351,6 +365,8 @@ pub fn acquire_single_instance_lock(path: &Path) -> io::Result<Option<InstanceLo
         .truncate(false)
         .open(path)?;
 
+    // SAFETY: `file` is open for the whole call, so its fd is valid; `flock`
+    // takes no pointers.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {

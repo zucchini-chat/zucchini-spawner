@@ -975,7 +975,7 @@ fn imported_agent(body: String, created_at: DateTime<Utc>) -> ImportedMessage {
 /// Parse a single rollout file. Returns `Ok(None)` when the session has no
 /// `cwd` (legacy bare-head file, or a `session_meta` lacking `cwd`) so the
 /// caller skips it. Errors only on unreadable files.
-async fn parse_session(path: &Path) -> anyhow::Result<Option<ParsedSession>> {
+async fn parse_session(path: &Path) -> Result<Option<ParsedSession>> {
     let file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("open {}", path.display()))?;
@@ -1080,7 +1080,7 @@ async fn parse_session(path: &Path) -> anyhow::Result<Option<ParsedSession>> {
                 let ts = line_ts.unwrap_or_else(Utc::now);
                 match pty {
                     Some("function_call") => {
-                        if let Some(frame) = normalize_persisted_function_call(payload.unwrap()) {
+                        if let Some(frame) = payload.and_then(normalize_persisted_function_call) {
                             messages.push(imported_agent(frame, ts));
                         }
                     }
@@ -1094,7 +1094,7 @@ async fn parse_session(path: &Path) -> anyhow::Result<Option<ParsedSession>> {
                             .and_then(|p| p.get("role"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        if let Some(text) = response_item_message_text(payload.unwrap()) {
+                        if let Some(text) = payload.and_then(response_item_message_text) {
                             match role {
                                 "user" => {
                                     if first_fallback_user_text.is_none() {
@@ -1411,7 +1411,7 @@ fn codex_rollout_thread_id(path: &Path) -> Option<String> {
         if first.trim().is_empty() {
             continue;
         }
-        let header: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
+        let header: Value = serde_json::from_str(first.trim()).ok()?;
         if header.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
             return None;
         }
@@ -1512,8 +1512,8 @@ fn codex_function_call_matches(
     // (an unparseable blob is treated as one leaf). See
     // crate::prune::value_is_prune_context_call.
     if let Some(a) = arguments {
-        let decoded = serde_json::from_str::<serde_json::Value>(a)
-            .unwrap_or_else(|_| serde_json::Value::String(a.to_string()));
+        let decoded =
+            serde_json::from_str::<Value>(a).unwrap_or_else(|_| Value::String(a.to_string()));
         if crate::prune::value_is_prune_context_call(&decoded) {
             return false;
         }
@@ -1529,7 +1529,7 @@ fn codex_function_call_matches(
             Some(a) => {
                 let t = a.trim();
                 t.is_empty()
-                    || serde_json::from_str::<serde_json::Value>(t)
+                    || serde_json::from_str::<Value>(t)
                         .ok()
                         .is_some_and(|v| crate::prune::args_value_is_empty(Some(&v)))
             }
@@ -1548,7 +1548,7 @@ fn codex_function_call_matches(
 /// needle matches as the agent saw it. Non-JSON `arguments` (defensive) → glob the
 /// raw string leaf so the call stays reachable.
 fn codex_arguments_match(arguments: &str, needle: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(arguments) {
+    match serde_json::from_str::<Value>(arguments) {
         Ok(v) => crate::prune::value_glob_match(&v, needle),
         Err(_) => crate::prune::glob_leaf_match(arguments, needle),
     }
@@ -1578,15 +1578,10 @@ fn eligible_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::Resu
 /// apply path, via [`crate::prune::rewrite_jsonl_batch_last_only`]). Pushes the matching
 /// `function_call`'s `call_id` in DOCUMENT ORDER onto `matched`. A function_call
 /// yields at most its own single call_id.
-fn codex_collect_matched(
-    entry: &serde_json::Value,
-    tool_name: &str,
-    needle: &str,
-    matched: &mut Vec<String>,
-) {
+fn codex_collect_matched(entry: &Value, tool_name: &str, needle: &str, matched: &mut Vec<String>) {
     // Same match predicate as the blank pass (via the shared collect helper) so
     // the count can't drift from what gets blanked.
-    let mut ids = std::collections::HashSet::new();
+    let mut ids = HashSet::new();
     collect_codex_call_id_if_matches(entry, tool_name, needle, &mut ids);
     matched.extend(ids);
 }
@@ -1595,10 +1590,7 @@ fn codex_collect_matched(
 /// `prune_batch_codex_jsonl` (same call sites as [`codex_collect_matched`]). Marks a
 /// call ineligible from a `function_call_output` whose `output` is already the
 /// `[pruned]` placeholder.
-fn codex_collect_pruned(
-    entry: &serde_json::Value,
-    already_pruned: &mut std::collections::HashSet<String>,
-) {
+fn codex_collect_pruned(entry: &Value, already_pruned: &mut HashSet<String>) {
     if entry.get("type").and_then(|t| t.as_str()) != Some("response_item") {
         return;
     }
@@ -1634,10 +1626,10 @@ fn count_codex_matches(path: &Path, tool_name: &str, needle: &str) -> std::io::R
 /// function-call match predicate, called per-entry by `eligible_matches` so the
 /// count + the last-only selection can't drift on what "matches" means.
 fn collect_codex_call_id_if_matches(
-    entry: &serde_json::Value,
+    entry: &Value,
     tool_name: &str,
     needle: &str,
-    ids: &mut std::collections::HashSet<String>,
+    ids: &mut HashSet<String>,
 ) {
     if entry.get("type").and_then(|t| t.as_str()) != Some("response_item") {
         return;
@@ -1708,9 +1700,9 @@ fn prune_batch_codex_jsonl(
 /// a field was blanked (`freed` may legitimately be `0` for a tiny output that
 /// was shorter than the placeholder — the caller still re-serializes).
 fn blank_codex_entry(
-    entry: &mut serde_json::Value,
+    entry: &mut Value,
     pruned_ids: &crate::prune::ChosenTargets,
-    outputs_blanked: &mut std::collections::HashSet<String>,
+    outputs_blanked: &mut HashSet<String>,
 ) -> Option<usize> {
     if entry.get("type").and_then(|t| t.as_str()) != Some("response_item") {
         return None;
@@ -1773,18 +1765,18 @@ fn blank_codex_entry(
 /// The `[pruned]` placeholder in the shape of `output`: a `custom_tool_call_output`
 /// carries either a plain string or (codex ≥0.15x) an `input_text` item array, and
 /// the placeholder keeps that shape so resume deserializes it as before.
-fn pruned_custom_output(output: &serde_json::Value) -> serde_json::Value {
+fn pruned_custom_output(output: &Value) -> Value {
     let placeholder = crate::prune::PRUNED_PLACEHOLDER;
     if output.is_array() {
         serde_json::json!([{ "type": "input_text", "text": placeholder }])
     } else {
-        serde_json::Value::String(placeholder.to_string())
+        Value::String(placeholder.to_string())
     }
 }
 
 /// Blank a `custom_tool_call_output.output` to [`pruned_custom_output`]. `None` when
 /// absent or already blanked (idempotent); else the freed serialized bytes.
-fn blank_custom_output(payload: &mut serde_json::Map<String, serde_json::Value>) -> Option<usize> {
+fn blank_custom_output(payload: &mut serde_json::Map<String, Value>) -> Option<usize> {
     let existing = payload.get("output")?;
     let blank = pruned_custom_output(existing);
     if *existing == blank {
@@ -2043,9 +2035,9 @@ mod tests {
         assert_eq!(frame_value(&events[2])["subtype"], "error");
 
         run(&mut a, TURN_STARTED);
-        let events = run(&mut a, refused);
-        assert_eq!(events[0], "UserTurnConsumed(u2)");
-        assert!(!events.contains(&"Result".to_string()), "{events:?}");
+        let in_turn = run(&mut a, refused);
+        assert_eq!(in_turn[0], "UserTurnConsumed(u2)");
+        assert!(!in_turn.contains(&"Result".to_string()), "{in_turn:?}");
     }
 
     #[test]
@@ -2140,9 +2132,9 @@ mod tests {
             frame_value(&events[1]),
             json!({ "type": "result", "subtype": "success", "is_error": false })
         );
-        let events = run(&mut a, TURN_FAILED);
-        assert_eq!(events[0], "Result");
-        let failed = frame_value(&events[1]);
+        let failed_events = run(&mut a, TURN_FAILED);
+        assert_eq!(failed_events[0], "Result");
+        let failed = frame_value(&failed_events[1]);
         assert_eq!(
             (failed["subtype"].as_str(), failed["is_error"].as_bool()),
             (Some("error"), Some(true))
@@ -2188,9 +2180,9 @@ mod tests {
             vec![format!("CommandFinished({id})")]
         );
         // A completion with no started renders.
-        let events = run(&mut a, COMMAND_COMPLETED);
-        assert_eq!(events.len(), 2);
-        assert!(events[0].starts_with("Frame("), "{events:?}");
+        let unstarted = run(&mut a, COMMAND_COMPLETED);
+        assert_eq!(unstarted.len(), 2);
+        assert!(unstarted[0].starts_with("Frame("), "{unstarted:?}");
     }
 
     /// A command `/stop` left running completes after its turn ended: still
@@ -2287,11 +2279,11 @@ mod tests {
         .is_empty());
 
         let multi = r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"fc","changes":[{"path":"/a","kind":{"type":"update","move_path":null},"diff":""},{"path":"/b","kind":{"type":"delete"},"diff":""}],"status":"inProgress"}}}"#;
-        let events = run(&mut a, multi);
-        let edit = frame_value(&events[0]);
+        let multi_events = run(&mut a, multi);
+        let edit = frame_value(&multi_events[0]);
         assert_eq!(edit["message"]["content"][0]["id"], "fc.0");
         assert_eq!(edit["message"]["content"][0]["name"], "Edit");
-        let rm = frame_value(&events[1]);
+        let rm = frame_value(&multi_events[1]);
         assert_eq!(rm["message"]["content"][0]["id"], "fc.1");
         assert_eq!(
             rm["message"]["content"][0]["input"],
@@ -2328,17 +2320,17 @@ mod tests {
     fn collab_tools_map_to_agent_or_their_exec_names() {
         let mut a = open_session();
         let spawn = r#"{"method":"item/started","params":{"item":{"type":"collabAgentToolCall","id":"c1","tool":"spawnAgent","status":"inProgress","senderThreadId":"t0","receiverThreadIds":[],"prompt":"audit the parser","model":null}}}"#;
-        let v = frame_value(&run(&mut a, spawn)[0]);
-        assert_eq!(v["message"]["content"][0]["name"], "Agent");
+        let spawned = frame_value(&run(&mut a, spawn)[0]);
+        assert_eq!(spawned["message"]["content"][0]["name"], "Agent");
         assert_eq!(
-            v["message"]["content"][0]["input"],
+            spawned["message"]["content"][0]["input"],
             json!({ "description": "audit the parser" })
         );
         let send = r#"{"method":"item/started","params":{"item":{"type":"collabAgentToolCall","id":"c2","tool":"sendInput","status":"inProgress","senderThreadId":"t0","receiverThreadIds":["t1"],"prompt":"go on","model":null}}}"#;
-        let v = frame_value(&run(&mut a, send)[0]);
-        assert_eq!(v["message"]["content"][0]["name"], "send_input");
+        let sent = frame_value(&run(&mut a, send)[0]);
+        assert_eq!(sent["message"]["content"][0]["name"], "send_input");
         assert_eq!(
-            v["message"]["content"][0]["input"],
+            sent["message"]["content"][0]["input"],
             json!({ "prompt": "go on", "sender_thread_id": "t0", "receiver_thread_ids": ["t1"] })
         );
     }
@@ -2913,9 +2905,9 @@ mod tests {
                     .results_blanked,
                 1
             );
-            let lines = read_lines(f.path());
-            assert_eq!(lines[1]["payload"]["arguments"], "{}");
-            assert_eq!(lines[2]["payload"]["output"], "[pruned]");
+            let after_second = read_lines(f.path());
+            assert_eq!(after_second[1]["payload"]["arguments"], "{}");
+            assert_eq!(after_second[2]["payload"]["output"], "[pruned]");
 
             // Third prune: nothing eligible left → reports 0, safe no-op.
             assert_eq!(count_codex_matches(f.path(), "Bash", "junk.rs").unwrap(), 0);
@@ -2955,9 +2947,9 @@ mod tests {
             );
             // Second prune → walks back to m1 (guard excludes the pruned m2).
             prune_codex_jsonl(f.path(), "mcp__zdbg__get_last_id", "").unwrap();
-            let lines = read_lines(f.path());
-            assert_eq!(lines[2]["payload"]["output"], "[pruned]");
-            assert_eq!(lines[4]["payload"]["output"], "[pruned]");
+            let after_second = read_lines(f.path());
+            assert_eq!(after_second[2]["payload"]["output"], "[pruned]");
+            assert_eq!(after_second[4]["payload"]["output"], "[pruned]");
             assert_eq!(
                 count_codex_matches(f.path(), "mcp__zdbg__get_last_id", "").unwrap(),
                 0
@@ -3055,11 +3047,11 @@ mod tests {
             );
 
             // Second prune walks back to m1.
-            let stats = prune_codex_jsonl(f.path(), "mcp__zdbg__get_last_id", "SELECT").unwrap();
-            assert_eq!(stats.results_blanked, 1);
-            let lines = read_lines(f.path());
-            assert_eq!(lines[1]["payload"]["arguments"], "{}");
-            assert_eq!(lines[2]["payload"]["output"], "[pruned]");
+            let second = prune_codex_jsonl(f.path(), "mcp__zdbg__get_last_id", "SELECT").unwrap();
+            assert_eq!(second.results_blanked, 1);
+            let after_second = read_lines(f.path());
+            assert_eq!(after_second[1]["payload"]["arguments"], "{}");
+            assert_eq!(after_second[2]["payload"]["output"], "[pruned]");
 
             // Third prune: nothing eligible left → reports 0, safe no-op.
             assert_eq!(

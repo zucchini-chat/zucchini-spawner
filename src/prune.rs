@@ -82,8 +82,7 @@ pub struct PruneRequest {
 /// between these two tasks) removes the previous two-channels-into-one-`select!`
 /// ordering hazard: the cue can no longer be processed before its request is
 /// visible, so a prune can't be silently dropped or stranded for a later turn.
-pub type PendingPrunes =
-    std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<PruneRequest>>>>;
+pub type PendingPrunes = std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<PruneRequest>>>>;
 
 /// Per-adapter selective-forgetting vtable. Each adapter whose CLI owns a local
 /// transcript the spawner can edit + the CLI re-reads on resume (claude, gemini,
@@ -187,13 +186,13 @@ pub(crate) fn args_value_is_empty(v: Option<&serde_json::Value>) -> bool {
 /// handled before the glob is invoked). Shared so the dialect matchers can't
 /// drift on glob semantics.
 pub(crate) fn glob_leaf_match(leaf: &str, pattern: &str) -> bool {
-    let mut cursor = 0usize;
+    let mut rest = leaf;
     for segment in pattern.split('*') {
         if segment.is_empty() {
             continue;
         }
-        match leaf[cursor..].find(segment) {
-            Some(rel) => cursor += rel + segment.len(),
+        match rest.split_once(segment) {
+            Some((_, after)) => rest = after,
             None => return false,
         }
     }
@@ -466,7 +465,8 @@ pub(crate) fn rewrite_jsonl_batch_last_only(
         |id| !already_pruned.contains(id),
     );
     blank_pass(path, parsed, &chosen, |entry, chosen, outputs_blanked| {
-        blank(entry, chosen, outputs_blanked).map(|freed| freed as isize)
+        blank(entry, chosen, outputs_blanked)
+            .map(|freed| isize::try_from(freed).expect("bytes of an in-memory value fit isize"))
     })
 }
 

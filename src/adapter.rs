@@ -319,11 +319,11 @@ pub struct NativeSpawn {
     /// Argv AFTER the program, unescaped — each element is one OS arg.
     pub args: Vec<String>,
     /// Working directory for the child, or None to inherit.
-    pub cwd: Option<std::path::PathBuf>,
+    pub cwd: Option<PathBuf>,
     /// One-shot only: file whose contents feed the child's stdin (the native
     /// replacement for `cat <file> | claude`). None ⇒ caller wires stdin
     /// (resident pipes frames).
-    pub prompt_stdin_file: Option<std::path::PathBuf>,
+    pub prompt_stdin_file: Option<PathBuf>,
 }
 
 /// Per-line normalized events the adapter forwards to Supervisor's response
@@ -651,9 +651,7 @@ pub(crate) fn extract_json_string_field<'a>(line: &'a str, key: &str) -> Option<
     // earlier string value is vanishingly unlikely as the FIRST occurrence (it
     // is the leading key), and a wrong hit just yields a value that fails the
     // conservative checks below → None.
-    let quoted = format!("\"{key}\"");
-    let at = line.find(&quoted)?;
-    let rest = &line[at + quoted.len()..];
+    let (_, rest) = line.split_once(&format!("\"{key}\""))?;
     // Skip whitespace, require a single `:`, skip whitespace again.
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(':')?;
@@ -662,11 +660,11 @@ pub(crate) fn extract_json_string_field<'a>(line: &'a str, key: &str) -> Option<
     let rest = rest.strip_prefix('"')?;
     // Plain scan to the next `"`. A backslash before it means an escape →
     // bail out (pi/claude type values never contain escapes).
-    let end = rest.find('"')?;
-    if rest[..end].contains('\\') {
+    let (value, _) = rest.split_once('"')?;
+    if value.contains('\\') {
         return None;
     }
-    Some(&rest[..end])
+    Some(value)
 }
 
 /// Shared shell-escape helper. Every adapter uses single-quote escaping for
@@ -1146,7 +1144,7 @@ pub(crate) async fn probe_with_blocking_auth(bin: &str, auth_fn: fn() -> bool) -
 /// this keeps the "presence + non-empty" auth contract identical across
 /// adapters so a future hardening (symlink handling, zero-byte sentinels, …)
 /// can't be applied to one probe and forgotten in another.
-pub(crate) fn file_nonempty(path: &std::path::Path) -> bool {
+pub(crate) fn file_nonempty(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.len() > 0)
         .unwrap_or(false)
@@ -1175,6 +1173,16 @@ impl<'a> TurnContext<'a> {
             user_timezone: None,
         }
     }
+}
+
+/// Held by every importer test that points `HOME` at a temp dir: cargo runs
+/// tests on parallel threads, so one import could read another test's `HOME`.
+#[cfg(test)]
+pub(crate) static TEST_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) fn ignore_progress() -> ImportProgress {
+    Box::new(|_| Box::pin(async {}))
 }
 
 /// Test-only stringifier shared by every adapter's `run()` helper. Maps a

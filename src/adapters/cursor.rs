@@ -258,10 +258,10 @@ const WINDOWS_LAUNCHER: &str = "pwsh";
 
 /// `cursor-agent.ps1` on PATH, else in the installer's default dir — a
 /// spawner started before the install still carries the PATH without it.
-fn cursor_launcher_script() -> Option<std::path::PathBuf> {
+fn cursor_launcher_script() -> Option<PathBuf> {
     which::which("cursor-agent.ps1").ok().or_else(|| {
         let local = std::env::var_os("LOCALAPPDATA")?;
-        let script = std::path::Path::new(&local)
+        let script = Path::new(&local)
             .join("cursor-agent")
             .join("cursor-agent.ps1");
         script.is_file().then_some(script)
@@ -278,8 +278,8 @@ fn windows_launcher_installed() -> bool {
 /// which surfaces in the chat (the probe already reports cursor uninstalled).
 fn windows_launcher_spawn(
     cursor_args: Vec<String>,
-    cwd: Option<std::path::PathBuf>,
-    prompt_stdin_file: Option<std::path::PathBuf>,
+    cwd: Option<PathBuf>,
+    prompt_stdin_file: Option<PathBuf>,
 ) -> NativeSpawn {
     let script = cursor_launcher_script()
         .map(|p| p.to_string_lossy().into_owned())
@@ -307,7 +307,7 @@ fn windows_launcher_spawn(
 /// Prepend `preamble` to the prompt file, so feeding the file as stdin
 /// delivers the same bytes as the login-shell path's `{ printf %s <preamble>;
 /// cat <file>; }`.
-fn prepend_to_file(path: &std::path::Path, preamble: &str) -> std::io::Result<()> {
+fn prepend_to_file(path: &Path, preamble: &str) -> std::io::Result<()> {
     let body = std::fs::read(path)?;
     let mut bytes = preamble.as_bytes().to_vec();
     bytes.extend_from_slice(&body);
@@ -339,7 +339,7 @@ impl AgentAdapter for CursorAdapter {
         }
         Some(windows_launcher_spawn(
             cli_argv(cursor_flag_args(ctx)),
-            ctx.project_path.map(std::path::PathBuf::from),
+            ctx.project_path.map(PathBuf::from),
             Some(ctx.prompt_file.to_path_buf()),
         ))
     }
@@ -567,9 +567,11 @@ impl AgentAdapter for CursorAdapter {
                         .get("cacheWriteTokens")
                         .and_then(|x| x.as_i64())
                         .unwrap_or(0);
-                    let n_calls = (self.model_call_ids.len()
-                        + usize::from(self.saw_unidentified_assistant))
-                    .max(1) as i64;
+                    let n_calls = i64::try_from(
+                        (self.model_call_ids.len() + usize::from(self.saw_unidentified_assistant))
+                            .max(1),
+                    )
+                    .unwrap_or(i64::MAX);
                     out.push(AgentEvent::ContextTokens(
                         (input + cache_read + cache_write) / n_calls,
                     ));
@@ -693,13 +695,17 @@ fn synthesize_oversize_tool_call_completed(line: &str) -> Option<String> {
 /// the verb key (alphanumeric). Returns `None` if the needle is absent or the
 /// closing quote isn't found within a small window.
 fn sniff_string_field(line: &str, needle: &str) -> Option<String> {
-    let start = line.find(needle)? + needle.len();
-    let rest = &line[start..];
+    let (_, rest) = line.split_once(needle)?;
     // Cap the search window so a malformed/huge value can't pin us scanning
     // multi-MB strings for a closing quote that isn't there.
-    let window = &rest[..rest.len().min(512)];
-    let end = window.find('"')?;
-    Some(window[..end].to_string())
+    let (value, _) = sniff_window(rest).split_once('"')?;
+    Some(value.to_string())
+}
+
+const SNIFF_WINDOW_BYTES: usize = 512;
+
+fn sniff_window(s: &str) -> &str {
+    crate::text::prefix_within(s, SNIFF_WINDOW_BYTES)
 }
 
 /// Locates the verb key inside `"tool_call":{ "<verb>ToolCall": ... }` via
@@ -707,14 +713,10 @@ fn sniff_string_field(line: &str, needle: &str) -> Option<String> {
 /// `"…ToolCall":` key after it. Cap the scan to a fixed window so an oversize
 /// line doesn't drag this O(n) scan through megabytes of payload.
 fn sniff_tool_call_verb(line: &str) -> Option<String> {
-    let anchor = line.find("\"tool_call\":{")? + "\"tool_call\":{".len();
-    let rest = &line[anchor..];
-    let window = &rest[..rest.len().min(512)];
+    let (_, rest) = line.split_once("\"tool_call\":{")?;
     // Expect: `"<verbKey>":`. Find the first `"`, then the next `"`.
-    let open = window.find('"')? + 1;
-    let after_open = &window[open..];
-    let close = after_open.find('"')?;
-    let key = &after_open[..close];
+    let (_, after_open) = sniff_window(rest).split_once('"')?;
+    let (key, _) = after_open.split_once('"')?;
     if key.ends_with("ToolCall") {
         Some(key.to_string())
     } else {
@@ -919,22 +921,21 @@ async fn is_authenticated() -> bool {
     // The JSON object may be preceded by shell-rc noise (e.g. asdf banner
     // lines printed on `-lic`). Find the first '{' and parse from there.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(start) = stdout.find('{') else {
+    let Some(json) = stdout.find('{').and_then(|start| stdout.get(start..)) else {
         warn!(
             stdout_len = stdout.len(),
             "cursor-agent status: no '{{' in stdout (binary printed non-JSON?); reporting not_authenticated"
         );
         return false;
     };
-    match serde_json::from_str::<StatusJson>(&stdout[start..]) {
+    match serde_json::from_str::<StatusJson>(json) {
         Ok(s) if s.is_authenticated => true,
         Ok(_) => {
             // Parsed cleanly but `isAuthenticated` was false or absent. The
             // `#[serde(default)]` on the field means a schema rename (e.g.
             // cursor switching to `authenticated`) silently lands here — log
             // the raw payload tail so an operator can spot drift.
-            let tail = &stdout[start..];
-            let snippet: String = tail.chars().take(200).collect();
+            let snippet: String = json.chars().take(200).collect();
             warn!(payload_snippet = %snippet, "cursor-agent status: isAuthenticated=false or field missing (schema drift?)");
             false
         }
@@ -1008,6 +1009,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Decode a lowercase-hex string to bytes; `None` on any non-hex char or odd
 /// length. Used to turn a blob id (hex) into the raw 32-byte hash the root
 /// protobuf embeds.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "two hex digits make at most 0xff"
+)]
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
@@ -1062,7 +1067,7 @@ struct CursorStore {
     /// (protobuf tree nodes — root + checkpoints — have no entry). Parsed ONCE
     /// here so the eligibility scan, the blob-target grouping, and the blank
     /// pass all read the same `Value` instead of `from_slice`-ing each blob 2-3×.
-    parsed: std::collections::HashMap<String, serde_json::Value>,
+    parsed: std::collections::HashMap<String, Value>,
     /// The decoded (un-hexlified) `meta['0']` JSON text — string-replaced on
     /// write to preserve byte-for-byte formatting, exactly like the PoC.
     meta_text: String,
@@ -1168,7 +1173,7 @@ fn load_cursor_store(conn: &rusqlite::Connection) -> Option<CursorStore> {
     }
 
     let meta_text = read_meta_text(conn)?;
-    let meta_json: serde_json::Value = serde_json::from_str(&meta_text).ok()?;
+    let meta_json: Value = serde_json::from_str(&meta_text).ok()?;
     let root_id = meta_json
         .get("latestRootBlobId")
         .and_then(|v| v.as_str())?
@@ -1181,10 +1186,10 @@ fn load_cursor_store(conn: &rusqlite::Connection) -> Option<CursorStore> {
     // Parse every JSON blob ONCE. Protobuf tree nodes (root + checkpoints) fail
     // `from_slice` and are simply absent from the map — downstream only ever
     // looks up message blobs by id.
-    let parsed: std::collections::HashMap<String, serde_json::Value> = blobs
+    let parsed: std::collections::HashMap<String, Value> = blobs
         .iter()
         .filter_map(|(id, data)| {
-            serde_json::from_slice::<serde_json::Value>(data)
+            serde_json::from_slice::<Value>(data)
                 .ok()
                 .map(|v| (id.clone(), v))
         })
@@ -1229,7 +1234,7 @@ fn cursor_eligible_ids(store: &CursorStore, tool_name: &str, needle: &str) -> Ve
                 {
                     continue;
                 }
-                let args = part.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                let args = part.get("args").cloned().unwrap_or(Value::Null);
                 // Never target the agent's OWN prune-context shell call.
                 if crate::prune::value_is_prune_context_call(&args) {
                     continue;
@@ -1500,7 +1505,7 @@ fn prune_batch_cursor(
 /// it). Returns the combined freed-byte estimate — both twins' original
 /// serialized length counts, so the `~Nk freed` tally doesn't undercount when
 /// the output lived in `experimental_content`.
-fn blank_tool_result_twins(obj: &mut serde_json::Map<String, serde_json::Value>) -> usize {
+fn blank_tool_result_twins(obj: &mut serde_json::Map<String, Value>) -> usize {
     let mut freed = 0usize;
     if let Some(f) =
         crate::prune::blank_string_field(obj, "result", crate::prune::PRUNED_PLACEHOLDER)
@@ -1615,7 +1620,7 @@ pub(crate) async fn import(
     user_id: Uuid,
     write_tx: mpsc::Sender<WriteEvent>,
     progress: ImportProgress,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let Some(db_path) = cursor_state_db_path() else {
         info!("HOME not set, skipping cursor history import");
         return Ok(());
@@ -1636,10 +1641,9 @@ pub(crate) async fn import(
     // We pull every row off the disk on the blocking thread, drop the
     // connection, then iterate + emit on the async side so progress
     // throttling and channel back-pressure work normally.
-    let raw =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<RawScan> { read_state_db(&db_path) })
-            .await
-            .map_err(|e| anyhow::anyhow!("cursor sqlite blocking task panicked: {e}"))??;
+    let raw = tokio::task::spawn_blocking(move || -> Result<RawScan> { read_state_db(&db_path) })
+        .await
+        .map_err(|e| anyhow::anyhow!("cursor sqlite blocking task panicked: {e}"))??;
 
     let RawScan {
         headers,
@@ -1764,12 +1768,12 @@ struct RawScan {
     /// `composerId` → parsed `composerData:<composerId>` row. Missing entries
     /// mean the header pointed at a row that doesn't exist (rare; usually a
     /// stale header from before cleanup); caller warns + skips.
-    composer_rows: std::collections::HashMap<String, serde_json::Value>,
+    composer_rows: std::collections::HashMap<String, Value>,
     /// `(composerId, bubbleId)` → parsed bubble row.
-    bubble_rows: std::collections::HashMap<(String, String), serde_json::Value>,
+    bubble_rows: std::collections::HashMap<(String, String), Value>,
 }
 
-fn read_state_db(db_path: &std::path::Path) -> anyhow::Result<RawScan> {
+fn read_state_db(db_path: &Path) -> Result<RawScan> {
     // Read-only + no-mutex: read-only protects against accidental corruption
     // if Cursor is running, and no-mutex is fine for a single-connection load.
     let conn = rusqlite::Connection::open_with_flags(
@@ -1780,8 +1784,8 @@ fn read_state_db(db_path: &std::path::Path) -> anyhow::Result<RawScan> {
     if headers.is_empty() {
         return Ok(RawScan {
             headers,
-            composer_rows: Default::default(),
-            bubble_rows: Default::default(),
+            composer_rows: std::collections::HashMap::new(),
+            bubble_rows: std::collections::HashMap::new(),
         });
     }
     let ids: Vec<String> = headers.iter().map(|h| h.id.clone()).collect();
@@ -1800,7 +1804,7 @@ fn read_state_db(db_path: &std::path::Path) -> anyhow::Result<RawScan> {
 /// `Vec<u8>` `FromSql` rejects the TEXT storage class with "Invalid column type
 /// Text at index: 0" (SPAWNER-Y), so coerce both here. Downstream callers feed
 /// the bytes straight into `serde_json::from_slice`, which is byte-agnostic.
-fn value_bytes(r: &rusqlite::Row) -> rusqlite::Result<Vec<u8>> {
+fn value_bytes(r: &rusqlite::Row<'_>) -> rusqlite::Result<Vec<u8>> {
     use rusqlite::types::ValueRef;
     match r.get_ref(0)? {
         ValueRef::Text(t) => Ok(t.to_vec()),
@@ -1811,7 +1815,7 @@ fn value_bytes(r: &rusqlite::Row) -> rusqlite::Result<Vec<u8>> {
     }
 }
 
-fn read_composer_headers(conn: &rusqlite::Connection) -> anyhow::Result<Vec<ComposerHeader>> {
+fn read_composer_headers(conn: &rusqlite::Connection) -> Result<Vec<ComposerHeader>> {
     let blob: Option<Vec<u8>> = conn
         .query_row(
             "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'",
@@ -1822,7 +1826,7 @@ fn read_composer_headers(conn: &rusqlite::Connection) -> anyhow::Result<Vec<Comp
     let Some(blob) = blob else {
         return Ok(Vec::new());
     };
-    let parsed: serde_json::Value = serde_json::from_slice(&blob)
+    let parsed: Value = serde_json::from_slice(&blob)
         .map_err(|e| anyhow::anyhow!("composer.composerHeaders not JSON: {e}"))?;
     let Some(all) = parsed.get("allComposers").and_then(|v| v.as_array()) else {
         return Ok(Vec::new());
@@ -1868,7 +1872,7 @@ fn read_composer_headers(conn: &rusqlite::Connection) -> anyhow::Result<Vec<Comp
 ///   work; importing the subagent as a standalone chat would surface junk
 ///   like "Time picker and platform detection search" in the user's chat
 ///   list.
-fn accept_header(entry: &serde_json::Value) -> bool {
+fn accept_header(entry: &Value) -> bool {
     if entry.get("isDraft").and_then(|v| v.as_bool()) == Some(true) {
         return false;
     }
@@ -1884,7 +1888,7 @@ fn accept_header(entry: &serde_json::Value) -> bool {
 fn load_composer_rows(
     conn: &rusqlite::Connection,
     ids: &[String],
-) -> anyhow::Result<std::collections::HashMap<String, serde_json::Value>> {
+) -> Result<std::collections::HashMap<String, Value>> {
     let mut stmt = conn.prepare("SELECT value FROM cursorDiskKV WHERE key = ?")?;
     let mut out = std::collections::HashMap::with_capacity(ids.len());
     for id in ids {
@@ -1894,7 +1898,7 @@ fn load_composer_rows(
             tracing::warn!(composer_id = %id, "cursor: composerData row missing for header, skipping");
             continue;
         };
-        match serde_json::from_slice::<serde_json::Value>(&blob) {
+        match serde_json::from_slice::<Value>(&blob) {
             Ok(v) => {
                 out.insert(id.clone(), v);
             }
@@ -1908,8 +1912,8 @@ fn load_composer_rows(
 
 fn load_bubble_rows(
     conn: &rusqlite::Connection,
-    composer_rows: &std::collections::HashMap<String, serde_json::Value>,
-) -> anyhow::Result<std::collections::HashMap<(String, String), serde_json::Value>> {
+    composer_rows: &std::collections::HashMap<String, Value>,
+) -> Result<std::collections::HashMap<(String, String), Value>> {
     let mut stmt = conn.prepare("SELECT value FROM cursorDiskKV WHERE key = ?")?;
     let mut out = std::collections::HashMap::new();
     for (composer_id, row) in composer_rows {
@@ -1933,7 +1937,7 @@ fn load_bubble_rows(
                 );
                 continue;
             };
-            match serde_json::from_slice::<serde_json::Value>(&blob) {
+            match serde_json::from_slice::<Value>(&blob) {
                 Ok(v) => {
                     out.insert((composer_id.clone(), bubble_id.to_string()), v);
                 }
@@ -1972,10 +1976,10 @@ async fn import_composer(
     header: &ComposerHeader,
     project_id: Uuid,
     user_id: Uuid,
-    composer_rows: &std::collections::HashMap<String, serde_json::Value>,
-    bubble_rows: &std::collections::HashMap<(String, String), serde_json::Value>,
+    composer_rows: &std::collections::HashMap<String, Value>,
+    bubble_rows: &std::collections::HashMap<(String, String), Value>,
     write_tx: &mpsc::Sender<WriteEvent>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let Some(row) = composer_rows.get(&header.id) else {
         // Already warned at load time; nothing to do.
         return Ok(());
@@ -2002,6 +2006,7 @@ async fn import_composer(
     // via `emit_chat`.
     let mut messages: Vec<ImportedMessage> = Vec::new();
     let mut first_user_text: Option<String> = None;
+    let mut next_created_at = chat_created_at;
     for h in headers {
         let Some(bubble_id) = h.get("bubbleId").and_then(|v| v.as_str()) else {
             continue;
@@ -2027,13 +2032,13 @@ async fn import_composer(
             BubbleOut::Skip => continue,
         };
         for body in frames {
-            let ts = chat_created_at + ChronoDuration::milliseconds(messages.len() as i64);
             messages.push(ImportedMessage {
                 id,
                 sender,
                 body,
-                created_at: ts,
+                created_at: next_created_at,
             });
+            next_created_at += ChronoDuration::milliseconds(1);
         }
     }
 
@@ -2080,7 +2085,7 @@ enum BubbleOut {
     Skip,
 }
 
-fn classify_bubble(bubble: &serde_json::Value) -> BubbleOut {
+fn classify_bubble(bubble: &Value) -> BubbleOut {
     let bubble_type = bubble.get("type").and_then(|v| v.as_i64()).unwrap_or(-1);
     match bubble_type {
         1 => classify_user_bubble(bubble),
@@ -2089,7 +2094,7 @@ fn classify_bubble(bubble: &serde_json::Value) -> BubbleOut {
     }
 }
 
-fn classify_user_bubble(bubble: &serde_json::Value) -> BubbleOut {
+fn classify_user_bubble(bubble: &Value) -> BubbleOut {
     let text = bubble
         .get("text")
         .and_then(|v| v.as_str())
@@ -2110,7 +2115,7 @@ fn classify_user_bubble(bubble: &serde_json::Value) -> BubbleOut {
     }
 }
 
-fn classify_assistant_bubble(bubble: &serde_json::Value) -> BubbleOut {
+fn classify_assistant_bubble(bubble: &Value) -> BubbleOut {
     let text = bubble.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let tool_former = bubble.get("toolFormerData");
 
@@ -2147,10 +2152,7 @@ fn assistant_text_frame(text: &str) -> String {
 /// the persisted shape, so we `from_str` before re-keying. Falls back to
 /// the raw payload + bubbleId-derived call id if `rawArgs` is missing or
 /// unparseable.
-fn assistant_tool_use_frame_from_persisted(
-    tool_former: &serde_json::Value,
-    bubble: &serde_json::Value,
-) -> Option<String> {
+fn assistant_tool_use_frame_from_persisted(tool_former: &Value, bubble: &Value) -> Option<String> {
     let name = tool_former
         .get("name")
         .and_then(|v| v.as_str())
@@ -2170,11 +2172,11 @@ fn assistant_tool_use_frame_from_persisted(
         })
         .unwrap_or_else(|| "cursor_persisted_unknown".to_string());
 
-    let raw_args: serde_json::Value = tool_former
+    let raw_args: Value = tool_former
         .get("rawArgs")
         .and_then(|v| v.as_str())
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(serde_json::Value::Object(Default::default()));
+        .unwrap_or(Value::Object(serde_json::Map::new()));
 
     let (claude_name, input) = map_cursor_persisted_tool(name, &raw_args);
     Some(claude_tool_use_envelope(&call_id, &claude_name, input))
@@ -2200,10 +2202,7 @@ fn assistant_tool_use_frame_from_persisted(
 /// counterpart in [`map_cursor_tool`]. That is intentional, not an oversight:
 /// `todo_write` is an observed persisted tool name, but the live wire's todo
 /// verb key (if any) is unconfirmed, so we don't guess a spelling there.
-fn map_cursor_persisted_tool(
-    name: &str,
-    raw_args: &serde_json::Value,
-) -> (String, serde_json::Value) {
+fn map_cursor_persisted_tool(name: &str, raw_args: &Value) -> (String, Value) {
     // Strip `_v2` for dispatch; the inner args layout doesn't change between
     // v1 and v2 for our purposes.
     let base = name.strip_suffix("_v2").unwrap_or(name);
@@ -2248,7 +2247,7 @@ fn map_cursor_persisted_tool(
 
 /// Clone `args` (if it's an object) and rename `from` → `to` in place.
 /// Non-object args pass through unchanged.
-fn rename_key(args: &serde_json::Value, from: &str, to: &str) -> serde_json::Value {
+fn rename_key(args: &Value, from: &str, to: &str) -> Value {
     rename_either_key(args, &[from], to)
 }
 
@@ -2256,11 +2255,7 @@ fn rename_key(args: &serde_json::Value, from: &str, to: &str) -> serde_json::Val
 /// one that's present wins. Useful when Cursor uses different arg key names
 /// across versions of the same tool (e.g. `target_file` vs
 /// `relativeWorkspacePath`).
-fn rename_either_key(
-    args: &serde_json::Value,
-    from_candidates: &[&str],
-    to: &str,
-) -> serde_json::Value {
+fn rename_either_key(args: &Value, from_candidates: &[&str], to: &str) -> Value {
     let Some(map) = args.as_object() else {
         return args.clone();
     };
@@ -2271,7 +2266,7 @@ fn rename_either_key(
             break;
         }
     }
-    serde_json::Value::Object(out)
+    Value::Object(out)
 }
 
 /// Cursor stores `createdAt` as ms since unix epoch. Saturating cast: the
@@ -2292,7 +2287,7 @@ fn import_boxed(
     user_id: Uuid,
     write_tx: mpsc::Sender<WriteEvent>,
     progress: ImportProgress,
-) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+) -> futures::future::BoxFuture<'static, Result<()>> {
     Box::pin(import(machine_id, user_id, write_tx, progress))
 }
 
@@ -2464,6 +2459,26 @@ mod tests {
         assert_eq!(block["name"], "Edit");
         // Oversize path emits empty input — iOS falls back to tool-name-only.
         assert!(block["input"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sniffs_survive_a_multibyte_char_across_the_window_end() {
+        // `é` takes bytes 511 and 512 of the text after each needle.
+        let value = format!("{}é", "x".repeat(SNIFF_WINDOW_BYTES - 1));
+        let key = format!("{}é", "x".repeat(SNIFF_WINDOW_BYTES - 2));
+        let call_id = "\"call_id\":\"";
+        assert_eq!(
+            sniff_string_field(&format!(r#""call_id":"{value}""#), call_id),
+            None
+        );
+        assert_eq!(
+            sniff_tool_call_verb(&format!(r#""tool_call":{{"{key}":{{}}}}"#)),
+            None
+        );
+        assert_eq!(
+            sniff_string_field(&format!(r#""call_id":"big_1","pad":"{value}""#), call_id),
+            Some("big_1".to_string())
+        );
     }
 
     #[test]
@@ -2760,7 +2775,7 @@ mod tests {
         let cursor_args = &spawn.args[file_at + 2..];
         assert_eq!(cursor_args, cli_argv(cursor_flag_args(&ctx)).as_slice());
         assert!(cursor_args.windows(2).any(|w| w == ["--model", model]));
-        assert_eq!(spawn.cwd, Some(std::path::PathBuf::from("/tmp/proj")));
+        assert_eq!(spawn.cwd, Some(PathBuf::from("/tmp/proj")));
 
         assert_eq!(
             spawn.prompt_stdin_file.as_deref(),
@@ -2773,6 +2788,7 @@ mod tests {
 
     // ===== Importer tests =====
 
+    use crate::adapter::{ignore_progress, TEST_HOME_LOCK};
     use serde_json::json;
 
     #[test]
@@ -2875,7 +2891,7 @@ mod tests {
         });
         let bubble = json!({"bubbleId": "b1"});
         let frame = assistant_tool_use_frame_from_persisted(&tool_former, &bubble).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
         let block = &v["message"]["content"][0];
         assert_eq!(block["type"], "tool_use");
         assert_eq!(block["id"], "tc1");
@@ -2928,10 +2944,10 @@ mod tests {
         };
         let text = text_frame.expect("text frame present");
         let tool = tool_frame.expect("tool frame present");
-        let t: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let t: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(t["message"]["content"][0]["type"], "text");
         assert_eq!(t["message"]["content"][0]["text"], "Sure, running it.");
-        let u: serde_json::Value = serde_json::from_str(&tool).unwrap();
+        let u: Value = serde_json::from_str(&tool).unwrap();
         assert_eq!(u["message"]["content"][0]["type"], "tool_use");
         assert_eq!(u["message"]["content"][0]["name"], "Bash");
         assert_eq!(u["message"]["content"][0]["input"]["command"], "ls");
@@ -3205,31 +3221,22 @@ mod tests {
             .expect("cursor importer supports this test OS");
         std::fs::create_dir_all(target_db.parent().unwrap()).unwrap();
         std::fs::copy(&db_path, &target_db).unwrap();
-        // SAFETY: tests run single-threaded per-test by default, but this is
-        // a process-wide mutation. The only other test that reads HOME in
-        // this crate is the claude importer, which is `ignore`d by default;
-        // we set + restore here to be safe. Also clear XDG_CONFIG_HOME so the
-        // Linux branch falls back to `$HOME/.config` (matches what we wrote).
+        // Clear XDG_CONFIG_HOME too, so the Linux branch falls back to
+        // `$HOME/.config` (matches what we wrote).
+        let _home_lock = TEST_HOME_LOCK.lock().await;
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: env mutation is single-threaded per test process; no
-        // concurrent threads read HOME / XDG_CONFIG_HOME during this test.
+        // SAFETY: TEST_HOME_LOCK keeps the other tests that set HOME out, and
+        // std's env lock orders this against env reads on other test threads.
         unsafe {
             std::env::set_var("HOME", &tempdir);
             std::env::remove_var("XDG_CONFIG_HOME");
         }
 
-        let result = import(
-            machine_id,
-            user_id,
-            tx,
-            Box::new(|_| Box::pin(async {}) as futures::future::BoxFuture<'static, ()>)
-                as ImportProgress,
-        )
-        .await;
+        let result = import(machine_id, user_id, tx, ignore_progress()).await;
 
         // Restore HOME / XDG_CONFIG_HOME before any assertions panic.
-        // SAFETY: same as above — single-threaded test process.
+        // SAFETY: as above, still under TEST_HOME_LOCK.
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("HOME", v),
@@ -3298,7 +3305,7 @@ mod tests {
         }
     }
 
-    fn tempfile_tempdir() -> std::path::PathBuf {
+    fn tempfile_tempdir() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
             "zucchini_cursor_import_home_{}_{}",
@@ -3463,11 +3470,11 @@ mod tests {
     /// Owns a unique temp dir holding a `store.db`, deleted on drop. Hand-rolled
     /// (no `tempfile` dep), mirroring the importer tests' temp-file pattern.
     struct TempStore {
-        dir: std::path::PathBuf,
+        dir: PathBuf,
     }
 
     impl TempStore {
-        fn db_path(&self) -> std::path::PathBuf {
+        fn db_path(&self) -> PathBuf {
             self.dir.join("store.db")
         }
     }
@@ -3484,7 +3491,7 @@ mod tests {
     }
 
     /// Compact JSON bytes (matches the production `serde_json::to_vec`).
-    fn json_bytes(v: &serde_json::Value) -> Vec<u8> {
+    fn json_bytes(v: &Value) -> Vec<u8> {
         serde_json::to_vec(v).unwrap()
     }
 
@@ -3550,13 +3557,13 @@ mod tests {
 
     /// Read the current meta head + that root's referenced (blanked-or-not) tool
     /// blob, from a freshly opened connection.
-    fn read_head(path: &std::path::Path) -> (String, Vec<String>) {
+    fn read_head(path: &Path) -> (String, Vec<String>) {
         let conn = rusqlite::Connection::open(path).unwrap();
         let store = load_cursor_store(&conn).unwrap();
         (store.root_id, store.order)
     }
 
-    fn blob_data(path: &std::path::Path, id: &str) -> Option<Vec<u8>> {
+    fn blob_data(path: &Path, id: &str) -> Option<Vec<u8>> {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.query_row(
             "SELECT data FROM blobs WHERE id = ?",
@@ -3608,7 +3615,7 @@ mod tests {
         // new root references the blanked (new) tool blob, not the old one.
         assert!(!new_order.contains(&old_tool_id), "old tool hash repointed");
         let new_tool_id = new_order[3].clone();
-        let blanked: serde_json::Value =
+        let blanked: Value =
             serde_json::from_slice(&blob_data(&path, &new_tool_id).unwrap()).unwrap();
         assert_eq!(
             blanked["content"][0]["result"],
@@ -3668,7 +3675,7 @@ mod tests {
         assert_eq!(stats.results_blanked, 1);
 
         let (_new_root, new_order) = read_head(&path);
-        let tool_blob: serde_json::Value =
+        let tool_blob: Value =
             serde_json::from_slice(&blob_data(&path, &new_order[2]).unwrap()).unwrap();
         let parts = tool_blob["content"].as_array().unwrap();
         let a = parts.iter().find(|p| p["toolCallId"] == "tc_a").unwrap();

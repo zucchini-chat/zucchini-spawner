@@ -100,7 +100,7 @@ pub fn token_fetcher(
     client: Arc<AuthClient>,
 ) -> Box<dyn Fn() -> futures_util::future::BoxFuture<'static, Result<String>> + Send + Sync> {
     Box::new(move || {
-        let c = client.clone();
+        let c = Arc::clone(&client);
         Box::pin(async move { c.fetch_jwt().await })
     })
 }

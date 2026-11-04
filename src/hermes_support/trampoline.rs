@@ -99,42 +99,24 @@ impl HermesTurnArgs {
     pub fn parse(args: &[String]) -> Result<Self> {
         let mut out = HermesTurnArgs::default();
         let mut it = args.iter();
-        while let Some(a) = it.next() {
-            match a.as_str() {
-                "--yolo" => out.yolo = true,
-                "--chat-id" => out.chat_id = it.next().cloned(),
-                "--project-path" => out.project_path = it.next().cloned(),
-                "--model" => out.model = it.next().cloned(),
-                "--resume" => out.resume = it.next().cloned(),
-                "--user-prompt-file" => out.user_prompt_file = it.next().cloned(),
-                "--channel-prompt-file" => out.channel_prompt_file = it.next().cloned(),
-                "--attachment" => {
-                    if let Some(p) = it.next().cloned() {
-                        out.attachments.push(p);
-                    }
-                }
-                s if s.starts_with("--chat-id=") => {
-                    out.chat_id = Some(s["--chat-id=".len()..].to_string());
-                }
-                s if s.starts_with("--project-path=") => {
-                    out.project_path = Some(s["--project-path=".len()..].to_string());
-                }
-                s if s.starts_with("--model=") => {
-                    out.model = Some(s["--model=".len()..].to_string());
-                }
-                s if s.starts_with("--resume=") => {
-                    out.resume = Some(s["--resume=".len()..].to_string());
-                }
-                s if s.starts_with("--user-prompt-file=") => {
-                    out.user_prompt_file = Some(s["--user-prompt-file=".len()..].to_string());
-                }
-                s if s.starts_with("--channel-prompt-file=") => {
-                    out.channel_prompt_file = Some(s["--channel-prompt-file=".len()..].to_string());
-                }
-                s if s.starts_with("--attachment=") => {
-                    out.attachments.push(s["--attachment=".len()..].to_string());
-                }
-                other => return Err(anyhow!("unknown hermes-turn flag: {other}")),
+        while let Some(arg) = it.next() {
+            if arg == "--yolo" {
+                out.yolo = true;
+                continue;
+            }
+            let (flag, value) = match arg.split_once('=') {
+                Some((flag, value)) => (flag, Some(value.to_string())),
+                None => (arg.as_str(), it.next().cloned()),
+            };
+            match flag {
+                "--chat-id" => out.chat_id = value,
+                "--project-path" => out.project_path = value,
+                "--model" => out.model = value,
+                "--resume" => out.resume = value,
+                "--user-prompt-file" => out.user_prompt_file = value,
+                "--channel-prompt-file" => out.channel_prompt_file = value,
+                "--attachment" => out.attachments.extend(value),
+                _ => return Err(anyhow!("unknown hermes-turn flag: {arg}")),
             }
         }
         if out.chat_id.as_deref().unwrap_or("").is_empty() {
@@ -259,12 +241,12 @@ async fn run_inner(args: HermesTurnArgs) -> Result<()> {
                     stop_sent = true;
                     continue;
                 }
-                _ = &mut timeout => Err(anyhow!("no envelopes for {:?}", ENVELOPE_IDLE_TIMEOUT)),
+                () = &mut timeout => Err(anyhow!("no envelopes for {:?}", ENVELOPE_IDLE_TIMEOUT)),
                 r = &mut read_fut => r.map_err(|e| anyhow!("read envelope: {e}")),
             }
         } else {
             tokio::select! {
-                _ = &mut timeout => Err(anyhow!("no envelopes for {:?}", ENVELOPE_IDLE_TIMEOUT)),
+                () = &mut timeout => Err(anyhow!("no envelopes for {:?}", ENVELOPE_IDLE_TIMEOUT)),
                 r = &mut read_fut => r.map_err(|e| anyhow!("read envelope: {e}")),
             }
         };

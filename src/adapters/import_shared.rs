@@ -237,6 +237,11 @@ impl ProgressThrottle {
     /// update if the percent has advanced since the last emission. `await`s the
     /// emit so a saturated writer channel applies backpressure rather than
     /// dropping the update (see [`ImportProgress`]).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "truncating to a whole percent is the emission contract"
+    )]
+    #[expect(clippy::cast_sign_loss, reason = "clamped to 0..=100 first")]
     pub(crate) async fn step(&mut self, done: usize, total: usize, progress: &ImportProgress) {
         let pct = ((done as f64 / total as f64) * 100.0) as i32;
         if pct > self.last_pct {
@@ -249,7 +254,6 @@ impl ProgressThrottle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::BoxFuture;
     use std::sync::{Arc, Mutex};
 
     fn recording() -> (ImportProgress, Arc<Mutex<Vec<u8>>>) {
@@ -259,7 +263,7 @@ mod tests {
             let sink = Arc::clone(&sink);
             Box::pin(async move {
                 sink.lock().unwrap().push(p);
-            }) as BoxFuture<'static, ()>
+            })
         });
         (cb, seen)
     }

@@ -128,7 +128,7 @@
 //! imported and live rows render identically. See `import`.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -301,7 +301,7 @@ impl AgentAdapter for PiAdapter {
                 // envelope is fixed/body-independent, so zero parse needed —
                 // dropping it here is what made the user see "Agent interrupted".
                 Some("agent_end") => {
-                    push_agent_end_terminal(&mut out, started.elapsed().as_millis() as i64);
+                    push_agent_end_terminal(&mut out, started.elapsed());
                     return out;
                 }
                 // The only content-bearing oversize case: a >64KB assistant
@@ -396,7 +396,7 @@ impl AgentAdapter for PiAdapter {
             }
             "agent_end" => {
                 // Terminal — same fixed output as the oversize fast-path above.
-                push_agent_end_terminal(&mut out, started.elapsed().as_millis() as i64);
+                push_agent_end_terminal(&mut out, started.elapsed());
             }
             other => {
                 // pi's many internal lifecycle events (turn_*, message_start,
@@ -420,13 +420,13 @@ impl AgentAdapter for PiAdapter {
 /// oversize fast-path, so this is the single source (repo rule: never copy-paste
 /// the result-frame block). iOS/Android render the `(Ns)` suffix from
 /// `duration_ms`; absent/zero just yields `(0s)`.
-fn push_agent_end_terminal(out: &mut SmallVec<[AgentEvent; 2]>, duration_ms: i64) {
+fn push_agent_end_terminal(out: &mut SmallVec<[AgentEvent; 2]>, elapsed: Duration) {
     out.push(AgentEvent::Frame(
         json!({
             "type": "result",
             "subtype": "success",
             "is_error": false,
-            "duration_ms": duration_ms,
+            "duration_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         })
         .to_string(),
     ));
@@ -769,12 +769,12 @@ async fn import_session(
     // via `emit_chat`.
     let messages: Vec<ImportedMessage> = emitted
         .into_iter()
-        .enumerate()
-        .map(|(seq, (ts, sender, body))| ImportedMessage {
+        .zip(0..)
+        .map(|((ts, sender, body), seq)| ImportedMessage {
             id: None,
             sender,
             body,
-            created_at: ts + ChronoDuration::milliseconds(seq as i64),
+            created_at: ts + ChronoDuration::milliseconds(seq),
         })
         .collect();
 
@@ -1477,7 +1477,7 @@ mod tests {
     // ===== history import (pi dialect) ===================================
     mod import_tests {
         use super::super::{import, pi_user_prompt_text};
-        use crate::adapter::ImportProgress;
+        use crate::adapter::{ignore_progress, TEST_HOME_LOCK};
         use crate::writer::WriteEvent;
         use serde_json::{json, Value};
         use tokio::sync::mpsc;
@@ -1569,20 +1569,15 @@ mod tests {
             );
 
             let (tx, mut rx) = mpsc::channel::<WriteEvent>(64);
+            let _home_lock = TEST_HOME_LOCK.lock().await;
             let prev_home = std::env::var_os("HOME");
-            // SAFETY: env mutation is single-threaded per test process.
+            // SAFETY: TEST_HOME_LOCK keeps the other tests that set HOME out, and
+            // std's env lock orders this against env reads on other test threads.
             unsafe {
                 std::env::set_var("HOME", &home);
             }
-            let result = import(
-                Uuid::nil(),
-                Uuid::nil(),
-                tx,
-                Box::new(|_| Box::pin(async {}) as futures::future::BoxFuture<'static, ()>)
-                    as ImportProgress,
-            )
-            .await;
-            // SAFETY: restore before assertions.
+            let result = import(Uuid::nil(), Uuid::nil(), tx, ignore_progress()).await;
+            // SAFETY: as above, still under TEST_HOME_LOCK.
             unsafe {
                 match prev_home {
                     Some(v) => std::env::set_var("HOME", v),
@@ -1643,18 +1638,15 @@ mod tests {
         async fn missing_sessions_dir_reports_done_and_no_writes() {
             let home = temp_home(); // exists, but no ~/.pi/agent/sessions
             let (tx, mut rx) = mpsc::channel::<WriteEvent>(8);
+            let _home_lock = TEST_HOME_LOCK.lock().await;
             let prev_home = std::env::var_os("HOME");
+            // SAFETY: TEST_HOME_LOCK keeps the other tests that set HOME out, and
+            // std's env lock orders this against env reads on other test threads.
             unsafe {
                 std::env::set_var("HOME", &home);
             }
-            let result = import(
-                Uuid::nil(),
-                Uuid::nil(),
-                tx,
-                Box::new(|_| Box::pin(async {}) as futures::future::BoxFuture<'static, ()>)
-                    as ImportProgress,
-            )
-            .await;
+            let result = import(Uuid::nil(), Uuid::nil(), tx, ignore_progress()).await;
+            // SAFETY: as above, still under TEST_HOME_LOCK.
             unsafe {
                 match prev_home {
                     Some(v) => std::env::set_var("HOME", v),

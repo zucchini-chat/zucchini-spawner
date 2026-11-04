@@ -81,7 +81,7 @@ impl WatchDef {
     /// Until the TTL passes; with none, far longer than any recheck.
     fn remaining(&self) -> Duration {
         match self.expires_at {
-            Some(at) => Duration::from_secs((at - unix_now()).max(0) as u64),
+            Some(at) => Duration::from_secs(secs_until(at)),
             None => Duration::MAX,
         }
     }
@@ -100,7 +100,7 @@ impl WatchDef {
     pub fn summary(&self) -> String {
         let expires = match self.expires_at {
             None => "never".to_string(),
-            Some(at) => format!("in {}", human_duration((at - unix_now()).max(0) as u64)),
+            Some(at) => format!("in {}", human_duration(secs_until(at))),
         };
         let mut out = format!("== {}", self.description);
         if self.ended {
@@ -430,7 +430,8 @@ impl Watches {
             cwd,
             description: description.to_string(),
             created_at: now,
-            expires_at: ttl.map(|t| now.saturating_add(t.as_secs() as i64)),
+            expires_at: ttl
+                .map(|t| now.saturating_add(i64::try_from(t.as_secs()).unwrap_or(i64::MAX))),
             ended: false,
         };
         let dir = self.0.dir(def.id);
@@ -551,10 +552,7 @@ impl Inner {
             return false;
         }
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(
-            self.clone()
-                .supervise(def.clone(), cancel.clone(), restored),
-        );
+        let task = tokio::spawn(Arc::clone(self).supervise(def.clone(), cancel.clone(), restored));
         entries.insert(def.id, Entry { def, cancel, task });
         true
     }
@@ -1011,16 +1009,13 @@ impl Batch {
             None
         };
         // Replacing invalid UTF-8 can grow a line past the cap it was read with.
-        let mut cut = line.len().min(MAX_MESSAGE_BYTES);
-        while !line.is_char_boundary(cut) {
-            cut -= 1;
-        }
+        let kept = crate::text::prefix_within(line, MAX_MESSAGE_BYTES);
         // `read_line_capped` stops a line at the cap and discards the rest.
-        self.truncated |= cut < line.len() || raw.len() >= MAX_MESSAGE_BYTES;
+        self.truncated |= kept.len() < line.len() || raw.len() >= MAX_MESSAGE_BYTES;
         if !self.text.is_empty() {
             self.text.push('\n');
         }
-        self.text.push_str(&line[..cut]);
+        self.text.push_str(kept);
         full
     }
 
@@ -1097,6 +1092,10 @@ fn unix_now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+fn secs_until(at: i64) -> u64 {
+    u64::try_from(at - unix_now()).unwrap_or(0)
+}
+
 /// `90s`, `30m`, `12h`, `7d`, `2w`, or `forever` (`None`).
 pub fn parse_ttl(s: &str) -> Result<Option<Duration>> {
     let s = s.trim();
@@ -1104,7 +1103,8 @@ pub fn parse_ttl(s: &str) -> Result<Option<Duration>> {
         return Ok(None);
     }
     let bad = || anyhow!("invalid --ttl {s:?}: use e.g. 30m, 12h, 7d, 2w or forever");
-    let unit = s.chars().last().ok_or_else(bad)?;
+    let mut number = s.chars();
+    let unit = number.next_back().ok_or_else(bad)?;
     let per_unit = match unit {
         's' => 1,
         'm' => 60,
@@ -1113,7 +1113,7 @@ pub fn parse_ttl(s: &str) -> Result<Option<Duration>> {
         'w' => 7 * 24 * 3600,
         _ => return Err(bad()),
     };
-    let n: u64 = s[..s.len() - 1].parse().map_err(|_| bad())?;
+    let n: u64 = number.as_str().parse().map_err(|_| bad())?;
     let secs = n
         .checked_mul(per_unit)
         .filter(|&secs| secs > 0)
@@ -1148,7 +1148,7 @@ mod tests {
 
     fn fresh_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("zucchini-watch-{name}-{}", Uuid::now_v7()));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root).expect("create the test root");
         root
     }
 
@@ -1176,17 +1176,17 @@ mod tests {
 
     fn recorder(failing: usize) -> (Deliver, Sent) {
         let sent: Sent = Arc::default();
-        let log = sent.clone();
+        let log = Arc::clone(&sent);
         let left = Arc::new(Mutex::new(failing));
         let deliver: Deliver = Box::new(move |out| {
-            let (log, left) = (log.clone(), left.clone());
+            let (log, left) = (Arc::clone(&log), Arc::clone(&left));
             Box::pin(async move {
-                let mut left = left.lock().unwrap();
+                let mut left = left.lock().expect("failing deliveries mutex");
                 if *left > 0 {
                     *left -= 1;
                     bail!("backend unreachable");
                 }
-                log.lock().unwrap().push(out.text);
+                log.lock().expect("sent mutex").push(out.text);
                 Ok(())
             })
         });
@@ -1196,7 +1196,7 @@ mod tests {
     fn create(w: &Watches, cmd: &str) -> WatchDef {
         let description = format!("test {}", w.list().len());
         w.create("chat", Uuid::nil(), cmd, "/tmp", "forever", &description)
-            .unwrap()
+            .expect("create the watch")
     }
 
     #[tokio::test]
@@ -1282,9 +1282,9 @@ mod tests {
         std::fs::remove_dir(&cwd).unwrap();
 
         let (deliver, sent) = recorder(0);
-        let w = Watches::start(root, deliver, unheard(), limits());
-        w.admit_restored(|_| true);
-        until_gone(&w).await;
+        let restarted = Watches::start(root, deliver, unheard(), limits());
+        restarted.admit_restored(|_| true);
+        until_gone(&restarted).await;
         let sent = sent.lock().unwrap().join("\n");
         assert!(
             sent.starts_with("ended: the command could not be started (")
@@ -1330,19 +1330,21 @@ mod tests {
         assert!(sent.lock().unwrap().is_empty());
         assert!(w.list().is_empty());
 
-        let (deliver, sent) = recorder(0);
-        let w = Watches::start(root, deliver, unheard(), limits());
-        assert_eq!(w.list().len(), 1, "restored from disk");
-        w.admit_restored(|_| true);
+        let (deliver, delivered) = recorder(0);
+        let restarted = Watches::start(root, deliver, unheard(), limits());
+        assert_eq!(restarted.list().len(), 1, "restored from disk");
+        restarted.admit_restored(|_| true);
         until("the message is delivered", || {
-            !sent.lock().unwrap().is_empty()
+            !delivered.lock().unwrap().is_empty()
         })
         .await;
-        assert_eq!(sent.lock().unwrap()[0], "event");
+        assert_eq!(delivered.lock().unwrap()[0], "event");
 
-        w.remove(def.id, Some("removed with a notice.")).await;
-        until_gone(&w).await;
-        assert!(sent
+        restarted
+            .remove(def.id, Some("removed with a notice."))
+            .await;
+        until_gone(&restarted).await;
+        assert!(delivered
             .lock()
             .unwrap()
             .last()
@@ -1366,9 +1368,9 @@ mod tests {
         .unwrap();
 
         let (deliver, sent2) = recorder(0);
-        let w = Watches::start(root, deliver, unheard(), limits());
-        w.admit_restored(|_| true);
-        until_gone(&w).await;
+        let restarted = Watches::start(root, deliver, unheard(), limits());
+        restarted.admit_restored(|_| true);
+        until_gone(&restarted).await;
         assert!(sent.lock().unwrap().is_empty());
         assert!(sent2.lock().unwrap()[0].contains("its TTL passed"));
     }
@@ -1391,26 +1393,29 @@ mod tests {
             std::fs::remove_file(ran(chat)).unwrap();
         }
 
-        let w = Watches::start(root.clone(), recorder(0).0, unheard(), limits());
+        let restarted = Watches::start(root.clone(), recorder(0).0, unheard(), limits());
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(w.list().len(), 2);
+        assert_eq!(restarted.list().len(), 2);
         assert!(!ran("kept").exists(), "nothing runs before admission");
 
-        w.admit_restored(|d| d.chat_id == "kept");
+        restarted.admit_restored(|d| d.chat_id == "kept");
         until("the kept watch ran", || ran("kept").exists()).await;
-        until("the refused watch is removed", || w.list().len() == 1).await;
-        assert_eq!(w.list()[0].chat_id, "kept");
+        until("the refused watch is removed", || {
+            restarted.list().len() == 1
+        })
+        .await;
+        assert_eq!(restarted.list()[0].chat_id, "kept");
         assert!(!ran("refused").exists());
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
-        w.shutdown().await;
+        restarted.shutdown().await;
     }
 
     #[tokio::test]
     async fn a_delivery_in_flight_when_the_command_exits_is_not_repeated() {
         let sent: Sent = Arc::default();
-        let log = sent.clone();
+        let log = Arc::clone(&sent);
         let deliver: Deliver = Box::new(move |out| {
-            let log = log.clone();
+            let log = Arc::clone(&log);
             // Like the main loop: performed whether or not the watch still waits.
             let performed = tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1491,9 +1496,9 @@ mod tests {
         set_mode(0o700).unwrap();
 
         outbox.push("three");
-        let (text, files) = outbox.next().unwrap().unwrap();
-        assert_eq!(text, "three");
-        outbox.acknowledge(files);
+        let (next_text, next_files) = outbox.next().unwrap().unwrap();
+        assert_eq!(next_text, "three");
+        outbox.acknowledge(next_files);
         assert!(outbox.next().unwrap().is_none());
     }
 
@@ -1563,25 +1568,24 @@ mod tests {
             *seen += std::iter::from_fn(|| changes.try_recv().ok()).count();
             *seen
         };
-        let running =
-            |w: &Watches| -> Vec<Uuid> { w.running_in("chat").iter().map(|d| d.id).collect() };
+        let running = || -> Vec<Uuid> { w.running_in("chat").iter().map(|d| d.id).collect() };
 
         let kept = create(&w, "sleep 30");
         let ending = create(&w, "sleep 0.3");
-        assert_eq!(running(&w), [kept.id, ending.id], "oldest first");
+        assert_eq!(running(), [kept.id, ending.id], "oldest first");
         assert!(w.running_in("another chat").is_empty());
         assert_eq!(reported(), 2);
 
-        until("the command is over", || running(&w) == [kept.id]).await;
+        until("the command is over", || running() == [kept.id]).await;
         until("its end is reported", || reported() == 3).await;
 
         let stopped = create(&w, "sleep 30");
         w.remove_in_background(|d| d.id == kept.id);
-        assert_eq!(running(&w), [stopped.id], "not while it is being removed");
+        assert_eq!(running(), [stopped.id], "not while it is being removed");
         until("the removal is reported", || reported() == 5).await;
 
         w.shutdown().await;
-        assert_eq!(running(&w), [stopped.id], "the next start runs it again");
+        assert_eq!(running(), [stopped.id], "the next start runs it again");
         assert_eq!(reported(), 5);
     }
 
@@ -1624,9 +1628,9 @@ mod tests {
         let (text, files) = outbox.next().unwrap().unwrap();
         assert_eq!(text, format!("{body}\n{body}"));
         outbox.acknowledge(files);
-        let (text, files) = outbox.next().unwrap().unwrap();
-        assert_eq!(text, body);
-        outbox.acknowledge(files);
+        let (next_text, next_files) = outbox.next().unwrap().unwrap();
+        assert_eq!(next_text, body);
+        outbox.acknowledge(next_files);
         assert!(outbox.next().unwrap().is_none());
     }
 }

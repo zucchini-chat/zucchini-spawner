@@ -98,7 +98,7 @@ mod tests {
             .arg("30")
             .process_group(0)
             .spawn()
-            .unwrap()
+            .expect("spawn sleep")
     }
 
     #[test]
@@ -150,7 +150,7 @@ mod tests {
         sweep_in(&dir, GRACE);
 
         let gone = (0..100).any(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20));
             !sys::process_exists(member)
         });
         assert!(gone, "the leaderless group's member was killed");

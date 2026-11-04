@@ -313,7 +313,7 @@ pub struct ControlState {
 /// hermes socket server), so a crash that left the inode behind doesn't
 /// permanently break the RPC path (the bind would otherwise fail with
 /// EADDRINUSE on every restart).
-pub async fn start(state: ControlState) -> Result<()> {
+pub fn start(state: ControlState) -> Result<()> {
     let path = control_socket_path();
     let listener = sys::IpcListener::bind(&path)
         .with_context(|| format!("bind control socket {}", path.display()))?;
@@ -368,7 +368,7 @@ async fn handle_conn(stream: sys::IpcStream, state: ControlState) -> Result<()> 
         .write_all(out.as_bytes())
         .await
         .context("write control response")?;
-    write_half.shutdown().await.ok();
+    let _ = write_half.shutdown().await;
     Ok(())
 }
 
@@ -794,7 +794,7 @@ async fn mint_upload(path: &Path, state: &ControlState) -> Result<blobs::MintedU
 async fn upload(
     http: reqwest::Client,
     key: Arc<crate::crypto::KUser>,
-    path: std::path::PathBuf,
+    path: PathBuf,
     presigned_url: String,
 ) -> Result<()> {
     let plaintext = tokio::fs::read(&path).await.context("read failed")?;
@@ -1057,12 +1057,12 @@ async fn set_system_prompt(
         .map_err(|e| anyhow!(e))?;
     let size = prompt.text.as_deref().map_or(0, str::len);
     let sealed = match &prompt.text {
-        Some(text) => {
+        Some(prompt_text) => {
             let key = state
                 .keys
                 .get(&user_id)
                 .with_context(|| format!("no key for user {user_id}"))?;
-            Some(crate::crypto::encrypt_field_b64(&key, text))
+            Some(crate::crypto::encrypt_field_b64(&key, prompt_text))
         }
         None => None,
     };
@@ -1326,7 +1326,7 @@ async fn send_control_request(req: &ControlRequest) -> Result<ControlResponse> {
         .write_all(payload.as_bytes())
         .await
         .context("write control request")?;
-    write_half.shutdown().await.ok();
+    let _ = write_half.shutdown().await;
 
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();

@@ -21,7 +21,7 @@ use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_shutdown, CtrlBreak, CtrlC
 use tracing::{info, warn};
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_LOCK_VIOLATION, ERROR_PIPE_BUSY, FILETIME, GENERIC_ALL, HANDLE,
-    INVALID_HANDLE_VALUE,
+    INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::{
     SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS,
@@ -177,7 +177,11 @@ pub fn configure_new_process_group(cmd: &mut tokio::process::Command) {
 /// closed twice). Sites that rely only on this cite `// SAFETY: FFI; see
 /// JobHandle.`
 struct JobHandle(HANDLE);
+// SAFETY: a job handle is valid from any thread, and `ProcessGroup` (its only
+// user) closes it once, in `Drop`.
 unsafe impl Send for JobHandle {}
+// SAFETY: through `&` it only reaches `TerminateJobObject`, which any number of
+// threads may call on one job at once.
 unsafe impl Sync for JobHandle {}
 
 /// Opaque handle to the spawned child's Job Object — the Windows analogue of
@@ -208,36 +212,37 @@ impl ProcessGroup {
         if job.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let job = JobHandle(job);
+        // An error return below drops `group`, which closes the job after the
+        // error is read.
+        let group = ProcessGroup {
+            job: JobHandle(job),
+        };
 
+        // SAFETY: the struct is integers only, so all-zero is valid.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: FFI. `info` is a valid, fully-initialized struct of the size
         // we pass for the `JobObjectExtendedLimitInformation` class.
         let ok = unsafe {
             SetInformationJobObject(
-                job.0,
+                group.job.0,
                 JobObjectExtendedLimitInformation,
                 std::ptr::addr_of!(info).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                win32_size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(),
             )
         };
         if ok == 0 {
-            let err = io::Error::last_os_error();
-            unsafe { CloseHandle(job.0) };
-            return Err(err);
+            return Err(io::Error::last_os_error());
         }
 
         // SAFETY: FFI. `handle` is the child's live process handle (checked
         // non-`None` above and not yet reaped on this synchronous path).
-        let assigned = unsafe { AssignProcessToJobObject(job.0, handle as HANDLE) };
+        let assigned = unsafe { AssignProcessToJobObject(group.job.0, handle as HANDLE) };
         if assigned == 0 {
-            let err = io::Error::last_os_error();
-            unsafe { CloseHandle(job.0) };
-            return Err(err);
+            return Err(io::Error::last_os_error());
         }
 
-        Ok(ProcessGroup { job })
+        Ok(group)
     }
 
     /// Graceful kill — best-effort. There is no Windows SIGTERM, so this diverges
@@ -311,6 +316,10 @@ pub fn process_group_exists(_pgid: u32) -> bool {
 /// Footprint (KB) of each root's whole process tree, or `None` if the process
 /// snapshot fails. Same ppid walk as unix; synchronous Win32 calls, a few ms
 /// for a few hundred processes.
+#[expect(
+    clippy::unused_async,
+    reason = "same signature as the unix twin, which awaits `ps`"
+)]
 pub async fn process_tree_footprint_kb(roots: &[u32]) -> Option<Vec<u64>> {
     let rows = process_rows()?;
     let footprints = roots
@@ -359,15 +368,17 @@ fn snapshot_process_rows() -> Option<Vec<(u32, u32)>> {
         return None;
     }
     let _guard = OwnedHandle(snapshot);
+    // SAFETY: the struct is integers and a `u16` array, so all-zero is valid.
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    entry.dwSize = win32_size_of::<PROCESSENTRY32W>();
     let mut rows = Vec::new();
     // SAFETY: FFI. `entry` is a valid struct with `dwSize` set, as both calls
     // require; `snapshot` is live for the loop.
-    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+    let mut ok = unsafe { Process32FirstW(snapshot, &raw mut entry) };
     while ok != 0 {
         rows.push((entry.th32ProcessID, entry.th32ParentProcessID));
-        ok = unsafe { Process32NextW(snapshot, &mut entry) };
+        // SAFETY: FFI. Same `snapshot` and `entry` as `Process32FirstW` above.
+        ok = unsafe { Process32NextW(snapshot, &raw mut entry) };
     }
     Some(rows)
 }
@@ -382,7 +393,10 @@ fn open_for_query(pid: u32) -> Option<OwnedHandle> {
 
 fn process_creation_time(pid: u32) -> Option<u64> {
     let process = open_for_query(pid)?;
-    let mut times: [FILETIME; 4] = unsafe { std::mem::zeroed() };
+    let mut times = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
     let [created, exited, kernel, user] = &mut times;
     // SAFETY: FFI. `process` is live; the four out-params are valid FILETIMEs.
     let ok = unsafe { GetProcessTimes(process.0, created, exited, kernel, user) };
@@ -395,8 +409,9 @@ fn process_creation_time(pid: u32) -> Option<u64> {
 /// shared `claude`/node image once per process.
 fn footprint_kb(pid: u32) -> Option<u64> {
     let process = open_for_query(pid)?;
+    // SAFETY: the struct is integers only, so all-zero is valid.
     let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let size = win32_size_of::<PROCESS_MEMORY_COUNTERS_EX>();
     counters.cb = size;
     // SAFETY: FFI. `process` is live; `counters` is a `_EX` struct of `size`
     // bytes, which the API accepts in place of the base struct.
@@ -411,10 +426,11 @@ fn footprint_kb(pid: u32) -> Option<u64> {
 /// Windows fails allocations when commit runs out, however much RAM is free.
 /// `None` if unreadable.
 pub fn memory() -> Option<crate::warm::Memory> {
+    // SAFETY: the struct is integers only, so all-zero is valid.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    status.dwLength = win32_size_of::<MEMORYSTATUSEX>();
     // SAFETY: FFI. `status` is a valid struct with `dwLength` set.
-    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 || status.ullTotalPhys == 0 {
+    if unsafe { GlobalMemoryStatusEx(&raw mut status) } == 0 || status.ullTotalPhys == 0 {
         return None;
     }
     Some(crate::warm::Memory {
@@ -422,6 +438,25 @@ pub fn memory() -> Option<crate::warm::Memory> {
         pressure: status.ullAvailPhys * 10 < status.ullTotalPhys
             || status.ullAvailPageFile * 10 < status.ullTotalPageFile,
     })
+}
+
+/// `size_of::<T>()` as the `u32` that Win32 size fields and arguments take.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Win32 structs are far smaller than 4 GiB"
+)]
+const fn win32_size_of<T>() -> u32 {
+    size_of::<T>() as u32
+}
+
+/// A Win32 error code the way `io::Error` holds it: the same 32 bits as an
+/// `i32`, as std's own `last_os_error` stores `GetLastError()`.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "a bit-for-bit reinterpretation is the intent"
+)]
+const fn raw_os_error(code: WIN32_ERROR) -> i32 {
+    code as i32
 }
 
 /// RAII close for a handle we opened (process, token, snapshot).
@@ -471,6 +506,8 @@ pub fn acquire_single_instance_lock(path: &Path) -> io::Result<Option<InstanceLo
         .truncate(false)
         .open(path)?;
 
+    // SAFETY: integers, a union of integers and a pointer, and a handle: all
+    // valid as zero (null).
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
     // SAFETY: FFI. `file`'s handle is live (just opened, kept alive by `file`);
     // `overlapped` is a valid zeroed struct we own for the duration of the call.
@@ -481,7 +518,7 @@ pub fn acquire_single_instance_lock(path: &Path) -> io::Result<Option<InstanceLo
             0,
             1,
             0,
-            &mut overlapped,
+            &raw mut overlapped,
         )
     };
     if ok == 0 {
@@ -489,7 +526,7 @@ pub fn acquire_single_instance_lock(path: &Path) -> io::Result<Option<InstanceLo
         // On the fail-immediately path `LockFileEx` returns `ERROR_LOCK_VIOLATION`
         // when another holder has the lock (the unix `EWOULDBLOCK` analogue), so
         // report contention, not error.
-        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        if err.raw_os_error() == Some(raw_os_error(ERROR_LOCK_VIOLATION)) {
             return Ok(None);
         }
         return Err(err);
@@ -538,8 +575,8 @@ fn build_owner_only_dacl(
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: FFI. `GetCurrentProcess` returns a pseudo-handle that needs no
     // close; we open it for `TOKEN_QUERY` only.
-    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
-    if ok == 0 {
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) };
+    if opened == 0 {
         return Err(io::Error::last_os_error());
     }
     let _token_guard = OwnedHandle(token);
@@ -548,26 +585,29 @@ fn build_owner_only_dacl(
     let mut needed: u32 = 0;
     // SAFETY: FFI. Passing null/0 to query the required length is the documented
     // two-call pattern; failure with a too-small buffer is expected here.
-    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut needed) };
     if needed == 0 {
         return Err(io::Error::last_os_error());
     }
     token_buf.resize(needed as usize, 0);
     // SAFETY: FFI. `token_buf` now holds `needed` bytes; on success it's a valid
     // `TOKEN_USER` whose `User.Sid` points within `token_buf`.
-    let ok = unsafe {
+    let filled = unsafe {
         GetTokenInformation(
             token,
             TokenUser,
             token_buf.as_mut_ptr().cast(),
             needed,
-            &mut needed,
+            &raw mut needed,
         )
     };
-    if ok == 0 {
+    if filled == 0 {
         return Err(io::Error::last_os_error());
     }
-    let user_sid: PSID = unsafe { (*token_buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: the call succeeded, so `token_buf` starts with a `TOKEN_USER`.
+    // Read unaligned: a `Vec<u8>` promises no alignment.
+    let token_user = unsafe { token_buf.as_ptr().cast::<TOKEN_USER>().read_unaligned() };
+    let user_sid: PSID = token_user.User.Sid;
 
     let explicit = EXPLICIT_ACCESS_W {
         grfAccessPermissions: GENERIC_ALL,
@@ -585,9 +625,10 @@ fn build_owner_only_dacl(
     let mut new_acl: *mut ACL = std::ptr::null_mut();
     // SAFETY: FFI. One explicit-access entry; `oldacl` null builds a fresh ACL.
     // `new_acl` receives a `LocalAlloc`-owned ACL we wrap in `LocalAllocAcl`.
-    let rc = unsafe { SetEntriesInAclW(1, &explicit, std::ptr::null(), &mut new_acl) };
+    let rc =
+        unsafe { SetEntriesInAclW(1, &raw const explicit, std::ptr::null(), &raw mut new_acl) };
     if rc != 0 {
-        return Err(io::Error::from_raw_os_error(rc as i32));
+        return Err(io::Error::from_raw_os_error(raw_os_error(rc)));
     }
     Ok(LocalAllocAcl(new_acl))
 }
@@ -630,7 +671,7 @@ fn apply_owner_only_dacl(path: &Path, inheritance: ACE_FLAGS) -> io::Result<()> 
         )
     };
     if rc != 0 {
-        return Err(io::Error::from_raw_os_error(rc as i32));
+        return Err(io::Error::from_raw_os_error(raw_os_error(rc)));
     }
     Ok(())
 }
@@ -829,7 +870,8 @@ impl IpcListener {
     /// inline. A successfully-connected client is never dropped over a restock
     /// failure.
     pub async fn accept(&self) -> io::Result<IpcStream> {
-        let server = match self.next.lock().expect("ipc accept mutex poisoned").take() {
+        let staged = self.next.lock().expect("ipc accept mutex poisoned").take();
+        let server = match staged {
             Some(s) => s,
             None => ServerOptions::new().create(&self.name)?,
         };
@@ -882,7 +924,8 @@ pub async fn ipc_connect(path: &Path) -> io::Result<IpcStream> {
                 })
             }
             Err(e)
-                if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && attempt < MAX_ATTEMPTS =>
+                if e.raw_os_error() == Some(raw_os_error(ERROR_PIPE_BUSY))
+                    && attempt < MAX_ATTEMPTS =>
             {
                 tokio::time::sleep(RETRY_WAIT).await;
             }

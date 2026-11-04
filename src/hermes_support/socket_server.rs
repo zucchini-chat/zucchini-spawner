@@ -195,9 +195,9 @@ pub fn start(
     let cancel_for_task = cancel.clone();
     let socket_path_for_env = socket_path.clone();
     let router = Arc::new(Mutex::new(RouterState::new()));
-    let router_for_accept = router.clone();
+    let router_for_accept = Arc::clone(&router);
     let write_tx_for_accept = write_tx.clone();
-    let mirror_for_accept = mirror.clone();
+    let mirror_for_accept = Arc::clone(&mirror);
 
     tokio::spawn(async move {
         // Spawn the gateway-child supervisor. It will (re)start
@@ -239,16 +239,16 @@ async fn run_accept_loop(
 ) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 info!("hermes socket server: shutdown");
                 return;
             }
             res = listener.accept() => {
                 match res {
                     Ok(stream) => {
-                        let router = router.clone();
+                        let router = Arc::clone(&router);
                         let write_tx = write_tx.clone();
-                        let mirror = mirror.clone();
+                        let mirror = Arc::clone(&mirror);
                         let cancel = cancel.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(stream, router, write_tx, mirror, cancel).await {
@@ -388,7 +388,7 @@ async fn run_plugin_connection(
         ticker.tick().await; // skip immediate first tick
         loop {
             tokio::select! {
-                _ = cancel_for_ping.cancelled() => return,
+                () = cancel_for_ping.cancelled() => return,
                 _ = ticker.tick() => {
                     let ping = r#"{"type":"ping"}"#.to_string();
                     if out_tx_for_ping.try_send(ping).is_err() {
@@ -407,7 +407,7 @@ async fn run_plugin_connection(
         loop {
             buf.clear();
             tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
+                () = cancel.cancelled() => return Ok(()),
                 r = reader.read_line(&mut buf) => {
                     let n = r.context("read from plugin")?;
                     if n == 0 {
@@ -494,7 +494,7 @@ async fn run_trampoline_connection(
         loop {
             buf.clear();
             tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
+                () = cancel.cancelled() => return Ok(()),
                 r = reader.read_line(&mut buf) => {
                     let n = r.context("read from trampoline")?;
                     if n == 0 {
@@ -540,7 +540,7 @@ async fn connection_writer(
 ) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => return,
+            () = cancel.cancelled() => return,
             msg = out_rx.recv() => {
                 let Some(mut msg) = msg else {
                     // Sender dropped — connection done.
@@ -707,8 +707,8 @@ async fn spawn_gateway_supervisor(socket_path: PathBuf, cancel: CancellationToke
                 logged_absent = true;
             }
             tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(HERMES_ABSENT_POLL_INTERVAL) => {}
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(HERMES_ABSENT_POLL_INTERVAL) => {}
             }
             continue;
         }
@@ -718,11 +718,11 @@ async fn spawn_gateway_supervisor(socket_path: PathBuf, cancel: CancellationToke
             backoff = GATEWAY_RESTART_MIN;
         }
         let started = std::time::Instant::now();
-        match start_gateway_child(&socket_path).await {
+        match start_gateway_child(&socket_path) {
             Ok(mut child) => {
                 info!("hermes gateway run: started, pid={:?}", child.id());
                 let exit_status = tokio::select! {
-                    _ = cancel.cancelled() => {
+                    () = cancel.cancelled() => {
                         let _ = child.kill().await;
                         return;
                     }
@@ -743,8 +743,8 @@ async fn spawn_gateway_supervisor(socket_path: PathBuf, cancel: CancellationToke
             }
         }
         tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(backoff) => {}
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(backoff) => {}
         }
         backoff = (backoff * 2).min(GATEWAY_RESTART_MAX);
     }
@@ -753,7 +753,7 @@ async fn spawn_gateway_supervisor(socket_path: PathBuf, cancel: CancellationToke
 /// Launch `hermes gateway run` with `ZUCCHINI_SPAWNER_SOCK` baked in.
 /// stdout/stderr are inherited so the operator sees gateway logs in the
 /// spawner journal. Returns the child handle.
-async fn start_gateway_child(socket_path: &Path) -> Result<tokio::process::Child> {
+fn start_gateway_child(socket_path: &Path) -> Result<tokio::process::Child> {
     // Run under the user's login shell so the plugin discovers hermes via
     // PATH the same way an interactive `hermes` invocation would. Same
     // convention as the agent supervisor (`agent.rs::default_spawn_fn`).
@@ -763,7 +763,7 @@ async fn start_gateway_child(socket_path: &Path) -> Result<tokio::process::Child
     // extend PATH only in `.zshrc`, which a non-interactive login shell does NOT
     // source — drop it and the probe still finds hermes while this launch can't
     // (`hermes gateway run` exits 127 and crash-loops).
-    let mut cmd = crate::sys::login_shell_command("hermes gateway run");
+    let mut cmd = sys::login_shell_command("hermes gateway run");
     cmd.env("ZUCCHINI_SPAWNER_SOCK", socket_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -794,7 +794,7 @@ mod tests {
                 "project_id": Uuid::now_v7().to_string(),
                 "user_id": user_id.to_string(),
                 "last_seq": 0,
-                "agent_session_id": serde_json::Value::Null,
+                "agent_session_id": Value::Null,
                 "agent_kind": "hermes",
                 "worktree": false,
             })
@@ -849,7 +849,7 @@ mod tests {
                 "project_id": Uuid::now_v7().to_string(),
                 "user_id": user_id.to_string(),
                 "last_seq": 0,
-                "agent_session_id": serde_json::Value::Null,
+                "agent_session_id": Value::Null,
                 "agent_kind": "hermes",
                 "worktree": false,
             })

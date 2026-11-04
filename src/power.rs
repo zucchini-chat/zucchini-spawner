@@ -41,6 +41,9 @@ impl AgentPowerAssertion {
 #[cfg(target_os = "macos")]
 impl Drop for AgentPowerAssertion {
     fn drop(&mut self) {
+        // SAFETY: takes no pointers; `self.id` comes from a successful
+        // `IOPMAssertionCreateWithName` (the only constructor) and Drop
+        // releases it once.
         unsafe {
             macos::IOPMAssertionRelease(self.id);
         }
@@ -117,6 +120,8 @@ mod macos {
 
     fn cfstring(s: &str) -> Option<CFStringRef> {
         let c = CString::new(s).ok()?;
+        // SAFETY: a null allocator means the default one; `c` is
+        // NUL-terminated UTF-8 and outlives the call, which copies it.
         let r =
             unsafe { CFStringCreateWithCString(ptr::null(), c.as_ptr(), kCFStringEncodingUTF8) };
         if r.is_null() {
@@ -146,6 +151,10 @@ mod macos {
         token: IOPMConnectionMessageToken,
         capabilities: IOPMSystemPowerStateCapabilities,
     ) {
+        // SAFETY: `param` is the `ctx_ptr` registered in `spawn_watcher`. IOKit
+        // calls us only from that thread's run loop, which runs only after
+        // setup succeeded and leaked the context, so it lives for the process;
+        // it is only ever read through `&` (atomics and an `Arc`).
         let ctx = unsafe { &*(param as *const WatcherContext) };
         let video_now = (capabilities & CAPABILITY_VIDEO) != 0;
         let had_video = ctx.had_video.swap(video_now, Ordering::Relaxed);
@@ -156,6 +165,8 @@ mod macos {
             );
             ctx.notify.notify_one();
         }
+        // SAFETY: acknowledges the event IOKit just delivered, on the
+        // connection it delivered it on, which is never released once set up.
         unsafe {
             IOPMConnectionAcknowledgeEvent(connection, token);
         }
@@ -172,7 +183,7 @@ mod macos {
             .name("power-watcher".into())
             .spawn(move || {
                 // Box stays owned through setup; on Err it drops normally (no unsafe),
-                // on Ok we mem::forget it so the IOKit registration's raw pointer
+                // on Ok we leak it so the IOKit registration's raw pointer
                 // remains valid for the process lifetime (CFRunLoopRun never returns).
                 let setup = || -> Result<(IOPMConnection, Box<WatcherContext>), SetupErr> {
                     let cf_name = cfstring("zucchini-spawner").ok_or(SetupErr {
@@ -185,41 +196,54 @@ mod macos {
                         notify,
                         had_video: AtomicBool::new(true),
                     });
-                    let ctx_ptr = &*ctx_box as *const WatcherContext as *mut c_void;
+                    let ctx_ptr = &raw const *ctx_box as *mut c_void;
 
                     let mut conn: IOPMConnection = ptr::null_mut();
                     let interest = CAPABILITY_CPU | CAPABILITY_VIDEO;
-                    let r = unsafe { IOPMConnectionCreate(cf_name, interest, &mut conn) };
-                    unsafe { CFRelease(cf_name as *const c_void) };
-                    if r != KERN_SUCCESS || conn.is_null() {
+                    // SAFETY: `cf_name` is a live CFString; `conn` is a writable
+                    // local the call fills in.
+                    let create_ret =
+                        unsafe { IOPMConnectionCreate(cf_name, interest, &raw mut conn) };
+                    // SAFETY: `cf_name` is non-null and its one reference is ours
+                    // (Create rule), released once and unused after; a callee that
+                    // keeps a CF object retains it.
+                    unsafe { CFRelease(cf_name.cast::<c_void>()) };
+                    if create_ret != KERN_SUCCESS || conn.is_null() {
                         return Err(SetupErr {
                             conn: None,
                             step: "IOPMConnectionCreate",
-                            code: r,
+                            code: create_ret,
                         });
                     }
 
-                    let r = unsafe { IOPMConnectionSetNotification(conn, ctx_ptr, power_callback) };
-                    if r != KERN_SUCCESS {
+                    // SAFETY: `conn` is the live connection just created. `ctx_ptr`
+                    // is valid whenever the handler runs: only on this thread's run
+                    // loop, which runs only after setup succeeded and leaked the box.
+                    let notify_ret =
+                        unsafe { IOPMConnectionSetNotification(conn, ctx_ptr, power_callback) };
+                    if notify_ret != KERN_SUCCESS {
                         return Err(SetupErr {
                             conn: Some(conn),
                             step: "IOPMConnectionSetNotification",
-                            code: r,
+                            code: notify_ret,
                         });
                     }
 
-                    let r = unsafe {
+                    // SAFETY: `conn` is live; `CFRunLoopGetCurrent` returns this
+                    // thread's run loop (Get rule: not ours to release) and
+                    // `kCFRunLoopDefaultMode` is a constant CFString.
+                    let schedule_ret = unsafe {
                         IOPMConnectionScheduleWithRunLoop(
                             conn,
-                            CFRunLoopGetCurrent() as *mut c_void,
+                            CFRunLoopGetCurrent().cast::<c_void>(),
                             kCFRunLoopDefaultMode,
                         )
                     };
-                    if r != KERN_SUCCESS {
+                    if schedule_ret != KERN_SUCCESS {
                         return Err(SetupErr {
                             conn: Some(conn),
                             step: "IOPMConnectionScheduleWithRunLoop",
-                            code: r,
+                            code: schedule_ret,
                         });
                     }
 
@@ -229,11 +253,17 @@ mod macos {
                 match setup() {
                     Ok((_conn, ctx_box)) => {
                         info!("power watcher registered (full-wake only)");
-                        std::mem::forget(ctx_box);
+                        Box::leak(ctx_box);
+                        // SAFETY: no arguments; runs this thread's run loop, which
+                        // delivers `power_callback`, for the rest of the process.
                         unsafe { CFRunLoopRun() };
                     }
                     Err(e) => {
                         if let Some(c) = e.conn {
+                            // SAFETY: `c` is the connection `IOPMConnectionCreate`
+                            // returned, released once here. Its handler never ran
+                            // (this thread's run loop didn't), so the dropped
+                            // context was never read.
                             unsafe { IOPMConnectionRelease(c) };
                         }
                         error!(
@@ -258,8 +288,10 @@ mod macos {
         let cf_type = cfstring_static(&CF_TYPE, "PreventUserIdleSystemSleep")?;
         let cf_name = cfstring_static(&CF_NAME, "zucchini-spawner agent running")?;
         let mut id: IOPMAssertionID = 0;
+        // SAFETY: `cf_type` and `cf_name` are process-lifetime CFStrings (never
+        // released); `id` is a writable local the call fills in.
         let r = unsafe {
-            IOPMAssertionCreateWithName(cf_type, IOPM_ASSERTION_LEVEL_ON, cf_name, &mut id)
+            IOPMAssertionCreateWithName(cf_type, IOPM_ASSERTION_LEVEL_ON, cf_name, &raw mut id)
         };
         if r != KERN_SUCCESS {
             warn!(code = r, "IOPMAssertionCreateWithName failed");

@@ -18,6 +18,7 @@ mod shell;
 mod state;
 mod suggest_chat;
 mod sys;
+mod text;
 mod tunnel;
 mod uninstall;
 mod updater;
@@ -35,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adapter::AgentKind;
-use agent::{AgentResponse, QueuedTurn, SpawnRequest, Supervisor};
+use agent::{AgentResponse, LiveTasksChange, QueuedTurn, SpawnRequest, Supervisor};
 use auth::AuthClient;
 use blobs::BlobDownloader;
 use crypto::KeyStore;
@@ -170,7 +171,7 @@ fn base_and_token(prod: Option<&ProdConfig>, dev_url: &str) -> (String, writer::
     match prod {
         Some(p) => (
             PROD_BASE_URL.to_string(),
-            auth::token_fetcher(p.auth.clone()),
+            auth::token_fetcher(Arc::clone(&p.auth)),
         ),
         None => (dev_url.to_string(), dev_token_fetcher()),
     }
@@ -245,7 +246,10 @@ enum StagedRow {
     Remove,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the main loop's state, borrowed piece by piece"
+)]
 async fn handle_sync_event(
     event: SyncEvent,
     machine_id: Option<Uuid>,
@@ -824,7 +828,7 @@ async fn publish_queued_turn(
     mirror: &Mirror,
     chat_id: String,
 ) {
-    if let Some(tasks) = supervisor.live_tasks_change(&chat_id) {
+    if let LiveTasksChange::Changed(tasks) = supervisor.live_tasks_change(&chat_id) {
         send_live_tasks(write_tx, mirror, chat_id.clone(), tasks).await;
     }
     send_run_state(write_tx, chat_id.clone(), true).await;
@@ -1230,7 +1234,7 @@ async fn stop_agent(
 }
 
 /// Per chat, the `seq`s of the user messages staged in one checkpoint window.
-type WindowUserSeqs = std::collections::HashMap<String, std::collections::HashSet<i64>>;
+type WindowUserSeqs = std::collections::HashMap<String, HashSet<i64>>;
 
 fn window_user_seqs(raw_rows: &[String]) -> WindowUserSeqs {
     let mut seqs = WindowUserSeqs::new();
@@ -1357,14 +1361,14 @@ async fn handle_message_put(
     mirror.set_handled_user_seq(&chat_id, seq);
 
     let Some(body_str) = row.get("body").and_then(|v| v.as_str()) else {
-        let keys: Vec<&String> = row
+        let columns: Vec<&String> = row
             .as_object()
             .map(|o| o.keys().collect())
             .unwrap_or_default();
         warn!(
             chat_id = %chat_id,
             seq,
-            keys = ?keys,
+            keys = ?columns,
             raw = %data,
             "message row missing body (dump of raw PowerSync row)"
         );
@@ -1861,7 +1865,7 @@ async fn apply_prune_group(
     // `PruneRequest` (control.rs only enqueues those); guard anyway rather than
     // panic if somehow `None`.
     let mut total = prune::PruneStats::default();
-    let mut groups: std::collections::HashMap<std::path::PathBuf, Vec<&prune::PruneRequest>> =
+    let mut groups: std::collections::HashMap<PathBuf, Vec<&prune::PruneRequest>> =
         std::collections::HashMap::new();
     for req in &reqs {
         groups.entry(req.jsonl_path.clone()).or_default().push(req);
@@ -2492,7 +2496,7 @@ async fn run_history_import(
 
     emit_status(&write_tx, machine_id, "running-0".to_string()).await;
 
-    let n = kinds.len() as u32;
+    let n = kinds.len();
     // Last `running-{scaled}` value we put on the wire, shared across every
     // kind's callback. The bar is monotonic non-decreasing (idx grows, and
     // each kind's percent grows), so deduping consecutive identical values
@@ -2501,19 +2505,18 @@ async fn run_history_import(
     let last_scaled = Arc::new(AtomicU8::new(0));
     let mut ok_count = 0usize;
     for (idx, kind) in kinds.iter().enumerate() {
-        let idx_u32 = idx as u32;
         let tx_for_progress = write_tx.clone();
         let last_scaled = Arc::clone(&last_scaled);
         // Per-kind rescaler. `scaled = (idx*100 + pct) / N`, capped at 99
         // (the dispatcher owns 100/finished). The adapter calls this ~once per
         // imported chat; we emit only when the rescaled bar value actually
         // moves, so multi-kind imports don't re-send the same percent N times.
-        let progress: crate::adapter::ImportProgress = Box::new(move |pct: u8| {
+        let progress: adapter::ImportProgress = Box::new(move |pct: u8| {
             let tx = tx_for_progress.clone();
             let last_scaled = Arc::clone(&last_scaled);
             Box::pin(async move {
-                let pct = pct.min(100) as u32;
-                let scaled = ((idx_u32 * 100 + pct) / n).min(99) as u8;
+                let pct = usize::from(pct.min(100));
+                let scaled = u8::try_from(((idx * 100 + pct) / n).min(99)).expect("capped at 99");
                 if last_scaled.swap(scaled, Ordering::Relaxed) != scaled {
                     emit_status(&tx, machine_id, format!("running-{scaled}")).await;
                 }
@@ -2560,7 +2563,7 @@ fn spawn_heartbeat(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => return,
+                () = cancel.cancelled() => return,
                 _ = ticker.tick() => {
                     if write_tx
                         .send(WriteEvent::Heartbeat { machine_id })
@@ -3267,7 +3270,7 @@ async fn run_system_prompt_cli(args: &[String]) {
                     println!("files: {files}");
                 }
                 match prompt.text {
-                    Some(text) => println!("text:\n{text}"),
+                    Some(saved) => println!("text:\n{saved}"),
                     None => println!("no text"),
                 }
             }),
@@ -3580,8 +3583,8 @@ async fn main() {
     // join the same sync stream and spawn a duplicate agent for every user
     // message (two responses + two `[result]`s per chat). See
     // `acquire_single_instance_lock`.
-    let _instance_lock = acquire_single_instance_lock();
-    if _instance_lock.is_some() {
+    let instance_lock = acquire_single_instance_lock();
+    if instance_lock.is_some() {
         orphans::sweep();
         sys::ensure_supervisor_task();
     }
@@ -3685,7 +3688,7 @@ async fn main() {
             base_url: writer_base_url,
             fetch_token: writer_token,
         },
-        keys.clone(),
+        Arc::clone(&keys),
     );
     let write_tx = writer.tx.clone();
 
@@ -3714,17 +3717,17 @@ async fn main() {
     // env var to find the socket. Export the path so the env var is
     // inherited by every subprocess (`agent.rs::default_spawn_fn` doesn't
     // override it).
-    let hermes_socket = match hermes_support::socket_server::start(write_tx.clone(), mirror.clone())
-    {
-        Ok(handle) => {
-            std::env::set_var("ZUCCHINI_SPAWNER_SOCK", &handle.socket_path);
-            Some(handle)
-        }
-        Err(e) => {
-            warn!(error = %e, "hermes socket server failed to start; hermes chats will fail");
-            None
-        }
-    };
+    let hermes_socket =
+        match hermes_support::socket_server::start(write_tx.clone(), Arc::clone(&mirror)) {
+            Ok(handle) => {
+                std::env::set_var("ZUCCHINI_SPAWNER_SOCK", &handle.socket_path);
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(error = %e, "hermes socket server failed to start; hermes chats will fail");
+                None
+            }
+        };
 
     // Probe-completion signal: `spawn_startup_info_report` sends once after
     // it fills `probe_statuses_cache` — the retry for the seed the boot
@@ -3739,7 +3742,7 @@ async fn main() {
         spawn_startup_info_report(
             p.machine_id,
             write_tx.clone(),
-            probe_statuses_cache.clone(),
+            Arc::clone(&probe_statuses_cache),
             probe_ready_tx,
         );
 
@@ -3776,7 +3779,7 @@ async fn main() {
         tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     );
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<TunnelDelivery>(16);
-    if _instance_lock.is_some() {
+    if instance_lock.is_some() {
         let deliver: watch::Deliver = Box::new(move |out| {
             let watch_tx = watch_tx.clone();
             Box::pin(async move {
@@ -3808,14 +3811,14 @@ async fn main() {
         let (api_base_url, api_token) = base_and_token(prod.as_ref(), DEV_API_BASE_URL);
         let backend = tunnel::Backend {
             http: reqwest::Client::builder()
-                .user_agent(crate::useragent::user_agent())
+                .user_agent(useragent::user_agent())
                 .timeout(Duration::from_secs(60))
                 .build()
                 .expect("control http client"),
             api_base_url,
             fetch_token: Arc::new(api_token),
         };
-        if _instance_lock.is_some() {
+        if instance_lock.is_some() {
             let deliver: tunnel::Deliver = Box::new(move |notice| {
                 let tunnel_tx = tunnel_tx.clone();
                 Box::pin(async move {
@@ -3831,15 +3834,15 @@ async fn main() {
             http: backend.http,
             api_base_url: backend.api_base_url,
             fetch_token: backend.fetch_token,
-            keys: keys.clone(),
+            keys: Arc::clone(&keys),
             pending: supervisor.pending_attachments(),
-            mirror: mirror.clone(),
+            mirror: Arc::clone(&mirror),
             live_sessions: supervisor.live_sessions(),
-            pending_prunes: pending_prunes.clone(),
+            pending_prunes: Arc::clone(&pending_prunes),
             write_tx: write_tx.clone(),
-            probe_statuses: probe_statuses_cache.clone(),
+            probe_statuses: Arc::clone(&probe_statuses_cache),
         };
-        if let Err(e) = control::start(control_state).await {
+        if let Err(e) = control::start(control_state) {
             warn!(error = %e, "failed to start control socket — `zucchini-spawner attach-file` will be unavailable");
         }
     }
@@ -3882,7 +3885,7 @@ async fn main() {
             _ = warm_tick.tick() => {
                 warm_due = true;
             }
-            _ = tokio::time::sleep_until(warm_deadline.unwrap_or_else(tokio::time::Instant::now)), if warm_deadline.is_some() => {
+            () = tokio::time::sleep_until(warm_deadline.unwrap_or_else(tokio::time::Instant::now)), if warm_deadline.is_some() => {
                 warm_due = true;
             }
             _ = shutdown.recv() => {
@@ -3892,7 +3895,7 @@ async fn main() {
                 shutdown_and_flush(&mut supervisor, &mut response_rx, &mirror, &write_tx, &heartbeat_cancel, &writer).await;
                 break;
             }
-            _ = revoked_token.cancelled() => {
+            () = revoked_token.cancelled() => {
                 info!("auth revoked (410 from /auth/token) — running self-uninstall and exiting");
                 run_uninstall(&mut supervisor, &heartbeat_cancel, &writer).await;
                 break 'main_loop;
@@ -4119,9 +4122,11 @@ mod tests {
     use super::*;
     use crate::agent::{ResidentHandles, ResidentSpawnFn, SessionState, SpawnFn};
     use crate::powersync::SyncEvent;
+    use crate::user_prompt::UserSystemPrompt;
     use crate::writer::WriteEvent;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
     /// Build a Supervisor whose RESIDENT spawn fn records every session
@@ -4135,7 +4140,7 @@ mod tests {
         resp_tx: mpsc::Sender<AgentResponse>,
     ) -> (Supervisor, StdArc<StdMutex<Vec<SpawnRequest>>>) {
         let recorded: StdArc<StdMutex<Vec<SpawnRequest>>> = StdArc::new(StdMutex::new(Vec::new()));
-        let rec = recorded.clone();
+        let rec = StdArc::clone(&recorded);
         let resident_fn: ResidentSpawnFn = StdArc::new(move |req, _tx, cancel, _pending| {
             rec.lock().unwrap().push(req);
             let reader = tokio::spawn(async move { cancel.cancelled().await });
@@ -4288,7 +4293,7 @@ mod tests {
         // messages) and triggers the deferred spawn.
         handle_sync_event(
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
             Some(machine_id),
             &mut mirror,
@@ -4469,9 +4474,9 @@ mod tests {
             &mut supervisor,
         )
         .await;
-        let events = drain(&mut write_rx);
-        assert_eq!(events.len(), 1);
-        match &events[0] {
+        let token_writes = drain(&mut write_rx);
+        assert_eq!(token_writes.len(), 1);
+        match &token_writes[0] {
             WriteEvent::ContextTokens {
                 chat_id: cid,
                 tokens,
@@ -4502,9 +4507,9 @@ mod tests {
             Some("sess-abc"),
             "session id must be stashed locally before the writer round-trip"
         );
-        let events = drain(&mut write_rx);
-        assert_eq!(events.len(), 1);
-        match &events[0] {
+        let session_writes = drain(&mut write_rx);
+        assert_eq!(session_writes.len(), 1);
+        match &session_writes[0] {
             WriteEvent::AgentSessionId {
                 chat_id: cid,
                 session_id,
@@ -4520,7 +4525,7 @@ mod tests {
         // Pre-register a fake handle so we can observe `supervisor.remove`.
         supervisor.spawn_agent(SpawnRequest {
             session_name: None,
-            user_system_prompt: Default::default(),
+            user_system_prompt: UserSystemPrompt::default(),
             chat_id: chat_id.clone(),
             prompt: String::new(),
             project_path: None,
@@ -4550,13 +4555,13 @@ mod tests {
             &mut supervisor,
         )
         .await;
-        let events = drain(&mut write_rx);
+        let interrupted_writes = drain(&mut write_rx);
         assert_eq!(
-            events.len(),
+            interrupted_writes.len(),
             3,
             "INTERRUPTED line + cleared live_tasks + ChatRunning(false) (idle clears the run state)"
         );
-        match &events[0] {
+        match &interrupted_writes[0] {
             WriteEvent::PutMessage {
                 content,
                 sender,
@@ -4573,11 +4578,14 @@ mod tests {
             ),
         }
         assert!(
-            matches!(&events[1], WriteEvent::ChatLiveTasks { tasks: None, .. }),
+            matches!(
+                &interrupted_writes[1],
+                WriteEvent::ChatLiveTasks { tasks: None, .. }
+            ),
             "the dead process's armed tasks are cleared: {:?}",
-            events[1]
+            interrupted_writes[1]
         );
-        match &events[2] {
+        match &interrupted_writes[2] {
             WriteEvent::ChatRunning {
                 chat_id: cid,
                 agent_running: false,
@@ -4604,9 +4612,9 @@ mod tests {
             &mut supervisor,
         )
         .await;
-        let events = drain(&mut write_rx);
-        assert_eq!(events.len(), 1);
-        match &events[0] {
+        let done_writes = drain(&mut write_rx);
+        assert_eq!(done_writes.len(), 1);
+        match &done_writes[0] {
             WriteEvent::ChatRunning {
                 chat_id: cid,
                 agent_running: false,
@@ -4634,8 +4642,7 @@ mod tests {
     /// send doesn't error on a dropped channel.
     fn inert_supervisor() -> (Supervisor, mpsc::Receiver<AgentResponse>) {
         let (resp_tx, resp_rx) = mpsc::channel::<AgentResponse>(64);
-        let spawn_fn: crate::agent::SpawnFn =
-            Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
+        let spawn_fn: SpawnFn = Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
         (Supervisor::with_spawn_fn(resp_tx, spawn_fn), resp_rx)
     }
 
@@ -4670,7 +4677,7 @@ mod tests {
             let mut mirror = Mirror::default();
             mirror.set_user_id(user_id); // owner classification
             let (write_tx, write_rx) = mpsc::channel::<WriteEvent>(64);
-            let (supervisor, _resp_rx) = inert_supervisor();
+            let (supervisor, resp_rx) = inert_supervisor();
             Self {
                 user_id,
                 machine_id: Uuid::now_v7(),
@@ -4681,7 +4688,7 @@ mod tests {
                 write_tx,
                 write_rx,
                 supervisor,
-                _resp_rx,
+                _resp_rx: resp_rx,
             }
         }
 
@@ -4691,7 +4698,7 @@ mod tests {
         async fn checkpoint(&mut self, probe_statuses: Option<&[(AgentKind, (bool, bool))]>) {
             handle_sync_event(
                 SyncEvent::CheckpointComplete {
-                    buckets: Default::default(),
+                    buckets: HashMap::default(),
                 },
                 Some(self.machine_id),
                 &mut self.mirror,
@@ -4899,14 +4906,14 @@ mod tests {
         );
 
         // (3) Probes complete → the `probe_ready_rx` retry seeds.
-        let done = seed_initial_agents_if_pending(
+        let seeded = seed_initial_agents_if_pending(
             Some(f.machine_id),
             &mut f.mirror,
             Some(&probe_statuses),
             &f.write_tx,
         )
         .await;
-        assert!(done, "the probe driver persists state on `true`");
+        assert!(seeded, "the probe driver persists state on `true`");
         let patches = f.seed_patches();
         assert_eq!(
             patches.len(),
@@ -5066,7 +5073,7 @@ mod tests {
         // CheckpointComplete — applies the staged window and fires both spawns.
         handle_sync_event(
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
             Some(machine_id),
             &mut mirror,
@@ -5159,7 +5166,7 @@ mod tests {
                 data: chat_row.clone(),
             },
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
         ] {
             handle_sync_event(
@@ -5203,7 +5210,7 @@ mod tests {
                 .to_string(),
             },
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
         ] {
             handle_sync_event(
@@ -5272,7 +5279,7 @@ mod tests {
                 .to_string(),
             },
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
         ] {
             handle_sync_event(
@@ -5302,7 +5309,7 @@ mod tests {
                 id: chat_id.clone(),
             },
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
         ] {
             handle_sync_event(
@@ -5388,7 +5395,7 @@ mod tests {
                 data: json!({ "id": project_id, "path": project_path, "name": "t" }).to_string(),
             },
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
         ] {
             handle_sync_event(
@@ -5468,7 +5475,7 @@ mod tests {
                 data: null_chat_row.clone(),
             },
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
         ] {
             handle_sync_event(
@@ -5498,7 +5505,7 @@ mod tests {
                 data: null_chat_row.clone(),
             },
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
         ] {
             handle_sync_event(
@@ -5546,7 +5553,7 @@ mod tests {
                 .to_string(),
             },
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
         ] {
             handle_sync_event(
@@ -5580,7 +5587,7 @@ mod tests {
 
     #[test]
     fn parse_prune_args_single_triple_is_one_item() {
-        let (force, items) = super::parse_prune_args(&sv(&[
+        let (force, items) = parse_prune_args(&sv(&[
             "--tool-name",
             "Read",
             "--args",
@@ -5599,7 +5606,7 @@ mod tests {
     #[test]
     fn parse_prune_args_summary_terminates_each_target() {
         // Three targets in one call; a legacy `--chat-id` is ignored wherever it sits.
-        let (force, items) = super::parse_prune_args(&sv(&[
+        let (force, items) = parse_prune_args(&sv(&[
             "--tool-name",
             "Read",
             "--args",
@@ -5640,7 +5647,7 @@ mod tests {
 
     #[test]
     fn parse_prune_args_accepts_eq_form_and_reason_alias() {
-        let (_, items) = super::parse_prune_args(&sv(&[
+        let (_, items) = parse_prune_args(&sv(&[
             "--tool-name=Read",
             "--args=a.ts",
             "--reason=legacy", //
@@ -5656,24 +5663,18 @@ mod tests {
     #[test]
     fn parse_prune_args_rejects_malformed() {
         // --summary with no preceding --args for this target.
-        assert!(super::parse_prune_args(&sv(&["--tool-name", "Read", "--summary", "s"])).is_err());
+        assert!(parse_prune_args(&sv(&["--tool-name", "Read", "--summary", "s"])).is_err());
         // Dangling target not closed by a --summary.
-        assert!(super::parse_prune_args(&sv(&[
-            "--args",
-            "a.ts",
-            "--summary",
-            "s",
-            "--args",
-            "b.ts"
-        ]))
-        .is_err());
+        assert!(
+            parse_prune_args(&sv(&["--args", "a.ts", "--summary", "s", "--args", "b.ts"])).is_err()
+        );
         // Empty batch (only call-level flags).
-        assert!(super::parse_prune_args(&sv(&["--chat-id", "c1"])).is_err());
+        assert!(parse_prune_args(&sv(&["--chat-id", "c1"])).is_err());
         // Unknown flag / help.
-        assert!(super::parse_prune_args(&sv(&["--bogus"])).is_err());
-        assert!(super::parse_prune_args(&sv(&["--help"])).is_err());
+        assert!(parse_prune_args(&sv(&["--bogus"])).is_err());
+        assert!(parse_prune_args(&sv(&["--help"])).is_err());
         // Flag expecting a value at end of args.
-        assert!(super::parse_prune_args(&sv(&["--args", "a.ts", "--summary"])).is_err());
+        assert!(parse_prune_args(&sv(&["--args", "a.ts", "--summary"])).is_err());
     }
 
     /// Regression for chat 1398d148: a single turn fires several `prune-context`
@@ -5772,7 +5773,7 @@ mod tests {
         // Apply the staged project + chat before wrapping in SharedMirror.
         handle_sync_event(
             SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             },
             Some(machine_id),
             &mut mirror,
@@ -5795,7 +5796,7 @@ mod tests {
         // exercise it with the coalesced batch directly.
         let mk = |needle: &str, reason: &str| prune::PruneRequest {
             jsonl_path: jsonl_path.clone(),
-            agent_kind: crate::adapter::AgentKind::Claude,
+            agent_kind: AgentKind::Claude,
             tool_name: "Read".into(),
             needle: needle.into(),
             reason: reason.into(),
@@ -5851,7 +5852,7 @@ mod tests {
 
         let mk = |prompt: &str, model: Option<&str>, sid: Option<&str>| SpawnRequest {
             session_name: None,
-            user_system_prompt: Default::default(),
+            user_system_prompt: UserSystemPrompt::default(),
             chat_id: chat_id.clone(),
             prompt: prompt.to_string(),
             project_path: Some("/tmp/p".to_string()),
@@ -5980,7 +5981,7 @@ mod tests {
         async fn window(&mut self, events: Vec<SyncEvent>) {
             let mut staging = SyncStaging::default();
             let checkpoint = SyncEvent::CheckpointComplete {
-                buckets: Default::default(),
+                buckets: HashMap::default(),
             };
             for event in events.into_iter().chain([checkpoint]) {
                 handle_sync_event(
@@ -6009,7 +6010,7 @@ mod tests {
 
         /// The live session's FSM, as its reader would mutate it.
         fn session(&self) -> StdArc<StdMutex<SessionState>> {
-            self.supervisor.live_sessions().lock().unwrap()[&self.chat_id].clone()
+            Arc::clone(&self.supervisor.live_sessions().lock().unwrap()[&self.chat_id])
         }
 
         /// Drive the events of ONE stdout line exactly as the resident reader
@@ -6018,14 +6019,14 @@ mod tests {
         /// line (its `result` closes the window, but that same line's frame and
         /// usage are still the rename's).
         async fn reader_line(&mut self, events: Vec<adapter::AgentEvent>) {
-            let mut renaming = crate::agent::InternalLine::default();
+            let mut renaming = agent::InternalLine::default();
             let mut turn_edges = Vec::new();
             for ev in events {
                 let session = self.session();
                 let (swallow, live_tasks) = {
                     let mut st = session.lock().unwrap();
                     let swallow = renaming.swallows(st.internal_in_flight(), &ev);
-                    crate::agent::reduce(&mut st, &ev);
+                    agent::reduce(&mut st, &ev);
                     turn_edges.extend(st.observe_turn_running());
                     (swallow, st.observe_live_tasks())
                 };
@@ -6041,7 +6042,7 @@ mod tests {
                     }
                     _ => {}
                 }
-                if let Some(tasks) = live_tasks {
+                if let LiveTasksChange::Changed(tasks) = live_tasks {
                     self.respond(AgentResponse::LiveTasks {
                         topic: self.chat_id.clone(),
                         session,
@@ -6162,7 +6163,7 @@ mod tests {
         chat_with(
             c,
             last_seq,
-            json!({ "always_on": always_on as i64, "agent_session_id": "sid" }),
+            json!({ "always_on": i64::from(always_on), "agent_session_id": "sid" }),
         )
     }
 
@@ -6252,15 +6253,15 @@ mod tests {
                 ..watch::WatchDef::for_test(chat_id, c.user_id, "mail")
             },
             text: "new_mail id=1".into(),
-            cancelled: Default::default(),
+            cancelled: CancellationToken::default(),
         };
 
         let stopped = message(&c.chat_id);
         stopped.cancelled.cancel();
-        let refused =
+        let stopped_delivery =
             deliver_watch_message(stopped, &c.mirror, &c.keys, &mut c.supervisor, &c.write_tx);
         assert!(
-            refused.await.is_err(),
+            stopped_delivery.await.is_err(),
             "queued before its watch was stopped"
         );
 
@@ -6532,7 +6533,7 @@ mod tests {
             .await;
         assert_eq!(
             c.recorded.lock().unwrap()[0].user_system_prompt,
-            user_prompt::UserSystemPrompt {
+            UserSystemPrompt {
                 files: Some("docs/a.md, ~/b.md".to_string()),
                 text: Some("be terse".to_string()),
                 undecryptable: false,
@@ -6544,7 +6545,7 @@ mod tests {
         c.window(vec![undecryptable, c.message(1, "first")]).await;
         assert_eq!(
             c.recorded.lock().unwrap()[1].user_system_prompt,
-            user_prompt::UserSystemPrompt {
+            UserSystemPrompt {
                 undecryptable: true,
                 ..Default::default()
             },
@@ -6561,7 +6562,7 @@ mod tests {
         );
         c.window(vec![codex, c.message(1, "first")]).await;
         for unset in &c.recorded.lock().unwrap()[2..] {
-            assert_eq!(unset.user_system_prompt, Default::default());
+            assert_eq!(unset.user_system_prompt, UserSystemPrompt::default());
         }
     }
 
@@ -6586,7 +6587,7 @@ mod tests {
         .await;
         let sandboxed = c.recorded.lock().unwrap()[1].clone();
         assert!(sandboxed.is_sandboxed);
-        assert_eq!(sandboxed.user_system_prompt, Default::default());
+        assert_eq!(sandboxed.user_system_prompt, UserSystemPrompt::default());
 
         finish_turn(&c);
         let undecryptable = chat_with(&c, 2, json!({ "system_prompt": "bm90IHNlYWxlZA==" }));
@@ -7135,15 +7136,19 @@ mod tests {
         let session = c.session();
         let tasks = {
             let mut st = session.lock().unwrap();
-            crate::agent::reduce(&mut st, &adapter::AgentEvent::TaskFinished("t1".into()));
-            st.observe_live_tasks().expect("the finished task clears")
+            agent::reduce(&mut st, &adapter::AgentEvent::TaskFinished("t1".into()));
+            st.observe_live_tasks()
         };
-        assert_eq!(tasks, None);
+        assert_eq!(
+            tasks,
+            LiveTasksChange::Changed(None),
+            "the finished task clears"
+        );
         c.resp_tx
             .send(AgentResponse::LiveTasks {
                 topic: c.chat_id.clone(),
                 session,
-                tasks,
+                tasks: None,
             })
             .await
             .unwrap();
@@ -7445,11 +7450,11 @@ mod tests {
         let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
         let (mut sup, _) = supervisor_with_resident_recorder(resp_tx);
         let hour = Duration::from_secs(3600);
-        let mut since = std::collections::HashMap::new();
+        let mut since = HashMap::new();
         for chat in ["busy", "idle-25h", "idle-24h", "no-edge", "idle-22h"] {
             sup.spawn_agent(SpawnRequest {
                 session_name: None,
-                user_system_prompt: Default::default(),
+                user_system_prompt: UserSystemPrompt::default(),
                 chat_id: chat.to_string(),
                 prompt: "hi".to_string(),
                 project_path: None,
@@ -7461,7 +7466,7 @@ mod tests {
                 user_timezone: None,
             });
             {
-                let state = sup.live_sessions().lock().unwrap()[chat].clone();
+                let state = Arc::clone(&sup.live_sessions().lock().unwrap()[chat]);
                 let mut st = state.lock().unwrap();
                 st.unconsumed.clear();
                 st.turn_in_flight = chat == "busy";
@@ -7676,9 +7681,12 @@ mod tests {
 
         c.window(vec![c.chat(1, ""), c.message(1, "/stop")]).await;
         assert!(tunnel::running_in(&c.chat_id).is_empty());
-        let writes = c.writes();
-        assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
-        assert_eq!(live_task_blobs(&writes), vec![None]);
+        let stop_writes = c.writes();
+        assert!(
+            stop_writes.iter().any(is_stopped_by_user),
+            "{stop_writes:?}"
+        );
+        assert_eq!(live_task_blobs(&stop_writes), vec![None]);
 
         c.window(vec![c.chat(2, ""), c.message(2, "next")]).await;
         let prompt = c.spawned_prompts().pop().unwrap();
@@ -7735,10 +7743,13 @@ mod tests {
             .remove(watch.parse().unwrap(), None);
         removed.await.expect("registered");
         publish_watch_change(&c.chat_id, &c.mirror, &c.keys, &c.supervisor, &c.write_tx).await;
-        let writes = c.writes();
-        assert_eq!(live_task_blobs(&writes), vec![None]);
-        assert_eq!(run_flags(&writes), vec![("agent", false)]);
-        assert!(!writes.iter().any(is_stopped_by_user), "an ordinary finish");
+        let removal_writes = c.writes();
+        assert_eq!(live_task_blobs(&removal_writes), vec![None]);
+        assert_eq!(run_flags(&removal_writes), vec![("agent", false)]);
+        assert!(
+            !removal_writes.iter().any(is_stopped_by_user),
+            "an ordinary finish"
+        );
     }
 
     #[tokio::test]
@@ -7893,14 +7904,14 @@ mod tests {
             let result = adapter::AgentEvent::Result {
                 origin_is_task: false,
             };
-            crate::agent::reduce(&mut st, &result);
+            agent::reduce(&mut st, &result);
             st.observe_turn_running().expect("the turn ended")
         };
         c.window(vec![c.chat(2, ""), c.message(2, "second")]).await;
         assert_eq!(turn_running_writes(&c.writes()), vec![true]);
         c.respond(AgentResponse::TurnRunning {
             topic: c.chat_id.clone(),
-            session: session.clone(),
+            session: Arc::clone(&session),
             running: ended,
         })
         .await;
@@ -7923,7 +7934,7 @@ mod tests {
         };
         c.respond(AgentResponse::TurnRunning {
             topic: c.chat_id.clone(),
-            session: session.clone(),
+            session: Arc::clone(&session),
             running: started,
         })
         .await;
@@ -7936,7 +7947,7 @@ mod tests {
         for running in [true, false] {
             c.respond(AgentResponse::TurnRunning {
                 topic: c.chat_id.clone(),
-                session: session.clone(),
+                session: Arc::clone(&session),
                 running,
             })
             .await;
@@ -7948,8 +7959,8 @@ mod tests {
     #[tokio::test]
     async fn a_one_shot_spawn_writes_turn_running() {
         let mut c = ResidentChat::new();
-        let cursor = |c: &ResidentChat, seq| chat_with(c, seq, json!({ "agent_kind": "cursor" }));
-        c.window(vec![c.project(), cursor(&c, 1), c.message(1, "first")])
+        let cursor_chat = chat_with(&c, 1, json!({ "agent_kind": "cursor" }));
+        c.window(vec![c.project(), cursor_chat, c.message(1, "first")])
             .await;
         assert_eq!(turn_running_writes(&c.writes()), vec![true]);
     }
@@ -7993,7 +8004,7 @@ mod tests {
         c.reader_raw(r#"{"type":"system","subtype":"task_started","task_id":"t-7","description":"deploy to prod","task_type":"local_bash"}"#).await;
         c.writes();
 
-        let transcript = crate::prune::test_util::write_jsonl(&[
+        let transcript = prune::test_util::write_jsonl(&[
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"junk.rs"}}]},"uuid":"a1","parentUuid":null}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"body"}]},"uuid":"u1","parentUuid":"a1"}"#,
         ]);
@@ -8051,21 +8062,29 @@ mod tests {
         );
 
         // A hard abort (`/kill`) does the same.
-        let mut c = armed().await;
-        c.window(vec![c.chat(2, ""), c.message(2, "/kill")]).await;
+        let mut killed = armed().await;
+        killed
+            .window(vec![killed.chat(2, ""), killed.message(2, "/kill")])
+            .await;
         assert_eq!(
-            live_task_blobs(&c.writes()),
+            live_task_blobs(&killed.writes()),
             vec![None],
             "a hard abort clears the column"
         );
 
         // The spawner is going down (SIGTERM / update): the agents are
         // cancelled, not finished, so no `Done` arm can clear the column.
-        let mut c = armed().await;
-        let mirror = c.shared_mirror();
-        shutdown_agents(&mut c.supervisor, &mut c.resp_rx, &mirror, &c.write_tx).await;
+        let mut stopping = armed().await;
+        let mirror = stopping.shared_mirror();
+        shutdown_agents(
+            &mut stopping.supervisor,
+            &mut stopping.resp_rx,
+            &mirror,
+            &stopping.write_tx,
+        )
+        .await;
         assert_eq!(
-            live_task_blobs(&c.writes()),
+            live_task_blobs(&stopping.writes()),
             vec![None],
             "shutdown clears the column"
         );
@@ -8321,7 +8340,7 @@ mod tests {
             .collect()
     }
 
-    fn live_tasks_reset_chats(writes: &[WriteEvent]) -> std::collections::HashSet<&str> {
+    fn live_tasks_reset_chats(writes: &[WriteEvent]) -> HashSet<&str> {
         writes
             .iter()
             .filter_map(|w| match w {
@@ -8335,7 +8354,7 @@ mod tests {
             .collect()
     }
 
-    fn alive_reset_chats(writes: &[WriteEvent]) -> std::collections::HashSet<&str> {
+    fn alive_reset_chats(writes: &[WriteEvent]) -> HashSet<&str> {
         writes
             .iter()
             .filter_map(|w| match w {

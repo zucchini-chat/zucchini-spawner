@@ -160,7 +160,7 @@ mod tests {
             (30, 0.0157),
         ];
         for (n, h) in expected_h {
-            let got = hours(ttl(n as f64));
+            let got = hours(ttl(f64::from(n)));
             assert!((got - h).abs() / h < 0.02, "n={n}: {got}h, expected ~{h}h");
         }
     }
@@ -206,8 +206,8 @@ mod tests {
             Decision::WaitUntil(three[1].idle_since + Duration::from_secs(24 * 3600))
         );
 
-        let three = idle(&[1.0, 25.0, 30.0], None, now);
-        let Decision::Evict(e) = choose(&three, None, now) else {
+        let past_ttl = idle(&[1.0, 25.0, 30.0], None, now);
+        let Decision::Evict(e) = choose(&past_ttl, None, now) else {
             panic!("expected an eviction");
         };
         assert_eq!(e.victim, 2);
@@ -231,11 +231,11 @@ mod tests {
         for r in ten.iter_mut() {
             r.pinned = true;
         }
-        let Decision::Evict(e) = choose(&ten, None, now) else {
+        let Decision::Evict(oldest) = choose(&ten, None, now) else {
             panic!("expected an eviction");
         };
-        assert_eq!(e.victim, 0);
-        assert!((hours(e.ttl) - 15.7).abs() < 0.1, "{:?}", e.ttl);
+        assert_eq!(oldest.victim, 0);
+        assert!((hours(oldest.ttl) - 15.7).abs() < 0.1, "{:?}", oldest.ttl);
 
         ten[0].idle_since = now - Duration::from_secs(10 * 3600);
         assert!(matches!(choose(&ten, None, now), Decision::WaitUntil(_)));
