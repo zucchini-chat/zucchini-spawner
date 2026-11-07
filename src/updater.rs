@@ -15,6 +15,9 @@ use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+// deploy.sh greps every release binary for this and refuses to publish one that
+// lacks it, so keep it referenced from runtime code or the linker drops it.
+const RELEASE_MARKER: &str = concat!("zucchini-spawner-release:", env!("CARGO_PKG_VERSION"), ";");
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const RETRY_WHEN_BUSY: Duration = Duration::from_secs(60);
 const PROD_INSTALL_BASE: &str = "https://api.zucchini.chat/install";
@@ -102,6 +105,12 @@ async fn check_version() -> Option<String> {
 }
 
 pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
+    // A build published after the check replaced the binary too, so persist the
+    // version as of now. Read before the binary: publishers write the binary
+    // first, so this can lag what we install but never get ahead of it.
+    let version = check_version()
+        .await
+        .unwrap_or_else(|| remote_version.to_string());
     let suffix = platform_suffix()?;
     let binary_name = format!("zucchini-spawner-{suffix}");
     let url = format!("{}/{binary_name}", base_url());
@@ -110,7 +119,7 @@ pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
         .to_str()
         .ok_or_else(|| "temp dir path is not valid UTF-8".to_string())?;
 
-    info!(url = %url, "downloading new spawner binary");
+    info!(url = %url, %version, "downloading new spawner binary");
 
     let bytes = fetch_bytes(&url).await?;
     tokio::fs::write(&tmp_path_buf, &bytes)
@@ -150,7 +159,7 @@ pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
     crate::sys::replace_running_exe(&tmp_path_buf, &current_exe)
         .map_err(|e| format!("replace running exe failed: {e}"))?;
 
-    if let Err(e) = std::fs::write(applied_version_path(), remote_version) {
+    if let Err(e) = std::fs::write(applied_version_path(), &version) {
         warn!("failed to persist applied version: {e}");
     }
 
@@ -163,6 +172,7 @@ pub async fn run_update_loop(update_tx: mpsc::Sender<String>) -> ! {
     let mut last = last_applied_version();
     info!(
         embedded = CURRENT_VERSION,
+        release_marker = RELEASE_MARKER,
         last_applied = %last,
         base = %base,
         interval_secs = interval.as_secs(),

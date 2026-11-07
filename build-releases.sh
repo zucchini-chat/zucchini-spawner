@@ -27,8 +27,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "$OUTPUT_DIR"
-# Wipe stragglers from prior runs (esp. --native leftovers) so the scp glob in
-# deploy.sh never ships a mix of fresh + stale arch binaries — but PRESERVE a
+# Wipe stragglers from prior runs (esp. --native leftovers) so releases/ never
+# mixes fresh + stale arch binaries — but PRESERVE a
 # hand-supplied zucchini-spawner-windows-x86_64. Windows is built + Authenticode-
 # signed on a Windows box and copied in here; this script never rebuilds it (see
 # build_target's windows branch), so the wipe must not delete it.
@@ -54,7 +54,8 @@ NATIVE_TARGET="aarch64-apple-darwin"
 # before this script runs. build_target's windows branch only VERIFIES it's
 # present (warns, does not fail, if missing) and the wipe above preserves it, so
 # this Mac/Linux run builds darwin + linux and ships the Windows binary alongside
-# them untouched. On the Windows box, zucchini-spawner/build-windows.ps1 does
+# them untouched (deploy.sh refuses one built from another version). On the
+# Windows box, zucchini-spawner/build-windows.ps1 does
 # build + sign + stage (signing via Azure Trusted Signing, sign-windows.ps1) and
 # copy-windows-to-mac.ps1 copies it to this Mac.
 ALL_TARGETS="
@@ -71,13 +72,14 @@ build_target() {
 
   # Windows is not built on this box — it's built + Authenticode-signed on a
   # Windows machine and hand-copied into releases/ (see the ALL_TARGETS note).
-  # Verify it's present; warn (don't fail) if not, so a Mac-only run still ships
-  # darwin + linux. The wipe above already preserved any existing copy.
+  # Verify it's present; warn (don't fail) if not, so a Mac-only run still builds
+  # darwin + linux, though deploy.sh won't publish them without it. The wipe
+  # above already preserved any existing copy.
   if [[ "$rust_target" == *"-windows-"* ]]; then
     if [[ -f "${OUTPUT_DIR}/${output_name}" ]]; then
       echo "Using prebuilt ${output_name} (built + signed on Windows)"
     else
-      echo "WARNING: ${OUTPUT_DIR}/${output_name} not found — Windows binary will NOT ship." >&2
+      echo "WARNING: ${OUTPUT_DIR}/${output_name} not found — deploy.sh will refuse to publish." >&2
       echo "         Build + Authenticode-sign it on a Windows box, copy it there, then re-run." >&2
     fi
     return 0
