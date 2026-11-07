@@ -258,9 +258,7 @@ impl AgentAdapter for HermesAdapter {
                 // latches `Done.has_result = true`. Matches codex's
                 // turn.completed branch.
                 out.push(AgentEvent::Frame(line));
-                out.push(AgentEvent::Result {
-                    origin_is_task: false,
-                });
+                out.push(AgentEvent::Result);
             }
             "error" => {
                 // Plugin emits this when the turn never produces a usable
@@ -281,9 +279,7 @@ impl AgentAdapter for HermesAdapter {
                 })
                 .to_string();
                 out.push(AgentEvent::Frame(result_frame));
-                out.push(AgentEvent::Result {
-                    origin_is_task: false,
-                });
+                out.push(AgentEvent::Result);
             }
             other => {
                 // Defensive forward — wire-format drift shouldn't silently

@@ -580,14 +580,7 @@ impl AgentAdapter for ClaudeAdapter {
             } else if line.contains("\"type\":\"result\"") {
                 // Emit Result on every result frame; the supervisor latches it
                 // (so AgentResponse::Done.has_result is set once and only once).
-                // `origin = {"kind":"task-notification"}` marks a background-task
-                // wake's result (vs an absent `origin` on a user-turn result) so
-                // the resident session FSM doesn't clear `turn_in_flight` for it.
-                // Parse-free: both needles are structural (any occurrence inside
-                // the JSON-escaped result text would be `\"`-escaped).
-                let origin_is_task =
-                    line.contains("\"origin\"") && line.contains("\"kind\":\"task-notification\"");
-                out.push(AgentEvent::Result { origin_is_task });
+                out.push(AgentEvent::Result);
                 // Hard-abort suppression (`/stop`, interrupt-then-send - both
                 // SIGTERM): we publish our own canonical `{"type":"result","subtype":
                 // "interrupted"}` row, and claude may flush a real abort result
@@ -2262,24 +2255,21 @@ mod tests {
         assert!(ClaudeAdapter::new().is_resident());
     }
 
+    /// `result` frames are latched (Result) AND forwarded as the result row
+    /// (Frame) — they are not skipped, unlike init/task frames. A task wake's
+    /// result carries its origin and is the same event. Fail-open: a genuine
+    /// execution error renders too; only the abort signature is suppressed.
     #[test]
-    fn user_turn_result_is_not_task_origin() {
-        let mut a = ClaudeAdapter::new();
-        // `result` frames are latched (Result) AND forwarded as the result row
-        // (Frame) — they are not skipped, unlike init/task frames.
-        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events[0], "Result");
-        assert!(events[1].starts_with("Frame("));
-    }
-
-    #[test]
-    fn task_wake_result_is_task_origin() {
-        let mut a = ClaudeAdapter::new();
-        let line = r#"{"type":"result","subtype":"success","is_error":false,"origin":{"kind":"task-notification"},"result":"task done"}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events[0], "Result(task)");
-        assert!(events[1].starts_with("Frame("));
+    fn every_result_is_latched_and_forwarded() {
+        for line in [
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"origin":{"kind":"task-notification"},"result":"task done"}"#,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"error","result":"boom"}"#,
+        ] {
+            let events = run(&mut ClaudeAdapter::new(), line);
+            assert_eq!(events[0], "Result");
+            assert!(events[1].starts_with("Frame("), "{events:?}");
+        }
     }
 
     // --- Regression fixtures captured from REAL claude 2.1.165 ---------------
@@ -2290,8 +2280,8 @@ mod tests {
     /// Drives the verbatim background-task frames through `handle_line` →
     /// `reduce` and asserts the headline transition: arming-turn result with a
     /// live task ⇒ WAITING; the task's `task_notification` ⇒ back to Idle; and
-    /// the task-wake result (origin = task-notification) must NOT clear an
-    /// unrelated in-flight turn.
+    /// the task-wake result (origin = task-notification) ends a turn absorbed
+    /// into the wake.
     #[test]
     fn real_background_task_lifecycle_drives_fsm_idle_waiting_idle() {
         use crate::agent::{reduce, SessionState};
@@ -2354,19 +2344,15 @@ mod tests {
             "task_updated{{completed}} clears the last live task"
         );
 
-        // 5. The task-wake turn's result carries origin=task-notification — it
-        //    must NOT touch turn state. Pretend a real user turn is in flight to
-        //    prove the wake result doesn't clear it.
+        // 5. A message absorbed into the task-wake turn is answered by the
+        //    wake's result, which carries origin=task-notification.
         st.turn_in_flight = true;
         feed(
             &mut a,
             &mut st,
             r#"{"type":"result","subtype":"success","is_error":false,"origin":{"kind":"task-notification"},"terminal_reason":"completed","result":"bg output: BG_DONE"}"#,
         );
-        assert!(
-            st.turn_in_flight,
-            "a task-wake result must NOT clear an unrelated in-flight user turn"
-        );
+        assert!(st.is_idle(), "the wake's result ends the absorbed turn");
     }
 
     /// Real claude emits an abort result for the killed turn on /stop. We
@@ -2382,20 +2368,6 @@ mod tests {
             events,
             vec!["Result"],
             "abort result must emit Result for the FSM but NO Frame (row suppressed)"
-        );
-    }
-
-    /// Fail-open guard: a genuine execution error (NOT the aborted-streaming
-    /// interrupt signature) still renders as a row so real failures stay visible.
-    #[test]
-    fn genuine_execution_error_still_renders_a_row() {
-        let mut a = ClaudeAdapter::new();
-        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"error","result":"boom"}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events[0], "Result");
-        assert!(
-            events[1].starts_with("Frame("),
-            "non-abort execution errors must still render: {events:?}"
         );
     }
 

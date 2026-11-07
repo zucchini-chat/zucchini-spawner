@@ -460,9 +460,7 @@ impl AgentAdapter for GeminiAdapter {
                     let message = result_error_message(&obj).to_string();
                     out.push(AgentEvent::Frame(claude_assistant_text_envelope(&message)));
                     out.push(AgentEvent::Frame(normalize_result_error_frame(&obj)));
-                    out.push(AgentEvent::Result {
-                        origin_is_task: false,
-                    });
+                    out.push(AgentEvent::Result);
                 } else {
                     // success (or anything non-error): harvest tokens, emit a
                     // claude-shape success result envelope, then Result.
@@ -472,9 +470,7 @@ impl AgentAdapter for GeminiAdapter {
                         }
                     }
                     out.push(AgentEvent::Frame(normalize_result_success_frame()));
-                    out.push(AgentEvent::Result {
-                        origin_is_task: false,
-                    });
+                    out.push(AgentEvent::Result);
                 }
             }
             other => {

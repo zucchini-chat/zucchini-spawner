@@ -347,15 +347,7 @@ pub enum AgentEvent {
     /// Marks a `result` frame seen — Supervisor uses this to set
     /// `Done.has_result` (one-shot adapters) and, in the resident claude
     /// session model, to drive the turn/Waiting state machine.
-    ///
-    /// `origin_is_task` distinguishes the two kinds of `result` a resident
-    /// claude process emits on the same stdout: a **user-turn** result (the
-    /// `origin` field is absent — this ends the in-flight turn, `false`) vs a
-    /// **background-task wake** result (`origin = {"kind":"task-notification"}`
-    /// — a monitor/`run_in_background` task fired post-turn; the user turn is
-    /// already done, so this must NOT clear `turn_in_flight`, `true`). One-shot
-    /// adapters never produce task-driven results and always emit `false`.
-    Result { origin_is_task: bool },
+    Result,
     /// Resident model only — a background task (a `run_in_background` Bash, a
     /// `Monitor`, a backgrounded subagent) was armed and started. The
     /// Supervisor inserts it into the session's `live_tasks` list; a non-empty
@@ -1198,12 +1190,7 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             AgentEvent::ContextTokens(n) => format!("ContextTokens({})", n),
             AgentEvent::CompactBoundary(n) => format!("CompactBoundary({})", n),
             AgentEvent::SessionIdHarvested(s) => format!("SessionIdHarvested({})", s),
-            AgentEvent::Result {
-                origin_is_task: false,
-            } => "Result".to_string(),
-            AgentEvent::Result {
-                origin_is_task: true,
-            } => "Result(task)".to_string(),
+            AgentEvent::Result => "Result".to_string(),
             AgentEvent::TaskStarted { id, .. } => format!("TaskStarted({})", id),
             AgentEvent::TaskFinished(s) => format!("TaskFinished({})", s),
             AgentEvent::CommandStarted { id, .. } => format!("CommandStarted({id})"),

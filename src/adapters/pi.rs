@@ -430,9 +430,7 @@ fn push_agent_end_terminal(out: &mut SmallVec<[AgentEvent; 2]>, elapsed: Duratio
         })
         .to_string(),
     ));
-    out.push(AgentEvent::Result {
-        origin_is_task: false,
-    });
+    out.push(AgentEvent::Result);
 }
 
 /// Context occupancy from pi's assistant `usage` block:

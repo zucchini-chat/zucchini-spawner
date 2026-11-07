@@ -252,9 +252,7 @@ impl CodexAdapter {
         };
         out.push(AgentEvent::UserTurnConsumed(uuid.to_string()));
         if self.active_turn.is_none() {
-            out.push(AgentEvent::Result {
-                origin_is_task: false,
-            });
+            out.push(AgentEvent::Result);
         }
         out.push(AgentEvent::Frame(error_result_frame(&message)));
     }
@@ -290,9 +288,7 @@ impl CodexAdapter {
                     warn!(%uuid, "codex turn ended without echoing this input");
                     out.push(AgentEvent::UserTurnConsumed(uuid));
                 }
-                out.push(AgentEvent::Result {
-                    origin_is_task: false,
-                });
+                out.push(AgentEvent::Result);
                 out.push(AgentEvent::Frame(turn_result_frame(&params["turn"])));
             }
             "item/started" => {
@@ -2213,12 +2209,7 @@ mod tests {
             &AgentEvent::TurnStarted("01a0ccc6-1d09-7902-a2b6-7d39a30c6290".into()),
         );
         assert!(st.running());
-        crate::agent::reduce(
-            &mut st,
-            &AgentEvent::Result {
-                origin_is_task: false,
-            },
-        );
+        crate::agent::reduce(&mut st, &AgentEvent::Result);
         assert!(!st.running());
     }
 

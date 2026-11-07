@@ -121,8 +121,7 @@ fn startup_timeout_message(timeout: Duration, retried: bool) -> String {
 #[derive(Debug, Default, Clone)]
 pub struct SessionState {
     /// A consumed user turn is in flight: set on its `UserTurnConsumed` (or a
-    /// peer session's `PeerTurnConsumed`) echo,
-    /// cleared on a user-turn `result` (origin absent — `Result{origin_is_task:false}`).
+    /// peer session's `PeerTurnConsumed`) echo, cleared on the next `result`.
     pub turn_in_flight: bool,
     /// The CLI started a turn that isn't one of our queued ones (a self-fired
     /// `CronCreate` prompt is never echoed); cleared by the next `result` of
@@ -396,16 +395,15 @@ impl SessionState {
 /// `SessionIdHarvested`, …) leaves the run state untouched and is handled by
 /// the reader directly.
 ///
-/// `Result{origin_is_task:false}` ends the user turn; `Result{origin_is_task:
-/// true}` is a background-task wake's result and must NOT clear the turn flag.
+/// A `result` ends the turn whatever started it: the CLI runs one turn at a
+/// time, and a turn consumed into a task wake is answered by the wake's
+/// `result`, which carries the task origin.
 pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
     match ev {
-        AgentEvent::Result { origin_is_task } => {
+        AgentEvent::Result => {
             state.close_internal_window();
-            if !origin_is_task {
-                state.turn_in_flight = false;
-                state.command_in_flight = false;
-            }
+            state.turn_in_flight = false;
+            state.command_in_flight = false;
             state.self_turn = false;
         }
         AgentEvent::TurnStarted(uuid) => {
@@ -898,7 +896,7 @@ impl AgentEvent {
                 topic: topic.to_string(),
                 session_id,
             },
-            AgentEvent::Result { origin_is_task: _ } => {
+            AgentEvent::Result => {
                 *has_result = true;
                 return None;
             }
@@ -2448,7 +2446,7 @@ fn default_resident_spawn_fn(
                                         // still tracks the waiting sub-state internally
                                         // via `SessionState`; it just doesn't cross the
                                         // wire.)
-                                        let is_result = matches!(&ev, AgentEvent::Result { .. });
+                                        let is_result = matches!(&ev, AgentEvent::Result);
                                         // Our own `/rename` turn is running: it is silent,
                                         // so every frame it produces (and its usage) is
                                         // dropped.
@@ -2458,7 +2456,7 @@ fn default_resident_spawn_fn(
                                             let swallow = renaming.swallows(internal, &ev);
                                             reduce(&mut st, &ev);
                                             let r = st.running();
-                                            let turn_ended = is_result && !internal && !st.in_turn();
+                                            let turn_ended = is_result && !internal;
                                             let live_tasks = st.observe_live_tasks();
                                             turn_edges.extend(st.observe_turn_running());
                                             // [DIAG tasktrace] TEMPORARY — log every
@@ -2467,7 +2465,7 @@ fn default_resident_spawn_fn(
                                             match &ev {
                                                 AgentEvent::TaskStarted { id, .. } => tracing::info!(diag = "tasktrace", topic = %topic, %id, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce TaskStarted"),
                                                 AgentEvent::TaskFinished(id) => tracing::info!(diag = "tasktrace", topic = %topic, %id, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce TaskFinished"),
-                                                AgentEvent::Result { origin_is_task } => tracing::info!(diag = "tasktrace", topic = %topic, origin_is_task, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce Result"),
+                                                AgentEvent::Result => tracing::info!(diag = "tasktrace", topic = %topic, live = st.live_tasks.len(), turn = st.turn_in_flight, running = r, "reduce Result"),
                                                 _ => {}
                                             }
                                             (r, swallow, live_tasks, turn_ended)
@@ -2512,7 +2510,7 @@ fn default_resident_spawn_fn(
                                             // TaskFinished) already updated the FSM via
                                             // `reduce`; the RunState recompute below emits a
                                             // transition if `running` changed.
-                                            AgentEvent::Result { .. }
+                                            AgentEvent::Result
                                             | AgentEvent::TaskStarted { .. }
                                             | AgentEvent::TaskFinished(_)
                                             | AgentEvent::CommandStarted { .. }
@@ -3059,12 +3057,7 @@ mod reduce_tests {
 
         // The user turn's own result lands (origin absent) → turn ends, but the
         // task is still armed → Waiting.
-        reduce(
-            &mut s,
-            &AgentEvent::Result {
-                origin_is_task: false,
-            },
-        );
+        reduce(&mut s, &AgentEvent::Result);
         assert_eq!((s.running(), s.waiting()), (true, true), "Waiting");
         assert!(!s.is_idle());
 
@@ -3074,26 +3067,25 @@ mod reduce_tests {
         assert!(s.is_idle());
     }
 
-    /// A task-driven wake's `result` (origin = task-notification) must NOT clear
-    /// `turn_in_flight` — only the user-turn's own result does.
+    /// Messages the CLI absorbs into a task wake's turn are answered by the
+    /// wake's single `result`, which ends the turn.
     #[test]
-    fn task_origin_result_does_not_end_user_turn() {
-        let mut s = SessionState {
-            turn_in_flight: true,
-            ..Default::default()
-        };
-        s.live_tasks.push(live_task("t1"));
+    fn a_turn_absorbed_into_a_task_wake_ends_with_its_result() {
+        let mut s = SessionState::default();
+        reduce(&mut s, &task_started("t1"));
+        reduce(&mut s, &AgentEvent::TaskFinished("t1".into()));
+        s.unconsumed.push(queued("user"));
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("user".into()));
         reduce(
             &mut s,
-            &AgentEvent::Result {
-                origin_is_task: true,
+            &AgentEvent::PeerTurnConsumed {
+                name: "peer".into(),
+                body: "hi".into(),
             },
         );
-        assert!(
-            s.turn_in_flight,
-            "a background-task wake result must not end the user turn"
-        );
-        assert_eq!((s.running(), s.waiting()), (true, false));
+        assert!(s.in_foreground());
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.is_idle() && !s.in_foreground());
     }
 
     /// Two stacked tasks: both must finish before the session goes Idle, and the
@@ -3370,18 +3362,7 @@ mod reduce_tests {
         assert!(s.command_in_flight);
         assert!(frames_to_write(&s, &mut written).is_empty());
 
-        reduce(
-            &mut s,
-            &AgentEvent::Result {
-                origin_is_task: true,
-            },
-        );
-        assert!(
-            frames_to_write(&s, &mut written).is_empty(),
-            "a background task's result doesn't end the compaction"
-        );
-
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert_eq!(frames_to_write(&s, &mut written), vec!["next"]);
     }
 
@@ -3399,7 +3380,7 @@ mod reduce_tests {
         reduce(&mut s, &task_started("t1"));
         assert_eq!(s.observe_turn_running(), None, "still the same turn");
 
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert_eq!(s.observe_turn_running(), Some(false), "turn ended");
         assert!(s.running(), "the armed task keeps the agent running");
 
@@ -3407,12 +3388,7 @@ mod reduce_tests {
         assert_eq!(s.observe_turn_running(), None);
         reduce(&mut s, &AgentEvent::TurnStarted("continuation".into()));
         assert_eq!(s.observe_turn_running(), Some(true), "continuation turn");
-        reduce(
-            &mut s,
-            &AgentEvent::Result {
-                origin_is_task: true,
-            },
-        );
+        reduce(&mut s, &AgentEvent::Result);
         assert_eq!(s.observe_turn_running(), Some(false));
         assert!(s.is_idle());
     }
@@ -3426,25 +3402,25 @@ mod reduce_tests {
         reduce(&mut s, &AgentEvent::TurnStarted("r".into()));
         reduce(&mut s, &AgentEvent::UserTurnConsumed("r".into()));
         assert_eq!(s.observe_turn_running(), None, "running rename");
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
 
         s.unconsumed.push(queued("a"));
         reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
         s.unconsumed.push(queued("b"));
         assert_eq!(s.observe_turn_running(), Some(true));
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert_eq!(s.observe_turn_running(), None, "b is still queued");
         reduce(&mut s, &AgentEvent::UserTurnConsumed("b".into()));
 
         // The turn's end has to be captured as the `result` is reduced: a turn
         // queued before a later look would hide it.
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         let ended = s.observe_turn_running();
         s.unconsumed.push(queued("b"));
         assert_eq!(ended, Some(false));
         assert_eq!(s.observe_turn_running(), Some(true), "the enqueue edge");
         reduce(&mut s, &AgentEvent::UserTurnConsumed("b".into()));
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert_eq!(s.observe_turn_running(), Some(false));
     }
 
@@ -3488,17 +3464,12 @@ mod reduce_tests {
         };
         s.unconsumed.push(queued("notice"));
         reduce(&mut s, &AgentEvent::ContextTokens(200_000));
-        reduce(
-            &mut s,
-            &AgentEvent::Result {
-                origin_is_task: true,
-            },
-        );
+        reduce(&mut s, &AgentEvent::Result);
         assert_eq!(s.after_turn(Some(100_000), true), None);
         assert_eq!(s.auto_compact, super::AutoCompact::Noticing);
 
         reduce(&mut s, &AgentEvent::UserTurnConsumed("notice".into()));
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert_eq!(s.after_turn(Some(100_000), true), None, "notice's end");
         assert!(s.after_turn(Some(100_000), true).is_some());
     }
@@ -3553,10 +3524,6 @@ mod reduce_tests {
         assert_eq!(frames_to_write(&s, &mut written), vec!["later"]);
     }
 
-    const RESULT: AgentEvent = AgentEvent::Result {
-        origin_is_task: false,
-    };
-
     /// Queued mid-turn: consumed at the next tool boundary and answered by the
     /// running turn's single `result`.
     #[test]
@@ -3568,7 +3535,7 @@ mod reduce_tests {
         s.unconsumed.push(queued("b"));
         reduce(&mut s, &AgentEvent::UserTurnConsumed("b".into()));
         assert!(s.unconsumed.is_empty() && s.running());
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
     }
 
@@ -3581,11 +3548,11 @@ mod reduce_tests {
             ..Default::default()
         };
         s.unconsumed.push(queued("b"));
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(s.running(), "turn b is not consumed yet");
         reduce(&mut s, &AgentEvent::UserTurnConsumed("b".into()));
         assert!(s.turn_in_flight);
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
     }
 
@@ -3603,17 +3570,12 @@ mod reduce_tests {
         let mut s = SessionState::default();
         reduce(&mut s, &AgentEvent::TurnStarted("cron".into()));
         assert!(s.running() && s.working());
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
 
         // A monitor wake's turn ends with a task result.
         reduce(&mut s, &AgentEvent::TurnStarted("wake".into()));
-        reduce(
-            &mut s,
-            &AgentEvent::Result {
-                origin_is_task: true,
-            },
-        );
+        reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
     }
 
@@ -3625,7 +3587,7 @@ mod reduce_tests {
         reduce(&mut s, &AgentEvent::TurnStarted("a".into()));
         assert!(!s.self_turn);
         reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
     }
 
@@ -3640,7 +3602,7 @@ mod reduce_tests {
         };
         reduce(&mut s, &peer);
         assert!(s.turn_in_flight && s.running());
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
     }
 
@@ -3668,7 +3630,7 @@ mod reduce_tests {
         // reader latches the window here and drops both (e2e:
         // `renaming_a_live_chat_writes_nothing_at_all`).
         let latched = s.internal_in_flight();
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(latched && internal_turn_swallows(&AgentEvent::Frame("{}".into())));
         assert!(
             !s.internal_in_flight(),
@@ -3705,7 +3667,7 @@ mod reduce_tests {
         s.unconsumed.insert(0, queued("a"));
         reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
         assert!(s.turn_in_flight && s.running());
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
         reduce(&mut s, &AgentEvent::TurnStarted("r1".into()));
         assert!(s.internal_in_flight());
@@ -3739,7 +3701,7 @@ mod reduce_tests {
         assert!(s.is_idle());
         assert!(s.internal_in_flight(), "r1's frames are still swallowed");
 
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(!s.internal_in_flight());
         reduce(&mut s, &AgentEvent::TurnStarted("r2".into()));
         reduce(&mut s, &AgentEvent::UserTurnConsumed("r2".into()));
@@ -3757,7 +3719,7 @@ mod reduce_tests {
         queue_rename(&mut s, "r2");
         assert!(s.internal_in_flight(), "r1's window survives r2 queueing");
 
-        reduce(&mut s, &RESULT);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(!s.internal_in_flight());
         reduce(&mut s, &AgentEvent::TurnStarted("r2".into()));
         assert!(s.internal_in_flight() && s.is_idle(), "r2 is still tracked");

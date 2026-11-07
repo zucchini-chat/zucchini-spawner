@@ -6176,9 +6176,7 @@ mod tests {
         c.consume_first_turn();
         c.reader_line(vec![
             adapter::AgentEvent::ContextTokens(120_000),
-            adapter::AgentEvent::Result {
-                origin_is_task: false,
-            },
+            adapter::AgentEvent::Result,
         ])
         .await;
         c.respond(AgentResponse::TurnEnded {
@@ -6199,9 +6197,7 @@ mod tests {
         c.consume_first_turn();
         c.reader_line(vec![
             adapter::AgentEvent::ContextTokens(120_000),
-            adapter::AgentEvent::Result {
-                origin_is_task: false,
-            },
+            adapter::AgentEvent::Result,
         ])
         .await;
         c.window(vec![chat_with(
@@ -6219,10 +6215,7 @@ mod tests {
         .await;
         assert_eq!(c.unconsumed().len(), 1, "the user's turn goes first");
         c.consume_first_turn();
-        c.reader_line(vec![adapter::AgentEvent::Result {
-            origin_is_task: false,
-        }])
-        .await;
+        c.reader_line(vec![adapter::AgentEvent::Result]).await;
 
         c.window(vec![chat_with(
             &c,
@@ -7194,10 +7187,7 @@ mod tests {
         ])
         .await;
         c.consume_first_turn();
-        c.reader_line(vec![adapter::AgentEvent::Result {
-            origin_is_task: false,
-        }])
-        .await;
+        c.reader_line(vec![adapter::AgentEvent::Result]).await;
         c.writes();
 
         c.window(vec![c.titled_chat(1, "my voice writer")]).await;
@@ -7392,12 +7382,7 @@ mod tests {
             &mut session.lock().unwrap(),
             &AgentEvent::UserTurnConsumed(first),
         );
-        reduce(
-            &mut session.lock().unwrap(),
-            &AgentEvent::Result {
-                origin_is_task: false,
-            },
-        );
+        reduce(&mut session.lock().unwrap(), &AgentEvent::Result);
         c.writes();
 
         let mirror = c.shared_mirror();
@@ -7432,12 +7417,7 @@ mod tests {
             &AgentEvent::UserTurnConsumed(second),
         );
         assert!(session.lock().unwrap().running());
-        reduce(
-            &mut session.lock().unwrap(),
-            &AgentEvent::Result {
-                origin_is_task: false,
-            },
-        );
+        reduce(&mut session.lock().unwrap(), &AgentEvent::Result);
         assert!(session.lock().unwrap().is_idle());
     }
 
@@ -7901,9 +7881,7 @@ mod tests {
         let session = c.session();
         let ended = {
             let mut st = session.lock().unwrap();
-            let result = adapter::AgentEvent::Result {
-                origin_is_task: false,
-            };
+            let result = adapter::AgentEvent::Result;
             agent::reduce(&mut st, &result);
             st.observe_turn_running().expect("the turn ended")
         };

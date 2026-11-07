@@ -582,9 +582,7 @@ impl AgentAdapter for CursorAdapter {
                 out.push(AgentEvent::Frame(frame));
                 // Emit Result on every result frame; the supervisor latches it
                 // (so AgentResponse::Done.has_result is set once and only once).
-                out.push(AgentEvent::Result {
-                    origin_is_task: false,
-                });
+                out.push(AgentEvent::Result);
                 // Reset per-turn state. One adapter per spawn today, but a
                 // future supervisor change that reuses an adapter across
                 // turns would otherwise carry stale call ids forward.
