@@ -497,24 +497,17 @@ async fn handle_sync_event(
                         // checkpoint that re-delivers the row with
                         // agent_session_id=NULL (the harvest is set locally
                         // between checkpoints via set_agent_session_id; PowerSync
-                        // can re-stream a stale NULL). A window containing a real
-                        // REMOVE collapses to remove_chat first (last-write-wins),
-                        // so nothing is restored for a genuine delete.
+                        // can re-stream a stale NULL), and keep a reset's
+                        // forgotten id from coming back the same way. A window
+                        // containing a real REMOVE collapses to remove_chat
+                        // first (last-write-wins), so nothing is restored for a
+                        // genuine delete.
                         let local_session = mirror
                             .chats
                             .get(&id)
                             .and_then(|c| c.agent_session_id.clone());
                         mirror.upsert_chat(id.clone(), &json, keys);
-                        if let Some(local) = local_session {
-                            if mirror
-                                .chats
-                                .get(&id)
-                                .map(|c| c.agent_session_id.is_none())
-                                .unwrap_or(false)
-                            {
-                                mirror.set_agent_session_id(&id, local);
-                            }
-                        }
+                        mirror.keep_local_session(&id, local_session);
                         // Chat renamed in the app: carry the new name to the
                         // live resident so peers keep addressing it by title.
                         // A cold chat needs nothing - its next spawn passes
@@ -619,6 +612,12 @@ pub(crate) async fn handle_agent_response(
         AgentResponse::Line { topic, content } => {
             send_agent_line(write_tx, mirror, &topic, content).await;
         }
+        // Until the fresh session's id is harvested, usage is the aborted
+        // session's: its reader was joined before the reset, so its responses
+        // precede the fresh process's, which reports its id before any usage.
+        AgentResponse::ContextTokens { topic, .. }
+        | AgentResponse::CompactBoundary { topic, .. }
+            if mirror.reset_pending(&topic) => {}
         AgentResponse::ContextTokens { topic, tokens } => {
             let _ = write_tx
                 .send(WriteEvent::ContextTokens {
@@ -639,7 +638,10 @@ pub(crate) async fn handle_agent_response(
             // Stash locally first so a fast-followup user message
             // in the same chat doesn't race the writer / PowerSync
             // round-trip and spawn a second claude without --resume.
-            mirror.set_agent_session_id(&topic, session_id.clone());
+            // A session the user reset is never written back.
+            if !mirror.set_agent_session_id(&topic, session_id.clone()) {
+                return;
+            }
             let _ = write_tx
                 .send(WriteEvent::AgentSessionId {
                     chat_id: topic,
@@ -1216,13 +1218,51 @@ async fn stop_agent(
     supervisor: &mut Supervisor,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
+    let watched = watch::chat_stopped(chat_id) | tunnel::chat_stopped(chat_id);
+    kill_agent(chat_id, user_id, watched, supervisor, write_tx).await;
+}
+
+/// `/reset` (`/clear`, `/new`): kill the chat's agent like `/stop`, but keep
+/// its watches, tunnels and always-on flag, and forget its session, so the
+/// next spawn starts a fresh one - for an always-on chat `reconcile_always_on`,
+/// at once.
+async fn reset_agent(
+    chat_id: &str,
+    user_id: Uuid,
+    mirror: &mut Mirror,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    kill_agent(chat_id, user_id, false, supervisor, write_tx).await;
+    // They tell of the old session's world.
+    watch::take_stop_note(chat_id);
+    tunnel::take_stop_note(chat_id);
+    mirror.forget_session(chat_id);
+    let _ = write_tx
+        .send(WriteEvent::SessionReset {
+            chat_id: chat_id.to_string(),
+        })
+        .await;
+}
+
+/// Kill the chat's agent process group on the user's word, background tasks
+/// and queued turns included: `interrupted` if it was working, then its run,
+/// task and alive flags cleared. `daemon_tasks_stopped`: the user also
+/// stopped watches or tunnels, so `agent_running` is cleared even if no agent
+/// ran.
+async fn kill_agent(
+    chat_id: &str,
+    user_id: Uuid,
+    daemon_tasks_stopped: bool,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
     let running = supervisor.is_running(chat_id);
     if supervisor.is_working(chat_id) {
         publish_interrupted(write_tx, chat_id, user_id).await;
     }
-    let watched = watch::chat_stopped(chat_id) | tunnel::chat_stopped(chat_id);
     supervisor.abort_agent(chat_id).await;
-    if running || watched {
+    if running || daemon_tasks_stopped {
         send_agent_idle(write_tx, chat_id.to_string(), true).await;
     }
     clear_live_tasks(write_tx, chat_id).await;
@@ -1231,6 +1271,16 @@ async fn stop_agent(
     let _ = write_tx
         .send(WriteEvent::chat_alive(chat_id.to_string(), false))
         .await;
+}
+
+/// A user message the spawner acts on itself instead of passing it to the
+/// agent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum UserCommand {
+    /// `/stop`, or `/kill` from older clients.
+    Stop,
+    /// `/reset`, `/clear` or `/new`.
+    Reset,
 }
 
 /// Per chat, the `seq`s of the user messages staged in one checkpoint window.
@@ -1335,10 +1385,11 @@ async fn handle_message_put(
     // respawns its long-finished agent. A message at or below the chat's
     // handled high-water mark is a replay. Without a mark, fall back to
     // chats.last_seq, the bucket-authoritative latest message: a message below
-    // it is a replay — unless (resident chat) only user messages of this same
-    // window follow it (seqs are contiguous per chat). The mark exists because
-    // last_seq also counts agent rows, which can share a window with a
-    // mid-turn user message.
+    // it is a replay — unless only user messages of this same window follow it
+    // (seqs are contiguous per chat; a one-shot chat then skips it as
+    // superseded unless it is a reset). The mark exists because last_seq also
+    // counts agent rows, which can share a window with a mid-turn user
+    // message.
     let is_resident = agent_kind.make_adapter().is_resident();
     let only_window_messages_follow = || {
         window
@@ -1347,17 +1398,17 @@ async fn handle_message_put(
     };
     let replayed = match mirror.handled_user_seq(&chat_id) {
         Some(handled) => seq <= handled,
-        None => seq < chat_last_seq && !(is_resident && only_window_messages_follow()),
+        None => seq < chat_last_seq && !only_window_messages_follow(),
     };
+    if replayed {
+        info!(chat_id = %chat_id, seq, chat_last_seq, "skipping replayed user message");
+        return;
+    }
     // One-shot adapters answer only the latest of a window's messages.
     let superseded = !is_resident
         && window
             .get(&chat_id)
             .is_some_and(|seqs| seqs.iter().any(|&s| s > seq));
-    if replayed || superseded {
-        info!(chat_id = %chat_id, seq, chat_last_seq, "skipping replayed user message");
-        return;
-    }
     mirror.set_handled_user_seq(&chat_id, seq);
 
     let Some(body_str) = row.get("body").and_then(|v| v.as_str()) else {
@@ -1394,14 +1445,18 @@ async fn handle_message_put(
         }
     };
 
-    // Detect /stop and /kill early but act after the membership gate, so an
+    // Detect the commands early but act after the membership gate, so an
     // invitee with an unsynced machine_users row can never trigger a stray
     // abort.
-    let command = |name: &str| envelope.attachments.is_empty() && envelope.text.trim() == name;
-    let is_stop = command("/stop");
-    let is_kill = command("/kill");
-    if is_stop || is_kill {
-        info!(chat_id = %chat_id, text = %envelope.text.trim(), "stop command received");
+    let command = match envelope.text.trim() {
+        _ if !envelope.attachments.is_empty() => None,
+        "/stop" | "/kill" => Some(UserCommand::Stop),
+        // Claude's `/clear` aliases.
+        "/reset" | "/clear" | "/new" => Some(UserCommand::Reset),
+        _ => None,
+    };
+    if let Some(command) = command {
+        info!(chat_id = %chat_id, text = %envelope.text.trim(), ?command, "command received");
     }
 
     // Sandbox gate: owners (`user_id == mirror.user_id`) are never sandboxed
@@ -1431,9 +1486,22 @@ async fn handle_message_put(
         s
     };
 
-    if is_stop || is_kill {
-        stop_agent(&chat_id, user_id, supervisor, write_tx).await;
+    // A superseded reset still forgets the session the later messages would
+    // resume.
+    if superseded && command != Some(UserCommand::Reset) {
+        info!(chat_id = %chat_id, seq, "skipping superseded user message");
         return;
+    }
+    match command {
+        Some(UserCommand::Stop) => {
+            stop_agent(&chat_id, user_id, supervisor, write_tx).await;
+            return;
+        }
+        Some(UserCommand::Reset) => {
+            reset_agent(&chat_id, user_id, mirror, supervisor, write_tx).await;
+            return;
+        }
+        None => {}
     }
     // One-shot adapters (gemini/cursor/hermes/pi) spawn per turn: a new message
     // aborts the running one. Resident adapters (claude, codex) take it on
@@ -1510,7 +1578,7 @@ async fn start_turn(
     command_may_interrupt: bool,
     was_running: bool,
     user_id: Uuid,
-    mirror: &Mirror,
+    mirror: &mut Mirror,
     supervisor: &mut Supervisor,
     write_tx: &mpsc::Sender<WriteEvent>,
 ) {
@@ -1522,6 +1590,7 @@ async fn start_turn(
         for note in [
             watch::take_stop_note(&chat_id),
             tunnel::take_stop_note(&chat_id),
+            take_reset_note(mirror, &chat_id),
         ]
         .into_iter()
         .flatten()
@@ -1596,7 +1665,7 @@ async fn start_turn(
 /// the same text. An error leaves it in the watch's outbox to be offered again.
 async fn deliver_watch_message(
     out: watch::Outgoing,
-    mirror: &Mirror,
+    mirror: &mut Mirror,
     keys: &KeyStore,
     supervisor: &mut Supervisor,
     write_tx: &mpsc::Sender<WriteEvent>,
@@ -1616,7 +1685,7 @@ async fn deliver_watch_message(
 /// sender, then a turn with the text under its label.
 async fn deliver_daemon_message(
     out: tunnel::Notice,
-    mirror: &Mirror,
+    mirror: &mut Mirror,
     keys: &KeyStore,
     supervisor: &mut Supervisor,
     write_tx: &mpsc::Sender<WriteEvent>,
@@ -1769,21 +1838,61 @@ const RESTART_NOTICE: &str = "Your process was (re)started with this session res
 dev servers, watchers and scheduled loops you started may have stopped. Check what is still \
 running before restarting anything that should be; if nothing should be, reply in one line.";
 
-/// The notice's system row: clients show "Message from Zucchini: …".
-const RESTART_NOTICE_SENDER: &str = "Zucchini";
+/// The first turn of an always-on resident's fresh session after a reset,
+/// ahead of `still_running_from_before`.
+const RESET_NOTICE: &str = "The user reset this chat: this is a fresh session with no memory of \
+the previous conversation, and your system prompt holds the standing instructions. Background \
+work the previous session ran in its process (tasks, monitors, servers) was stopped.";
 
-fn restart_notice_turn() -> String {
-    format!("[{RESTART_NOTICE_SENDER}] {RESTART_NOTICE}")
+fn reset_notice(chat_id: &str) -> String {
+    let still = still_running_from_before(chat_id)
+        .map(|still| format!(" {still}"))
+        .unwrap_or_default();
+    format!(
+        "{RESET_NOTICE}{still} Start what your instructions say should be running, \
+         then reply in one line."
+    )
+}
+
+/// The first non-command turn after a reset tells the fresh session, once,
+/// what still runs from before.
+fn take_reset_note(mirror: &mut Mirror, chat_id: &str) -> Option<String> {
+    if !mirror.take_reset_note_due(chat_id) {
+        return None;
+    }
+    still_running_from_before(chat_id).map(|still| {
+        format!("[zucchini] The user reset this chat, so this session starts fresh. {still}")
+    })
+}
+
+/// The chat's watches and tunnels, which a reset keeps, for its fresh session.
+fn still_running_from_before(chat_id: &str) -> Option<String> {
+    let watches = watch::running_in(chat_id)
+        .into_iter()
+        .map(|w| w.sender_name());
+    let tunnels = tunnel::running_in(chat_id)
+        .into_iter()
+        .map(|t| format!("tunnel {}", t.description()));
+    let still: Vec<String> = watches.chain(tunnels).collect();
+    (!still.is_empty()).then(|| format!("Still running from before: {}.", still.join(", ")))
+}
+
+/// A notice's system row: clients show "Message from Zucchini: …".
+const NOTICE_SENDER: &str = "Zucchini";
+
+fn notice_turn(notice: &str) -> String {
+    format!("[{NOTICE_SENDER}] {notice}")
 }
 
 /// How many starts of an always-on resident `reconcile_always_on` makes
 /// before a pass sees it through its notice turn.
 const ALWAYS_ON_RETRIES: u32 = 3;
 
-/// Start the resident of every always-on chat that has a session to resume,
-/// a resident adapter and no agent, with `RESTART_NOTICE` as its turn and as
-/// a system row in the chat. A chat whose starts no pass saw through the
-/// notice turn `ALWAYS_ON_RETRIES` times is left alone.
+/// Start the resident of every always-on chat that has a session to resume
+/// or was reset, a resident adapter and no agent, with `RESTART_NOTICE`
+/// (`reset_notice` for the fresh session) as its turn and as a system row in
+/// the chat. A chat whose starts no pass saw through the notice turn
+/// `ALWAYS_ON_RETRIES` times is left alone.
 async fn reconcile_always_on(
     mirror: &mut Mirror,
     supervisor: &mut Supervisor,
@@ -1801,7 +1910,8 @@ async fn reconcile_always_on(
     });
     for chat_id in always_on {
         let chat = &mirror.chats[&chat_id];
-        let startable = chat.agent_session_id.is_some()
+        let reset = mirror.reset_pending(&chat_id);
+        let startable = (chat.agent_session_id.is_some() || reset)
             && chat.agent_kind.make_adapter().is_resident()
             && !supervisor.has_agent(&chat_id)
             && mirror.always_on_starts.get(&chat_id).copied().unwrap_or(0) < ALWAYS_ON_RETRIES;
@@ -1810,11 +1920,20 @@ async fn reconcile_always_on(
         }
         let user_id = chat.user_id;
         *mirror.always_on_starts.entry(chat_id.clone()).or_default() += 1;
-        let Some(req) = chat_spawn_request(mirror, &chat_id, restart_notice_turn()) else {
+        let notice = if reset {
+            reset_notice(&chat_id)
+        } else {
+            RESTART_NOTICE.to_string()
+        };
+        let Some(req) = chat_spawn_request(mirror, &chat_id, notice_turn(&notice)) else {
             continue;
         };
-        info!(chat_id = %chat_id, "starting always-on resident");
-        let row = agent::peer_message_frame_json(RESTART_NOTICE_SENDER, RESTART_NOTICE);
+        info!(chat_id = %chat_id, reset, "starting always-on resident");
+        if reset {
+            // The notice lists what still runs.
+            mirror.take_reset_note_due(&chat_id);
+        }
+        let row = agent::peer_message_frame_json(NOTICE_SENDER, &notice);
         let _ = write_tx
             .send(WriteEvent::agent_line(chat_id.clone(), user_id, row))
             .await;
@@ -4045,12 +4164,12 @@ async fn main() {
             }
             Some((out, reply)) = watch_rx.recv() => {
                 let delivered =
-                    deliver_watch_message(out, &*mirror.read().await, &keys, &mut supervisor, &write_tx).await;
+                    deliver_watch_message(out, &mut *mirror.write().await, &keys, &mut supervisor, &write_tx).await;
                 let _ = reply.send(delivered);
             }
             Some((notice, reply)) = tunnel_rx.recv() => {
                 let delivered =
-                    deliver_daemon_message(notice, &*mirror.read().await, &keys, &mut supervisor, &write_tx).await;
+                    deliver_daemon_message(notice, &mut *mirror.write().await, &keys, &mut supervisor, &write_tx).await;
                 let _ = reply.send(delivered);
             }
             Some(chat_id) = watched_chat_rx.recv() => {
@@ -4150,8 +4269,12 @@ mod tests {
                 state: StdArc::new(StdMutex::new(SessionState::default())),
             }
         });
-        // One-shot fn is unused for claude tests but required by the ctor.
-        let one_shot: SpawnFn = StdArc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
+        // A one-shot spawn is recorded too and finishes at once.
+        let one_shot_rec = StdArc::clone(&recorded);
+        let one_shot: SpawnFn = StdArc::new(move |req, _tx, _token, _pending| {
+            one_shot_rec.lock().unwrap().push(req);
+            tokio::spawn(async {})
+        });
         let supervisor = Supervisor::with_spawn_fns(resp_tx, one_shot, resident_fn);
         (supervisor, recorded)
     }
@@ -5959,8 +6082,13 @@ mod tests {
         }
 
         fn message(&self, seq: i64, text: &str) -> SyncEvent {
+            self.message_with(seq, json!({ "text": text, "attachments": [] }))
+        }
+
+        /// A user message whose body is `envelope`.
+        fn message_with(&self, seq: i64, envelope: serde_json::Value) -> SyncEvent {
             let key = self.keys.get(&self.user_id).expect("seeded key");
-            let envelope = json!({ "text": text, "attachments": [] }).to_string();
+            let envelope = envelope.to_string();
             let id = Uuid::now_v7().to_string();
             SyncEvent::Put {
                 table: "messages".into(),
@@ -6251,8 +6379,13 @@ mod tests {
 
         let stopped = message(&c.chat_id);
         stopped.cancelled.cancel();
-        let stopped_delivery =
-            deliver_watch_message(stopped, &c.mirror, &c.keys, &mut c.supervisor, &c.write_tx);
+        let stopped_delivery = deliver_watch_message(
+            stopped,
+            &mut c.mirror,
+            &c.keys,
+            &mut c.supervisor,
+            &c.write_tx,
+        );
         assert!(
             stopped_delivery.await.is_err(),
             "queued before its watch was stopped"
@@ -6263,13 +6396,14 @@ mod tests {
         for (chat_id, keys) in [("no-such-chat", &c.keys), (c.chat_id.as_str(), &revoked)] {
             let out = message(chat_id);
             let refused =
-                deliver_watch_message(out, &c.mirror, keys, &mut c.supervisor, &c.write_tx).await;
+                deliver_watch_message(out, &mut c.mirror, keys, &mut c.supervisor, &c.write_tx)
+                    .await;
             assert!(refused.is_err(), "stays in the outbox");
         }
         assert!(c.spawned_prompts().is_empty());
 
         let out = message(&c.chat_id);
-        deliver_watch_message(out, &c.mirror, &c.keys, &mut c.supervisor, &c.write_tx)
+        deliver_watch_message(out, &mut c.mirror, &c.keys, &mut c.supervisor, &c.write_tx)
             .await
             .unwrap();
         assert_eq!(
@@ -6290,7 +6424,7 @@ mod tests {
     fn notices(c: &ResidentChat) -> usize {
         c.spawned_prompts()
             .iter()
-            .filter(|p| **p == restart_notice_turn())
+            .filter(|p| **p == notice_turn(RESTART_NOTICE))
             .count()
     }
 
@@ -6300,7 +6434,7 @@ mod tests {
         c.window(vec![c.project()]).await;
         c.writes();
         c.window(vec![always_on_chat(&c, 1, true)]).await;
-        assert_eq!(c.spawned_prompts(), vec![restart_notice_turn()]);
+        assert_eq!(c.spawned_prompts(), vec![notice_turn(RESTART_NOTICE)]);
         assert_eq!(
             c.recorded.lock().unwrap()[0].agent_session_id.as_deref(),
             Some("sid")
@@ -6874,7 +7008,7 @@ mod tests {
         c.window(vec![]).await;
         let recorded = c.recorded.lock().unwrap();
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].prompt, restart_notice_turn());
+        assert_eq!(recorded[0].prompt, notice_turn(RESTART_NOTICE));
         assert_eq!(
             recorded[0].session_name.as_deref(),
             Some("cover letters writer")
@@ -7767,6 +7901,478 @@ mod tests {
             ),
             "{writes:?}"
         );
+    }
+
+    /// `c.chat(last_seq, "")` still naming the session a reset forgot.
+    fn chat_on_old_session(c: &ResidentChat, last_seq: i64) -> SyncEvent {
+        chat_with(c, last_seq, json!({ "agent_session_id": "old" }))
+    }
+
+    /// `chat_on_old_session` for a one-shot (cursor) chat.
+    fn cursor_on_old_session(c: &ResidentChat, last_seq: i64) -> SyncEvent {
+        chat_with(
+            c,
+            last_seq,
+            json!({ "agent_kind": "cursor", "agent_session_id": "old" }),
+        )
+    }
+
+    /// The session each spawn resumed.
+    fn spawned_sessions(c: &ResidentChat) -> Vec<Option<String>> {
+        c.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.agent_session_id.clone())
+            .collect()
+    }
+
+    fn is_session_reset(w: &WriteEvent) -> bool {
+        matches!(w, WriteEvent::SessionReset { .. })
+    }
+
+    fn harvested(c: &ResidentChat, session_id: &str) -> AgentResponse {
+        AgentResponse::SessionIdHarvested {
+            topic: c.chat_id.clone(),
+            session_id: session_id.into(),
+        }
+    }
+
+    /// A working resident on the old session, then a reset.
+    async fn reset_while_working(text: &str) -> ResidentChat {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            chat_on_old_session(&c, 1),
+            c.message(1, "first"),
+        ])
+        .await;
+        c.consume_first_turn();
+        c.writes();
+        c.window(vec![chat_on_old_session(&c, 2), c.message(2, text)])
+            .await;
+        c
+    }
+
+    #[tokio::test]
+    async fn reset_ends_the_turn_and_the_next_message_starts_a_fresh_session() {
+        for reset in ["/reset", "/clear", "/new"] {
+            let mut c = reset_while_working(&format!("\n {reset} \n")).await;
+            assert!(!c.supervisor.has_agent(&c.chat_id), "{reset}");
+            let writes = c.writes();
+            assert!(writes.iter().any(is_interrupted), "{writes:?}");
+            assert!(writes.iter().any(is_stopped_by_user), "{writes:?}");
+            assert_eq!(alive_writes(&writes), vec![false]);
+            assert_eq!(writes.iter().filter(|w| is_session_reset(w)).count(), 1);
+
+            c.window(vec![c.chat(3, ""), c.message(3, "second")]).await;
+            assert_eq!(c.spawned_prompts(), vec!["first", "second"]);
+            assert_eq!(spawned_sessions(&c), vec![Some("old".into()), None]);
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_keeps_the_chats_watches() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        let watch = watch_in(&c);
+        c.writes();
+        c.window(vec![c.chat(2, ""), c.message(2, "/reset")]).await;
+
+        assert_eq!(watch::running_in(&c.chat_id).len(), 1);
+        let writes = c.writes();
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+        assert_eq!(
+            run_flags(&writes),
+            vec![("turn", false)],
+            "the watch keeps the chat running"
+        );
+        assert_eq!(live_task_ids(&writes), vec![vec![watch]]);
+    }
+
+    #[tokio::test]
+    async fn a_reset_command_with_more_text_or_an_attachment_is_a_message() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            chat_on_old_session(&c, 1),
+            c.message(1, "first"),
+        ])
+        .await;
+        finish_turn(&c);
+        c.window(vec![chat_on_old_session(&c, 2), c.message(2, "/clear foo")])
+            .await;
+        assert_eq!(c.unconsumed(), vec!["/clear foo"]);
+
+        let dir = std::env::temp_dir().join(format!("zucchini-attachments-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob_key = Uuid::now_v7();
+        let file = dir.join(format!("{blob_key}.txt"));
+        std::fs::write(&file, "notes").unwrap();
+        c.blobs = BlobDownloader::cached_in(dir.clone());
+        let attached = c.message_with(
+            3,
+            json!({
+                "text": "/reset",
+                "attachments": [{ "blob_key": blob_key, "size": 5, "name": "a.txt" }],
+            }),
+        );
+        c.window(vec![chat_on_old_session(&c, 3), attached]).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let attached_turn = format!(
+            "[The user attached the following files:]\n- {} (original name: a.txt)\n\n\
+             [User's message:]\n/reset",
+            file.display()
+        );
+        assert_eq!(
+            c.unconsumed(),
+            vec!["/clear foo".to_string(), attached_turn]
+        );
+        assert!(!c.writes().iter().any(is_session_reset));
+        assert_eq!(
+            c.mirror.chats[&c.chat_id].agent_session_id.as_deref(),
+            Some("old")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reset_from_a_member_whose_row_has_not_synced_does_nothing() {
+        let mut c = ResidentChat::new();
+        invite(&mut c, "row");
+        c.window(vec![
+            c.project(),
+            chat_on_old_session(&c, 1),
+            c.message(1, "first"),
+        ])
+        .await;
+        c.mirror.remove_member("row");
+        c.writes();
+        c.window(vec![chat_on_old_session(&c, 2), c.message(2, "/reset")])
+            .await;
+
+        assert!(c.supervisor.has_agent(&c.chat_id));
+        assert!(c.writes().is_empty());
+        assert_eq!(
+            c.mirror.chats[&c.chat_id].agent_session_id.as_deref(),
+            Some("old")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_harvest_of_the_reset_session_is_refused() {
+        let mut c = reset_while_working("/reset").await;
+        c.writes();
+        c.respond(harvested(&c, "old")).await;
+        assert!(c.writes().is_empty());
+
+        c.window(vec![c.chat(3, ""), c.message(3, "second")]).await;
+        assert_eq!(spawned_sessions(&c), vec![Some("old".into()), None]);
+    }
+
+    #[tokio::test]
+    async fn a_stale_row_does_not_bring_back_a_reset_session_nor_drop_the_fresh_one() {
+        let mut c = reset_while_working("/reset").await;
+        // The reset's NULL hasn't synced back yet.
+        c.window(vec![chat_on_old_session(&c, 2)]).await;
+        c.window(vec![chat_on_old_session(&c, 3), c.message(3, "second")])
+            .await;
+        assert_eq!(spawned_sessions(&c), vec![Some("old".into()), None]);
+
+        c.respond(harvested(&c, "fresh")).await;
+        assert!(c.writes().iter().any(|w| matches!(
+            w,
+            WriteEvent::AgentSessionId { session_id, .. } if session_id == "fresh"
+        )));
+        // The reset's NULL, then the old id once more: both predate the harvest.
+        c.window(vec![c.chat(3, "")]).await;
+        c.window(vec![chat_on_old_session(&c, 3)]).await;
+        c.supervisor.abort_agent(&c.chat_id).await;
+        c.window(vec![c.chat(4, ""), c.message(4, "third")]).await;
+        assert_eq!(
+            spawned_sessions(&c),
+            vec![Some("old".into()), None, Some("fresh".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reset_sessions_late_usage_does_not_reach_the_gauge() {
+        // No session harvested yet: the reset still waits for a fresh one.
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.window(vec![c.chat(2, ""), c.message(2, "/reset")]).await;
+        c.writes();
+        let topic = c.chat_id.clone();
+        c.respond(AgentResponse::ContextTokens {
+            topic: topic.clone(),
+            tokens: 90_000,
+        })
+        .await;
+        c.respond(AgentResponse::CompactBoundary {
+            topic: topic.clone(),
+            post_tokens: 5_000,
+        })
+        .await;
+        assert!(c.writes().is_empty());
+
+        c.window(vec![c.chat(3, ""), c.message(3, "second")]).await;
+        c.respond(harvested(&c, "fresh")).await;
+        c.respond(AgentResponse::ContextTokens {
+            topic,
+            tokens: 1_000,
+        })
+        .await;
+        assert!(c
+            .writes()
+            .iter()
+            .any(|w| matches!(w, WriteEvent::ContextTokens { tokens: 1_000, .. })));
+    }
+
+    fn always_on_null_session_chat(c: &ResidentChat, last_seq: i64) -> SyncEvent {
+        chat_with(c, last_seq, json!({ "always_on": 1 }))
+    }
+
+    #[tokio::test]
+    async fn an_always_on_chat_restarts_fresh_after_a_reset_and_resumes_once_harvested() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        let watch = watch::WatchDef::for_test(&c.chat_id, c.user_id, "mail");
+        watch::register_idle(watch);
+        let tunnel = tunnel::TunnelDef::for_test(&c.chat_id, c.user_id);
+        tunnel::register_idle(tunnel.clone());
+        c.consume_first_turn();
+        c.writes();
+
+        c.window(vec![always_on_chat(&c, 2, true), c.message(2, "/reset")])
+            .await;
+        let notice = format!(
+            "{RESET_NOTICE} Still running from before: watch \"mail\", tunnel 8080 → {}. \
+             Start what your instructions say should be running, then reply in one line.",
+            tunnel.url()
+        );
+        let reset_turn = format!("[Zucchini] {notice}");
+        assert_eq!(
+            c.spawned_prompts(),
+            vec![notice_turn(RESTART_NOTICE), reset_turn.clone()]
+        );
+        assert_eq!(spawned_sessions(&c), vec![Some("sid".into()), None]);
+        let rows = c.message_rows();
+        assert_eq!(
+            rows.last(),
+            Some(&json!({
+                "type": "system",
+                "subtype": "peer_message",
+                "name": "Zucchini",
+                "body": notice,
+            }))
+        );
+
+        // Not again while it runs; a crash before its id is harvested starts
+        // it fresh again, and a stale row changes nothing.
+        reconcile_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
+        c.supervisor.abort_agent(&c.chat_id).await;
+        c.window(vec![always_on_chat(&c, 3, true)]).await;
+        assert_eq!(c.spawned_prompts().len(), 3);
+        assert_eq!(c.spawned_prompts()[2], reset_turn);
+        assert_eq!(spawned_sessions(&c)[2], None);
+
+        c.respond(harvested(&c, "fresh")).await;
+        c.supervisor.abort_agent(&c.chat_id).await;
+        c.window(vec![always_on_null_session_chat(&c, 3)]).await;
+        assert_eq!(c.spawned_prompts()[3], notice_turn(RESTART_NOTICE));
+        assert_eq!(spawned_sessions(&c)[3].as_deref(), Some("fresh"));
+    }
+
+    #[tokio::test]
+    async fn a_reset_gives_an_always_on_chat_its_retries_back() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        for _ in 0..5 {
+            c.supervisor.abort_agent(&c.chat_id).await;
+            reconcile_always_on(&mut c.mirror, &mut c.supervisor, &c.write_tx).await;
+        }
+        assert_eq!(notices(&c), ALWAYS_ON_RETRIES as usize);
+
+        c.window(vec![
+            always_on_null_session_chat(&c, 2),
+            c.message(2, "/reset"),
+        ])
+        .await;
+        assert_eq!(spawned_sessions(&c).last(), Some(&None));
+        assert_eq!(c.spawned_prompts().len(), ALWAYS_ON_RETRIES as usize + 1);
+    }
+
+    #[tokio::test]
+    async fn the_first_fresh_turn_after_a_reset_lists_what_still_runs() {
+        for watched in [true, false] {
+            let mut c = ResidentChat::new();
+            c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+                .await;
+            c.consume_first_turn();
+            if watched {
+                watch_in(&c);
+            }
+            for (seq, text) in [(2, "/reset"), (3, "second"), (4, "third")] {
+                c.window(vec![c.chat(seq, ""), c.message(seq, text)]).await;
+            }
+            let second = if watched {
+                "[zucchini] The user reset this chat, so this session starts fresh. \
+                 Still running from before: watch \"mail\".\n\nsecond"
+            } else {
+                "second"
+            };
+            assert_eq!(c.spawned_prompts(), vec!["first", second]);
+            assert_eq!(c.unconsumed(), vec![second, "third"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reset_drops_the_note_of_an_earlier_stop() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        watch_in(&c);
+        for (seq, text) in [(2, "/stop"), (3, "/reset"), (4, "second")] {
+            c.window(vec![c.chat(seq, ""), c.message(seq, text)]).await;
+        }
+        assert_eq!(c.spawned_prompts(), vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn a_reset_outlives_a_restart_and_goes_with_its_chat() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            chat_on_old_session(&c, 1),
+            c.message(1, "first"),
+        ])
+        .await;
+        c.window(vec![chat_on_old_session(&c, 2), c.message(2, "/reset")])
+            .await;
+        restart(&mut c);
+        // The reset's NULL was lost with the writer's queue.
+        c.window(vec![chat_on_old_session(&c, 3), c.message(3, "second")])
+            .await;
+        assert_eq!(spawned_sessions(&c), vec![None]);
+
+        c.window(vec![remove("chats", &c.chat_id)]).await;
+        let saved = serde_json::to_string(&c.mirror).unwrap();
+        assert!(!saved.contains(&c.chat_id), "{saved}");
+    }
+
+    #[test]
+    fn a_chat_remembers_its_last_five_reset_sessions_and_its_note_across_a_restart() {
+        let mut mirror = Mirror::default();
+        for i in 0..7 {
+            let chat = state::ChatState {
+                agent_session_id: Some(format!("s{i}")),
+                ..Default::default()
+            };
+            mirror.chats.insert("c".into(), chat);
+            mirror.forget_session("c");
+        }
+        let saved = serde_json::to_value(&mirror).unwrap();
+        assert_eq!(
+            saved["resets"]["c"]["forgotten"],
+            json!(["s2", "s3", "s4", "s5", "s6"])
+        );
+        let mut restarted: Mirror = serde_json::from_value(saved).unwrap();
+        assert!(restarted.take_reset_note_due("c"));
+        assert!(!restarted.take_reset_note_due("c"));
+    }
+
+    /// A one-shot chat answers only a window's latest message, but a reset
+    /// before it still forgets the session.
+    #[tokio::test]
+    async fn a_one_shot_reset_superseded_in_its_window_still_applies() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            cursor_on_old_session(&c, 1),
+            c.message(1, "first"),
+        ])
+        .await;
+        c.writes();
+        c.window(vec![
+            cursor_on_old_session(&c, 3),
+            c.message(2, "/reset"),
+            c.message(3, "do X"),
+        ])
+        .await;
+
+        assert_eq!(c.spawned_prompts(), vec!["first", "do X"]);
+        assert_eq!(spawned_sessions(&c), vec![Some("old".into()), None]);
+        assert!(c.writes().iter().any(is_session_reset));
+    }
+
+    /// The same before the chat has a handled-seq mark (fresh state.json): the
+    /// earlier messages of the window aren't taken for replays, and the
+    /// superseded ones that aren't a reset are still skipped.
+    #[tokio::test]
+    async fn a_one_shot_reset_superseded_before_any_mark_still_applies() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            cursor_on_old_session(&c, 3),
+            c.message(1, "/reset"),
+            c.message(2, "a"),
+            c.message(3, "do X"),
+        ])
+        .await;
+
+        assert_eq!(c.spawned_prompts(), vec!["do X"]);
+        assert_eq!(spawned_sessions(&c), vec![None]);
+        assert!(c.writes().iter().any(is_session_reset));
+    }
+
+    /// The note waits for the first turn that isn't a command, on whichever
+    /// process, and comes once.
+    #[tokio::test]
+    async fn a_command_first_after_a_reset_leaves_the_note_to_the_next_turn() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        watch_in(&c);
+        for (seq, text) in [(2, "/reset"), (3, "/compact")] {
+            c.window(vec![c.chat(seq, ""), c.message(seq, text)]).await;
+        }
+        c.respond(harvested(&c, "fresh")).await;
+        for (seq, text) in [(4, "second"), (5, "third")] {
+            c.window(vec![c.chat(seq, ""), c.message(seq, text)]).await;
+        }
+        let note = "[zucchini] The user reset this chat, so this session starts fresh. \
+                    Still running from before: watch \"mail\".";
+        assert_eq!(c.spawned_prompts(), vec!["first", "/compact"]);
+        assert_eq!(
+            c.unconsumed(),
+            vec![
+                "/compact".to_string(),
+                format!("{note}\n\nsecond"),
+                "third".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_always_on_reset_notice_stands_in_for_the_note() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), always_on_chat(&c, 1, true)])
+            .await;
+        watch_in(&c);
+        c.window(vec![always_on_chat(&c, 2, true), c.message(2, "/reset")])
+            .await;
+        c.window(vec![
+            always_on_null_session_chat(&c, 3),
+            c.message(3, "hello"),
+        ])
+        .await;
+        assert_eq!(c.unconsumed().last().map(String::as_str), Some("hello"));
     }
 
     /// The blob the clients read: a real `task_started` line puts the armed task

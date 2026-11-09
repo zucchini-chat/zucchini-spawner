@@ -100,6 +100,11 @@ pub enum WriteEvent {
         chat_id: String,
         session_id: String,
     },
+    /// The user reset the chat: no session to resume and no context to show
+    /// until the fresh session reports its own.
+    SessionReset {
+        chat_id: String,
+    },
     Heartbeat {
         machine_id: Uuid,
     },
@@ -361,6 +366,11 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
             chat_id,
             "AgentSessionId",
             serde_json::json!({ "agent_session_id": session_id }),
+        )?,
+        WriteEvent::SessionReset { chat_id } => chats_patch(
+            chat_id,
+            "SessionReset",
+            serde_json::json!({ "agent_session_id": null, "context_tokens": null }),
         )?,
         WriteEvent::Heartbeat { machine_id } => {
             // Server stamps now() for last_heartbeat_at; the null is just a presence marker.
@@ -765,5 +775,18 @@ mod live_tasks_tests {
                 BACKEND_HAS_TURN_RUNNING
             );
         }
+    }
+
+    #[test]
+    fn a_session_reset_nulls_the_session_and_the_context_gauge() {
+        let ev = WriteEvent::SessionReset {
+            chat_id: Uuid::now_v7().to_string(),
+        };
+        let op = encode_event(&ev, &KeyStore::new()).expect("op");
+        assert_eq!((op.op, op.table), ("PATCH", "chats"));
+        assert_eq!(
+            op.data.expect("data"),
+            serde_json::json!({ "agent_session_id": null, "context_tokens": null })
+        );
     }
 }

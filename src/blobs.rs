@@ -25,6 +25,7 @@ pub struct BlobDownloader {
     http: reqwest::Client,
     download_url_endpoint: String,
     fetch_token: TokenFetcher,
+    dir: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -179,6 +180,19 @@ impl BlobDownloader {
                 api_base_url.trim_end_matches('/')
             ),
             fetch_token,
+            dir: attachment_dir(),
+        }
+    }
+
+    /// Hands out only the attachments already in `dir`; nothing downloads.
+    #[cfg(test)]
+    pub fn cached_in(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            ..Self::new(
+                "http://test.invalid",
+                Box::new(|| Box::pin(async { Err(anyhow!("no backend in tests")) })),
+            )
         }
     }
 
@@ -193,8 +207,8 @@ impl BlobDownloader {
         if attachments.is_empty() {
             return Ok(Vec::new());
         }
-        let dir = attachment_dir();
-        tokio::fs::create_dir_all(&dir)
+        let dir = &self.dir;
+        tokio::fs::create_dir_all(dir)
             .await
             .with_context(|| format!("create attachments dir {}", dir.display()))?;
 

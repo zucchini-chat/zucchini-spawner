@@ -165,6 +165,10 @@ pub struct Mirror {
     /// or no message handled yet) falls back to the `chats.last_seq` guard.
     #[serde(default)]
     handled_user_seqs: HashMap<String, i64>,
+    /// Per chat the user reset (`main.rs::reset_agent`). Persisted because the
+    /// reset's NULL may not have synced back before a restart.
+    #[serde(default)]
+    resets: HashMap<String, ChatReset>,
     /// Chats whose last-synced row had `agent_running`, `agent_alive` or
     /// `live_tasks` set.
     /// Persisted because PowerSync resumes from the saved cursor and won't
@@ -227,6 +231,25 @@ struct MemberInfo {
 
 fn default_true() -> bool {
     true
+}
+
+/// A stale row carries the session of one of the last few resets at most.
+const FORGOTTEN_SESSIONS_KEPT: usize = 5;
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ChatReset {
+    /// The session ids the chat's resets forgot, newest last: a synced row or
+    /// a harvest still carrying one is an old session's.
+    forgotten: Vec<String>,
+    /// The fresh session isn't told yet what still runs from before the reset.
+    note_due: bool,
+}
+
+fn is_forgotten(resets: &HashMap<String, ChatReset>, chat_id: &str, session_id: &str) -> bool {
+    resets
+        .get(chat_id)
+        .is_some_and(|r| r.forgotten.iter().any(|id| id == session_id))
 }
 
 impl Mirror {
@@ -412,13 +435,70 @@ impl Mirror {
     /// Stash the harvested session id locally so a fast-followup user message
     /// in the same chat doesn't race the writer/PowerSync round-trip and
     /// re-spawn the agent without `--resume`. Idempotent on subsequent harvests
-    /// (keeps the first id).
-    pub fn set_agent_session_id(&mut self, chat_id: &str, session_id: String) {
+    /// (keeps the first id). `false`: a session the chat's reset forgot, refused.
+    pub fn set_agent_session_id(&mut self, chat_id: &str, session_id: String) -> bool {
+        if is_forgotten(&self.resets, chat_id, &session_id) {
+            return false;
+        }
         if let Some(c) = self.chats.get_mut(chat_id) {
             if c.agent_session_id.is_none() {
                 c.agent_session_id = Some(session_id);
             }
         }
+        true
+    }
+
+    /// After `upsert_chat` of a re-streamed row: a session id it lacks (a NULL
+    /// streamed before the harvest synced back) or one a reset forgot (streamed
+    /// before the reset's NULL synced back) is stale, so the chat keeps `local`,
+    /// the id it had before.
+    pub fn keep_local_session(&mut self, chat_id: &str, local: Option<String>) {
+        let Some(chat) = self.chats.get_mut(chat_id) else {
+            return;
+        };
+        let stale = chat
+            .agent_session_id
+            .as_deref()
+            .is_none_or(|id| is_forgotten(&self.resets, chat_id, id));
+        if stale {
+            chat.agent_session_id = local;
+        }
+    }
+
+    /// The user reset the chat: its next spawn starts a fresh session, the
+    /// current one is never taken back, the fresh session is to hear what
+    /// still runs, and an always-on chat gets a fresh retry budget.
+    pub fn forget_session(&mut self, chat_id: &str) {
+        let reset = self.resets.entry(chat_id.to_string()).or_default();
+        reset.note_due = true;
+        if let Some(id) = self
+            .chats
+            .get_mut(chat_id)
+            .and_then(|c| c.agent_session_id.take())
+        {
+            reset.forgotten.push(id);
+            if reset.forgotten.len() > FORGOTTEN_SESSIONS_KEPT {
+                reset.forgotten.remove(0);
+            }
+        }
+        self.always_on_starts.remove(chat_id);
+    }
+
+    /// The chat was reset and its fresh session's id isn't harvested yet.
+    pub fn reset_pending(&self, chat_id: &str) -> bool {
+        self.resets.contains_key(chat_id)
+            && self
+                .chats
+                .get(chat_id)
+                .is_some_and(|c| c.agent_session_id.is_none())
+    }
+
+    /// The chat's fresh session is still to hear what runs from before its
+    /// reset; true once per reset.
+    pub fn take_reset_note_due(&mut self, chat_id: &str) -> bool {
+        self.resets
+            .get_mut(chat_id)
+            .is_some_and(|r| std::mem::take(&mut r.note_due))
     }
 
     /// Returns true iff the stored `user_id` materially changed (None→Some, or
@@ -659,6 +739,7 @@ impl Mirror {
     pub fn remove_chat(&mut self, id: &str) {
         self.chats.remove(id);
         self.handled_user_seqs.remove(id);
+        self.resets.remove(id);
         self.flagged_chats.remove(id);
     }
 

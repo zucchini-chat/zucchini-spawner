@@ -179,11 +179,16 @@ impl TunnelDef {
         Ok(SigningKey::from_bytes(&seed))
     }
 
+    /// How a chat lists it: `<port> → <url>`.
+    pub fn description(&self) -> String {
+        format!("{} → {}", self.port, self.url())
+    }
+
     /// Its `chats.live_tasks` entry.
     pub fn live_task(&self) -> serde_json::Value {
         serde_json::json!({
             "i": self.id,
-            "d": format!("{} → {}", self.port, self.url()),
+            "d": self.description(),
             "k": "tunnel",
             "u": self.url(),
             "s0": self.created_at.saturating_mul(1000),
