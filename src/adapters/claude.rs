@@ -461,18 +461,18 @@ impl AgentAdapter for ClaudeAdapter {
             self.record_prune_tool_use_ids(&line);
         }
 
-        // Pre-skip harvest: `system/init` frames carry claude's
-        // self-generated session id (we no longer pass --session-id
-        // on the first turn). Emit it BEFORE the skip decision so
-        // the init frame itself still gets filtered out below and
-        // never reaches the chat. Init frames are tiny — no need
-        // for the MAX_STREAM_FRAME_BYTES guard.
+        // Every turn opens with a `system/init` frame, and it is the only
+        // announcement of a task wake. It also carries claude's self-generated
+        // session id (we pass no --session-id on the first turn). Handled
+        // BEFORE the skip decision so the init frame itself still gets
+        // filtered out below and never reaches the chat.
         if line.starts_with('{')
             && line.contains("\"type\":\"system\"")
             && line.contains("\"subtype\":\"init\"")
         {
-            if let Some(session_id) = parse_init_session_id(&line) {
-                out.push(AgentEvent::SessionIdHarvested(session_id));
+            if let Some(init) = parse_init(&line) {
+                out.extend(init.session_id.map(AgentEvent::SessionIdHarvested));
+                out.push(AgentEvent::TurnBegan);
             }
         }
 
@@ -512,18 +512,13 @@ impl AgentAdapter for ClaudeAdapter {
                     || (line.contains("\"subtype\":\"task_updated\"")
                         && task_updated_is_terminal(&line))
                 {
-                    // Terminal task signal (completed/failed/cancelled) — clears
-                    // the task from `live_tasks`. Two frame shapes carry it:
-                    // claude's one-shot `--print` mode emits a dedicated
-                    // `task_notification`, but the resident `stream-json` session
-                    // signals completion via `task_updated` with `patch.status` =
-                    // completed/failed/cancelled and never sends a
-                    // `task_notification` (verified live: chat c06c30b2, task
-                    // bo87ftywa — only a task_started then a task_updated{completed}
-                    // ever crossed the wire). Match BOTH, or the resident session's
-                    // `live_tasks` never empties → `running` sticks true → no
-                    // `chat_running(false)` is ever written and the chat is pinned
-                    // to agent_running / "Waiting…" forever after a Monitor ends. A
+                    // Terminal task signal — clears the task from `live_tasks`.
+                    // Two frame shapes carry it: `task_updated` with a terminal
+                    // `patch.status` and `task_notification`. claude 2.1.321 sends
+                    // both, in that order (`tmp/wake-turn/wake_probe.log`), so the
+                    // second finds no live task. Match BOTH: on a build that sends
+                    // only one, `live_tasks` would never empty and the chat would
+                    // stay pinned to agent_running / "Waiting…". A
                     // `task_updated` PROGRESS frame (status running/pending) is not
                     // terminal and still falls through to skip.
                     if let Some(id) = parse_task_id(&line) {
@@ -534,7 +529,8 @@ impl AgentAdapter for ClaudeAdapter {
             } else if line.contains("\"type\":\"user\"") {
                 // `--replay-user-messages` echo of a stdin frame we wrote (claude
                 // has consumed that turn; the user's own message row already
-                // exists) or of a peer session's `SendMessage`.
+                // exists), of a peer session's `SendMessage`, or of the task
+                // notifications claude injected into the running turn.
                 if line.contains("\"isReplay\":true") {
                     out.extend(parse_replay_echo(&line));
                 }
@@ -625,23 +621,49 @@ fn parse_started_command_uuid(line: &str) -> Option<String> {
         .map(|l| l.command_uuid)
 }
 
-fn parse_replay_echo(line: &str) -> Option<AgentEvent> {
-    // `origin` stays untyped so an unexpected shape can't cost us our own echo.
+fn parse_replay_echo(line: &str) -> SmallVec<[AgentEvent; 2]> {
+    // `origin` and `message` stay untyped so an unexpected shape can't cost
+    // us our own echo.
     #[derive(serde::Deserialize)]
     struct Replay {
         uuid: String,
         #[serde(default)]
         origin: serde_json::Value,
+        #[serde(default)]
+        message: serde_json::Value,
     }
-    let r = serde_json::from_str::<Replay>(line).ok()?;
-    if r.origin["kind"] != "peer" {
-        return Some(AgentEvent::UserTurnConsumed(r.uuid));
+    let Ok(r) = serde_json::from_str::<Replay>(line) else {
+        return SmallVec::new();
+    };
+    match r.origin["kind"].as_str() {
+        Some("peer") => {
+            let field = |k: &str| r.origin[k].as_str().unwrap_or_default().to_string();
+            smallvec::smallvec![AgentEvent::PeerTurnConsumed {
+                name: field("name"),
+                body: field("body"),
+            }]
+        }
+        Some("task-notification") => smallvec::smallvec![
+            AgentEvent::UserTurnConsumed(r.uuid),
+            AgentEvent::NotificationsConsumed(notified_task_ids(&r.message["content"])),
+        ],
+        _ => smallvec::smallvec![AgentEvent::UserTurnConsumed(r.uuid)],
     }
-    let field = |k: &str| r.origin[k].as_str().unwrap_or_default().to_string();
-    Some(AgentEvent::PeerTurnConsumed {
-        name: field("name"),
-        body: field("body"),
-    })
+}
+
+/// The `<task-id>`s a task-notification echo's content reports; a batched one
+/// carries several. The content is a string or an array of text blocks.
+fn notified_task_ids(content: &serde_json::Value) -> Vec<String> {
+    let blocks = content.as_array().into_iter().flatten();
+    let texts = content
+        .as_str()
+        .into_iter()
+        .chain(blocks.filter_map(|block| block["text"].as_str()));
+    texts
+        .flat_map(|text| text.split("<task-id>").skip(1))
+        .filter_map(|rest| rest.split_once("</task-id>"))
+        .map(|(id, _)| id.trim().to_string())
+        .collect()
 }
 
 /// Cumulative for the current turn — caller overwrites `chats.context_tokens`
@@ -695,18 +717,23 @@ fn parse_assistant_usage(line: &str) -> Option<i64> {
     }
 }
 
-/// Reads `session_id` from a `system/init` stream-json frame. Narrow Deserialize
-/// struct so serde skips the rest of the (init payload is small but heterogeneous —
-/// `cwd`, `model`, `tools`, etc.) without allocating it.
-fn parse_init_session_id(line: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Frame {
-        session_id: String,
-    }
-    match serde_json::from_str::<Frame>(line) {
-        Ok(f) => Some(f.session_id),
+#[derive(serde::Deserialize)]
+struct InitFrame {
+    r#type: String,
+    subtype: String,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// A top-level `system/init` stream-json frame, or `None` for anything else:
+/// a false positive would leave the session busy with no `result` to come.
+/// Narrow Deserialize struct so serde skips the rest of the (init payload is
+/// small but heterogeneous — `cwd`, `model`, `tools`, etc.) without allocating it.
+fn parse_init(line: &str) -> Option<InitFrame> {
+    match serde_json::from_str::<InitFrame>(line) {
+        Ok(f) => (f.r#type == "system" && f.subtype == "init").then_some(f),
         Err(e) => {
-            debug!("failed to parse init frame for session_id: {}", e);
+            debug!("failed to parse init frame: {}", e);
             None
         }
     }
@@ -729,6 +756,10 @@ fn parse_task_started(line: &str) -> Option<AgentEvent> {
         task_type: Option<String>,
         #[serde(default)]
         subagent_type: Option<String>,
+        #[serde(default)]
+        owned_by_subagent: Option<bool>,
+        #[serde(default)]
+        is_backgrounded: Option<bool>,
     }
     match serde_json::from_str::<Frame>(line) {
         Ok(f) => Some(AgentEvent::TaskStarted {
@@ -736,6 +767,8 @@ fn parse_task_started(line: &str) -> Option<AgentEvent> {
             description: f.description.unwrap_or_default(),
             task_type: f.task_type.unwrap_or_default(),
             subagent_type: f.subagent_type.filter(|s| !s.is_empty()),
+            owned_by_subagent: f.owned_by_subagent.unwrap_or_default(),
+            backgrounded: f.is_backgrounded.unwrap_or(true),
         }),
         Err(e) => {
             debug!("failed to parse task_started frame: {}", e);
@@ -1900,11 +1933,40 @@ mod tests {
     }
 
     #[test]
-    fn init_frame_harvests_session_id_and_drops_frame() {
+    fn init_frame_harvests_session_id_begins_a_turn_and_drops_frame() {
         let mut a = ClaudeAdapter::new();
-        let line = r#"{"type":"system","subtype":"init","session_id":"abc-123","model":"sonnet"}"#;
-        let events = run(&mut a, line);
-        assert_eq!(events, vec!["SessionIdHarvested(abc-123)"]);
+        let line = r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"s1","tools":["Bash","Read"],"mcp_servers":[],"model":"claude-opus-5-5","permissionMode":"bypassPermissions","slash_commands":["compact"],"apiKeySource":"none","claude_code_version":"2.1.321","output_style":"default","agents":["general-purpose"],"uuid":"5e0c1f2a-4b7d-4e8a-9c3f-2d1b0a9e8f7c"}"#;
+        assert_eq!(
+            run(&mut a, line),
+            vec!["SessionIdHarvested(s1)", "TurnBegan"]
+        );
+    }
+
+    /// Only a top-level `system/init` begins a turn: another system frame, or
+    /// a frame whose text merely contains the needles, would leave the session
+    /// busy with no `result` to come.
+    #[test]
+    fn only_an_init_frame_begins_a_turn() {
+        let mut a = ClaudeAdapter::new();
+        for line in [
+            r#"{"type":"system","subtype":"hook_started","session_id":"s1"}"#,
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s1"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s9\"}"}]},"session_id":"s1"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01","type":"tool_result","content":[{"type":"system","subtype":"init","session_id":"s9"}]}]},"session_id":"s1"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_03","name":"Write","input":{"type":"system","subtype":"init","session_id":"s9"}}]},"session_id":"s1"}"#,
+            // Top-level `type` and `subtype` of their own, so only the value
+            // check tells them from an init.
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","structured_output":{"type":"system","subtype":"init","session_id":"s9"},"session_id":"s1"}"#,
+            r#"{"type":"system","subtype":"hook_response","hook_name":"SessionStart","output":{"type":"system","subtype":"init","session_id":"s9"},"session_id":"s1"}"#,
+        ] {
+            let events = run(&mut a, line);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e == "TurnBegan" || e.starts_with("SessionIdHarvested")),
+                "{line}: {events:?}"
+            );
+        }
     }
 
     /// Real claude 2.1.265 shape (tmp/claude_stdin_probe.py): the echo carries
@@ -1967,11 +2029,15 @@ mod tests {
                 description,
                 task_type,
                 subagent_type,
+                owned_by_subagent,
+                backgrounded,
             }) => {
                 assert_eq!(id, "buukg9452");
                 assert_eq!(description, "npm test -- --watch");
                 assert_eq!(task_type, "local_bash");
                 assert_eq!(subagent_type, None);
+                assert!(!owned_by_subagent);
+                assert!(backgrounded, "a frame without is_backgrounded");
             }
             other => panic!("expected TaskStarted, got {other:?}"),
         }
@@ -1988,6 +2054,57 @@ mod tests {
             }
             other => panic!("expected TaskStarted, got {other:?}"),
         }
+    }
+
+    /// A task says whether a subagent armed it (verbatim spawner log) and
+    /// whether it runs in the background (probe logs); a frame without
+    /// `is_backgrounded` counts as backgrounded.
+    #[test]
+    fn task_started_reads_ownership_and_backgrounding() {
+        let mut a = ClaudeAdapter::new();
+        let owned = r#"{"type":"system","subtype":"task_started","task_id":"b6g23sqdg","run_id":"0mw9rh5ac-4973e01d","owned_by_subagent":true,"tool_use_id":"toolu_01RHcjZWvho2ErUSkiBbzXae","description":"Check gbuild issues","is_backgrounded":false,"parent_task_id":"a7c1a517e2b3a508f","task_type":"local_bash"}"#;
+        let top_level = r#"{"type":"system","subtype":"task_started","task_id":"b2xwky1x8","is_backgrounded":true,"task_type":"local_bash"}"#;
+        let foreground = r#"{"type":"system","subtype":"task_started","task_id":"b6dtapzj8","is_backgrounded":false,"task_type":"local_bash"}"#;
+        let older = r#"{"type":"system","subtype":"task_started","task_id":"t-7","task_type":"local_bash"}"#;
+        for (line, owned_expected, backgrounded_expected) in [
+            (owned, true, false),
+            (top_level, false, true),
+            (foreground, false, false),
+            (older, false, true),
+        ] {
+            match a.handle_line(line.to_string()).into_iter().next() {
+                Some(AgentEvent::TaskStarted {
+                    owned_by_subagent,
+                    backgrounded,
+                    ..
+                }) => {
+                    assert_eq!(owned_by_subagent, owned_expected, "{line}");
+                    assert_eq!(backgrounded, backgrounded_expected, "{line}");
+                }
+                other => panic!("expected TaskStarted, got {other:?}"),
+            }
+        }
+    }
+
+    /// A notification claude injects into the running turn echoes with a
+    /// task-notification origin and a uuid we never wrote
+    /// (`tmp/wake-turn/probe3.log`); its `<task-id>`s settle what those tasks
+    /// owed. A batched one names several, as a string or as text blocks.
+    #[test]
+    fn a_task_notification_echo_names_the_tasks_it_reports() {
+        let mut a = ClaudeAdapter::new();
+        let single = r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>br463ry5p</task-id>\n<tool-use-id>toolu_018g1c5a6XaGBAGCybRDtFB2</tool-use-id>\n<output-file>/private/tmp/claude-501/tasks/br463ry5p.output</output-file>\n<status>completed</status>\n<summary>Background command \"Sleep 3 seconds then echo P_DONE\" completed (exit code 0)</summary>\n</task-notification>"},"session_id":"c736dfd3-8c4a-4dee-9010-af1b12ca02d1","parent_tool_use_id":null,"uuid":"9e3b6aa2-8cdd-4ade-a619-f7e82b0f188b","isReplay":true,"origin":{"kind":"task-notification","producer":"session-task","runId":"0mwabz3ph-82e54e70"}}"#;
+        assert_eq!(
+            run(&mut a, single),
+            vec![
+                "UserTurnConsumed(9e3b6aa2-8cdd-4ade-a619-f7e82b0f188b)",
+                "NotificationsConsumed(br463ry5p)"
+            ]
+        );
+        let batched = r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n</task-notification>\n<task-notification>\n<task-id>b2</task-id>\n<status>failed</status>\n</task-notification>"},"uuid":"u2","isReplay":true,"origin":{"kind":"task-notification"}}"#;
+        assert_eq!(run(&mut a, batched)[1], "NotificationsConsumed(a1,b2)");
+        let blocks = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<task-notification>\n<task-id>c3</task-id>\n</task-notification>"},{"type":"text","text":"<task-notification><task-id>d4</task-id></task-notification>"}]},"uuid":"u3","isReplay":true,"origin":{"kind":"task-notification"}}"#;
+        assert_eq!(run(&mut a, blocks)[1], "NotificationsConsumed(c3,d4)");
     }
 
     /// A frame missing everything but the id must still ARM the task — dropping
@@ -2279,11 +2396,11 @@ mod tests {
 
     /// Drives the verbatim background-task frames through `handle_line` →
     /// `reduce` and asserts the headline transition: arming-turn result with a
-    /// live task ⇒ WAITING; the task's `task_notification` ⇒ back to Idle; and
-    /// the task-wake result (origin = task-notification) ends a turn absorbed
-    /// into the wake.
+    /// live task ⇒ WAITING; the task's terminal frame ⇒ the wake it starts; and
+    /// the task-wake result (origin = task-notification) ends the wake and a
+    /// turn absorbed into it ⇒ Idle.
     #[test]
-    fn real_background_task_lifecycle_drives_fsm_idle_waiting_idle() {
+    fn real_background_task_lifecycle_drives_fsm_waiting_wake_idle() {
         use crate::agent::{reduce, SessionState};
         let mut a = ClaudeAdapter::new();
         let mut st = SessionState {
@@ -2328,11 +2445,11 @@ mod tests {
             "task_updated progress must not change run state"
         );
 
-        // 4. Terminal task signal ⇒ task removed ⇒ Idle. The resident stream-json
-        //    session emits this as a `task_updated{patch.status:"completed"}` (NOT a
-        //    `task_notification`); failing to treat it as terminal here is exactly the
-        //    bug that pinned chats to agent_running/"Waiting…" after a Monitor ended
-        //    (chat c06c30b2). The `task_notification` shape is covered by
+        // 4. Terminal task signal ⇒ task removed, and its notification wakes the
+        //    session ⇒ busy until the wake's result. Failing to treat
+        //    `task_updated{patch.status:"completed"}` as terminal pinned chats to
+        //    agent_running/"Waiting…" after a Monitor ended (chat c06c30b2). The
+        //    `task_notification` shape is covered by
         //    `task_notification_frame_emits_taskfinished_and_drops_frame`.
         feed(
             &mut a,
@@ -2340,12 +2457,22 @@ mod tests {
             r#"{"type":"system","subtype":"task_updated","task_id":"bzdt1ec2n","patch":{"status":"completed","end_time":1780889095302}}"#,
         );
         assert!(
-            st.is_idle(),
+            !st.has_live_task("bzdt1ec2n"),
             "task_updated{{completed}} clears the last live task"
         );
+        assert!(
+            st.running() && !st.waiting(),
+            "the wake it starts is a turn"
+        );
 
-        // 5. A message absorbed into the task-wake turn is answered by the
-        //    wake's result, which carries origin=task-notification.
+        // 5. The wake opens with an `init`; a message absorbed into it is
+        //    answered by the wake's result, which carries
+        //    origin=task-notification.
+        feed(
+            &mut a,
+            &mut st,
+            r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-5-5"}"#,
+        );
         st.turn_in_flight = true;
         feed(
             &mut a,

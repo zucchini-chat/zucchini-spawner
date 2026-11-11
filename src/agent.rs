@@ -15,7 +15,7 @@ use std::sync::{
     Arc, Mutex as StdMutex,
 };
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -106,7 +106,7 @@ fn startup_timeout_message(timeout: Duration, retried: bool) -> String {
 /// `chats.agent_running`, true the whole time the agent is busy):
 ///   - `running = in_turn || user_queued || !live_tasks.is_empty()`
 ///   - `waiting = running && !in_turn && !user_queued`
-///   - `in_turn = turn_in_flight || self_turn`
+///   - `in_turn = turn_in_flight || self_turn || !owed_notifications.is_empty()`
 ///
 /// i.e. Thinking = a turn in flight or queued; Waiting = only a background task
 /// (monitor / `run_in_background`) is still armed; Idle = none. `running`
@@ -118,15 +118,32 @@ fn startup_timeout_message(timeout: Duration, retried: bool) -> String {
 /// is answered by the running turn's single `result`; written after the last
 /// tool call it runs as its own turn after that `result` — which therefore
 /// can't end the busy state while the turn is still unconsumed.
+///
+/// A backgrounded top-level task's end owes the session its notification:
+/// claude injects it into the running turn (an echo) or runs it as a wake,
+/// right after that turn's `result` or ~100 ms after the task's end when no
+/// turn runs. A wake has neither a `command_lifecycle` frame nor an echo, only
+/// the `system/init` that opens every turn (`TurnBegan`), so the owed
+/// notification is a turn until then and nothing reads idle in between.
 #[derive(Debug, Default, Clone)]
 pub struct SessionState {
     /// A consumed user turn is in flight: set on its `UserTurnConsumed` (or a
     /// peer session's `PeerTurnConsumed`) echo, cleared on the next `result`.
     pub turn_in_flight: bool,
-    /// The CLI started a turn that isn't one of our queued ones (a self-fired
-    /// `CronCreate` prompt is never echoed); cleared by the next `result` of
-    /// any origin, so it can't outlive a turn.
+    /// A turn the CLI started that none of our queued or echoed markers
+    /// covers: a cron prompt, a task wake, or any turn from its `init`.
+    /// Cleared by the next `result` of any origin, so it can't outlive a turn.
     pub self_turn: bool,
+    /// Our queued turn's `command_lifecycle` started: its `init` and echo
+    /// follow. Cleared by the next `result`.
+    pub(crate) own_turn_started: bool,
+    /// Ids of backgrounded top-level tasks that ended and whose notification
+    /// hasn't run: its echo removes an id, a wake's `init` (one nothing else
+    /// announced) all of them, and the reader gives up on them `WAKE_GRACE`
+    /// after nothing else runs. A wake a future CLI announced would settle its
+    /// ids only through the notification's echo; without one they stay owed
+    /// until the give-up after its `result`.
+    pub(crate) owed_notifications: Vec<String>,
     /// Armed background tasks in arm order (appended on `TaskStarted`, retained
     /// out on `TaskFinished`). A `Vec`, not a map: it never exceeds a handful of
     /// entries and the client renders it in arm order.
@@ -201,6 +218,11 @@ pub struct LiveTask {
     pub subagent_type: Option<String>,
     /// Epoch milliseconds.
     pub started_at: i64,
+    /// Armed by a subagent, so its end owes this session nothing. Not
+    /// published.
+    pub owned_by_subagent: bool,
+    /// Its end notifies the model (`AgentEvent::TaskStarted`). Not published.
+    pub backgrounded: bool,
 }
 
 impl LiveTask {
@@ -274,9 +296,24 @@ impl SessionState {
     pub(crate) fn has_live_task(&self, id: &str) -> bool {
         self.live_tasks.iter().any(|t| t.id == id)
     }
-    /// A turn runs: a consumed one of ours or a peer's, or a self-fired one.
-    fn in_turn(&self) -> bool {
+    /// A turn has begun: a consumed one of ours or a peer's, or a self-fired
+    /// one.
+    fn turn_begun(&self) -> bool {
         self.turn_in_flight || self.self_turn
+    }
+    /// A turn has begun, or the wake an owed notification starts is due.
+    fn in_turn(&self) -> bool {
+        self.turn_begun() || !self.owed_notifications.is_empty()
+    }
+    /// Only owed notifications keep the session in a turn: their wake hasn't
+    /// begun.
+    pub(crate) fn awaiting_wake(&self) -> bool {
+        !self.closed && !self.owed_notifications.is_empty() && !self.turn_announced()
+    }
+    /// A turn some marker announced runs: ours (started or echoed), a peer's,
+    /// a self-fired one, or the spawner's `/rename`.
+    fn turn_announced(&self) -> bool {
+        self.turn_begun() || self.own_turn_started || self.internal_in_flight()
     }
     /// Mid-turn or hosting background tasks — what a hard abort interrupts.
     fn working(&self) -> bool {
@@ -397,7 +434,11 @@ impl SessionState {
 ///
 /// A `result` ends the turn whatever started it: the CLI runs one turn at a
 /// time, and a turn consumed into a task wake is answered by the wake's
-/// `result`, which carries the task origin.
+/// `result`, which carries the task origin. A turn begins with our own echo, a
+/// peer's, a `command_lifecycle` start nobody queued, an `init` (`TurnBegan`)
+/// or the end of a backgrounded top-level task, whose notification is owed
+/// until its echo or the `init` of a wake (the one turn no other marker
+/// announces).
 pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
     match ev {
         AgentEvent::Result => {
@@ -405,19 +446,40 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
             state.turn_in_flight = false;
             state.command_in_flight = false;
             state.self_turn = false;
+            state.own_turn_started = false;
         }
         AgentEvent::TurnStarted(uuid) => {
             // The command's assistant text precedes its echo, so the window has
             // to open here rather than on `UserTurnConsumed`.
-            if !state.start_internal(uuid) && !state.unconsumed.iter().any(|t| &t.uuid == uuid) {
+            if state.start_internal(uuid) {
+            } else if state.unconsumed.iter().any(|t| &t.uuid == uuid) {
+                state.own_turn_started = true;
+            } else {
                 state.self_turn = true;
             }
         }
+        AgentEvent::TurnBegan => {
+            // A `/rename`'s `init` comes inside its window: it is no turn of
+            // the user's, and the owed notifications run after it.
+            if !state.internal_in_flight() {
+                // Only a wake opens unannounced, and it may report several tasks.
+                if !state.turn_announced() {
+                    state.owed_notifications.clear();
+                }
+                state.self_turn = true;
+            }
+        }
+        AgentEvent::NotificationsConsumed(ids) => {
+            state.owed_notifications.retain(|id| !ids.contains(id));
+        }
+        AgentEvent::WakeOverdue => state.owed_notifications.clear(),
         AgentEvent::TaskStarted {
             id,
             description,
             task_type,
             subagent_type,
+            owned_by_subagent,
+            backgrounded,
         } => {
             if !state.live_tasks.iter().any(|t| &t.id == id) {
                 state.live_tasks.push(LiveTask {
@@ -426,11 +488,18 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
                     task_type: task_type.clone(),
                     subagent_type: subagent_type.clone(),
                     started_at: now_epoch_ms(),
+                    owned_by_subagent: *owned_by_subagent,
+                    backgrounded: *backgrounded,
                 });
             }
         }
         AgentEvent::TaskFinished(id) => {
-            state.live_tasks.retain(|t| &t.id != id);
+            if let Some(i) = state.live_tasks.iter().position(|t| &t.id == id) {
+                let task = state.live_tasks.remove(i);
+                if task.backgrounded && !task.owned_by_subagent {
+                    state.owed_notifications.push(task.id);
+                }
+            }
         }
         AgentEvent::CommandStarted { id, command } => {
             if !state.live_commands.iter().any(|(i, _)| i == id) {
@@ -522,6 +591,8 @@ pub fn live_tasks_with_daemon_tasks(
             task_type: "watch".to_string(),
             subagent_type: None,
             started_at: w.created_at.saturating_mul(1000),
+            owned_by_subagent: false,
+            backgrounded: false,
         })
     }));
     if let Some(serde_json::Value::Array(armed)) = blob.remove("t") {
@@ -619,6 +690,49 @@ impl InternalLine {
     pub(crate) fn swallows(&mut self, window_open: bool, ev: &AgentEvent) -> bool {
         self.0 |= window_open;
         self.0 && internal_turn_swallows(ev)
+    }
+}
+
+/// The event ends a turn: a `result`, or giving up on a wake that never came.
+fn ends_turn(ev: &AgentEvent) -> bool {
+    matches!(ev, AgentEvent::Result | AgentEvent::WakeOverdue)
+}
+
+/// How long owed task notifications may wait for their wake once nothing else
+/// runs. Older CLIs consumed some with neither an echo nor a wake, which would
+/// otherwise keep the session busy until the next turn.
+const WAKE_GRACE: Duration = Duration::from_secs(10);
+
+/// The wake deadline after a stdout line: set when the session starts awaiting
+/// a wake (`SessionState::awaiting_wake`), kept while it waits, dropped when it
+/// stops.
+fn next_wake_deadline(
+    armed: Option<tokio::time::Instant>,
+    awaiting: bool,
+) -> Option<tokio::time::Instant> {
+    awaiting.then(|| armed.unwrap_or_else(|| tokio::time::Instant::now() + WAKE_GRACE))
+}
+
+/// What the resident reader handles next.
+enum ReaderInput {
+    Line(String),
+    WakeOverdue,
+}
+
+/// The next stdout line (`None` at EOF), or `WakeOverdue` if `deadline` comes
+/// first.
+async fn next_input<R: AsyncBufRead + Unpin>(
+    lines: &mut Lines<R>,
+    deadline: Option<tokio::time::Instant>,
+) -> std::io::Result<Option<ReaderInput>> {
+    let next = lines.next_line();
+    let line = match deadline {
+        Some(at) => tokio::time::timeout_at(at, next).await,
+        None => Ok(next.await),
+    };
+    match line {
+        Ok(line) => Ok(line?.map(ReaderInput::Line)),
+        Err(_elapsed) => Ok(Some(ReaderInput::WakeOverdue)),
     }
 }
 
@@ -806,11 +920,10 @@ pub enum AgentResponse {
     /// identical values). `running` stays true for the whole time the agent is
     /// busy — including while a background task / monitor is still armed (the
     /// internal "waiting" sub-state); only the busy↔idle edge crosses the wire.
-    /// The idle (`running=false`) edge is emitted ONLY on a `Result` turn-boundary
-    /// frame — never on a bare `TaskFinished` that empties `live_tasks`, because a
-    /// claude-self-initiated continuation turn is about to run and will end with its
-    /// own `Result`, so the false edge is deferred to that real boundary. Busy
-    /// (`running=true`) edges always emit.
+    /// The idle (`running=false`) edge is emitted ONLY at a turn end
+    /// (`ends_turn`) — never on a bare `TaskFinished`: a backgrounded task's end
+    /// owes the turn its notification wakes, which ends with its own `Result`.
+    /// Busy (`running=true`) edges always emit.
     /// `main.rs::handle_agent_response` maps it to `WriteEvent::chat_running(...)`
     /// via `send_run_state`. See `SessionState`.
     RunState {
@@ -901,8 +1014,8 @@ impl AgentEvent {
                 return None;
             }
             // Inert on the one-shot spawn path: the `--print` process exits at
-            // its first `result`, so no background task ever fires and these
-            // never reach this mapper. The resident session reader consumes them
+            // its first `result`, so no background task ever fires and it has
+            // no turns to track. The resident session reader consumes them
             // directly to drive the Thinking/Waiting state machine (it does not
             // route through `into_response`). Kept exhaustive so a stray frame
             // can't panic the match.
@@ -912,7 +1025,10 @@ impl AgentEvent {
             | AgentEvent::CommandFinished(_)
             | AgentEvent::UserTurnConsumed(_)
             | AgentEvent::PeerTurnConsumed { .. }
-            | AgentEvent::TurnStarted(_) => {
+            | AgentEvent::TurnStarted(_)
+            | AgentEvent::TurnBegan
+            | AgentEvent::NotificationsConsumed(_)
+            | AgentEvent::WakeOverdue => {
                 return None;
             }
             AgentEvent::ToolResult => AgentResponse::ToolResult {
@@ -1359,7 +1475,9 @@ impl Supervisor {
             let st = s.state.lock().expect("SessionState mutex");
             (
                 st.closed,
-                st.in_turn() && !st.command_in_flight,
+                // A wake that hasn't begun is no turn to cut: a respawn would
+                // lose its notification, so a command waits for it.
+                st.turn_begun() && !st.command_in_flight,
                 st.between_turns(),
             )
         };
@@ -2356,6 +2474,7 @@ fn default_resident_spawn_fn(
             // `Done` so the crash-recovery path can clear columns + publish
             // INTERRUPTED_RESULT when it died mid-turn.
             let mut cancelled = false;
+            let mut wake_deadline = None;
 
             if let Some(stdout) = child.stdout.take() {
                 let bufreader = BufReader::new(stdout);
@@ -2421,13 +2540,19 @@ fn default_resident_spawn_fn(
                             });
                             break 'read;
                         }
-                        line_result = lines.next_line() => {
+                        line_result = next_input(&mut lines, wake_deadline) => {
                             match line_result {
-                                Ok(Some(line)) => {
-                                    let (events, started) = {
-                                        let mut a = lock_adapter(&adapter);
-                                        let events = a.handle_line(line);
-                                        (events, a.startup_complete())
+                                Ok(Some(input)) => {
+                                    let (events, started) = match input {
+                                        ReaderInput::Line(line) => {
+                                            let mut a = lock_adapter(&adapter);
+                                            let events = a.handle_line(line);
+                                            (events, a.startup_complete())
+                                        }
+                                        ReaderInput::WakeOverdue => {
+                                            warn!(topic = %topic, "no wake began for the owed task notifications within {:?}, giving up", WAKE_GRACE);
+                                            (smallvec::smallvec![AgentEvent::WakeOverdue], false)
+                                        }
                                     };
                                     if started {
                                         agent_started.store(true, Ordering::Relaxed);
@@ -2446,7 +2571,7 @@ fn default_resident_spawn_fn(
                                         // still tracks the waiting sub-state internally
                                         // via `SessionState`; it just doesn't cross the
                                         // wire.)
-                                        let is_result = matches!(&ev, AgentEvent::Result);
+                                        let turn_end = ends_turn(&ev);
                                         // Our own `/rename` turn is running: it is silent,
                                         // so every frame it produces (and its usage) is
                                         // dropped.
@@ -2456,7 +2581,7 @@ fn default_resident_spawn_fn(
                                             let swallow = renaming.swallows(internal, &ev);
                                             reduce(&mut st, &ev);
                                             let r = st.running();
-                                            let turn_ended = is_result && !internal;
+                                            let turn_ended = turn_end && !internal;
                                             let live_tasks = st.observe_live_tasks();
                                             turn_edges.extend(st.observe_turn_running());
                                             // [DIAG tasktrace] TEMPORARY — log every
@@ -2471,12 +2596,12 @@ fn default_resident_spawn_fn(
                                             (r, swallow, live_tasks, turn_ended)
                                         };
                                         // A slash turn held by the writer may be due now.
-                                        if is_result {
+                                        if turn_end {
                                             wake_for_writer.notify_one();
                                         }
                                         // Attachments no assistant text picked up
                                         // belong to this turn, not the next one.
-                                        if is_result && !swallow {
+                                        if turn_end && !swallow {
                                             if let Some(row) = attachment_row(&topic, &mut attach_rx) {
                                                 send_or_cancel!(row);
                                             }
@@ -2516,17 +2641,17 @@ fn default_resident_spawn_fn(
                                             | AgentEvent::CommandStarted { .. }
                                             | AgentEvent::CommandFinished(_)
                                             | AgentEvent::UserTurnConsumed(_)
-                                            | AgentEvent::TurnStarted(_) => {}
+                                            | AgentEvent::TurnStarted(_)
+                                            | AgentEvent::TurnBegan
+                                            | AgentEvent::NotificationsConsumed(_)
+                                            | AgentEvent::WakeOverdue => {}
                                         }
                                         if turn_ended {
                                             send_or_cancel!(AgentResponse::TurnEnded { topic: topic.clone() });
                                         }
-                                        // Emit the idle (`running=false`) edge ONLY on a `Result` frame — a real
-                                        // turn boundary. A bare `TaskFinished` that empties `live_tasks` also drops
-                                        // `running` to false, but a claude-self-initiated continuation turn is about
-                                        // to run (and will end with its own `Result`), so suppressing the edge here
-                                        // defers it to that turn's end. Busy (`running=true`) edges always emit.
-                                        if last_emitted != Some(running) && (running || is_result) {
+                                        // Emit the idle (`running=false`) edge ONLY at a turn end. Busy
+                                        // (`running=true`) edges always emit.
+                                        if last_emitted != Some(running) && (running || turn_end) {
                                             last_emitted = Some(running);
                                             state_for_reader.lock().expect("SessionState mutex").idle_since =
                                                 (!running).then(tokio::time::Instant::now);
@@ -2554,6 +2679,8 @@ fn default_resident_spawn_fn(
                                     if writer_follows_every_line {
                                         wake_for_writer.notify_one();
                                     }
+                                    let awaiting = state_for_reader.lock().expect("SessionState mutex").awaiting_wake();
+                                    wake_deadline = next_wake_deadline(wake_deadline, awaiting);
                                 }
                                 Ok(None) => { break 'read; }
                                 Err(e) => { error!(topic = %topic, "error reading resident stdout: {}", e); break 'read; }
@@ -2962,6 +3089,21 @@ pub(crate) fn task_started(id: &str) -> AgentEvent {
         description: format!("{id} description"),
         task_type: "local_bash".into(),
         subagent_type: None,
+        owned_by_subagent: false,
+        backgrounded: true,
+    }
+}
+
+/// A backgrounded subagent arming.
+#[cfg(test)]
+pub(crate) fn subagent_started(id: &str) -> AgentEvent {
+    AgentEvent::TaskStarted {
+        id: id.into(),
+        description: format!("{id} description"),
+        task_type: "local_agent".into(),
+        subagent_type: Some("general-purpose".into()),
+        owned_by_subagent: false,
+        backgrounded: true,
     }
 }
 
@@ -2974,6 +3116,8 @@ pub(crate) fn live_task(id: &str) -> LiveTask {
         task_type: "local_bash".into(),
         subagent_type: None,
         started_at: 1_780_886_492_000,
+        owned_by_subagent: false,
+        backgrounded: true,
     }
 }
 
@@ -3007,9 +3151,10 @@ fn test_frames_to_write(st: &SessionState, written: &mut HashSet<String>) -> Vec
 #[cfg(test)]
 mod reduce_tests {
     use super::{
-        internal_turn_swallows, live_task, live_tasks_payload, live_tasks_with_daemon_tasks,
-        peer_message_frame_json, reduce, task_started, test_frames_to_write as frames_to_write,
-        AgentEvent, LiveTask, LiveTasksChange, LiveTasksDedup, QueuedTurn, SessionState, WatchDef,
+        ends_turn, internal_turn_swallows, live_task, live_tasks_payload,
+        live_tasks_with_daemon_tasks, next_wake_deadline, peer_message_frame_json, reduce,
+        subagent_started, task_started, test_frames_to_write as frames_to_write, AgentEvent,
+        LiveTask, LiveTasksChange, LiveTasksDedup, QueuedTurn, SessionState, WatchDef,
     };
     use std::collections::HashSet;
 
@@ -3035,9 +3180,9 @@ mod reduce_tests {
     /// (running, waiting) pair after each event — the resident FSM contract.
     /// Mirrors a real claude resident turn that arms a background task:
     ///   user frame → Thinking; user-turn result with a task live → Waiting;
-    ///   task finished → Idle.
+    ///   task finished → Thinking (the wake it starts); the wake's result → Idle.
     #[test]
-    fn user_turn_then_task_then_finish_walks_thinking_waiting_idle() {
+    fn user_turn_then_task_then_wake_walks_thinking_waiting_thinking_idle() {
         // A user turn is in flight (the Supervisor sets this when it writes the
         // user frame; here we model it explicitly).
         let mut s = SessionState {
@@ -3061,8 +3206,13 @@ mod reduce_tests {
         assert_eq!((s.running(), s.waiting()), (true, true), "Waiting");
         assert!(!s.is_idle());
 
-        // The task completes → fully Idle.
+        // The task completes → its notification wakes the session.
         reduce(&mut s, &AgentEvent::TaskFinished("t1".into()));
+        assert_eq!((s.running(), s.waiting()), (true, false), "the wake");
+
+        // The wake's init and result → fully Idle.
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        reduce(&mut s, &AgentEvent::Result);
         assert_eq!((s.running(), s.waiting()), (false, false), "Idle");
         assert!(s.is_idle());
     }
@@ -3074,6 +3224,7 @@ mod reduce_tests {
         let mut s = SessionState::default();
         reduce(&mut s, &task_started("t1"));
         reduce(&mut s, &AgentEvent::TaskFinished("t1".into()));
+        reduce(&mut s, &AgentEvent::TurnBegan);
         s.unconsumed.push(queued("user"));
         reduce(&mut s, &AgentEvent::UserTurnConsumed("user".into()));
         reduce(
@@ -3102,9 +3253,17 @@ mod reduce_tests {
         reduce(&mut s, &task_started("a"));
         assert_eq!(ids(&s), vec!["a", "b"]);
         reduce(&mut s, &AgentEvent::TaskFinished("a".into()));
-        assert_eq!((s.running(), s.waiting()), (true, true), "b still live");
         assert_eq!(ids(&s), vec!["b"], "only the finished one is retained out");
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        reduce(&mut s, &AgentEvent::Result);
+        assert_eq!(
+            (s.running(), s.waiting()),
+            (true, true),
+            "a's wake is over, b still live"
+        );
         reduce(&mut s, &AgentEvent::TaskFinished("b".into()));
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
     }
 
@@ -3126,6 +3285,8 @@ mod reduce_tests {
                 description: "npm test -- --watch".into(),
                 task_type: "local_bash".into(),
                 subagent_type: None,
+                owned_by_subagent: false,
+                backgrounded: true,
             },
         );
         reduce(
@@ -3135,6 +3296,8 @@ mod reduce_tests {
                 description: "count tmp files".into(),
                 task_type: "local_agent".into(),
                 subagent_type: Some("Explore".into()),
+                owned_by_subagent: false,
+                backgrounded: true,
             },
         );
         reduce(
@@ -3144,6 +3307,8 @@ mod reduce_tests {
                 description: String::new(),
                 task_type: "local_future_kind".into(),
                 subagent_type: None,
+                owned_by_subagent: true,
+                backgrounded: true,
             },
         );
         let blob: serde_json::Value =
@@ -3160,6 +3325,11 @@ mod reduce_tests {
             "unknown kind rides verbatim"
         );
         assert_eq!(blob["t"][2]["d"], "");
+        assert_eq!(
+            blob["t"][2].as_object().expect("object").len(),
+            4,
+            "ownership is not published"
+        );
         assert!(blob.get("q").is_none(), "no queued user turn, no `q`");
     }
 
@@ -3367,8 +3537,8 @@ mod reduce_tests {
     }
 
     /// `chats.turn_running` across a turn that leaves a task armed and the
-    /// continuation turn the task's completion wakes: false while the chat is
-    /// only Waiting (still `running`), true again for the continuation.
+    /// wake the task's completion starts: false while the chat is only Waiting
+    /// (still `running`), true again from the task's end to the wake's result.
     #[test]
     fn turn_running_follows_turns_not_background_tasks() {
         let mut s = SessionState::default();
@@ -3385,9 +3555,9 @@ mod reduce_tests {
         assert!(s.running(), "the armed task keeps the agent running");
 
         reduce(&mut s, &AgentEvent::TaskFinished("t1".into()));
-        assert_eq!(s.observe_turn_running(), None);
-        reduce(&mut s, &AgentEvent::TurnStarted("continuation".into()));
-        assert_eq!(s.observe_turn_running(), Some(true), "continuation turn");
+        assert_eq!(s.observe_turn_running(), Some(true), "the wake");
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        assert_eq!(s.observe_turn_running(), None, "the wake's init");
         reduce(&mut s, &AgentEvent::Result);
         assert_eq!(s.observe_turn_running(), Some(false));
         assert!(s.is_idle());
@@ -3563,6 +3733,292 @@ mod reduce_tests {
         assert!(s.is_idle());
     }
 
+    /// A backgrounded task that ends outside a turn owes the session the wake
+    /// claude announces only by a later `init`: nothing reads the session as
+    /// between turns until the wake's `result`. claude reports each end twice;
+    /// a repeat, or the end of a task never started, changes nothing.
+    #[test]
+    fn a_tasks_end_is_a_turn_until_the_wakes_result() {
+        for (id, armed) in [
+            ("agent", subagent_started("agent")),
+            ("bash", task_started("bash")),
+        ] {
+            let mut s = SessionState::default();
+            s.unconsumed.push(queued("a"));
+            reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
+            reduce(&mut s, &armed);
+            assert_eq!(s.observe_turn_running(), Some(true), "{id}");
+            reduce(&mut s, &AgentEvent::Result);
+            assert_eq!(s.observe_turn_running(), Some(false), "{id}");
+            assert!(s.waiting() && !s.awaiting_wake(), "{id}");
+
+            for _ in 0..2 {
+                reduce(&mut s, &AgentEvent::TaskFinished(id.into()));
+                assert!(
+                    s.in_foreground() && !s.between_turns() && s.awaiting_wake(),
+                    "{id}"
+                );
+            }
+            assert_eq!(s.owed_notifications, vec![id], "{id}");
+            assert_eq!(s.observe_turn_running(), Some(true), "{id}: the wake");
+            reduce(&mut s, &AgentEvent::TurnBegan);
+            assert!(s.owed_notifications.is_empty() && !s.awaiting_wake());
+            reduce(&mut s, &AgentEvent::Result);
+            assert!(s.is_idle() && s.between_turns(), "{id}");
+            assert_eq!(s.observe_turn_running(), Some(false), "{id}");
+
+            reduce(&mut s, &AgentEvent::TaskFinished(id.into()));
+            reduce(&mut s, &AgentEvent::TaskFinished("never-started".into()));
+            assert!(s.is_idle(), "{id}");
+            assert_eq!(s.observe_turn_running(), None, "{id}");
+        }
+    }
+
+    /// Case B of `tmp/wake-turn/wake_probe.log`: a backgrounded task ends
+    /// during the turn's final text, no tool boundary injects it, and its wake
+    /// runs right after the turn's `result`, opened only by an `init`. The
+    /// owed notification holds the turn (no false edge, slash commands wait)
+    /// across that `result`.
+    #[test]
+    fn a_notification_left_at_the_turns_result_holds_the_turn_until_its_wake() {
+        let mut s = SessionState::default();
+        s.unconsumed.push(queued("a"));
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
+        reduce(&mut s, &task_started("fast"));
+        assert_eq!(s.observe_turn_running(), Some(true));
+        reduce(&mut s, &AgentEvent::TaskFinished("fast".into()));
+        reduce(&mut s, &AgentEvent::TaskFinished("fast".into()));
+        assert!(!s.awaiting_wake(), "the turn still runs");
+
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.in_foreground() && !s.between_turns() && s.awaiting_wake());
+        assert_eq!(s.observe_turn_running(), None, "no false edge");
+        s.unconsumed.push(QueuedTurn {
+            own_turn: true,
+            ..queued("/compact")
+        });
+        assert!(
+            frames_to_write(&s, &mut HashSet::new()).is_empty(),
+            "a slash command waits for the wake"
+        );
+        s.unconsumed.clear();
+
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        assert!(s.self_turn && s.owed_notifications.is_empty());
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.is_idle());
+        assert_eq!(s.observe_turn_running(), Some(false));
+    }
+
+    /// A notification injected at a tool boundary echoes inside the running
+    /// turn (`tmp/wake-turn/probe2.log` case I): it owes nothing more, so the
+    /// turn's `result` ends it.
+    #[test]
+    fn an_injected_notification_owes_no_wake() {
+        let mut s = SessionState::default();
+        s.unconsumed.push(queued("a"));
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
+        reduce(&mut s, &task_started("bwhcjkbu7"));
+        reduce(&mut s, &AgentEvent::TaskFinished("bwhcjkbu7".into()));
+        reduce(
+            &mut s,
+            &AgentEvent::NotificationsConsumed(vec!["bwhcjkbu7".into()]),
+        );
+        assert!(s.owed_notifications.is_empty());
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.is_idle());
+    }
+
+    /// A batched echo settles every task it names, and only those.
+    #[test]
+    fn a_batched_echo_settles_the_tasks_it_names() {
+        let mut s = SessionState {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        for id in ["a", "b", "c"] {
+            reduce(&mut s, &task_started(id));
+            reduce(&mut s, &AgentEvent::TaskFinished(id.into()));
+        }
+        reduce(
+            &mut s,
+            &AgentEvent::NotificationsConsumed(vec!["a".into(), "b".into()]),
+        );
+        reduce(
+            &mut s,
+            &AgentEvent::NotificationsConsumed(vec!["other".into()]),
+        );
+        assert_eq!(s.owed_notifications, vec!["c"]);
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.awaiting_wake(), "c's wake is still owed");
+    }
+
+    /// A foreground task (a plain Bash call) gets a terminal frame but
+    /// notifies the model of nothing: its end owes no wake.
+    #[test]
+    fn a_foreground_tasks_end_owes_nothing() {
+        let foreground = |id: &str| AgentEvent::TaskStarted {
+            id: id.into(),
+            description: String::new(),
+            task_type: "local_bash".into(),
+            subagent_type: None,
+            owned_by_subagent: false,
+            backgrounded: false,
+        };
+        let mut s = SessionState {
+            turn_in_flight: true,
+            ..Default::default()
+        };
+        reduce(&mut s, &foreground("mid-turn"));
+        reduce(&mut s, &AgentEvent::TaskFinished("mid-turn".into()));
+        reduce(&mut s, &foreground("outlives"));
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.waiting());
+        reduce(&mut s, &AgentEvent::TaskFinished("outlives".into()));
+        assert!(s.is_idle() && s.owed_notifications.is_empty());
+    }
+
+    /// A task a subagent armed notifies that subagent, not the session: its
+    /// end owes nothing, whether the subagent still runs or not.
+    #[test]
+    fn a_subagent_owned_tasks_end_starts_no_turn() {
+        let owned = AgentEvent::TaskStarted {
+            id: "owned".into(),
+            description: "Check gbuild issues".into(),
+            task_type: "local_bash".into(),
+            subagent_type: None,
+            owned_by_subagent: true,
+            backgrounded: true,
+        };
+        for parent_live in [true, false] {
+            let mut s = SessionState::default();
+            reduce(&mut s, &subagent_started("parent"));
+            reduce(&mut s, &owned);
+            if !parent_live {
+                reduce(&mut s, &AgentEvent::TaskFinished("parent".into()));
+                reduce(&mut s, &AgentEvent::TurnBegan);
+                reduce(&mut s, &AgentEvent::Result);
+            }
+            reduce(&mut s, &AgentEvent::TaskFinished("owned".into()));
+            assert!(
+                s.owed_notifications.is_empty() && !s.in_foreground(),
+                "parent live: {parent_live}"
+            );
+            assert_eq!(s.is_idle(), !parent_live);
+        }
+    }
+
+    /// A `/rename`'s `init` is not the wake: what a task's end owes survives
+    /// it and runs after the rename.
+    #[test]
+    fn an_owed_notification_survives_a_renames_init() {
+        let mut s = renaming("r");
+        reduce(&mut s, &task_started("bash"));
+        reduce(&mut s, &AgentEvent::TurnStarted("r".into()));
+        reduce(&mut s, &AgentEvent::TaskFinished("bash".into()));
+        assert_eq!(
+            next_wake_deadline(None, s.awaiting_wake()),
+            None,
+            "no clock while the rename runs"
+        );
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("r".into()));
+        reduce(&mut s, &AgentEvent::Result);
+        assert_eq!(s.owed_notifications, vec!["bash"]);
+        assert!(s.awaiting_wake() && !s.is_idle());
+
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.is_idle());
+    }
+
+    /// A cron prompt's turn is announced (`command_lifecycle` started with a
+    /// uuid nobody queued), so its `init` is not the wake: what a task's end
+    /// owed is still owed after it.
+    #[test]
+    fn a_cron_turns_init_leaves_the_owed_wake() {
+        let mut s = SessionState::default();
+        reduce(&mut s, &task_started("bash"));
+        reduce(&mut s, &AgentEvent::TaskFinished("bash".into()));
+        reduce(&mut s, &AgentEvent::TurnStarted("cron".into()));
+        assert!(!s.awaiting_wake());
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        assert_eq!(s.owed_notifications, vec!["bash"]);
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.awaiting_wake());
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.is_idle());
+    }
+
+    /// Giving up on a wake ends the turn like a `result`.
+    #[test]
+    fn an_overdue_wake_ends_the_turn() {
+        assert!(ends_turn(&AgentEvent::Result));
+        assert!(ends_turn(&AgentEvent::WakeOverdue));
+        assert!(!ends_turn(&AgentEvent::TurnBegan));
+        assert!(!ends_turn(&AgentEvent::TaskFinished("t".into())));
+
+        let mut s = SessionState::default();
+        reduce(&mut s, &task_started("lost"));
+        reduce(&mut s, &AgentEvent::TaskFinished("lost".into()));
+        assert_eq!(s.observe_turn_running(), Some(true));
+        reduce(&mut s, &AgentEvent::WakeOverdue);
+        assert!(s.is_idle() && !s.awaiting_wake());
+        assert_eq!(s.observe_turn_running(), Some(false));
+    }
+
+    /// Case A of `tmp/wake-turn/wake_probe.log` (claude 2.1.321) through the
+    /// real adapter, frames filled out to their full shape: a backgrounded
+    /// Bash ends after the arming turn, and the session is busy from the
+    /// task's terminal frame until the wake's `result`.
+    #[test]
+    fn a_real_idle_task_wake_is_busy_from_the_tasks_end_to_its_result() {
+        use crate::adapter::AgentAdapter;
+        let uuid = "dc7e0a69-bca6-49d4-9b98-6ba28ce30093";
+        let mut adapter = crate::adapters::claude::ClaudeAdapter::new();
+        let mut feed = |s: &mut SessionState, line: &str| {
+            for ev in adapter.handle_line(line.to_string()) {
+                reduce(s, &ev);
+            }
+        };
+        let mut s = SessionState::default();
+        s.unconsumed.push(queued(uuid));
+        for line in [
+            r#"{"type":"command_lifecycle","command_uuid":"dc7e0a69-bca6-49d4-9b98-6ba28ce30093","state":"queued","uuid":"aae1e948-ca8e-48d3-864c-8bfd025fda80","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+            r#"{"type":"command_lifecycle","command_uuid":"dc7e0a69-bca6-49d4-9b98-6ba28ce30093","state":"started","uuid":"d0420110-2dec-4544-85a5-ad60a1d48928","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+            r#"{"type":"system","subtype":"init","cwd":"/private/tmp/wake-probe","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902","tools":["Bash"],"mcp_servers":[],"model":"claude-opus-5-5","permissionMode":"bypassPermissions","claude_code_version":"2.1.321","uuid":"7d2c6a51-0f3e-4b8a-9e1d-3c5b7a9f1e2d"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Use the Bash tool with run_in_background=true to run: sleep 6; echo BG_DONE. Then reply with just the word armed. Do not wait for it or check on it."}]},"session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902","parent_tool_use_id":null,"uuid":"dc7e0a69-bca6-49d4-9b98-6ba28ce30093","isReplay":true}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01Qfm19QHEBYvKGMFdwqmaKf","name":"Bash","input":{"command":"sleep 6; echo BG_DONE","description":"Run delayed echo in background","run_in_background":true}}],"usage":{"input_tokens":3,"cache_creation_input_tokens":120,"cache_read_input_tokens":21000,"output_tokens":60}},"parent_tool_use_id":null,"session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"b2xwky1x8","tool_use_id":"toolu_01Qfm19QHEBYvKGMFdwqmaKf","description":"Run delayed echo in background","is_backgrounded":true,"task_type":"local_bash","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01Qfm19QHEBYvKGMFdwqmaKf","type":"tool_result","content":"Command running in background with ID: b2xwky1x8. Output is being written to: /private/tmp/claude-501/tasks/b2xwky1x8.output","is_error":false}]},"parent_tool_use_id":null,"session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902","uuid":"214c58bb-9409-4669-b815-1892edac380c"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"armed"}],"usage":{"input_tokens":1,"cache_creation_input_tokens":200,"cache_read_input_tokens":21120,"output_tokens":4}},"parent_tool_use_id":null,"session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4100,"num_turns":2,"result":"armed","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902","terminal_reason":"completed"}"#,
+            r#"{"type":"command_lifecycle","command_uuid":"dc7e0a69-bca6-49d4-9b98-6ba28ce30093","state":"completed","uuid":"cac0fba0-be43-4a7d-b8b2-3b66dc92cfab","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+        ] {
+            feed(&mut s, line);
+        }
+        assert!(s.waiting() && !s.in_foreground(), "the arming turn is over");
+
+        for line in [
+            r#"{"type":"system","subtype":"task_updated","task_id":"b2xwky1x8","patch":{"status":"completed","end_time":1794291919760},"session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"b2xwky1x8","tool_use_id":"toolu_01Qfm19QHEBYvKGMFdwqmaKf","status":"completed","output_file":"/private/tmp/claude-501/tasks/b2xwky1x8.output","summary":"Background command \"Run delayed echo in background\" completed (exit code 0)","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+            r#"{"type":"system","subtype":"init","cwd":"/private/tmp/wake-probe","session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902","tools":["Bash"],"mcp_servers":[],"model":"claude-opus-5-5","permissionMode":"bypassPermissions","claude_code_version":"2.1.321","uuid":"0c4e8b2a-6d1f-4a3e-8b7c-5e9d2f1a4c6b"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The background command `sleep 6; echo BG_DONE` finished with exit code 0. Nothing else is pending."}],"usage":{"input_tokens":1,"cache_creation_input_tokens":300,"cache_read_input_tokens":21320,"output_tokens":30}},"parent_tool_use_id":null,"session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902"}"#,
+        ] {
+            feed(&mut s, line);
+            assert!(s.in_foreground() && !s.between_turns(), "{line}");
+        }
+
+        feed(
+            &mut s,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"The background command `sleep 6; echo BG_DONE` finished with exit code 0. Nothing else is pending.","origin":{"kind":"task-notification","producer":"session-task","runId":"0mwab2t7t-14bd5787"},"session_id":"b52f99f0-9d2c-4f4c-b6e6-76c00cba1902","terminal_reason":"completed"}"#,
+        );
+        assert!(s.is_idle() && s.between_turns());
+    }
+
     /// A `CronCreate` prompt fires on an idle resident: no echo, only a
     /// started frame, and the result carries no origin (tmp/cron_probe.log).
     #[test]
@@ -3573,10 +4029,42 @@ mod reduce_tests {
         reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
 
-        // A monitor wake's turn ends with a task result.
-        reduce(&mut s, &AgentEvent::TurnStarted("wake".into()));
+        // A turn announced only by its `init` (a monitor event's wake).
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        assert!(s.in_foreground() && !s.between_turns());
+        assert_eq!(s.observe_turn_running(), Some(true));
         reduce(&mut s, &AgentEvent::Result);
         assert!(s.is_idle());
+        assert_eq!(s.observe_turn_running(), Some(false));
+    }
+
+    /// Our own turn's `init` comes between its `command_lifecycle` start and
+    /// its echo; the turn's `result` ends both.
+    #[test]
+    fn the_init_of_our_own_turn_ends_with_its_result() {
+        let mut s = SessionState::default();
+        s.unconsumed.push(queued("a"));
+        reduce(&mut s, &AgentEvent::TurnStarted("a".into()));
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("a".into()));
+        assert!(s.in_foreground());
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.is_idle() && !s.in_foreground());
+    }
+
+    /// The spawner's `/rename` opens with an `init` too, inside its window
+    /// (tmp/wake-turn/probe2.log): it stays invisible.
+    #[test]
+    fn a_renames_init_raises_nothing() {
+        let mut s = renaming("r");
+        reduce(&mut s, &AgentEvent::TurnStarted("r".into()));
+        reduce(&mut s, &AgentEvent::TurnBegan);
+        assert!(s.is_idle() && !s.self_turn);
+        reduce(&mut s, &AgentEvent::UserTurnConsumed("r".into()));
+        assert_eq!(s.observe_turn_running(), None);
+        reduce(&mut s, &AgentEvent::Result);
+        assert!(s.is_idle());
+        assert_eq!(s.observe_turn_running(), None);
     }
 
     /// Our own queued turn starts before its echo: it stays a queued turn.
@@ -4069,6 +4557,385 @@ mod live_session_tests {
             Some(true)
         );
         assert!(!sup.has_agent("chat"));
+    }
+
+    /// A task that ends outside a turn starts a wake claude announces only by
+    /// a later `init`: a retire checked in between must not cut it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_prompt_waits_for_the_wake_a_tasks_end_starts() {
+        let current = prompt_text("be verbose");
+        for (id, armed) in [
+            ("agent", subagent_started("agent")),
+            ("bash", task_started("bash")),
+        ] {
+            let (mut sup, exposed) = supervisor_with_exposed_sessions();
+            sup.spawn_agent(SpawnRequest {
+                user_system_prompt: prompt_text("be terse"),
+                ..claude_req("chat")
+            });
+            let state = Arc::clone(&exposed.lock().unwrap()["chat"]);
+            let feed = |events: Vec<AgentEvent>| {
+                let mut st = state.lock().unwrap();
+                for ev in &events {
+                    reduce(&mut st, ev);
+                }
+            };
+            let first = state.lock().unwrap().unconsumed[0].uuid.clone();
+            feed(vec![
+                AgentEvent::UserTurnConsumed(first),
+                armed,
+                AgentEvent::Result,
+            ]);
+            if id == "agent" {
+                assert_eq!(
+                    sup.retire_stale_prompt("chat", &current, true).await,
+                    None,
+                    "the subagent runs"
+                );
+            }
+            feed(vec![
+                AgentEvent::TaskFinished(id.into()),
+                AgentEvent::TaskFinished(id.into()),
+            ]);
+            assert_eq!(
+                sup.retire_stale_prompt("chat", &current, true).await,
+                None,
+                "{id}: its wake is starting"
+            );
+            feed(vec![AgentEvent::TurnBegan, AgentEvent::Result]);
+            assert_eq!(
+                sup.retire_stale_prompt("chat", &current, true).await,
+                Some(false),
+                "{id}"
+            );
+        }
+    }
+
+    /// What the resident reader does with one stdout line's events, minus the
+    /// publishing: reduce them, then let the wake deadline follow.
+    fn read_line(
+        state: &Arc<StdMutex<SessionState>>,
+        deadline: &mut Option<tokio::time::Instant>,
+        events: Vec<AgentEvent>,
+    ) {
+        let mut st = state.lock().unwrap();
+        for ev in &events {
+            reduce(&mut st, ev);
+        }
+        *deadline = next_wake_deadline(*deadline, st.awaiting_wake());
+    }
+
+    /// A stdout that stays open and says nothing.
+    fn silent_stdout() -> (
+        tokio::io::DuplexStream,
+        Lines<BufReader<tokio::io::DuplexStream>>,
+    ) {
+        let (writer, reader) = tokio::io::duplex(64);
+        (writer, BufReader::new(reader).lines())
+    }
+
+    /// A chat whose first turn is in flight with a backgrounded task armed,
+    /// spawned with another system prompt than `prompt_text("be verbose")`.
+    fn turn_with_a_task() -> (Supervisor, Arc<StdMutex<SessionState>>) {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(SpawnRequest {
+            user_system_prompt: prompt_text("be terse"),
+            ..claude_req("chat")
+        });
+        let state = Arc::clone(&exposed.lock().unwrap()["chat"]);
+        let first = state.lock().unwrap().unconsumed[0].uuid.clone();
+        let mut st = state.lock().unwrap();
+        reduce(&mut st, &AgentEvent::UserTurnConsumed(first));
+        reduce(&mut st, &task_started("bash"));
+        drop(st);
+        (sup, state)
+    }
+
+    /// A notification claude never runs (older CLIs consumed some with
+    /// neither an echo nor a wake) holds the turn for `WAKE_GRACE` after the
+    /// turn's `result`, then the reader gives up on it: a turn end, after
+    /// which the retire goes ahead.
+    #[tokio::test(start_paused = true)]
+    async fn an_owed_wake_that_never_begins_is_given_up_after_the_grace() {
+        let current = prompt_text("be verbose");
+        let (mut sup, state) = turn_with_a_task();
+        let (_stdout, mut lines) = silent_stdout();
+        let mut deadline = None;
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::TaskFinished("bash".into())],
+        );
+        assert_eq!(deadline, None, "a task that ends mid-turn starts no clock");
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        let result_at = tokio::time::Instant::now();
+        assert_eq!(deadline, Some(result_at + WAKE_GRACE));
+
+        tokio::time::advance(WAKE_GRACE * 9 / 10).await;
+        assert!(state.lock().unwrap().running());
+        assert_eq!(sup.retire_stale_prompt("chat", &current, true).await, None);
+
+        let input = next_input(&mut lines, deadline).await.unwrap();
+        assert!(matches!(input, Some(ReaderInput::WakeOverdue)));
+        assert_eq!(tokio::time::Instant::now(), result_at + WAKE_GRACE);
+        assert!(ends_turn(&AgentEvent::WakeOverdue));
+        read_line(&state, &mut deadline, vec![AgentEvent::WakeOverdue]);
+        assert_eq!(deadline, None);
+        assert!(state.lock().unwrap().is_idle());
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &current, true).await,
+            Some(false)
+        );
+    }
+
+    /// The grace counts from the moment only the owed notification keeps the
+    /// turn, not from the task's end: a long turn after it still gets its
+    /// wake, and the wake's `init` stops the clock.
+    #[tokio::test(start_paused = true)]
+    async fn the_grace_starts_at_the_turns_result_not_at_the_tasks_end() {
+        let current = prompt_text("be verbose");
+        let (mut sup, state) = turn_with_a_task();
+        let (_stdout, mut lines) = silent_stdout();
+        let mut deadline = None;
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::TaskFinished("bash".into())],
+        );
+        tokio::time::advance(WAKE_GRACE * 2).await;
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        assert!(state.lock().unwrap().in_foreground());
+        assert_eq!(sup.retire_stale_prompt("chat", &current, true).await, None);
+        let early = WAKE_GRACE * 9 / 10;
+        assert!(
+            tokio::time::timeout(early, next_input(&mut lines, deadline))
+                .await
+                .is_err(),
+            "not overdue yet"
+        );
+
+        read_line(&state, &mut deadline, vec![AgentEvent::TurnBegan]);
+        assert_eq!(deadline, None, "the wake began");
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        assert!(state.lock().unwrap().is_idle());
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &current, true).await,
+            Some(false)
+        );
+    }
+
+    /// Our own turn starting while a wake is owed cancels the countdown: no
+    /// give-up while it runs, and its `result` starts a fresh grace.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_that_starts_while_a_wake_is_owed_cancels_the_grace() {
+        let (sup, state) = turn_with_a_task();
+        let (_stdout, mut lines) = silent_stdout();
+        let mut deadline = None;
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::TaskFinished("bash".into())],
+        );
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        assert!(deadline.is_some());
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert!(sup.send_user_turn(&SpawnRequest {
+            user_system_prompt: prompt_text("be terse"),
+            ..claude_req("chat")
+        }));
+        let next = state.lock().unwrap().unconsumed[0].uuid.clone();
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::UserTurnConsumed(next)],
+        );
+        assert_eq!(deadline, None);
+        assert!(
+            tokio::time::timeout(WAKE_GRACE * 3, next_input(&mut lines, deadline))
+                .await
+                .is_err(),
+            "no give-up while the turn runs"
+        );
+
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        assert_eq!(
+            deadline,
+            Some(tokio::time::Instant::now() + WAKE_GRACE),
+            "a fresh grace"
+        );
+    }
+
+    /// Lines that change nothing (a running subagent's frames and progress)
+    /// don't push the give-up back: it comes `WAKE_GRACE` after the `result`.
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_lines_dont_push_the_give_up_back() {
+        use crate::adapter::AgentAdapter;
+        let (_sup, state) = turn_with_a_task();
+        let (_stdout, mut lines) = silent_stdout();
+        let mut adapter = crate::adapters::claude::ClaudeAdapter::new();
+        let mut deadline = None;
+        read_line(
+            &state,
+            &mut deadline,
+            vec![
+                subagent_started("agent"),
+                AgentEvent::TaskFinished("bash".into()),
+            ],
+        );
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        let result_at = tokio::time::Instant::now();
+        for line in [
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still counting"}],"usage":{"input_tokens":5,"output_tokens":3}},"parent_tool_use_id":"toolu_01","session_id":"s1"}"#,
+            r#"{"type":"system","subtype":"task_progress","task_id":"agent","description":"Counting files","session_id":"s1"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_02","name":"Bash","input":{"command":"ls"}}]},"parent_tool_use_id":"toolu_01","session_id":"s1"}"#,
+        ] {
+            tokio::time::advance(Duration::from_secs(3)).await;
+            let events = adapter.handle_line(line.to_string()).into_iter().collect();
+            read_line(&state, &mut deadline, events);
+        }
+        let input = next_input(&mut lines, deadline).await.unwrap();
+        assert!(matches!(input, Some(ReaderInput::WakeOverdue)));
+        assert_eq!(tokio::time::Instant::now(), result_at + WAKE_GRACE);
+    }
+
+    /// Our own `/compact` is announced from its `command_lifecycle` start,
+    /// 15 s before its `init` and echo (`tmp/wake-turn/probe2.log` case K): a
+    /// task ending meanwhile starts no clock, the compaction's `init` leaves
+    /// it owed, and the wake after the compaction's `result` is still covered.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_ending_during_our_compaction_keeps_its_wake_owed() {
+        let current = prompt_text("be verbose");
+        let (mut sup, state) = turn_with_a_task();
+        let (_stdout, mut lines) = silent_stdout();
+        let mut deadline = None;
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        assert!(sup.send_user_turn(&SpawnRequest {
+            prompt: "/compact".to_string(),
+            user_system_prompt: prompt_text("be terse"),
+            ..claude_req("chat")
+        }));
+        let compact = state.lock().unwrap().unconsumed[0].uuid.clone();
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::TurnStarted(compact.clone())],
+        );
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::TaskFinished("bash".into())],
+        );
+        assert_eq!(deadline, None, "the compaction runs");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(15), next_input(&mut lines, deadline))
+                .await
+                .is_err(),
+            "no give-up during the compaction"
+        );
+        assert_eq!(sup.retire_stale_prompt("chat", &current, true).await, None);
+
+        read_line(&state, &mut deadline, vec![AgentEvent::TurnBegan]);
+        assert_eq!(state.lock().unwrap().owed_notifications, vec!["bash"]);
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::UserTurnConsumed(compact), AgentEvent::Result],
+        );
+        assert!(state.lock().unwrap().awaiting_wake());
+        assert_eq!(sup.retire_stale_prompt("chat", &current, true).await, None);
+
+        read_line(&state, &mut deadline, vec![AgentEvent::TurnBegan]);
+        assert!(state.lock().unwrap().owed_notifications.is_empty());
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        assert!(state.lock().unwrap().is_idle());
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &current, true).await,
+            Some(false)
+        );
+    }
+
+    /// A live-typed `prompt` for the chat `turn_with_a_task` spawned.
+    fn live_command(prompt: &str) -> SpawnRequest {
+        SpawnRequest {
+            prompt: prompt.to_string(),
+            user_system_prompt: prompt_text("be terse"),
+            ..claude_req("chat")
+        }
+    }
+
+    fn writer_holds_everything(state: &Arc<StdMutex<SessionState>>) -> bool {
+        test_frames_to_write(&state.lock().unwrap(), &mut HashSet::new()).is_empty()
+    }
+
+    /// A live slash command cuts a running turn, but not an owed wake that
+    /// hasn't begun: the respawn would lose the notification (it was never
+    /// persisted), so the command is queued and the writer holds it. Once the
+    /// wake begins it is cut like any turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_slash_command_waits_for_an_owed_wake() {
+        let (sup, state) = turn_with_a_task();
+        let mut deadline = None;
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::TaskFinished("bash".into())],
+        );
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        assert!(state.lock().unwrap().awaiting_wake());
+        assert!(sup.send_user_turn(&live_command("/context")), "queued");
+        assert!(writer_holds_everything(&state));
+        read_line(&state, &mut deadline, vec![AgentEvent::TurnBegan]);
+        assert!(
+            !sup.send_user_turn(&live_command("/context")),
+            "the wake is cut like any turn"
+        );
+    }
+
+    /// Nor our `/compact` started but not echoed, with a notification owed.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_slash_command_waits_for_our_unechoed_compaction() {
+        let (sup, state) = turn_with_a_task();
+        let mut deadline = None;
+        read_line(&state, &mut deadline, vec![AgentEvent::Result]);
+        assert!(sup.send_user_turn(&live_command("/compact")));
+        let compact = state.lock().unwrap().unconsumed[0].uuid.clone();
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::TurnStarted(compact)],
+        );
+        read_line(
+            &state,
+            &mut deadline,
+            vec![AgentEvent::TaskFinished("bash".into())],
+        );
+        assert!(
+            sup.send_user_turn(&live_command("/context")),
+            "the compaction isn't cut"
+        );
+        assert!(writer_holds_everything(&state));
+    }
+
+    /// The give-up arrives only when the deadline beats stdout, and a line
+    /// waiting at the deadline still wins.
+    #[tokio::test(start_paused = true)]
+    async fn the_reader_takes_stdout_before_an_overdue_wake() {
+        let (mut stdout, mut lines) = silent_stdout();
+        assert!(
+            tokio::time::timeout(WAKE_GRACE * 3, next_input(&mut lines, None))
+                .await
+                .is_err(),
+            "no deadline, no give-up"
+        );
+        let deadline = tokio::time::Instant::now();
+        tokio::io::AsyncWriteExt::write_all(&mut stdout, b"{}\n")
+            .await
+            .unwrap();
+        let input = next_input(&mut lines, Some(deadline)).await.unwrap();
+        assert!(matches!(input, Some(ReaderInput::Line(line)) if line == "{}"));
+        drop(stdout);
+        assert!(next_input(&mut lines, None).await.unwrap().is_none(), "EOF");
     }
 
     /// A chats row re-streams on every writeback, so the rename is queued only

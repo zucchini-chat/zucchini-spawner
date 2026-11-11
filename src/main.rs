@@ -6642,6 +6642,8 @@ mod tests {
                 task_type: "bash".into(),
                 subagent_type: None,
                 started_at: 0,
+                owned_by_subagent: false,
+                backgrounded: true,
             });
     }
 
@@ -8426,8 +8428,8 @@ mod tests {
         r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
 
     /// A turn that leaves a task armed ends `turn_running` (after its result
-    /// row) while the chat stays `agent_running`; the continuation turn the
-    /// task's completion wakes raises it again.
+    /// row) while the chat stays `agent_running`; the task's completion raises
+    /// it again for the wake it starts, until the wake's result.
     #[tokio::test]
     async fn turn_running_ends_with_the_turn_while_tasks_keep_the_agent_running() {
         let mut c = ResidentChat::new();
@@ -8462,9 +8464,15 @@ mod tests {
         assert!(c.supervisor.is_running(&c.chat_id), "the task is armed");
 
         c.reader_raw(r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#).await;
-        c.reader_line(vec![adapter::AgentEvent::TurnStarted("woken".into())])
-            .await;
         assert_eq!(turn_running_writes(&c.writes()), vec![true]);
+        c.reader_raw(
+            r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-5-5"}"#,
+        )
+        .await;
+        assert!(
+            turn_running_writes(&c.writes()).is_empty(),
+            "the wake's init"
+        );
         c.reader_raw(RESULT_LINE).await;
         assert_eq!(turn_running_writes(&c.writes()), vec![false]);
     }

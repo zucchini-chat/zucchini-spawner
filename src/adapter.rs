@@ -368,10 +368,18 @@ pub enum AgentEvent {
         task_type: String,
         /// Backgrounded subagents only, e.g. `Explore`.
         subagent_type: Option<String>,
+        /// Armed by a subagent: its end notifies that subagent, not the main
+        /// session.
+        owned_by_subagent: bool,
+        /// `is_backgrounded`, true when absent. A foreground task (a plain
+        /// Bash call) ends inside its tool call and notifies nobody.
+        backgrounded: bool,
     },
     /// Resident model only — a previously-`TaskStarted` background task reached
-    /// a terminal `task_notification` (completed/failed/cancelled). Carries the
-    /// same `task_id`; the Supervisor removes it from `live_tasks`.
+    /// a terminal `task_updated` / `task_notification` (a backgrounded task's
+    /// end comes as both, so it arrives twice). Carries the same `task_id`; the Supervisor removes it
+    /// from `live_tasks`. A backgrounded top-level task's end owes the session
+    /// its notification (`SessionState::owed_notifications`).
     TaskFinished(String),
     /// Resident codex only — a shell command started. It can outlive its turn
     /// (and a prune restart kills it), so the prune guard counts it; it never
@@ -390,8 +398,19 @@ pub enum AgentEvent {
     /// Resident model only — the CLI started a turn (`command_lifecycle`
     /// `started`) for this command uuid: one of our stdin turns, a peer's
     /// `SendMessage`, or a self-fired one (a `CronCreate` prompt) that is
-    /// never echoed.
+    /// never echoed. A task wake has no such frame (`TurnBegan`).
     TurnStarted(String),
+    /// Resident claude only — the `system/init` frame that opens every turn:
+    /// ours, a peer's, a cron prompt, a task wake (announced by nothing else),
+    /// a `/rename` or `/compact`.
+    TurnBegan,
+    /// Resident claude only — task notifications claude injected into the
+    /// running turn (an `isReplay` echo with `origin.kind=task-notification`),
+    /// by the `<task-id>`s they report.
+    NotificationsConsumed(Vec<String>),
+    /// Never from an adapter: the resident reader gave up on owed task
+    /// notifications whose wake didn't begin in time.
+    WakeOverdue,
     /// The agent's own `prune-context` call has PERSISTED its result. Content-free
     /// CUE the main loop uses to drive the prune restart: when the chat has a queued
     /// `PruneRequest`, the loop aborts → rewrites → respawns NOW (strictly after the
@@ -1200,6 +1219,11 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
                 format!("PeerTurnConsumed({name}: {body})")
             }
             AgentEvent::TurnStarted(s) => format!("TurnStarted({})", s),
+            AgentEvent::TurnBegan => "TurnBegan".to_string(),
+            AgentEvent::NotificationsConsumed(ids) => {
+                format!("NotificationsConsumed({})", ids.join(","))
+            }
+            AgentEvent::WakeOverdue => "WakeOverdue".to_string(),
             AgentEvent::ToolResult => "ToolResult".to_string(),
         })
         .collect()
