@@ -444,7 +444,7 @@ impl AgentAdapter for ClaudeAdapter {
         Some(format!("{}\n", frame))
     }
 
-    fn handle_line(&mut self, line: String) -> SmallVec<[AgentEvent; 2]> {
+    fn handle_line(&mut self, mut line: String) -> SmallVec<[AgentEvent; 2]> {
         let mut out: SmallVec<[AgentEvent; 2]> = SmallVec::new();
 
         // [DIAG tasktrace] TEMPORARY — capture every frame that touches a
@@ -649,6 +649,8 @@ impl AgentAdapter for ClaudeAdapter {
                     && line.contains("\"terminal_reason\":\"aborted_streaming\"")
                 {
                     skip = true;
+                } else if let Some(slim) = slim_result_frame(&line) {
+                    line = slim;
                 }
             }
         }
@@ -663,6 +665,40 @@ impl AgentAdapter for ClaudeAdapter {
 
         out
     }
+}
+
+/// The `result` row as written. Clients read only its `subtype` and
+/// `duration_ms`; usage, cost and a success's final text (already shown as the
+/// last assistant row) would only make every chats-row sync heavier. `None`
+/// when the line is not a top-level result object.
+fn slim_result_frame(line: &str) -> Option<String> {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct ResultFrame {
+        r#type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subtype: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        origin: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        errors: Option<serde_json::Value>,
+    }
+    let mut frame: ResultFrame = serde_json::from_str(line).ok()?;
+    if frame.r#type != "result" {
+        return None;
+    }
+    if frame.is_error != Some(true) {
+        frame.result = None;
+        frame.errors = None;
+    }
+    serde_json::to_string(&frame).ok()
 }
 
 fn parse_started_command_uuid(line: &str) -> Option<String> {
@@ -2673,6 +2709,56 @@ mod tests {
             vec!["Result"],
             "abort result must emit Result for the FSM but NO Frame (row suppressed)"
         );
+    }
+
+    fn result_row(line: &str) -> String {
+        ClaudeAdapter::new()
+            .handle_line(line.to_string())
+            .into_iter()
+            .find_map(|e| match e {
+                AgentEvent::Frame(row) => Some(row),
+                _ => None,
+            })
+            .expect("a result row")
+    }
+
+    #[test]
+    fn a_result_row_is_written_slim() {
+        assert_eq!(
+            result_row(
+                r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4100,"duration_api_ms":3900,"num_turns":2,"result":"armed","session_id":"s1","total_cost_usd":0.12,"usage":{"input_tokens":3},"modelUsage":{},"permission_denials":[],"uuid":"u1","origin":{"kind":"task-notification"},"terminal_reason":"completed","future_field":1}"#
+            ),
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4100,"origin":{"kind":"task-notification"},"terminal_reason":"completed"}"#
+        );
+        assert_eq!(
+            result_row(
+                r#"{"type":"result","subtype":"success","is_error":true,"duration_ms":12,"result":"Prompt is too long","session_id":"s1","usage":{}}"#
+            ),
+            r#"{"type":"result","subtype":"success","is_error":true,"duration_ms":12,"result":"Prompt is too long"}"#
+        );
+        assert_eq!(
+            result_row(
+                r#"{"type":"result","subtype":"error_max_turns","is_error":true,"duration_ms":30,"num_turns":5,"errors":["Reached maximum number of turns (5)"],"session_id":"s1"}"#
+            ),
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"duration_ms":30,"errors":["Reached maximum number of turns (5)"]}"#
+        );
+        assert_eq!(
+            result_row(
+                r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":30,"errors":["stale"]}"#
+            ),
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":30}"#
+        );
+    }
+
+    /// A line the slim parse can't read as a top-level result keeps its row.
+    #[test]
+    fn an_unreadable_result_row_is_written_verbatim() {
+        for line in [
+            r#"{"type":"result","subtype":"success","is_error":"maybe"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01","name":"Write","input":{"type":"result"}}]}}"#,
+        ] {
+            assert_eq!(result_row(line), line);
+        }
     }
 
     #[test]

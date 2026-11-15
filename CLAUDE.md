@@ -8,7 +8,7 @@ In prod the installer registers a **per-user service** (`SERVICE_NAME=chat.zucch
 
 ## Message-frame invariant
 
-Consumes claude's `--output-format stream-json` and writes one `messages` row per JSON frame (whole frames, not token deltas — bodies are final at insert, never grow; attachments are encoded inside the body envelope so they're frozen alongside it). Combined with append-only ordering by `seq`, `(count, last.id)` is a stable identity for a chat's message array — guards like `ChatMessagesList.ApplyFingerprint` depend on this; widen them before adding edits, deletes, or out-of-envelope attachment hydration.
+Consumes claude's `--output-format stream-json` and writes one `messages` row per JSON frame (whole frames, not token deltas — bodies are final at insert, never grow; attachments are encoded inside the body envelope so they're frozen alongside it). Combined with append-only ordering by `seq`, `(count, last.id)` is a stable identity for a chat's message array — guards like `ChatMessagesList.ApplyFingerprint` depend on this; widen them before adding edits, deletes, or out-of-envelope attachment hydration. Claude's `result` frame is written slim (`claude.rs::slim_result_frame`): `type`, `subtype`, `is_error`, `duration_ms`, `origin`, `terminal_reason`, and `result` and `errors` only on an error. A claude subagent's frame (a non-empty string top-level `parent_tool_use_id` and a string `type`, the clients' hide rule) carries plaintext `subagent: true` (`writer.rs::BACKEND_HAS_MESSAGE_SUBAGENT`, on since migration 0057 and the backend's `subagent` field went live in prod, 2026-11-15; published binaries ≤ 3.5.1 don't send it), so the backend inserts the row without updating the chats row.
 
 ## Checkpoint-windowed sync reconciliation
 

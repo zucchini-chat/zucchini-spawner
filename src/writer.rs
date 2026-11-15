@@ -296,6 +296,9 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
             if let Some(ts) = created_at {
                 data["created_at"] = serde_json::Value::String(ts.to_rfc3339());
             }
+            if BACKEND_HAS_MESSAGE_SUBAGENT {
+                mark_subagent_row(&mut data, sender, content);
+            }
             BatchOp {
                 op: "PUT",
                 table: "messages",
@@ -527,6 +530,30 @@ pub(crate) fn live_tasks_patch(
     )
 }
 
+/// A claude subagent's row carries plaintext `subagent: true`, so the backend
+/// inserts it without updating the chats row. Split out of `encode_event` so
+/// the wire shape stays testable while `BACKEND_HAS_MESSAGE_SUBAGENT` is false.
+pub(crate) fn mark_subagent_row(data: &mut serde_json::Value, sender: &str, content: &str) {
+    if sender == "agent" && is_subagent_frame(content) {
+        data["subagent"] = serde_json::Value::Bool(true);
+    }
+}
+
+/// Frames can be MBs, so only a frame with a string `parent_tool_use_id`
+/// somewhere pays the parse; the parse then reads the top-level field alone,
+/// not a same-named key inside a tool input.
+fn is_subagent_frame(content: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Frame {
+        #[serde(rename = "type")]
+        _type: String,
+        parent_tool_use_id: Option<String>,
+    }
+    content.contains("\"parent_tool_use_id\":\"")
+        && serde_json::from_str::<Frame>(content)
+            .is_ok_and(|f| f.parent_tool_use_id.is_some_and(|id| !id.is_empty()))
+}
+
 /// Split out of `encode_event` so the wire shape stays testable while
 /// `BACKEND_HAS_TURN_RUNNING` is false.
 pub(crate) fn turn_running_patch(chat_id: &str, turn_running: bool) -> Option<BatchOp> {
@@ -671,6 +698,10 @@ const BACKEND_HAS_LIVE_TASKS: bool = true;
 /// `process_chat_patch`'s `machine_fields` are live in prod.
 const BACKEND_HAS_TURN_RUNNING: bool = true;
 
+/// Same 4xx queue-poison guard, for `messages.subagent`: migration 0057 and the
+/// backend's `subagent` field on messages PUTs are live in prod (2026-11-15).
+const BACKEND_HAS_MESSAGE_SUBAGENT: bool = true;
+
 async fn send_batch(
     http: &reqwest::Client,
     url: &str,
@@ -775,6 +806,76 @@ mod live_tasks_tests {
                 BACKEND_HAS_TURN_RUNNING
             );
         }
+    }
+
+    const SUBAGENT_FRAME: &str = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]},"parent_tool_use_id":"toolu_01","session_id":"s1"}"#;
+
+    fn marked(sender: &str, content: &str) -> bool {
+        let mut data = serde_json::json!({});
+        mark_subagent_row(&mut data, sender, content);
+        data.get("subagent") == Some(&serde_json::Value::Bool(true))
+    }
+
+    #[test]
+    fn only_an_agent_row_of_a_subagent_frame_is_marked() {
+        assert!(marked("agent", SUBAGENT_FRAME));
+        for content in [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_02","name":"Write","input":{"parent_tool_use_id":"toolu_01"}}]},"parent_tool_use_id":null}"#,
+            "not json \"parent_tool_use_id\":\"toolu_01\"",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]},"parent_tool_use_id":""}"#,
+            r#"{"message":{"content":[{"type":"text","text":"hi"}]},"parent_tool_use_id":"toolu_01"}"#,
+        ] {
+            assert!(!marked("agent", content), "{content}");
+        }
+        assert!(!marked("user", SUBAGENT_FRAME));
+    }
+
+    #[test]
+    fn spawner_made_rows_are_never_marked() {
+        let suggestion = crate::suggest_chat::ChatSuggestion {
+            message: "go".into(),
+            attachments: vec![],
+            project_path: "/p".into(),
+            agent_kind: "claude".into(),
+            model: None,
+            worktree: false,
+            title: None,
+            system_prompt: None,
+            system_prompt_files: None,
+            always_on: false,
+            background: false,
+            auto_compact_tokens: None,
+        };
+        for content in [
+            crate::agent::peer_message_frame_json(
+                "Explore",
+                SUBAGENT_FRAME,
+                Some(crate::agent::PeerFrom::Agent("a1")),
+            ),
+            crate::adapter::INTERRUPTED_RESULT.to_string(),
+            suggestion.frame_json(),
+        ] {
+            assert!(!marked("agent", &content), "{content}");
+        }
+    }
+
+    /// Until the backend knows the field the row must go without it: an
+    /// unknown field 4xx's the batch and blocks every write behind it.
+    #[test]
+    fn subagent_ships_only_once_the_backend_has_the_column() {
+        let user_id = Uuid::now_v7();
+        let ev = WriteEvent::agent_line(
+            Uuid::now_v7().to_string(),
+            user_id,
+            SUBAGENT_FRAME.to_string(),
+        );
+        let op = encode_event(&ev, &keys_for(user_id)).expect("op");
+        assert_eq!(
+            op.data.expect("data").get("subagent"),
+            BACKEND_HAS_MESSAGE_SUBAGENT.then_some(&serde_json::Value::Bool(true))
+        );
     }
 
     #[test]
