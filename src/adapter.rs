@@ -377,6 +377,11 @@ pub enum AgentEvent {
         /// `is_backgrounded`, true when absent. A foreground task (a plain
         /// Bash call) ends inside its tool call and notifies nobody.
         backgrounded: bool,
+        /// The task that armed it: the subagent of a nested subagent or of a
+        /// subagent's shell.
+        parent_task_id: Option<String>,
+        /// The `name` its Agent call gave it, which `SendMessage` can address.
+        name: Option<String>,
     },
     /// Resident model only — a previously-`TaskStarted` background task reached
     /// a terminal `task_updated` / `task_notification` (a backgrounded task's
@@ -415,6 +420,10 @@ pub enum AgentEvent {
     /// running turn (an `isReplay` echo with `origin.kind=task-notification`),
     /// by the `<task-id>`s they report.
     NotificationsConsumed(Vec<String>),
+    /// Resident claude only — a `SendMessage` call to `to` (its `to` input),
+    /// made by the main session or a subagent, was delivered: its
+    /// `tool_result` came back without an error.
+    SendMessageTo(String),
     /// Never from an adapter: the resident reader gave up on owed task
     /// notifications whose wake didn't begin in time.
     WakeOverdue,
@@ -1239,6 +1248,7 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             AgentEvent::NotificationsConsumed(ids) => {
                 format!("NotificationsConsumed({})", ids.join(","))
             }
+            AgentEvent::SendMessageTo(to) => format!("SendMessageTo({to})"),
             AgentEvent::WakeOverdue => "WakeOverdue".to_string(),
             AgentEvent::ToolResult => "ToolResult".to_string(),
         })

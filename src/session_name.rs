@@ -48,6 +48,13 @@ pub fn from_title(title: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// A `SendMessage` `to` without its ` [<ref>]` disambiguation suffix.
+pub fn without_ref(to: &str) -> &str {
+    to.strip_suffix(']')
+        .and_then(|to| to.rsplit_once(" ["))
+        .map_or(to, |(name, _)| name)
+}
+
 fn is_zero_width(ch: char) -> bool {
     matches!(ch, '\u{200b}'..='\u{200f}' | '\u{feff}' | '\u{2060}')
 }

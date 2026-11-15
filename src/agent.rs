@@ -186,6 +186,15 @@ pub struct SessionState {
     /// The context usage last reported, as the client's gauge shows it.
     pub(crate) context_tokens: Option<i64>,
     pub(crate) auto_compact: AutoCompact,
+    /// Per live subagent (task id): the line its next `subagents wait` returns
+    /// at once, for an event no wait has returned on yet (`crate::subagents`).
+    pub(crate) subagent_wakes: HashMap<String, String>,
+    /// Per live subagent: how many `subagents wait`s it started. Only the
+    /// latest one may return on a wake; an older one was given up on.
+    pub(crate) subagent_waits: HashMap<String, u64>,
+    /// Notified on every change a `subagents wait` or the `SubagentStop`
+    /// check may be waiting for.
+    pub(crate) subagent_events: Arc<Notify>,
 }
 
 /// Where the session is in a spawner-issued compaction (`SessionState::after_turn`).
@@ -226,16 +235,24 @@ pub struct LiveTask {
     pub owned_by_subagent: bool,
     /// Its end notifies the model (`AgentEvent::TaskStarted`). Not published.
     pub backgrounded: bool,
+    /// The task that armed it (`AgentEvent::TaskStarted`). Not published.
+    pub parent_task_id: Option<String>,
+    /// The name its Agent call gave it. Not published.
+    pub name: Option<String>,
 }
 
 impl LiveTask {
     /// What to call the task in spawner-side prose (the forced-prune note).
-    fn label(&self) -> &str {
+    pub(crate) fn label(&self) -> &str {
         if self.description.is_empty() {
             &self.id
         } else {
             &self.description
         }
+    }
+
+    pub(crate) fn is_subagent(&self) -> bool {
+        self.task_type == "local_agent"
     }
 }
 
@@ -484,6 +501,8 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
             tool_use_id,
             owned_by_subagent,
             backgrounded,
+            parent_task_id,
+            name,
         } => {
             if let Some(task) = state.live_tasks.iter_mut().find(|t| &t.id == id) {
                 task.tool_use_id = tool_use_id.clone();
@@ -497,15 +516,44 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
                     started_at: now_epoch_ms(),
                     owned_by_subagent: *owned_by_subagent,
                     backgrounded: *backgrounded,
+                    parent_task_id: parent_task_id.clone(),
+                    name: name.clone(),
                 });
             }
+            state.subagent_events.notify_waiters();
         }
         AgentEvent::TaskFinished(id) => {
             if let Some(i) = state.live_tasks.iter().position(|t| &t.id == id) {
                 let task = state.live_tasks.remove(i);
-                if task.backgrounded && !task.owned_by_subagent {
-                    state.owed_notifications.push(task.id);
+                // A live parent gets the task's report itself.
+                let parent = task
+                    .parent_task_id
+                    .as_deref()
+                    .filter(|p| state.live_tasks.iter().any(|t| t.id == *p));
+                if task.backgrounded && !task.owned_by_subagent && parent.is_none() {
+                    state.owed_notifications.push(task.id.clone());
                 }
+                if let Some(parent) = parent.filter(|_| task.is_subagent()) {
+                    let wake = crate::subagents::child_ended(task.label());
+                    state.subagent_wakes.insert(parent.to_string(), wake);
+                }
+                state.subagent_wakes.remove(&task.id);
+                state.subagent_waits.remove(&task.id);
+                state.subagent_events.notify_waiters();
+            }
+        }
+        AgentEvent::SendMessageTo(to) => {
+            let to = crate::session_name::without_ref(to);
+            // A name goes to the latest subagent that has it.
+            let subagents = || state.live_tasks.iter().filter(|t| t.is_subagent());
+            let target = subagents()
+                .find(|t| t.id == to)
+                .or_else(|| subagents().rev().find(|t| t.name.as_deref() == Some(to)))
+                .map(|t| t.id.clone());
+            if let Some(id) = target {
+                let wake = crate::subagents::MESSAGE_ARRIVED.to_string();
+                state.subagent_wakes.insert(id, wake);
+                state.subagent_events.notify_waiters();
             }
         }
         AgentEvent::CommandStarted { id, command } => {
@@ -602,6 +650,8 @@ pub fn live_tasks_with_daemon_tasks(
             started_at: w.created_at.saturating_mul(1000),
             owned_by_subagent: false,
             backgrounded: false,
+            parent_task_id: None,
+            name: None,
         })
     }));
     if let Some(serde_json::Value::Array(armed)) = blob.remove("t") {
@@ -1063,6 +1113,7 @@ impl AgentEvent {
             | AgentEvent::TurnStarted(_)
             | AgentEvent::TurnBegan
             | AgentEvent::NotificationsConsumed(_)
+            | AgentEvent::SendMessageTo(_)
             | AgentEvent::WakeOverdue => {
                 return None;
             }
@@ -2107,7 +2158,7 @@ fn default_spawn_fn(
         // binary — `current_exe()` is whatever launchd/systemd runs, which
         // is also what the RPC handler listens on.
         cmd.env("ZUCCHINI_CHAT_ID", &topic_clone);
-        if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe) = spawner_bin() {
             cmd.env("ZUCCHINI_SPAWNER_BIN", exe);
         }
         // One automatic respawn is allowed after a silent startup timeout (see
@@ -2470,7 +2521,7 @@ fn default_resident_spawn_fn(
             .stderr(std::process::Stdio::piped());
         sys::configure_new_process_group(&mut cmd);
         cmd.env("ZUCCHINI_CHAT_ID", &topic);
-        if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe) = spawner_bin() {
             cmd.env("ZUCCHINI_SPAWNER_BIN", exe);
         }
         // One automatic respawn is allowed after a silent startup timeout (see
@@ -2614,6 +2665,10 @@ fn default_resident_spawn_fn(
                                 Ok(Some(input)) => {
                                     let (events, started) = match input {
                                         ReaderInput::Line(line) => {
+                                            #[cfg(test)]
+                                            if let Some(tap) = STDOUT_TAP.lock().unwrap().as_mut() {
+                                                tap.push((std::time::Instant::now(), line.clone()));
+                                            }
                                             let mut a = lock_adapter(&adapter);
                                             let events = a.handle_line(line);
                                             (events, a.startup_complete())
@@ -2712,6 +2767,7 @@ fn default_resident_spawn_fn(
                                             | AgentEvent::TurnStarted(_)
                                             | AgentEvent::TurnBegan
                                             | AgentEvent::NotificationsConsumed(_)
+                                            | AgentEvent::SendMessageTo(_)
                                             | AgentEvent::WakeOverdue => {}
                                         }
                                         if turn_ended {
@@ -2970,8 +3026,29 @@ fn encode_due(
     frames
 }
 
-fn close_session(state: &Arc<StdMutex<SessionState>>) {
-    state.lock().expect("SessionState mutex").closed = true;
+/// The binary agents call back into (`$ZUCCHINI_SPAWNER_BIN`). A test binary
+/// can't serve the CLI subcommands, so tests use the daemon binary
+/// `cargo build` puts next to it.
+fn spawner_bin() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    #[cfg(test)]
+    let exe = exe
+        .parent()?
+        .parent()?
+        .join(format!("zucchini-spawner{}", std::env::consts::EXE_SUFFIX));
+    Some(exe)
+}
+
+/// The CLI smoke tests' copy of every resident stdout line, with its arrival
+/// time; off while `None`.
+#[cfg(test)]
+pub(crate) static STDOUT_TAP: StdMutex<Option<Vec<(std::time::Instant, String)>>> =
+    StdMutex::new(None);
+
+pub(crate) fn close_session(state: &Arc<StdMutex<SessionState>>) {
+    let mut st = state.lock().expect("SessionState mutex");
+    st.closed = true;
+    st.subagent_events.notify_waiters();
 }
 
 /// Spawn the stderr reader task. Buffers startup lines silently (capped), keeps
@@ -3160,6 +3237,8 @@ pub(crate) fn task_started(id: &str) -> AgentEvent {
         tool_use_id: None,
         owned_by_subagent: false,
         backgrounded: true,
+        parent_task_id: None,
+        name: None,
     }
 }
 
@@ -3174,6 +3253,8 @@ pub(crate) fn subagent_started(id: &str) -> AgentEvent {
         tool_use_id: None,
         owned_by_subagent: false,
         backgrounded: true,
+        parent_task_id: None,
+        name: None,
     }
 }
 
@@ -3189,6 +3270,8 @@ pub(crate) fn live_task(id: &str) -> LiveTask {
         started_at: 1_780_886_492_000,
         owned_by_subagent: false,
         backgrounded: true,
+        parent_task_id: None,
+        name: None,
     }
 }
 
@@ -3361,6 +3444,8 @@ mod reduce_tests {
                 tool_use_id: Some("toolu_bash".into()),
                 owned_by_subagent: false,
                 backgrounded: true,
+                parent_task_id: None,
+                name: None,
             },
         );
         reduce(
@@ -3373,6 +3458,8 @@ mod reduce_tests {
                 tool_use_id: Some("toolu_agent".into()),
                 owned_by_subagent: false,
                 backgrounded: true,
+                parent_task_id: None,
+                name: None,
             },
         );
         reduce(
@@ -3385,6 +3472,8 @@ mod reduce_tests {
                 tool_use_id: Some("toolu_weird".into()),
                 owned_by_subagent: true,
                 backgrounded: true,
+                parent_task_id: None,
+                name: None,
             },
         );
         let blob: serde_json::Value =
@@ -3423,6 +3512,8 @@ mod reduce_tests {
             tool_use_id: Some(call.into()),
             owned_by_subagent: false,
             backgrounded: true,
+            parent_task_id: None,
+            name: None,
         };
         let mut s = SessionState::default();
         reduce(&mut s, &started("count tmp files", "toolu_agent"));
@@ -3968,6 +4059,8 @@ mod reduce_tests {
             tool_use_id: None,
             owned_by_subagent: false,
             backgrounded: false,
+            parent_task_id: None,
+            name: None,
         };
         let mut s = SessionState {
             turn_in_flight: true,
@@ -3994,6 +4087,8 @@ mod reduce_tests {
             tool_use_id: None,
             owned_by_subagent: true,
             backgrounded: true,
+            parent_task_id: None,
+            name: None,
         };
         for parent_live in [true, false] {
             let mut s = SessionState::default();

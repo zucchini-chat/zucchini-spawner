@@ -58,6 +58,12 @@ pub struct ClaudeAdapter {
     /// `prune-context` call's own result persists, so the resumed agent never
     /// sees its prune + summary and re-runs it. See `AgentEvent::ToolResult`.
     pending_prune_tool_use_ids: HashSet<String>,
+    /// The `name` of each Agent call that set one, by its `tool_use` id, until
+    /// that call's `task_started` takes it or its `tool_result` comes back.
+    agent_names: HashMap<String, String>,
+    /// The `to` of each `SendMessage` call, by its `tool_use` id, until its
+    /// `tool_result` says whether the message went out.
+    pending_sends: HashMap<String, String>,
 }
 
 impl ClaudeAdapter {
@@ -65,47 +71,67 @@ impl ClaudeAdapter {
         Self::default()
     }
 
-    /// Scan an assistant frame for `prune-context` `tool_use` blocks and record
-    /// their ids so the matching `tool_result` (and only it) can later drive the
-    /// queued prune's apply. Caller gates on `line.contains("prune-context")`,
-    /// so the parse only runs on frames that actually mention the subcommand.
-    fn record_prune_tool_use_ids(&mut self, line: &str) {
+    /// Scan an assistant frame's `tool_use` blocks for what later frames need:
+    /// the ids of `prune-context` calls, so the matching `tool_result` (and only
+    /// it) can later drive the queued prune's apply; where `SendMessage` calls
+    /// go; and the names Agent calls give their subagents. Caller gates on
+    /// substrings, so the parse only runs on frames that mention one of them.
+    fn record_tool_uses(&mut self, line: &str) {
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
-        let Some(blocks) = entry
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_array())
-        else {
-            return;
-        };
-        for block in blocks {
-            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-                continue;
-            }
-            let Some(input) = block.get("input") else {
+        let blocks = entry["message"]["content"].as_array().into_iter().flatten();
+        for block in blocks.filter(|b| b["type"] == "tool_use") {
+            let Some(id) = block["id"].as_str() else {
                 continue;
             };
+            let input = &block["input"];
             if crate::prune::value_is_prune_context_call(input) {
-                if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
-                    self.pending_prune_tool_use_ids.insert(id.to_string());
+                self.pending_prune_tool_use_ids.insert(id.to_string());
+            }
+            let field = |k: &str| {
+                input[k]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            };
+            match (block["name"].as_str(), field("to"), field("name")) {
+                (Some("SendMessage"), Some(to), _) => {
+                    self.pending_sends.insert(id.to_string(), to);
                 }
+                (Some("Agent"), _, Some(name)) => {
+                    self.agent_names.insert(id.to_string(), name);
+                }
+                _ => {}
             }
         }
     }
 }
 
-/// Extract a `tool_result` frame's `tool_use_id` WITHOUT a full parse of the
-/// (possibly multi-MB) result body — the id is a short token near the head of
-/// the content block. The structural field is unescaped (`"tool_use_id":"`);
-/// any occurrence inside the result's own text is JSON-escaped (`\"…\"`), so
-/// this substring only matches the real field — same reasoning the frame-skip
-/// filters above rely on.
-fn extract_tool_result_id(line: &str) -> Option<&str> {
-    let (_, rest) = line.split_once("\"tool_use_id\":\"")?;
-    let (id, _) = rest.split_once('"')?;
-    Some(id)
+/// `(tool_use_id, is_error)` of each `tool_result` block in a user frame. A
+/// narrow parse: the (possibly multi-MB) result bodies are skipped, not kept.
+fn tool_results(line: &str) -> Vec<(String, bool)> {
+    #[derive(serde::Deserialize)]
+    struct Frame {
+        message: Message,
+    }
+    #[derive(serde::Deserialize)]
+    struct Message {
+        content: Vec<Block>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Block {
+        #[serde(default)]
+        tool_use_id: Option<String>,
+        #[serde(default)]
+        is_error: bool,
+    }
+    serde_json::from_str::<Frame>(line)
+        .map(|f| f.message.content)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|b| Some((b.tool_use_id?, b.is_error)))
+        .collect()
 }
 
 /// First sentence of the one-shot `--append-system-prompt` block. One-shot
@@ -277,7 +303,7 @@ fn claude_flag_args(
     // system-prompt nudge. `--settings` MERGES with (never replaces) the user's
     // settings.json / project hooks, so user-configured hooks survive the spawn
     // (verified empirically). See `zucchini-spawner/CLAUDE.md`.
-    let settings = serde_json::json!({
+    let mut settings = serde_json::json!({
         "hooks": {
             "PostToolUse": [{
                 // Match-all. claude treats the matcher as a REGEX, so the
@@ -291,6 +317,18 @@ fn claude_flag_args(
             }]
         }
     });
+    // Holds a subagent in its turn while its background subagents run
+    // (`crate::subagents`). Sandboxed: the default permission mode denies the
+    // Bash call the hook asks for, so the subagent would only loop.
+    if resident && !is_sandboxed {
+        settings["hooks"]["SubagentStop"] = serde_json::json!([{
+            "hooks": [{
+                "type": "command",
+                "command": "\"$ZUCCHINI_SPAWNER_BIN\" subagent-stop-hook",
+                "timeout": 10
+            }]
+        }]);
+    }
     args.push(CliArg::Lit("--settings"));
     args.push(CliArg::Val(settings.to_string()));
 
@@ -452,13 +490,16 @@ impl AgentAdapter for ClaudeAdapter {
         // it). The substring + starts_with('{') + assistant-type check keep
         // this scoped to assistant-shaped prune-bearing frames (a user/
         // tool_result frame can also echo "prune-context" in its result text,
-        // but record_prune_tool_use_ids only inspects `tool_use` blocks, so
+        // but record_tool_uses only inspects `tool_use` blocks, so
         // restricting to assistant frames just avoids a needless parse).
+        // `SendMessage` and Agent calls feed `crate::subagents`.
         if line.starts_with('{')
             && line.contains("\"type\":\"assistant\"")
-            && line.contains("prune-context")
+            && (line.contains("prune-context")
+                || line.contains("\"name\":\"SendMessage\"")
+                || line.contains("\"name\":\"Agent\""))
         {
-            self.record_prune_tool_use_ids(&line);
+            self.record_tool_uses(&line);
         }
 
         // Every turn opens with a `system/init` frame, and it is the only
@@ -507,7 +548,7 @@ impl AgentAdapter for ClaudeAdapter {
                     // it in `live_tasks` (Waiting state) until its terminal
                     // `task_notification`; the rest of the frame names it for the
                     // client (`chats.live_tasks`).
-                    out.extend(parse_task_started(&line));
+                    out.extend(parse_task_started(&line, &mut self.agent_names));
                 } else if line.contains("\"subtype\":\"task_notification\"")
                     || (line.contains("\"subtype\":\"task_updated\"")
                         && task_updated_is_terminal(&line))
@@ -549,14 +590,27 @@ impl AgentAdapter for ClaudeAdapter {
                 // result in the same parallel batch must NOT preempt the apply
                 // (it would abort→respawn before the prune's own result
                 // persists). The set is empty for every ordinary turn, so the
-                // id extraction is skipped entirely unless a prune is in flight.
+                // parse is skipped entirely unless a prune is in flight.
+                //
+                // A `SendMessage` call's result without an error means the
+                // message is queued for its recipient, which gets it at its next
+                // tool boundary.
                 if line.contains("\"type\":\"tool_result\"")
-                    && !self.pending_prune_tool_use_ids.is_empty()
+                    && !(self.pending_prune_tool_use_ids.is_empty()
+                        && self.pending_sends.is_empty()
+                        && self.agent_names.is_empty())
                 {
-                    if let Some(id) = extract_tool_result_id(&line) {
-                        if self.pending_prune_tool_use_ids.remove(id) {
-                            out.push(AgentEvent::ToolResult);
+                    let mut prune_cue = false;
+                    for (id, is_error) in tool_results(&line) {
+                        prune_cue |= self.pending_prune_tool_use_ids.remove(&id);
+                        // A failed Agent call starts no task to take its name.
+                        self.agent_names.remove(&id);
+                        if let Some(to) = self.pending_sends.remove(&id).filter(|_| !is_error) {
+                            out.push(AgentEvent::SendMessageTo(to));
                         }
+                    }
+                    if prune_cue {
+                        out.push(AgentEvent::ToolResult);
                     }
                 }
                 skip = true;
@@ -761,8 +815,9 @@ fn parse_init(line: &str) -> Option<InitFrame> {
 /// client its label. Verbatim shapes in `tmp/monitor_raw.jsonl` (backgrounded
 /// Bash / Monitor: `task_type: "local_bash"`, no `subagent_type`) and
 /// `tmp/agent_task_raw.jsonl` (backgrounded subagent: `task_type:
-/// "local_agent"` + `subagent_type`).
-fn parse_task_started(line: &str) -> Option<AgentEvent> {
+/// "local_agent"` + `subagent_type`). Takes the name the starting Agent call
+/// gave the task out of `agent_names`.
+fn parse_task_started(line: &str, agent_names: &mut HashMap<String, String>) -> Option<AgentEvent> {
     #[derive(serde::Deserialize)]
     struct Frame {
         task_id: String,
@@ -778,20 +833,27 @@ fn parse_task_started(line: &str) -> Option<AgentEvent> {
         owned_by_subagent: Option<bool>,
         #[serde(default)]
         is_backgrounded: Option<bool>,
+        #[serde(default)]
+        parent_task_id: Option<String>,
     }
     match serde_json::from_str::<Frame>(line) {
-        Ok(f) => Some(AgentEvent::TaskStarted {
-            id: f.task_id,
-            description: f.description.unwrap_or_default(),
-            task_type: f.task_type.unwrap_or_default(),
-            subagent_type: f.subagent_type.filter(|s| !s.is_empty()),
-            tool_use_id: match f.tool_use_id {
+        Ok(f) => {
+            let tool_use_id = match f.tool_use_id {
                 Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id),
                 _ => None,
-            },
-            owned_by_subagent: f.owned_by_subagent.unwrap_or_default(),
-            backgrounded: f.is_backgrounded.unwrap_or(true),
-        }),
+            };
+            Some(AgentEvent::TaskStarted {
+                id: f.task_id,
+                description: f.description.unwrap_or_default(),
+                task_type: f.task_type.unwrap_or_default(),
+                subagent_type: f.subagent_type.filter(|s| !s.is_empty()),
+                name: tool_use_id.as_ref().and_then(|id| agent_names.remove(id)),
+                tool_use_id,
+                owned_by_subagent: f.owned_by_subagent.unwrap_or_default(),
+                backgrounded: f.is_backgrounded.unwrap_or(true),
+                parent_task_id: f.parent_task_id.filter(|p| !p.is_empty()),
+            })
+        }
         Err(e) => {
             debug!("failed to parse task_started frame: {}", e);
             None
@@ -2054,6 +2116,8 @@ mod tests {
                 tool_use_id,
                 owned_by_subagent,
                 backgrounded,
+                parent_task_id,
+                name,
             }) => {
                 assert_eq!(id, "buukg9452");
                 assert_eq!(description, "npm test -- --watch");
@@ -2062,6 +2126,8 @@ mod tests {
                 assert_eq!(tool_use_id.as_deref(), Some("tu9"));
                 assert!(!owned_by_subagent);
                 assert!(backgrounded, "a frame without is_backgrounded");
+                assert_eq!(parent_task_id, None);
+                assert_eq!(name, None);
             }
             other => panic!("expected TaskStarted, got {other:?}"),
         }
@@ -2949,6 +3015,88 @@ mod tests {
         assert!(cmd.contains("--settings"), "got: {}", cmd);
         assert!(cmd.contains("prune-reminder-hook"), "got: {}", cmd);
         assert!(cmd.contains("PostToolUse"), "got: {}", cmd);
+        assert!(!cmd.contains("SubagentStop"), "no session to hold: {cmd}");
+    }
+
+    /// A resident holds a stopping subagent through its `SubagentStop` hook,
+    /// except sandboxed, where the subagent can't run the wait it is told to.
+    #[test]
+    fn resident_settings_add_the_subagent_stop_hook_unless_sandboxed() {
+        let settings = |ctx: &crate::adapter::SessionContext<'_>| -> serde_json::Value {
+            let argv = ClaudeAdapter::new()
+                .prepare_session_native(ctx)
+                .unwrap()
+                .args;
+            let i = argv.iter().position(|s| s == "--settings").unwrap();
+            serde_json::from_str(&argv[i + 1]).unwrap()
+        };
+        let owner = &settings(&session_ctx())["hooks"];
+        assert_eq!(
+            owner["SubagentStop"],
+            serde_json::json!([{"hooks": [{
+                "type": "command",
+                "command": "\"$ZUCCHINI_SPAWNER_BIN\" subagent-stop-hook",
+                "timeout": 10
+            }]}])
+        );
+        assert_eq!(
+            owner["PostToolUse"][0]["hooks"][0]["command"],
+            "\"$ZUCCHINI_SPAWNER_BIN\" prune-reminder-hook"
+        );
+        let sandboxed = crate::adapter::SessionContext {
+            is_sandboxed: true,
+            ..session_ctx()
+        };
+        let member = &settings(&sandboxed)["hooks"];
+        assert!(member.get("SubagentStop").is_none(), "{member}");
+        assert!(member.get("PostToolUse").is_some(), "{member}");
+    }
+
+    /// What a subagent's `subagents wait` wakes on: a `SendMessage` from
+    /// anyone, by its `to`, once its result says the message went out; and
+    /// the name an Agent call gave the task it starts.
+    #[test]
+    fn subagent_calls_name_tasks_and_report_delivered_messages() {
+        let mut a = ClaudeAdapter::new();
+        let launch = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_B","name":"Agent","input":{"description":"B","name":"researcher","prompt":"p","run_in_background":true}},{"type":"tool_use","id":"toolu_X","name":"Agent","input":{"description":"X","prompt":"p"}}]},"parent_tool_use_id":null}"#;
+        assert_eq!(run(&mut a, launch), vec![format!("Frame({launch})")]);
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"a433398a674cb174a","tool_use_id":"toolu_B","parent_task_id":"a14c5e51278712e43","spawn_depth":2,"task_type":"local_agent","description":"B"}"#;
+        match a.handle_line(started.to_string()).into_iter().next() {
+            Some(AgentEvent::TaskStarted {
+                parent_task_id,
+                name,
+                ..
+            }) => {
+                assert_eq!(parent_task_id.as_deref(), Some("a14c5e51278712e43"));
+                assert_eq!(name.as_deref(), Some("researcher"));
+            }
+            other => panic!("expected TaskStarted, got {other:?}"),
+        }
+        assert!(a.agent_names.is_empty(), "taken by its task");
+        let denied = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_D","name":"Agent","input":{"description":"D","name":"helper","prompt":"p"}}]}}"#;
+        run(&mut a, denied);
+        let refused = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"<tool_use_error>Agent type not found</tool_use_error>","is_error":true,"tool_use_id":"toolu_D"}]}}"#;
+        assert!(run(&mut a, refused).is_empty());
+        assert!(a.agent_names.is_empty(), "dropped with its result");
+
+        // Verbatim shapes from the nested-subagents smoke.
+        let send = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_S","name":"SendMessage","input":{"to":"a14c5e51278712e43","message":"PING","recipient_kind":"agent"}},{"type":"tool_use","id":"toolu_F","name":"SendMessage","input":{"to":"nobody","message":"x"}}]},"parent_tool_use_id":"toolu_main"}"#;
+        assert_eq!(run(&mut a, send), vec![format!("Frame({send})")]);
+        let failed = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"<tool_use_error>No agent named nobody</tool_use_error>","is_error":true,"tool_use_id":"toolu_F"}]},"parent_tool_use_id":"toolu_main"}"#;
+        assert!(run(&mut a, failed).is_empty());
+        let queued = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_S","type":"tool_result","content":[{"type":"text","text":"{\"success\":true,\"message\":\"Message queued for delivery to a14c5e51278712e43 at its next tool round.\"}"}]}]},"parent_tool_use_id":"toolu_main"}"#;
+        assert_eq!(
+            run(&mut a, queued),
+            vec!["SendMessageTo(a14c5e51278712e43)"]
+        );
+        assert!(run(&mut a, queued).is_empty(), "once");
+        assert!(a.pending_sends.is_empty());
+
+        // Two results in one frame, each with its own `is_error`.
+        let two = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"SendMessage","input":{"to":"x","message":"m"}},{"type":"tool_use","id":"toolu_2","name":"SendMessage","input":{"to":"y","message":"m"}}]}}"#;
+        run(&mut a, two);
+        let results = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"<tool_use_error>No agent named x</tool_use_error>","is_error":true},{"tool_use_id":"toolu_2","type":"tool_result","content":"queued","is_error":false}]}}"#;
+        assert_eq!(run(&mut a, results), vec!["SendMessageTo(y)"]);
     }
 
     #[test]

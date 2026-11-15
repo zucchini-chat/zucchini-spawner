@@ -16,6 +16,7 @@ mod prune;
 mod session_name;
 mod shell;
 mod state;
+mod subagents;
 mod suggest_chat;
 mod sys;
 mod text;
@@ -830,11 +831,7 @@ fn send_message_target<'a>(
         let pid = Path::new(socket).file_name()?.to_str()?;
         return supervisor.resident_chat_of(pid.strip_suffix(".sock")?.parse().ok()?);
     }
-    let name = to
-        .strip_suffix(']')
-        .and_then(|to| to.rsplit_once(" ["))
-        .map_or(to, |(name, _)| name);
-    supervisor.resident_chat_named(name, sender)
+    supervisor.resident_chat_named(session_name::without_ref(to), sender)
 }
 
 /// Claude's agent ids: `a` and 16 lowercase hex digits.
@@ -3713,6 +3710,16 @@ async fn main() {
             run_prune_reminder_hook_cli();
             return;
         }
+        if first == "subagent-stop-hook" {
+            // claude `SubagentStop` hook (wired via `--settings`; see
+            // `subagents.rs`). Exit 0 on any failure, like the one above.
+            subagents::run_stop_hook_cli(env_chat_id()).await;
+            return;
+        }
+        if first == "subagents" {
+            subagents::run_cli(&raw_args[1..], env_chat_id()).await;
+            return;
+        }
         if first == "scheduled-messages" {
             run_scheduled_messages_cli(&raw_args[1..]).await;
             return;
@@ -3770,7 +3777,7 @@ async fn main() {
         let is_help = first == "--help" || first == "-h";
         eprintln!(
             "zucchini-spawner — run with NO arguments to start the daemon.\n\
-             subcommands: attach-file, prune-context, prune-reminder-hook, scheduled-messages, watch, tunnel, system-prompt, hermes-turn\n\
+             subcommands: attach-file, prune-context, prune-reminder-hook, subagent-stop-hook, subagents, scheduled-messages, watch, tunnel, system-prompt, hermes-turn\n\
              flags: --version|-V, --help|-h"
         );
         std::process::exit(if is_help { 0 } else { 2 });
@@ -6920,6 +6927,8 @@ mod tests {
                 started_at: 0,
                 owned_by_subagent: false,
                 backgrounded: true,
+                parent_task_id: None,
+                name: None,
             });
     }
 

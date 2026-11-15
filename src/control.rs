@@ -13,15 +13,21 @@
 //!     the next agent-free window; non-null = that wall-clock time, zoned daemon-side)
 //!     or `{ "action": "list_scheduled_messages", "chat_id": "<uuid>" }\n`
 //!     or `{ "action": "cancel_scheduled_message", "chat_id": "<uuid>", "id": "<uuid>" }\n`
+//!     or `{ "action": "subagent_stop", "chat_id": "<uuid>", "agent_id": "<task id>",
+//!     "running": ["<task id>"] }\n`
+//!     or `{ "action": "wait_subagent", "chat_id": "<uuid>", "agent_id": "<task id>" }\n`
 //!   - response: `{ "ok": true, "blob_key": "...", "name": "..." }\n`
 //!     or `{ "ok": true, "scheduled_message_id": "<uuid>" }\n` (schedule + cancel)
 //!     or `{ "ok": true, "scheduled_messages": [ { "id": "<uuid>",
 //!     "deliver_at": "<local-wall-clock>"|null, "text": "...", "attachments": ["<name>"] } ] }\n`
+//!     or `{ "ok": true, "reason": "..." }\n` (`subagent_stop` without `reason`: the
+//!     subagent may stop; `wait_subagent`: why the wait returned)
 //!     or `{ "ok": false, "error": "..." }\n`
 //!
 //! Connection is one request/one response then close — the CLI exits and we
-//! release the per-conn task. Concurrent agents in different chats are
-//! independent connections.
+//! release the per-conn task. `wait_subagent` holds its connection open until
+//! it answers. Concurrent agents in different chats are independent
+//! connections.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,8 +52,12 @@ use crate::writer::{TokenFetcher, WriteEvent};
 /// Where the daemon binds and the CLI connects. Lives under the same
 /// `~/.zucchini-spawner` dir whose perms we already lock to 0o700 in
 /// `main.rs`, so the socket inherits that confinement.
+/// `ZUCCHINI_CONTROL_SOCKET` moves it: the CLI smoke tests run a daemon and
+/// its agents' hooks on their own socket, away from the live daemon's.
 pub fn control_socket_path() -> PathBuf {
-    crate::zucchini_spawner_dir().join("control.sock")
+    std::env::var_os("ZUCCHINI_CONTROL_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::zucchini_spawner_dir().join("control.sock"))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +158,19 @@ pub enum ControlRequest {
         chat_id: String,
         suggestion: SuggestChatRequest,
     },
+    /// The `SubagentStop` hook of subagent `agent_id` (`subagents.rs`): the
+    /// response's `reason` says why it must not end its turn yet; none, it may.
+    /// `running`: the other subagents claude listed as running, which the
+    /// daemon briefly waits to know before it decides.
+    SubagentStop {
+        chat_id: String,
+        agent_id: String,
+        #[serde(default)]
+        running: Vec<String>,
+    },
+    /// `subagents wait`: answered once there is something for subagent
+    /// `agent_id` to read, or after `subagents::WAIT_TIMEOUT`; `reason` says why.
+    WaitSubagent { chat_id: String, agent_id: String },
 }
 
 /// A chat's user system prompt as the CLI sees it: both fields decrypted.
@@ -220,6 +243,13 @@ pub struct ControlResponse {
     /// Set by `suggest_chat`: the suggestion as written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_suggestion: Option<ChatSuggestion>,
+    /// Set by `subagent_stop` (only to block the stop) and `wait_subagent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The wake a `wait_subagent` answer carries, given back if the answer
+    /// can't be written. Never on the wire.
+    #[serde(skip)]
+    pub taken_wake: Option<crate::subagents::TakenWake>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Per-item eligible-match counts, parallel to the request's `items` — set
@@ -364,10 +394,12 @@ async fn handle_conn(stream: sys::IpcStream, state: ControlState) -> Result<()> 
         r#"{"ok":false,"error":"failed to serialize response"}"#.to_string()
     });
     out.push('\n');
-    write_half
-        .write_all(out.as_bytes())
-        .await
-        .context("write control response")?;
+    if let Err(e) = write_half.write_all(out.as_bytes()).await {
+        if let Some(wake) = resp.taken_wake {
+            crate::subagents::put_back(&state.live_sessions, wake);
+        }
+        return Err(e).context("write control response");
+    }
     let _ = write_half.shutdown().await;
     Ok(())
 }
@@ -488,6 +520,42 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
                 ControlResponse::err(format!("{e:#}"))
             }
         },
+        ControlRequest::SubagentStop {
+            chat_id,
+            agent_id,
+            running,
+        } => ControlResponse {
+            ok: true,
+            reason: crate::subagents::stop_reason(
+                &state.live_sessions,
+                &chat_id,
+                &agent_id,
+                &running,
+                crate::subagents::HOOK_CATCH_UP,
+            )
+            .await,
+            ..Default::default()
+        },
+        ControlRequest::WaitSubagent { chat_id, agent_id } => {
+            let crate::subagents::Waited { line, took_wake } = crate::subagents::wait(
+                &state.live_sessions,
+                &chat_id,
+                &agent_id,
+                crate::subagents::WAIT_TIMEOUT,
+            )
+            .await;
+            let taken_wake = took_wake.then(|| crate::subagents::TakenWake {
+                chat_id,
+                agent_id,
+                line: line.clone(),
+            });
+            ControlResponse {
+                ok: true,
+                reason: Some(line),
+                taken_wake,
+                ..Default::default()
+            }
+        }
     }
 }
 
@@ -1350,6 +1418,32 @@ async fn send_control_request(req: &ControlRequest) -> Result<ControlResponse> {
     Ok(resp)
 }
 
+/// Why the stopping subagent `agent_id` must not end its turn yet, if it must.
+pub async fn subagent_stop_via_socket(
+    chat_id: &str,
+    agent_id: &str,
+    running: Vec<String>,
+) -> Result<Option<String>> {
+    let resp = send_control_request(&ControlRequest::SubagentStop {
+        chat_id: chat_id.to_string(),
+        agent_id: agent_id.to_string(),
+        running,
+    })
+    .await?;
+    Ok(resp.reason)
+}
+
+/// Waits until there is something for subagent `agent_id` to read; says why.
+pub async fn wait_subagent_via_socket(chat_id: &str, agent_id: &str) -> Result<String> {
+    let resp = send_control_request(&ControlRequest::WaitSubagent {
+        chat_id: chat_id.to_string(),
+        agent_id: agent_id.to_string(),
+    })
+    .await?;
+    resp.reason
+        .ok_or_else(|| anyhow!("response missing reason"))
+}
+
 /// Connect to the daemon's control socket and run one `attach-file` RPC.
 /// Returns the (blob_key, name) on success; bubbles up daemon-side errors
 /// (no-such-chat, upload failure) verbatim.
@@ -1640,9 +1734,69 @@ pub async fn suggest_chat_via_socket(
     .ok_or_else(|| anyhow!("response missing the suggestion"))
 }
 
+/// A daemon state with no backend, for tests of the socket.
+#[cfg(test)]
+pub(crate) fn test_state(live_sessions: crate::agent::LiveSessions) -> ControlState {
+    ControlState {
+        http: reqwest::Client::new(),
+        api_base_url: String::new(),
+        fetch_token: Arc::new(Box::new(|| Box::pin(async { anyhow::bail!("no backend") }))),
+        keys: Arc::new(KeyStore::default()),
+        pending: Arc::default(),
+        mirror: Arc::default(),
+        live_sessions,
+        pending_prunes: Arc::default(),
+        write_tx: tokio::sync::mpsc::channel(1).0,
+        probe_statuses: Arc::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wait whose caller is gone when it answers (killed by its Bash
+    /// timeout) gives the wake it took back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wait_answer_nobody_reads_gives_its_wake_back() {
+        use crate::adapter::AgentEvent;
+        use crate::agent::{reduce, subagent_started, SessionState};
+        let mut st = SessionState::default();
+        reduce(&mut st, &subagent_started("B"));
+        reduce(&mut st, &subagent_started("C"));
+        st.live_tasks[1].parent_task_id = Some("B".into());
+        reduce(&mut st, &AgentEvent::SendMessageTo("B".into()));
+        let session = Arc::new(std::sync::Mutex::new(st));
+        let sessions: crate::agent::LiveSessions = Arc::default();
+        sessions
+            .lock()
+            .unwrap()
+            .insert("chat".into(), Arc::clone(&session));
+
+        let path = std::env::temp_dir().join(format!("zs-wait-{}.sock", std::process::id()));
+        let listener = sys::IpcListener::bind(&path).unwrap();
+        let mut client = sys::ipc_connect(&path).await.unwrap();
+        client
+            .write_all(b"{\"action\":\"wait_subagent\",\"chat_id\":\"chat\",\"agent_id\":\"B\"}\n")
+            .await
+            .unwrap();
+        drop(client);
+        let stream = listener.accept().await.unwrap();
+        assert!(handle_conn(stream, test_state(Arc::clone(&sessions)))
+            .await
+            .is_err());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            session
+                .lock()
+                .unwrap()
+                .subagent_wakes
+                .get("B")
+                .map(String::as_str),
+            Some(crate::subagents::MESSAGE_ARRIVED)
+        );
+    }
 
     #[test]
     fn a_watch_needs_an_unsandboxed_chat_whose_user_still_has_a_key() {
