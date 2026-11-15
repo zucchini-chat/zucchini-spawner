@@ -709,7 +709,8 @@ pub fn harden_dir(path: &Path) -> io::Result<()> {
 /// rename the live exe to `<exe>.old`, then move the new one into its place. The
 /// Scheduled Task's keep-alive trigger ([`ensure_supervisor_task`])
 /// respawns from the new file within a minute of our exit; the leftover
-/// `<exe>.old` is best-effort-deleted at startup by [`sweep_stale_exe`].
+/// `<exe>.old` is best-effort-deleted at startup by [`sweep_stale_exe`]. If the
+/// new one can't move in, the live exe goes back, so the task still finds it.
 pub fn replace_running_exe(new_exe: &Path, current_exe: &Path) -> io::Result<()> {
     let old_exe = stale_exe_path(current_exe);
     // A `.old` from a prior update may still exist (locked if the previous
@@ -717,7 +718,9 @@ pub fn replace_running_exe(new_exe: &Path, current_exe: &Path) -> io::Result<()>
     // the path is genuinely unavailable.
     let _ = std::fs::remove_file(&old_exe);
     std::fs::rename(current_exe, &old_exe)?;
-    std::fs::rename(new_exe, current_exe)
+    std::fs::rename(new_exe, current_exe).inspect_err(|_| {
+        let _ = std::fs::rename(&old_exe, current_exe);
+    })
 }
 
 /// Adds a once-a-minute trigger to the logon Scheduled Task `install.ps1`

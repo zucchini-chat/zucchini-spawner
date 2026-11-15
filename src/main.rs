@@ -4317,38 +4317,43 @@ async fn main() {
         }
         publish_alive_changes(&mut supervisor, &write_tx).await;
 
-        // If an update is pending and no agent is busy, stop producing
-        // heartbeats, shut down idle agents, wait for the writer to drain
-        // (including their final writes), then swap the binary and exit —
-        // launchd/systemd will respawn the new version.
+        // If an update is pending and no agent is busy, download the new
+        // binary, and if still none is busy, swap it in: only then stop
+        // heartbeats, agents, watches and tunnels, drain the writer and exit
+        // for launchd/systemd to respawn it. A failed update tears nothing down
+        // and the daemon runs on.
         if let Some(new_version) = update_pending.as_ref() {
             if !supervisor.any_running() {
                 info!(
                     current = env!("CARGO_PKG_VERSION"),
                     new = %new_version,
-                    "all agents finished, draining writer before update"
+                    "all agents finished, updating"
                 );
-                shutdown_and_flush(
-                    &mut supervisor,
-                    &mut response_rx,
-                    &mirror,
-                    &write_tx,
-                    &heartbeat_cancel,
-                    &writer,
-                )
-                .await;
-                match updater::download_and_replace(new_version).await {
-                    Ok(()) => {
-                        // Only now: after a failed download the daemon runs
-                        // on, and so do its watches.
-                        watch::shutdown().await;
-                        tunnel::shutdown().await;
-                        info!("binary replaced, exiting for restart");
-                        break 'main_loop;
-                    }
-                    Err(e) => {
-                        error!("update failed: {}", e);
-                        update_pending = None;
+                let downloaded = updater::download(new_version).await;
+                // A task wake or a cron prompt can start a turn meanwhile.
+                if downloaded.is_ok() && supervisor.any_running() {
+                    info!("an agent turn began during the download, updating once idle");
+                } else {
+                    match downloaded.and_then(updater::install) {
+                        Ok(()) => {
+                            shutdown_and_flush(
+                                &mut supervisor,
+                                &mut response_rx,
+                                &mirror,
+                                &write_tx,
+                                &heartbeat_cancel,
+                                &writer,
+                            )
+                            .await;
+                            watch::shutdown().await;
+                            tunnel::shutdown().await;
+                            info!("binary replaced, exiting for restart");
+                            break 'main_loop;
+                        }
+                        Err(e) => {
+                            error!("update failed: {}", e);
+                            update_pending = None;
+                        }
                     }
                 }
             }

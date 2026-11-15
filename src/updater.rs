@@ -1,6 +1,7 @@
 //! Self-update loop: polls a remote (or file://) version file, downloads the
-//! matching binary when the version changes, replaces the running binary,
-//! and lets launchd/systemd respawn with the new version.
+//! matching binary next to the running one when the version changes, renames
+//! it over the running binary, and lets launchd/systemd respawn with the new
+//! version.
 //!
 //! Dev loop: set `SPAWNER_UPDATE_BASE_URL=file:///.../.zucchini-spawner/dev-update`
 //! (written by `dev-watch.sh`) + `SPAWNER_UPDATE_CHECK_INTERVAL_SECS=2`.
@@ -10,6 +11,7 @@
 //! applied version under `~/.zucchini-spawner/.applied-version` — otherwise the
 //! loop would re-apply the same dev tag on every boot.
 
+use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
@@ -20,6 +22,8 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_MARKER: &str = concat!("zucchini-spawner-release:", env!("CARGO_PKG_VERSION"), ";");
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const RETRY_WHEN_BUSY: Duration = Duration::from_secs(60);
+// The main loop waits on the download, so a stalled one must not hold it.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PROD_INSTALL_BASE: &str = "https://api.zucchini.chat/install";
 const VERSION_FILENAME: &str = "zucchini-spawner-version.txt";
 
@@ -104,34 +108,78 @@ async fn check_version() -> Option<String> {
     Some(version)
 }
 
-pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
-    // A build published after the check replaced the binary too, so persist the
-    // version as of now. Read before the binary: publishers write the binary
-    // first, so this can lag what we install but never get ahead of it.
-    let version = check_version()
-        .await
-        .unwrap_or_else(|| remote_version.to_string());
+/// A new binary downloaded beside the running one. Dropping it deletes the
+/// file, which is already gone once [`install`] moved it into place.
+pub struct Staged {
+    path: std::path::PathBuf,
+    current_exe: std::path::PathBuf,
+    version: String,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub async fn download(remote_version: &str) -> Result<Staged, String> {
     let suffix = platform_suffix()?;
     let binary_name = format!("zucchini-spawner-{suffix}");
     let url = format!("{}/{binary_name}", base_url());
-    let tmp_path_buf = std::env::temp_dir().join("zucchini-spawner-new");
-    let tmp_path = tmp_path_buf
-        .to_str()
-        .ok_or_else(|| "temp dir path is not valid UTF-8".to_string())?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("cannot find current exe: {e}"))?;
 
-    info!(url = %url, %version, "downloading new spawner binary");
-
-    let bytes = fetch_bytes(&url).await?;
-    tokio::fs::write(&tmp_path_buf, &bytes)
+    let fetch = async {
+        // A build published after the check replaced the binary too, so persist
+        // the version as of now. Read before the binary: publishers write the
+        // binary first, so this can lag what we install but never get ahead of it.
+        let version = check_version()
+            .await
+            .unwrap_or_else(|| remote_version.to_string());
+        info!(url = %url, %version, "downloading new spawner binary");
+        fetch_bytes(&url).await.map(|bytes| (version, bytes))
+    };
+    let (version, bytes) = tokio::time::timeout(DOWNLOAD_TIMEOUT, fetch)
         .await
-        .map_err(|e| format!("write {tmp_path}: {e}"))?;
+        .map_err(|_| format!("download of {url} timed out"))??;
+
+    let staged = Staged {
+        // Beside the exe: a rename across filesystems (a tmpfs /tmp) fails.
+        path: current_exe.with_extension("new"),
+        current_exe,
+        version,
+    };
+    write_executable(&staged.path, &bytes).await?;
+    Ok(staged)
+}
+
+/// Replaces the running binary. Unix renames the inode in place; Windows can't
+/// overwrite a live .exe, so the windows seam renames the live exe aside to
+/// `<exe>.old` first (swept on next start). Either way the supervisor (launchd /
+/// systemd / the logon Scheduled Task) respawns from the new file once we exit.
+pub fn install(staged: Staged) -> Result<(), String> {
+    crate::sys::replace_running_exe(&staged.path, &staged.current_exe)
+        .map_err(|e| format!("replace running exe failed: {e}"))?;
+
+    if let Err(e) = std::fs::write(applied_version_path(), &staged.version) {
+        warn!("failed to persist applied version: {e}");
+    }
+
+    Ok(())
+}
+
+async fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    tokio::fs::write(path, bytes)
+        .await
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
 
     // Post-download prep is unix-only: Windows binaries need no execute bit and
     // carry no `com.apple.quarantine` xattr.
     #[cfg(unix)]
     {
         let status = tokio::process::Command::new("chmod")
-            .args(["+x", tmp_path])
+            .arg("+x")
+            .arg(path)
             .status()
             .await
             .map_err(|e| format!("chmod failed: {e}"))?;
@@ -141,26 +189,13 @@ pub async fn download_and_replace(remote_version: &str) -> Result<(), String> {
 
         #[cfg(target_os = "macos")]
         if let Err(e) = tokio::process::Command::new("xattr")
-            .args(["-c", tmp_path])
+            .arg("-c")
+            .arg(path)
             .status()
             .await
         {
             warn!("xattr clear failed: {e}");
         }
-    }
-
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("cannot find current exe: {e}"))?;
-
-    // Replace the running binary. Unix renames the inode in place; Windows can't
-    // overwrite a live .exe, so the windows seam renames the live exe aside to
-    // `<exe>.old` first (swept on next start). Either way the supervisor
-    // (launchd / systemd / the logon Scheduled Task) respawns from the new file.
-    crate::sys::replace_running_exe(&tmp_path_buf, &current_exe)
-        .map_err(|e| format!("replace running exe failed: {e}"))?;
-
-    if let Err(e) = std::fs::write(applied_version_path(), &version) {
-        warn!("failed to persist applied version: {e}");
     }
 
     Ok(())

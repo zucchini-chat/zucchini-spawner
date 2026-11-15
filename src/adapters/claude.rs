@@ -534,7 +534,34 @@ impl AgentAdapter for ClaudeAdapter {
         //     below only matches structural block types.
         let mut skip = false;
         if line.starts_with('{') {
-            if line.contains("\"type\":\"system\"") && !line.contains("\"subtype\":\"status\"") {
+            if is_result_frame(&line) {
+                // Emit Result on every result frame; the supervisor latches it
+                // (so AgentResponse::Done.has_result is set once and only once).
+                out.push(AgentEvent::Result);
+                // Hard-abort suppression (`/stop`, interrupt-then-send - both
+                // SIGTERM): we publish our own canonical `{"type":"result","subtype":
+                // "interrupted"}` row, and claude may flush a real abort result
+                // for the killed turn before the process dies.
+                // claude ALSO emits a real abort result for the killed turn —
+                // empirically (real claude 2.1.165, tmp/claude_proto_probe.py):
+                //   {"subtype":"error_during_execution",...,
+                //    "terminal_reason":"aborted_streaming"}
+                // Forwarding that as a Frame too would render a SECOND terminal
+                // row ("[result: error_during_execution]" right after "Agent
+                // interrupted"). Suppress the row (keep the Result above so the
+                // FSM still clears `turn_in_flight`). Gated on BOTH needles so we
+                // fail OPEN — a genuine execution error (different subtype or
+                // terminal_reason) still renders.
+                if line.contains("\"subtype\":\"error_during_execution\"")
+                    && line.contains("\"terminal_reason\":\"aborted_streaming\"")
+                {
+                    skip = true;
+                } else if let Some(slim) = slim_result_frame(&line) {
+                    line = slim;
+                }
+            } else if line.contains("\"type\":\"system\"")
+                && !line.contains("\"subtype\":\"status\"")
+            {
                 // System frames are skipped, but compact_boundary
                 // carries postTokens we need — harvest it here
                 // instead of dropping the line silently.
@@ -627,31 +654,6 @@ impl AgentAdapter for ClaudeAdapter {
                     && !line.contains("\"type\":\"tool_use\""))
             {
                 skip = true;
-            } else if line.contains("\"type\":\"result\"") {
-                // Emit Result on every result frame; the supervisor latches it
-                // (so AgentResponse::Done.has_result is set once and only once).
-                out.push(AgentEvent::Result);
-                // Hard-abort suppression (`/stop`, interrupt-then-send - both
-                // SIGTERM): we publish our own canonical `{"type":"result","subtype":
-                // "interrupted"}` row, and claude may flush a real abort result
-                // for the killed turn before the process dies.
-                // claude ALSO emits a real abort result for the killed turn —
-                // empirically (real claude 2.1.165, tmp/claude_proto_probe.py):
-                //   {"subtype":"error_during_execution",...,
-                //    "terminal_reason":"aborted_streaming"}
-                // Forwarding that as a Frame too would render a SECOND terminal
-                // row ("[result: error_during_execution]" right after "Agent
-                // interrupted"). Suppress the row (keep the Result above so the
-                // FSM still clears `turn_in_flight`). Gated on BOTH needles so we
-                // fail OPEN — a genuine execution error (different subtype or
-                // terminal_reason) still renders.
-                if line.contains("\"subtype\":\"error_during_execution\"")
-                    && line.contains("\"terminal_reason\":\"aborted_streaming\"")
-                {
-                    skip = true;
-                } else if let Some(slim) = slim_result_frame(&line) {
-                    line = slim;
-                }
             }
         }
 
@@ -665,6 +667,18 @@ impl AgentAdapter for ClaudeAdapter {
 
         out
     }
+}
+
+/// claude's own top-level `result` frame, not a line that only nests a
+/// `"type":"result"` object (a tool's input, a `structured_output`). The
+/// substring keeps the parse off ordinary lines, which can be multi-MB.
+fn is_result_frame(line: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Frame {
+        r#type: String,
+    }
+    line.contains("\"type\":\"result\"")
+        && serde_json::from_str::<Frame>(line).is_ok_and(|f| f.r#type == "result")
 }
 
 /// The `result` row as written. Clients read only its `subtype` and
@@ -2759,6 +2773,28 @@ mod tests {
         ] {
             assert_eq!(result_row(line), line);
         }
+    }
+
+    /// Grep's file-type param, or any MCP tool's input, can carry a `type` key:
+    /// only claude's own result frame ends the turn.
+    #[test]
+    fn a_nested_result_type_does_not_end_the_turn() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_04","name":"Grep","input":{"pattern":"x","type":"result"}}]},"session_id":"s1"}"#;
+        assert_eq!(run(&mut a, line), vec![format!("Frame({line})")]);
+    }
+
+    #[test]
+    fn a_result_with_a_nested_system_type_ends_the_turn() {
+        let mut a = ClaudeAdapter::new();
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","structured_output":{"type":"system","subtype":"init","session_id":"s9"},"session_id":"s1"}"#;
+        assert_eq!(
+            run(&mut a, line),
+            vec![
+                "Result".to_string(),
+                r#"Frame({"type":"result","subtype":"success","is_error":false})"#.to_string(),
+            ]
+        );
     }
 
     #[test]
