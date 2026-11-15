@@ -368,6 +368,9 @@ pub enum AgentEvent {
         task_type: String,
         /// Backgrounded subagents only, e.g. `Explore`.
         subagent_type: Option<String>,
+        /// The call that started this run: the Agent call, or the
+        /// SendMessage that resumed it.
+        tool_use_id: Option<String>,
         /// Armed by a subagent: its end notifies that subagent, not the main
         /// session.
         owned_by_subagent: bool,
@@ -394,7 +397,11 @@ pub enum AgentEvent {
     /// Resident model only — claude started a turn for a cross-session
     /// `SendMessage` from the session named `name` (its replay echo carries
     /// `origin.kind == "peer"`). Busy like our own consumed turn.
-    PeerTurnConsumed { name: String, body: String },
+    PeerTurnConsumed {
+        name: String,
+        body: String,
+        sender: Option<PeerSender>,
+    },
     /// Resident model only — the CLI started a turn (`command_lifecycle`
     /// `started`) for this command uuid: one of our stdin turns, a peer's
     /// `SendMessage`, or a self-fired one (a `CronCreate` prompt) that is
@@ -428,6 +435,15 @@ pub enum AgentEvent {
     /// codex matches the completed `commandExecution`'s `command` (it has no
     /// standalone tool_result frame). See `crate::prune` flow.
     ToolResult,
+}
+
+/// Who sent a peer turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerSender {
+    /// Another session's process, kernel-verified.
+    Pid(u32),
+    /// One of the session's own background subagents, by agent id.
+    Agent(String),
 }
 
 pub trait AgentAdapter: Send + Sync {
@@ -1215,8 +1231,8 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             AgentEvent::CommandStarted { id, .. } => format!("CommandStarted({id})"),
             AgentEvent::CommandFinished(id) => format!("CommandFinished({id})"),
             AgentEvent::UserTurnConsumed(s) => format!("UserTurnConsumed({})", s),
-            AgentEvent::PeerTurnConsumed { name, body } => {
-                format!("PeerTurnConsumed({name}: {body})")
+            AgentEvent::PeerTurnConsumed { name, body, sender } => {
+                format!("PeerTurnConsumed({name}: {body}) from {sender:?}")
             }
             AgentEvent::TurnStarted(s) => format!("TurnStarted({})", s),
             AgentEvent::TurnBegan => "TurnBegan".to_string(),

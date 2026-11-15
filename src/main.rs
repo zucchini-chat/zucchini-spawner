@@ -610,6 +610,7 @@ pub(crate) async fn handle_agent_response(
     }
     match resp {
         AgentResponse::Line { topic, content } => {
+            let content = with_to_chat_ids(content, &topic, mirror, supervisor);
             send_agent_line(write_tx, mirror, &topic, content).await;
         }
         // Until the fresh session's id is harvested, usage is the aborted
@@ -745,7 +746,102 @@ pub(crate) async fn handle_agent_response(
                 retire_stale_prompt(&topic, mirror, supervisor, write_tx).await;
             }
         }
+        AgentResponse::PeerMessage {
+            topic,
+            name,
+            body,
+            sender,
+        } => {
+            let from = match &sender {
+                Some(adapter::PeerSender::Pid(pid)) => {
+                    same_user_peer(mirror, &topic, supervisor.resident_chat_of(*pid))
+                        .map(agent::PeerFrom::Chat)
+                }
+                Some(adapter::PeerSender::Agent(id)) => Some(agent::PeerFrom::Agent(id)),
+                None => None,
+            };
+            let row = agent::peer_message_frame_json(&name, &body, from);
+            send_agent_line(write_tx, mirror, &topic, row).await;
+        }
     }
+}
+
+/// `peer` when it is another chat of `chat`'s user: another user's chat id
+/// must not leak into `chat`'s rows.
+fn same_user_peer<'a>(mirror: &Mirror, chat: &str, peer: Option<&'a str>) -> Option<&'a str> {
+    let peer = peer?;
+    let (theirs, ours) = (mirror.chats.get(peer)?, mirror.chats.get(chat)?);
+    (peer != chat && theirs.user_id == ours.user_id).then_some(peer)
+}
+
+/// `line` plus `"to_chat_ids": {<SendMessage tool_use id>: <chat id>}` when it
+/// is an assistant frame whose `SendMessage` calls reach other live chats of
+/// `chat_id`'s user. The line's own bytes stay as they are.
+fn with_to_chat_ids(
+    mut line: String,
+    chat_id: &str,
+    mirror: &Mirror,
+    supervisor: &Supervisor,
+) -> String {
+    if !line.contains("\"SendMessage\"") {
+        return line;
+    }
+    let Some(frame) = serde_json::from_str::<serde_json::Value>(&line)
+        .ok()
+        .filter(|f| f["type"] == "assistant")
+    else {
+        return line;
+    };
+    let targets: std::collections::BTreeMap<&str, &str> = frame["message"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b["name"] == "SendMessage")
+        .filter_map(|b| {
+            let id = b["id"].as_str().filter(|id| !id.is_empty())?;
+            let target = send_message_target(&b["input"], chat_id, supervisor);
+            same_user_peer(mirror, chat_id, target).map(|target| (id, target))
+        })
+        .collect();
+    let Some(end) = line.rfind('}').filter(|_| !targets.is_empty()) else {
+        return line;
+    };
+    let targets = serde_json::to_string(&targets).expect("a string map serializes");
+    line.insert_str(end, &format!(",\"to_chat_ids\":{targets}"));
+    line
+}
+
+/// The chat whose live resident a `SendMessage` addresses: by socket address
+/// (`uds:<dir>/<pid>.sock`) or by session name, a ` [<ref>]` suffix dropped.
+/// A subagent and a subagent's parent (`main`) are no chats.
+fn send_message_target<'a>(
+    input: &serde_json::Value,
+    sender: &str,
+    supervisor: &'a Supervisor,
+) -> Option<&'a str> {
+    let to = input["to"].as_str()?;
+    if matches!(input["recipient_kind"].as_str(), Some("agent" | "main"))
+        || to == "main"
+        || is_agent_id(to)
+    {
+        return None;
+    }
+    if let Some(socket) = to.strip_prefix("uds:") {
+        let pid = Path::new(socket).file_name()?.to_str()?;
+        return supervisor.resident_chat_of(pid.strip_suffix(".sock")?.parse().ok()?);
+    }
+    let name = to
+        .strip_suffix(']')
+        .and_then(|to| to.rsplit_once(" ["))
+        .map_or(to, |(name, _)| name);
+    supervisor.resident_chat_named(name, sender)
+}
+
+/// Claude's agent ids: `a` and 16 lowercase hex digits.
+fn is_agent_id(to: &str) -> bool {
+    to.strip_prefix('a').is_some_and(|hex| {
+        hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// A chat whose agent outlived its row (its responses were queued before the
@@ -1711,7 +1807,7 @@ async fn deliver_daemon_message(
         anyhow::bail!("the chat's agent is busy");
     }
     let user_id = out.user_id;
-    let row = agent::peer_message_frame_json(&out.sender, &out.text);
+    let row = agent::peer_message_frame_json(&out.sender, &out.text, None);
     let _ = write_tx
         .send(WriteEvent::agent_line(chat_id.clone(), user_id, row))
         .await;
@@ -1933,7 +2029,7 @@ async fn reconcile_always_on(
             // The notice lists what still runs.
             mirror.take_reset_note_due(&chat_id);
         }
-        let row = agent::peer_message_frame_json(NOTICE_SENDER, &notice);
+        let row = agent::peer_message_frame_json(NOTICE_SENDER, &notice, None);
         let _ = write_tx
             .send(WriteEvent::agent_line(chat_id.clone(), user_id, row))
             .await;
@@ -6235,12 +6331,17 @@ mod tests {
         }
 
         fn message_rows(&mut self) -> Vec<serde_json::Value> {
+            self.message_contents()
+                .into_iter()
+                .map(|content| serde_json::from_str(&content).expect("message row is JSON"))
+                .collect()
+        }
+
+        fn message_contents(&mut self) -> Vec<String> {
             self.writes()
                 .into_iter()
                 .filter_map(|w| match w {
-                    WriteEvent::PutMessage { content, .. } => {
-                        Some(serde_json::from_str(&content).expect("message row is JSON"))
-                    }
+                    WriteEvent::PutMessage { content, .. } => Some(content),
                     _ => None,
                 })
                 .collect()
@@ -6419,6 +6520,180 @@ mod tests {
                 "body": "new_mail id=1",
             })]
         );
+    }
+
+    #[test]
+    fn a_peer_row_names_no_chat_the_mirror_lacks() {
+        let mut mirror = Mirror::default();
+        let chat = state::ChatState::default();
+        mirror.chats.insert("chat".into(), chat);
+        assert_eq!(same_user_peer(&mirror, "chat", Some("unknown")), None);
+        assert_eq!(same_user_peer(&mirror, "chat", None), None);
+        assert_eq!(same_user_peer(&mirror, "gone", Some("chat")), None);
+    }
+
+    /// Another live claude resident: a chat of `user_id`, session `name`,
+    /// process `pid`.
+    fn add_resident(c: &mut ResidentChat, user_id: Uuid, name: &str, pid: u32) -> String {
+        let chat_id = Uuid::now_v7().to_string();
+        let chat = state::ChatState {
+            user_id,
+            ..Default::default()
+        };
+        c.mirror.chats.insert(chat_id.clone(), chat);
+        let spawned = c.recorded.lock().unwrap()[0].clone();
+        c.supervisor.spawn_agent(SpawnRequest {
+            chat_id: chat_id.clone(),
+            session_name: Some(name.into()),
+            ..spawned
+        });
+        c.supervisor.live_sessions().lock().unwrap()[&chat_id]
+            .lock()
+            .unwrap()
+            .pid = Some(pid);
+        chat_id
+    }
+
+    /// The reader hands the peer turn to the main loop, which writes its row
+    /// naming the sender's chat only for another resident chat of the same
+    /// user, and a subagent sender's id as is.
+    #[tokio::test]
+    async fn a_peer_turn_writes_its_row_from_the_main_loop() {
+        use adapter::PeerSender;
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "hi")])
+            .await;
+        c.writes();
+        c.session().lock().unwrap().pid = Some(u32::MAX);
+        let user = c.user_id;
+        let mine = add_resident(&mut c, user, "mine", u32::MAX - 1);
+        add_resident(&mut c, Uuid::now_v7(), "theirs", u32::MAX - 2);
+        let agent_id = "a58a3d5d06fe9f1c9";
+        for (sender, link) in [
+            (PeerSender::Pid(u32::MAX), None),
+            (
+                PeerSender::Pid(u32::MAX - 1),
+                Some(("from_chat_id", &*mine)),
+            ),
+            (PeerSender::Pid(u32::MAX - 2), None),
+            (
+                PeerSender::Agent(agent_id.into()),
+                Some(("from_agent_id", agent_id)),
+            ),
+        ] {
+            c.respond(AgentResponse::PeerMessage {
+                topic: c.chat_id.clone(),
+                name: "zucchini-9d".into(),
+                body: "hi".into(),
+                sender: Some(sender.clone()),
+            })
+            .await;
+            let mut row = json!({
+                "type": "system",
+                "subtype": "peer_message",
+                "name": "zucchini-9d",
+                "body": "hi",
+            });
+            if let Some((key, id)) = link {
+                row[key] = id.into();
+            }
+            assert_eq!(c.message_rows(), vec![row], "{sender:?}");
+        }
+    }
+
+    /// What the main loop writes for the chat's stdout `line`.
+    async fn written_line(c: &mut ResidentChat, line: &str) -> String {
+        c.respond(AgentResponse::Line {
+            topic: c.chat_id.clone(),
+            content: line.into(),
+        })
+        .await;
+        let mut rows = c.message_contents();
+        assert_eq!(rows.len(), 1, "{line}");
+        rows.remove(0)
+    }
+
+    /// An assistant frame whose `SendMessage` reaches exactly one other live
+    /// chat of the same user maps the call to that chat.
+    #[tokio::test]
+    async fn a_send_message_to_another_chat_names_it() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.project(),
+            c.titled_chat(1, "me"),
+            c.message(1, "hi"),
+        ])
+        .await;
+        c.writes();
+        let user = c.user_id;
+        let worker = add_resident(&mut c, user, "worker", u32::MAX - 1);
+        let theirs_pid = u32::MAX - 2;
+        add_resident(&mut c, Uuid::now_v7(), "theirs", theirs_pid);
+        add_resident(&mut c, user, "twin", u32::MAX - 3);
+        add_resident(&mut c, user, "twin", u32::MAX - 4);
+        add_resident(&mut c, user, "shared", u32::MAX - 5);
+        add_resident(&mut c, Uuid::now_v7(), "shared", u32::MAX - 6);
+        add_resident(&mut c, user, "main", u32::MAX - 7);
+        add_resident(&mut c, user, "a4900146fa8f92f4f", u32::MAX - 8);
+        let socket = |pid: u32| format!("uds:/tmp/cc-socks/{pid}.sock");
+
+        for (input, target) in [
+            (
+                json!({ "to": "worker", "recipient_kind": "name" }),
+                Some(&worker),
+            ),
+            (json!({ "to": "worker [3fa9c1]" }), Some(&worker)),
+            (
+                json!({ "to": socket(u32::MAX - 1), "recipient_kind": "session" }),
+                Some(&worker),
+            ),
+            (json!({ "to": "theirs" }), None),
+            (json!({ "to": socket(theirs_pid) }), None),
+            (json!({ "to": "twin" }), None),
+            (json!({ "to": "shared" }), None),
+            (json!({ "to": "me" }), None),
+            (json!({ "to": "worker", "recipient_kind": "agent" }), None),
+            (json!({ "to": "worker", "recipient_kind": "main" }), None),
+            (json!({ "to": "main" }), None),
+            (json!({ "to": "a4900146fa8f92f4f" }), None),
+        ] {
+            let mut frame = json!({
+                "type": "assistant",
+                "message": { "content": [
+                    { "type": "tool_use", "id": "toolu_1", "name": "SendMessage", "input": input },
+                ] },
+            });
+            let line = frame.to_string();
+            let written = written_line(&mut c, &line).await;
+            match target {
+                Some(chat_id) => frame["to_chat_ids"] = json!({ "toolu_1": chat_id }),
+                None => assert_eq!(written, line),
+            }
+            assert_eq!(
+                written.parse::<serde_json::Value>().unwrap(),
+                frame,
+                "{line}"
+            );
+        }
+
+        let top = r#"{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_01","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_A","name":"SendMessage","input":{"to":"worker","message":"hi","recipient":"worker","recipient_kind":"name"}},{"type":"tool_use","id":"toolu_B","name":"SendMessage","input":{"to":"nobody","message":"hi"}}]},"parent_tool_use_id":null,"session_id":"s1","uuid":"u1"}"#;
+        let subagents = top.replace(
+            r#""parent_tool_use_id":null"#,
+            r#""parent_tool_use_id":"toolu_P""#,
+        );
+        for line in [top, &subagents] {
+            let written = written_line(&mut c, line).await;
+            assert!(
+                written.starts_with(line.strip_suffix('}').unwrap()),
+                "{written}"
+            );
+            let mut expected: serde_json::Value = line.parse().unwrap();
+            expected["to_chat_ids"] = json!({ "toolu_A": worker });
+            assert_eq!(written.parse::<serde_json::Value>().unwrap(), expected);
+        }
+
+        let text = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I will use SendMessage"}]},"uuid":"u2"}"#;
+        assert_eq!(written_line(&mut c, text).await, text);
     }
 
     fn notices(c: &ResidentChat) -> usize {
@@ -6641,6 +6916,7 @@ mod tests {
                 description: String::new(),
                 task_type: "bash".into(),
                 subagent_type: None,
+                tool_use_id: None,
                 started_at: 0,
                 owned_by_subagent: false,
                 backgrounded: true,

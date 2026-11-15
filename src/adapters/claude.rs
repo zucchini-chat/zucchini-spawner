@@ -19,8 +19,8 @@ use tracing::debug;
 use crate::adapter::{
     agent_capabilities_instructions, cli_argv, file_nonempty, probe_with_blocking_auth,
     push_posix_args, shell_escape, AdapterDescriptor, AgentAdapter, AgentEvent, AgentKind, CliArg,
-    LastTokensDedup, NativeSpawn, TurnContext, WorktreeInstructions, MAX_STREAM_FRAME_BYTES,
-    PRUNE_CONTEXT_INSTRUCTION_CLAUDE,
+    LastTokensDedup, NativeSpawn, PeerSender, TurnContext, WorktreeInstructions,
+    MAX_STREAM_FRAME_BYTES, PRUNE_CONTEXT_INSTRUCTION_CLAUDE,
 };
 
 /// Wired into `adapter::ADAPTERS`. See `adapter::AdapterDescriptor` for the
@@ -641,6 +641,7 @@ fn parse_replay_echo(line: &str) -> SmallVec<[AgentEvent; 2]> {
             smallvec::smallvec![AgentEvent::PeerTurnConsumed {
                 name: field("name"),
                 body: field("body"),
+                sender: peer_sender(&r.origin),
             }]
         }
         Some("task-notification") => smallvec::smallvec![
@@ -649,6 +650,21 @@ fn parse_replay_echo(line: &str) -> SmallVec<[AgentEvent; 2]> {
         ],
         _ => smallvec::smallvec![AgentEvent::UserTurnConsumed(r.uuid)],
     }
+}
+
+/// A cross-session peer has a verified pid; a background subagent of this
+/// session has its agent id in `senderTaskId`, else as a bare `from` (other
+/// `from`s are addresses: `uds:…`, `bridge:…`).
+fn peer_sender(origin: &serde_json::Value) -> Option<PeerSender> {
+    if let Some(pid) = origin["verifiedPeerPid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+    {
+        return Some(PeerSender::Pid(pid));
+    }
+    let id = |k: &str| origin[k].as_str().filter(|id| !id.is_empty());
+    let agent = id("senderTaskId").or_else(|| id("from").filter(|from| !from.contains(':')))?;
+    Some(PeerSender::Agent(agent.to_string()))
 }
 
 /// The `<task-id>`s a task-notification echo's content reports; a batched one
@@ -757,6 +773,8 @@ fn parse_task_started(line: &str) -> Option<AgentEvent> {
         #[serde(default)]
         subagent_type: Option<String>,
         #[serde(default)]
+        tool_use_id: Option<serde_json::Value>,
+        #[serde(default)]
         owned_by_subagent: Option<bool>,
         #[serde(default)]
         is_backgrounded: Option<bool>,
@@ -767,6 +785,10 @@ fn parse_task_started(line: &str) -> Option<AgentEvent> {
             description: f.description.unwrap_or_default(),
             task_type: f.task_type.unwrap_or_default(),
             subagent_type: f.subagent_type.filter(|s| !s.is_empty()),
+            tool_use_id: match f.tool_use_id {
+                Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id),
+                _ => None,
+            },
             owned_by_subagent: f.owned_by_subagent.unwrap_or_default(),
             backgrounded: f.is_backgrounded.unwrap_or(true),
         }),
@@ -2029,6 +2051,7 @@ mod tests {
                 description,
                 task_type,
                 subagent_type,
+                tool_use_id,
                 owned_by_subagent,
                 backgrounded,
             }) => {
@@ -2036,23 +2059,42 @@ mod tests {
                 assert_eq!(description, "npm test -- --watch");
                 assert_eq!(task_type, "local_bash");
                 assert_eq!(subagent_type, None);
+                assert_eq!(tool_use_id.as_deref(), Some("tu9"));
                 assert!(!owned_by_subagent);
                 assert!(backgrounded, "a frame without is_backgrounded");
             }
             other => panic!("expected TaskStarted, got {other:?}"),
         }
 
-        let subagent = r#"{"type":"system","subtype":"task_started","task_id":"a3bc46a79","description":"count tmp files","subagent_type":"Explore","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"Count the files"}"#;
+        let subagent = r#"{"type":"system","subtype":"task_started","task_id":"a3bc46a792bfa348e","tool_use_id":"toolu_01AguPkHLbQEJqzfFLSeWJcs","description":"count tmp files","subagent_type":"Explore","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"Count the files directly inside /tmp and report just the number.","uuid":"a691cae8-a8f2-49c5-9379-2619617af188","session_id":"fe4edcc3-4237-4893-a3a9-828fba6f0856"}"#;
         match a.handle_line(subagent.to_string()).into_iter().next() {
             Some(AgentEvent::TaskStarted {
                 task_type,
                 subagent_type,
+                tool_use_id,
                 ..
             }) => {
                 assert_eq!(task_type, "local_agent");
                 assert_eq!(subagent_type.as_deref(), Some("Explore"));
+                assert_eq!(
+                    tool_use_id.as_deref(),
+                    Some("toolu_01AguPkHLbQEJqzfFLSeWJcs")
+                );
             }
             other => panic!("expected TaskStarted, got {other:?}"),
+        }
+
+        for line in [
+            r#"{"type":"system","subtype":"task_started","task_id":"a3bc46a79","task_type":"local_agent"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a3bc46a79","tool_use_id":"","task_type":"local_agent"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a3bc46a79","tool_use_id":42,"task_type":"local_agent"}"#,
+        ] {
+            match a.handle_line(line.to_string()).into_iter().next() {
+                Some(AgentEvent::TaskStarted { tool_use_id, .. }) => {
+                    assert_eq!(tool_use_id, None, "{line}");
+                }
+                other => panic!("expected TaskStarted, got {other:?}"),
+            }
         }
     }
 
@@ -2265,8 +2307,63 @@ mod tests {
         let line = r#"{"type":"user","message":{"role":"user","content":"Another Claude session sent a message:\n<cross-session-message from=\"uds:/tmp/cc-socks/95696.sock\" from-name=\"zucchini-9d\" from-mode=\"bypass\">\nProbe question 2: what is 6 x 7? Reply to me via SendMessage.\n</cross-session-message>"},"session_id":"011e1e77-dbc3-44e8-b423-06b9379903f5","parent_tool_use_id":null,"uuid":"153cc7ac-438d-4e49-a41e-2ab0afbaf756","timestamp":"2026-09-10T15:28:41.059Z","isReplay":true,"isSynthetic":true,"origin":{"kind":"peer","from":"uds:/tmp/cc-socks/95696.sock","verifiedPeerPid":95696,"msg_id":"a2abd1f2-a0c3-4ff6-a3f6-8940043e28e4","name":"zucchini-9d","fromMode":"bypass","body":"Probe question 2: what is 6 x 7? Reply to me via SendMessage."}}"#;
         assert_eq!(
             run(&mut a, line),
-            vec!["PeerTurnConsumed(zucchini-9d: Probe question 2: what is 6 x 7? Reply to me via SendMessage.)"]
+            vec!["PeerTurnConsumed(zucchini-9d: Probe question 2: what is 6 x 7? Reply to me via SendMessage.) from Some(Pid(95696))"]
         );
+    }
+
+    /// Real claude 2.1.325 shape: a background subagent's `SendMessage` to
+    /// "main" is echoed with its agent id and no pid.
+    #[test]
+    fn a_subagent_echo_names_its_agent_id() {
+        let line = r#"{"type":"user","message":{"role":"user","content":"probe-ping"},"parent_tool_use_id":null,"uuid":"287db8b1-ebe8-4151-b198-5b0a9298faef","isReplay":true,"origin":{"kind":"peer","from":"a58a3d5d06fe9f1c9","senderTaskId":"a58a3d5d06fe9f1c9","name":"general-purpose","body":"probe-ping"}}"#;
+        assert_eq!(
+            run(&mut ClaudeAdapter::new(), line),
+            vec![
+                r#"PeerTurnConsumed(general-purpose: probe-ping) from Some(Agent("a58a3d5d06fe9f1c9"))"#
+            ]
+        );
+    }
+
+    #[test]
+    fn a_peer_echo_falls_back_to_a_bare_from() {
+        for (from, sender) in [
+            (
+                r#""a58a3d5d06fe9f1c9""#,
+                r#"Some(Agent("a58a3d5d06fe9f1c9"))"#,
+            ),
+            (r#""uds:/tmp/cc-socks/95696.sock""#, "None"),
+            (r#""bridge:session_01abc""#, "None"),
+            (r#""""#, "None"),
+        ] {
+            let line = format!(
+                r#"{{"type":"user","uuid":"u1","isReplay":true,"origin":{{"kind":"peer","name":"p","body":"b","from":{from}}}}}"#
+            );
+            assert_eq!(
+                run(&mut ClaudeAdapter::new(), &line),
+                vec![format!("PeerTurnConsumed(p: b) from {sender}")],
+                "{from}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_echo_without_a_valid_pid_has_no_sender() {
+        for pid in [
+            "",
+            r#","verifiedPeerPid":"95696""#,
+            r#","verifiedPeerPid":-1"#,
+            r#","verifiedPeerPid":1.5"#,
+            r#","verifiedPeerPid":4294967296"#,
+        ] {
+            let line = format!(
+                r#"{{"type":"user","uuid":"u1","isReplay":true,"origin":{{"kind":"peer","name":"p","body":"b"{pid}}}}}"#
+            );
+            assert_eq!(
+                run(&mut ClaudeAdapter::new(), &line),
+                vec!["PeerTurnConsumed(p: b) from None"],
+                "{pid}"
+            );
+        }
     }
 
     fn system_prompt_arg(argv: &[String]) -> &str {

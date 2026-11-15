@@ -309,6 +309,11 @@ pub fn process_group_exists(_pgid: u32) -> bool {
     false
 }
 
+/// A job object is no process group: only the exact pid matches.
+pub fn process_group_of(_pid: u32) -> Option<u32> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Memory measurement (warm-keep eviction, `warm.rs`)
 // ---------------------------------------------------------------------------

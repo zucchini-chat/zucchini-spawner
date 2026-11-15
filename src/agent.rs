@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::adapter::{AgentEvent, AgentKind, TurnContext};
+use crate::adapter::{AgentEvent, AgentKind, PeerSender, TurnContext};
 use crate::envelope::{EnvelopeAttachment, MessageEnvelope};
 use crate::prune::PendingPrunes;
 use crate::sys;
@@ -216,6 +216,9 @@ pub struct LiveTask {
     pub description: String,
     pub task_type: String,
     pub subagent_type: Option<String>,
+    /// Of the task's current run (`AgentEvent::TaskStarted`). Published for
+    /// subagents only.
+    pub tool_use_id: Option<String>,
     /// Epoch milliseconds.
     pub started_at: i64,
     /// Armed by a subagent, so its end owes this session nothing. Not
@@ -478,15 +481,19 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
             description,
             task_type,
             subagent_type,
+            tool_use_id,
             owned_by_subagent,
             backgrounded,
         } => {
-            if !state.live_tasks.iter().any(|t| &t.id == id) {
+            if let Some(task) = state.live_tasks.iter_mut().find(|t| &t.id == id) {
+                task.tool_use_id = tool_use_id.clone();
+            } else {
                 state.live_tasks.push(LiveTask {
                     id: id.clone(),
                     description: description.clone(),
                     task_type: task_type.clone(),
                     subagent_type: subagent_type.clone(),
+                    tool_use_id: tool_use_id.clone(),
                     started_at: now_epoch_ms(),
                     owned_by_subagent: *owned_by_subagent,
                     backgrounded: *backgrounded,
@@ -544,7 +551,8 @@ const MAX_LIVE_TASK_DESCRIPTION_CHARS: usize = 200;
 /// The PLAINTEXT `chats.live_tasks` blob for a session — `{"t":[…],"q":N}` —
 /// or `None` (⇒ column NULL) when nothing is armed and no user turn is queued.
 /// `t` is omitted when empty, `q` when 0; per task `i` id, `d` description,
-/// `k` kind, `a` subagent type (omitted when absent), `s0` start epoch ms.
+/// `k` kind, `a` subagent type (omitted when absent), `c` a subagent's
+/// `tool_use_id` (omitted when unknown), `s0` start epoch ms.
 /// The prompts themselves never ride along: they're already in the timeline as
 /// user bubbles right above the pill.
 pub fn live_tasks_payload(state: &SessionState) -> Option<String> {
@@ -590,6 +598,7 @@ pub fn live_tasks_with_daemon_tasks(
             description: w.description.clone(),
             task_type: "watch".to_string(),
             subagent_type: None,
+            tool_use_id: None,
             started_at: w.created_at.saturating_mul(1000),
             owned_by_subagent: false,
             backgrounded: false,
@@ -620,6 +629,9 @@ fn live_task_json(task: &LiveTask) -> serde_json::Value {
     obj.insert("k".to_string(), serde_json::json!(kind));
     if let Some(subagent) = &task.subagent_type {
         obj.insert("a".to_string(), serde_json::json!(subagent));
+    }
+    if let (Some(call), "local_agent") = (&task.tool_use_id, task.task_type.as_str()) {
+        obj.insert("c".to_string(), serde_json::json!(call));
     }
     obj.insert("s0".to_string(), serde_json::json!(task.started_at));
     serde_json::Value::Object(obj)
@@ -660,15 +672,28 @@ pub enum LiveTasksChange {
 
 /// Spawner-synthesized message row for a turn the user didn't send: another
 /// claude session's `SendMessage`, or a watch (`watch.rs`). Older clients hide
-/// unknown system subtypes.
-pub fn peer_message_frame_json(name: &str, body: &str) -> String {
-    serde_json::json!({
+/// unknown system subtypes. `from` links the row to its sender.
+pub fn peer_message_frame_json(name: &str, body: &str, from: Option<PeerFrom<'_>>) -> String {
+    let mut frame = serde_json::json!({
         "type": "system",
         "subtype": "peer_message",
         "name": name,
         "body": body,
-    })
-    .to_string()
+    });
+    match from {
+        Some(PeerFrom::Chat(id)) => frame["from_chat_id"] = id.into(),
+        Some(PeerFrom::Agent(id)) => frame["from_agent_id"] = id.into(),
+        None => {}
+    }
+    frame.to_string()
+}
+
+/// The sender a `peer_message` row links to.
+pub enum PeerFrom<'a> {
+    /// Another chat of the receiving chat's user.
+    Chat(&'a str),
+    /// A background subagent of the receiving chat's session.
+    Agent(&'a str),
 }
 
 /// Dropped while the internal `/rename` turn's suppression window is open: its
@@ -966,6 +991,15 @@ pub enum AgentResponse {
     TurnEnded {
         topic: String,
     },
+    /// RESIDENT path only — another session's `SendMessage` started a turn
+    /// (`AgentEvent::PeerTurnConsumed`). The main loop writes its
+    /// `peer_message` row, naming the sender when it can.
+    PeerMessage {
+        topic: String,
+        name: String,
+        body: String,
+        sender: Option<PeerSender>,
+    },
 }
 
 impl AgentResponse {
@@ -980,6 +1014,7 @@ impl AgentResponse {
             | AgentResponse::ToolResult { topic }
             | AgentResponse::TurnEnded { topic }
             | AgentResponse::TurnRunning { topic, .. }
+            | AgentResponse::PeerMessage { topic, .. }
             | AgentResponse::LiveTasks { topic, .. } => topic,
         }
     }
@@ -1587,6 +1622,40 @@ impl Supervisor {
     /// `session` is the chat's live resident session.
     pub fn is_current_session(&self, topic: &str, session: &Arc<StdMutex<SessionState>>) -> bool {
         matches!(self.agents.get(topic), Some(AgentEntry::Resident(s)) if Arc::ptr_eq(&s.state, session))
+    }
+
+    /// The chat whose live resident is process `pid` or its process group
+    /// (claude may run under the login shell, in the group it leads).
+    pub fn resident_chat_of(&self, pid: u32) -> Option<&str> {
+        let group = sys::process_group_of(pid);
+        self.live_residents().find_map(|(topic, _, leader)| {
+            let leader = leader?;
+            (leader == pid || group == Some(leader)).then_some(topic)
+        })
+    }
+
+    /// The one chat other than `sender` whose live resident goes by session
+    /// `name`; `None` when none or several do.
+    pub fn resident_chat_named(&self, name: &str, sender: &str) -> Option<&str> {
+        let mut named = self.live_residents().filter_map(|(topic, s, _)| {
+            (topic != sender
+                && s.asked_name.as_deref() == Some(name)
+                && s.knobs.agent_kind.make_adapter().names_session())
+            .then_some(topic)
+        });
+        let only = named.next()?;
+        named.next().is_none().then_some(only)
+    }
+
+    /// Residents whose reader runs and whose session is open, with their pid.
+    fn live_residents(&self) -> impl Iterator<Item = (&str, &ResidentSession, Option<u32>)> {
+        self.agents.iter().filter_map(|(topic, entry)| {
+            let AgentEntry::Resident(s) = entry else {
+                return None;
+            };
+            let st = s.state.lock().expect("SessionState mutex");
+            (!s.reader.is_finished() && !st.closed).then_some((topic.as_str(), s, st.pid))
+        })
     }
 
     /// Residents kept warm past their idle edge with nothing pending, by topic.
@@ -2627,9 +2696,8 @@ fn default_resident_spawn_fn(
                                             AgentEvent::ToolResult => {
                                                 send_or_cancel!(AgentResponse::ToolResult { topic: topic.clone() });
                                             }
-                                            AgentEvent::PeerTurnConsumed { name, body } => {
-                                                let content = peer_message_frame_json(&name, &body);
-                                                send_or_cancel!(AgentResponse::Line { topic: topic.clone(), content });
+                                            AgentEvent::PeerTurnConsumed { name, body, sender } => {
+                                                send_or_cancel!(AgentResponse::PeerMessage { topic: topic.clone(), name, body, sender });
                                             }
                                             // Run-state-bearing events (Result/TaskStarted/
                                             // TaskFinished) already updated the FSM via
@@ -3089,6 +3157,7 @@ pub(crate) fn task_started(id: &str) -> AgentEvent {
         description: format!("{id} description"),
         task_type: "local_bash".into(),
         subagent_type: None,
+        tool_use_id: None,
         owned_by_subagent: false,
         backgrounded: true,
     }
@@ -3102,6 +3171,7 @@ pub(crate) fn subagent_started(id: &str) -> AgentEvent {
         description: format!("{id} description"),
         task_type: "local_agent".into(),
         subagent_type: Some("general-purpose".into()),
+        tool_use_id: None,
         owned_by_subagent: false,
         backgrounded: true,
     }
@@ -3115,6 +3185,7 @@ pub(crate) fn live_task(id: &str) -> LiveTask {
         description: format!("{id} description"),
         task_type: "local_bash".into(),
         subagent_type: None,
+        tool_use_id: None,
         started_at: 1_780_886_492_000,
         owned_by_subagent: false,
         backgrounded: true,
@@ -3154,7 +3225,8 @@ mod reduce_tests {
         ends_turn, internal_turn_swallows, live_task, live_tasks_payload,
         live_tasks_with_daemon_tasks, next_wake_deadline, peer_message_frame_json, reduce,
         subagent_started, task_started, test_frames_to_write as frames_to_write, AgentEvent,
-        LiveTask, LiveTasksChange, LiveTasksDedup, QueuedTurn, SessionState, WatchDef,
+        LiveTask, LiveTasksChange, LiveTasksDedup, PeerFrom, PeerSender, QueuedTurn, SessionState,
+        WatchDef,
     };
     use std::collections::HashSet;
 
@@ -3232,6 +3304,7 @@ mod reduce_tests {
             &AgentEvent::PeerTurnConsumed {
                 name: "peer".into(),
                 body: "hi".into(),
+                sender: None,
             },
         );
         assert!(s.in_foreground());
@@ -3273,8 +3346,8 @@ mod reduce_tests {
 
     /// The exact plaintext blob three clients parse. Kinds map `local_bash` →
     /// `bash` and `local_agent` → `agent`, an unknown kind rides verbatim, `a`
-    /// is present only for a subagent, and `q` is omitted when no user turn is
-    /// queued.
+    /// and `c` are present only for a subagent, and `q` is omitted when no user
+    /// turn is queued.
     #[test]
     fn live_tasks_blob_is_the_documented_wire_shape() {
         let mut s = SessionState::default();
@@ -3285,6 +3358,7 @@ mod reduce_tests {
                 description: "npm test -- --watch".into(),
                 task_type: "local_bash".into(),
                 subagent_type: None,
+                tool_use_id: Some("toolu_bash".into()),
                 owned_by_subagent: false,
                 backgrounded: true,
             },
@@ -3296,6 +3370,7 @@ mod reduce_tests {
                 description: "count tmp files".into(),
                 task_type: "local_agent".into(),
                 subagent_type: Some("Explore".into()),
+                tool_use_id: Some("toolu_agent".into()),
                 owned_by_subagent: false,
                 backgrounded: true,
             },
@@ -3307,6 +3382,7 @@ mod reduce_tests {
                 description: String::new(),
                 task_type: "local_future_kind".into(),
                 subagent_type: None,
+                tool_use_id: Some("toolu_weird".into()),
                 owned_by_subagent: true,
                 backgrounded: true,
             },
@@ -3317,9 +3393,11 @@ mod reduce_tests {
         assert_eq!(blob["t"][0]["d"], "npm test -- --watch");
         assert_eq!(blob["t"][0]["k"], "bash");
         assert!(blob["t"][0].get("a").is_none(), "no subagent, no `a`");
+        assert!(blob["t"][0].get("c").is_none(), "no subagent, no `c`");
         assert!(blob["t"][0]["s0"].as_i64().unwrap() > 1_700_000_000_000);
         assert_eq!(blob["t"][1]["k"], "agent");
         assert_eq!(blob["t"][1]["a"], "Explore");
+        assert_eq!(blob["t"][1]["c"], "toolu_agent");
         assert_eq!(
             blob["t"][2]["k"], "local_future_kind",
             "unknown kind rides verbatim"
@@ -3328,9 +3406,34 @@ mod reduce_tests {
         assert_eq!(
             blob["t"][2].as_object().expect("object").len(),
             4,
-            "ownership is not published"
+            "neither ownership nor an unknown kind's `c` is published"
         );
         assert!(blob.get("q").is_none(), "no queued user turn, no `q`");
+    }
+
+    /// A SendMessage resuming a subagent re-sends `task_started` with the same
+    /// task id and its own call id: the entry stays one and takes the new `c`.
+    #[test]
+    fn a_restarted_subagent_keeps_its_entry_and_takes_the_new_call_id() {
+        let started = |description: &str, call: &str| AgentEvent::TaskStarted {
+            id: "a3bc46a79".into(),
+            description: description.into(),
+            task_type: "local_agent".into(),
+            subagent_type: Some("Explore".into()),
+            tool_use_id: Some(call.into()),
+            owned_by_subagent: false,
+            backgrounded: true,
+        };
+        let mut s = SessionState::default();
+        reduce(&mut s, &started("count tmp files", "toolu_agent"));
+        let first_start = s.live_tasks[0].started_at;
+        reduce(&mut s, &started("continue counting", "toolu_send_message"));
+        let blob: serde_json::Value =
+            serde_json::from_str(&live_tasks_payload(&s).expect("armed")).expect("valid JSON");
+        assert_eq!(blob["t"].as_array().expect("array").len(), 1);
+        assert_eq!(blob["t"][0]["d"], "count tmp files");
+        assert_eq!(blob["t"][0]["s0"], first_start);
+        assert_eq!(blob["t"][0]["c"], "toolu_send_message");
     }
 
     /// Nothing armed and nothing queued ⇒ the column is NULL, never an empty
@@ -3862,6 +3965,7 @@ mod reduce_tests {
             description: String::new(),
             task_type: "local_bash".into(),
             subagent_type: None,
+            tool_use_id: None,
             owned_by_subagent: false,
             backgrounded: false,
         };
@@ -3887,6 +3991,7 @@ mod reduce_tests {
             description: "Check gbuild issues".into(),
             task_type: "local_bash".into(),
             subagent_type: None,
+            tool_use_id: None,
             owned_by_subagent: true,
             backgrounded: true,
         };
@@ -4087,6 +4192,7 @@ mod reduce_tests {
         let peer = AgentEvent::PeerTurnConsumed {
             name: "zucchini-9d".into(),
             body: "what is 6 x 7?".into(),
+            sender: Some(PeerSender::Pid(95696)),
         };
         reduce(&mut s, &peer);
         assert!(s.turn_in_flight && s.running());
@@ -4136,6 +4242,7 @@ mod reduce_tests {
             AgentEvent::PeerTurnConsumed {
                 name: "zucchini-9d".into(),
                 body: "hi".into(),
+                sender: None,
             },
         ] {
             let mut s = renaming("r1");
@@ -4215,17 +4322,23 @@ mod reduce_tests {
 
     #[test]
     fn peer_message_frame_is_a_system_row() {
-        let v: serde_json::Value =
-            serde_json::from_str(&peer_message_frame_json("zucchini-9d", "hi \"there\"")).unwrap();
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "type": "system",
-                "subtype": "peer_message",
-                "name": "zucchini-9d",
-                "body": "hi \"there\"",
-            })
-        );
+        let mut v = serde_json::json!({
+            "type": "system",
+            "subtype": "peer_message",
+            "name": "zucchini-9d",
+            "body": "hi \"there\"",
+        });
+        let frame = |from| {
+            peer_message_frame_json("zucchini-9d", "hi \"there\"", from)
+                .parse::<serde_json::Value>()
+                .unwrap()
+        };
+        assert_eq!(frame(None), v);
+        let mut from_chat = v.clone();
+        from_chat["from_chat_id"] = "c1".into();
+        assert_eq!(frame(Some(PeerFrom::Chat("c1"))), from_chat);
+        v["from_agent_id"] = "a58a3d5d06fe9f1c9".into();
+        assert_eq!(frame(Some(PeerFrom::Agent("a58a3d5d06fe9f1c9"))), v);
     }
 }
 
@@ -4394,6 +4507,41 @@ mod live_session_tests {
             text.contains("current local time") && text.ends_with("second"),
             "{text}"
         );
+    }
+
+    /// A peer's pid finds the open resident that is it or leads its group.
+    #[tokio::test]
+    async fn a_peer_pid_finds_its_open_resident() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(claude_req("exact"));
+        let exact = Arc::clone(&exposed.lock().unwrap()["exact"]);
+        exact.lock().unwrap().pid = Some(u32::MAX);
+        assert_eq!(sup.resident_chat_of(u32::MAX), Some("exact"));
+        assert_eq!(sup.resident_chat_of(u32::MAX - 1), None);
+        exact.lock().unwrap().closed = true;
+        assert_eq!(sup.resident_chat_of(u32::MAX), None, "closed");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let sleep_in = |group: u32| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .process_group(i32::try_from(group).unwrap())
+                    .spawn()
+                    .unwrap()
+            };
+            let mut leader = sleep_in(0);
+            let mut member = sleep_in(leader.id());
+            sup.spawn_agent(claude_req("group"));
+            exposed.lock().unwrap()["group"].lock().unwrap().pid = Some(leader.id());
+            assert_ne!(member.id(), leader.id());
+            assert_eq!(sup.resident_chat_of(member.id()), Some("group"));
+            for child in [&mut member, &mut leader] {
+                child.kill().unwrap();
+                child.wait().unwrap();
+            }
+        }
     }
 
     /// Only a resident past its idle edge with nothing pending is evictable,
@@ -5196,6 +5344,7 @@ mod cli_smoke {
             AgentResponse::LiveTasks { tasks, .. } => format!("LiveTasks {tasks:?}"),
             AgentResponse::TurnEnded { .. } => "TurnEnded".to_string(),
             AgentResponse::TurnRunning { running, .. } => format!("TurnRunning {running}"),
+            AgentResponse::PeerMessage { name, body, .. } => format!("PeerMessage {name}: {body}"),
         }
     }
 

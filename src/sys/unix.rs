@@ -202,6 +202,14 @@ pub fn process_group_exists(pgid: u32) -> bool {
     nix_pid(pgid).and_then(|pgid| signal::killpg(pgid, None)) != Err(Errno::ESRCH)
 }
 
+/// The process group of the live process `pid`. Never pid 0, which
+/// `getpgid` reads as the calling process.
+pub fn process_group_of(pid: u32) -> Option<u32> {
+    let pid = libc::pid_t::try_from(pid).ok().filter(|&pid| pid > 0)?;
+    // SAFETY: no pointers; an unknown pid is an error return.
+    u32::try_from(unsafe { libc::getpgid(pid) }).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Memory measurement (warm-keep eviction, `warm.rs`)
 // ---------------------------------------------------------------------------
