@@ -1685,6 +1685,21 @@ impl Supervisor {
         })
     }
 
+    /// The chat whose live resident listens on peer `socket`, by claude's
+    /// session registry (`<sessions>/<pid>.json`): a Windows pipe name
+    /// carries no pid.
+    pub fn resident_chat_at_socket(
+        &self,
+        socket: &str,
+        sessions: &std::path::Path,
+    ) -> Option<&str> {
+        self.live_residents().find_map(|(topic, _, pid)| {
+            let entry = std::fs::read(sessions.join(format!("{}.json", pid?))).ok()?;
+            let entry: serde_json::Value = serde_json::from_slice(&entry).ok()?;
+            (entry["messagingSocketPath"] == socket).then_some(topic)
+        })
+    }
+
     /// The one chat other than `sender` whose live resident goes by session
     /// `name`; `None` when none or several do.
     pub fn resident_chat_named(&self, name: &str, sender: &str) -> Option<&str> {

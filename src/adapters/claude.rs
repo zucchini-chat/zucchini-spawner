@@ -706,9 +706,10 @@ fn parse_replay_echo(line: &str) -> SmallVec<[AgentEvent; 2]> {
     }
 }
 
-/// A cross-session peer has a verified pid; a background subagent of this
-/// session has its agent id in `senderTaskId`, else as a bare `from` (other
-/// `from`s are addresses: `uds:…`, `bridge:…`).
+/// A cross-session peer has a verified pid, else (Windows) its `uds:…`
+/// address; a background subagent of this session has its agent id in
+/// `senderTaskId`, else as a bare `from` (other `from`s are addresses:
+/// `uds:…`, `bridge:…`).
 fn peer_sender(origin: &serde_json::Value) -> Option<PeerSender> {
     if let Some(pid) = origin["verifiedPeerPid"]
         .as_u64()
@@ -717,8 +718,14 @@ fn peer_sender(origin: &serde_json::Value) -> Option<PeerSender> {
         return Some(PeerSender::Pid(pid));
     }
     let id = |k: &str| origin[k].as_str().filter(|id| !id.is_empty());
-    let agent = id("senderTaskId").or_else(|| id("from").filter(|from| !from.contains(':')))?;
-    Some(PeerSender::Agent(agent.to_string()))
+    if let Some(agent) = id("senderTaskId") {
+        return Some(PeerSender::Agent(agent.to_string()));
+    }
+    let from = id("from")?;
+    if from.starts_with("uds:") {
+        return Some(PeerSender::Address(from.to_string()));
+    }
+    (!from.contains(':')).then(|| PeerSender::Agent(from.to_string()))
 }
 
 /// The `<task-id>`s a task-notification echo's content reports; a batched one
@@ -2397,7 +2404,14 @@ mod tests {
                 r#""a58a3d5d06fe9f1c9""#,
                 r#"Some(Agent("a58a3d5d06fe9f1c9"))"#,
             ),
-            (r#""uds:/tmp/cc-socks/95696.sock""#, "None"),
+            (
+                r#""uds:/tmp/cc-socks/95696.sock""#,
+                r#"Some(Address("uds:/tmp/cc-socks/95696.sock"))"#,
+            ),
+            (
+                r#""uds:\\\\.\\pipe\\LOCAL\\cc-msg-fd99""#,
+                r#"Some(Address("uds:\\\\.\\pipe\\LOCAL\\cc-msg-fd99"))"#,
+            ),
             (r#""bridge:session_01abc""#, "None"),
             (r#""""#, "None"),
         ] {

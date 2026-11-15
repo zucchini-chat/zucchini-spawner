@@ -758,6 +758,12 @@ pub(crate) async fn handle_agent_response(
                     same_user_peer(mirror, &topic, supervisor.resident_chat_of(*pid))
                         .map(agent::PeerFrom::Chat)
                 }
+                Some(adapter::PeerSender::Address(address)) => same_user_peer(
+                    mirror,
+                    &topic,
+                    resident_chat_at_address(address, supervisor),
+                )
+                .map(agent::PeerFrom::Chat),
                 Some(adapter::PeerSender::Agent(id)) => Some(agent::PeerFrom::Agent(id)),
                 None => None,
             };
@@ -813,8 +819,9 @@ fn with_to_chat_ids(
 }
 
 /// The chat whose live resident a `SendMessage` addresses: by socket address
-/// (`uds:<dir>/<pid>.sock`) or by session name, a ` [<ref>]` suffix dropped.
-/// A subagent and a subagent's parent (`main`) are no chats.
+/// (`uds:<dir>/<pid>.sock`, on Windows `uds:\\.\pipe\…`) or by session name,
+/// a ` [<ref>]` suffix dropped. A subagent and a subagent's parent (`main`)
+/// are no chats.
 fn send_message_target<'a>(
     input: &serde_json::Value,
     sender: &str,
@@ -827,11 +834,26 @@ fn send_message_target<'a>(
     {
         return None;
     }
-    if let Some(socket) = to.strip_prefix("uds:") {
-        let pid = Path::new(socket).file_name()?.to_str()?;
-        return supervisor.resident_chat_of(pid.strip_suffix(".sock")?.parse().ok()?);
+    if to.starts_with("uds:") {
+        return resident_chat_at_address(to, supervisor);
     }
     supervisor.resident_chat_named(session_name::without_ref(to), sender)
+}
+
+/// The chat whose live resident listens on peer `address`:
+/// `uds:<dir>/<pid>.sock`, or on Windows `uds:\\.\pipe\…`.
+fn resident_chat_at_address<'a>(address: &str, supervisor: &'a Supervisor) -> Option<&'a str> {
+    let socket = address.strip_prefix("uds:")?;
+    let pid = Path::new(socket)
+        .file_name()
+        .and_then(|name| name.to_str()?.strip_suffix(".sock"));
+    match pid {
+        Some(pid) => supervisor.resident_chat_of(pid.parse().ok()?),
+        None => {
+            let sessions = AgentKind::Claude.cli_home()?.join("sessions");
+            supervisor.resident_chat_at_socket(socket, &sessions)
+        }
+    }
 }
 
 /// Claude's agent ids: `a` and 16 lowercase hex digits.
@@ -6584,6 +6606,14 @@ mod tests {
             ),
             (PeerSender::Pid(u32::MAX - 2), None),
             (
+                PeerSender::Address(format!("uds:/tmp/cc-socks/{}.sock", u32::MAX - 1)),
+                Some(("from_chat_id", &*mine)),
+            ),
+            (
+                PeerSender::Address(format!("uds:/tmp/cc-socks/{}.sock", u32::MAX - 2)),
+                None,
+            ),
+            (
                 PeerSender::Agent(agent_id.into()),
                 Some(("from_agent_id", agent_id)),
             ),
@@ -6701,6 +6731,40 @@ mod tests {
 
         let text = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I will use SendMessage"}]},"uuid":"u2"}"#;
         assert_eq!(written_line(&mut c, text).await, text);
+    }
+
+    /// A Windows peer address is a pipe with no pid; claude's session registry
+    /// names the pid that listens on it.
+    #[tokio::test]
+    async fn a_pipe_address_maps_to_the_resident_the_registry_names() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "hi")])
+            .await;
+        let user = c.user_id;
+        let worker_pid = u32::MAX - 1;
+        let worker = add_resident(&mut c, user, "worker", worker_pid);
+        add_resident(&mut c, user, "other", u32::MAX - 2);
+        let sessions = std::env::temp_dir().join(format!("zucc-sessions-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&sessions).unwrap();
+        let pipe = r"\\.\pipe\LOCAL\cc-msg-e915cb83982ba4178b3b08599c6b4e4d";
+        let entry = json!({ "pid": worker_pid, "messagingSocketPath": pipe });
+        std::fs::write(
+            sessions.join(format!("{worker_pid}.json")),
+            entry.to_string(),
+        )
+        .unwrap();
+        std::fs::write(sessions.join(format!("{}.json", u32::MAX - 2)), "not json").unwrap();
+
+        assert_eq!(
+            c.supervisor.resident_chat_at_socket(pipe, &sessions),
+            Some(worker.as_str())
+        );
+        let unknown = r"\\.\pipe\LOCAL\cc-msg-00000000000000000000000000000000";
+        assert_eq!(
+            c.supervisor.resident_chat_at_socket(unknown, &sessions),
+            None
+        );
+        std::fs::remove_dir_all(&sessions).unwrap();
     }
 
     fn notices(c: &ResidentChat) -> usize {

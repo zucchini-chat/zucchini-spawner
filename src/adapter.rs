@@ -451,6 +451,9 @@ pub enum AgentEvent {
 pub enum PeerSender {
     /// Another session's process, kernel-verified.
     Pid(u32),
+    /// Another session's peer socket as it claims it (`uds:…`), when no pid
+    /// was verified: claude verifies none on Windows.
+    Address(String),
     /// One of the session's own background subagents, by agent id.
     Agent(String),
 }
