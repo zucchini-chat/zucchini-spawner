@@ -838,7 +838,7 @@ pub const TUNNEL_INSTRUCTION: &str =
 
 /// An agent-suggested chat (`suggest_chat.rs`).
 pub const SUGGEST_CHAT_INSTRUCTION: &str =
-    "- `suggest-chat`: offer the user a new chat for a separate task (its own context, maybe another project or agent); they decide, nothing starts until they accept.";
+    "- `suggest-chat`: offer the user a new chat for a separate task (its own context, maybe another project or agent); they decide, nothing starts until they accept. For a chat that keeps working (background, a watch, scheduled messages), put its standing brief in `--system-prompt`, or its playbook in `--system-prompt-files`, so a compaction can't lose it; keep `--message` to the kickoff; set `--auto-compact`.";
 
 /// Per-turn current-local-time line for the agent prompt, from the sender's IANA
 /// timezone (`machine_users.timezone`, migration 0040). `None` when `iana_tz` is

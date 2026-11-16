@@ -39,6 +39,7 @@ pub struct SuggestChatRequest {
     pub background: bool,
     pub auto_compact: Option<String>,
     pub attach: Vec<String>,
+    pub force: bool,
 }
 
 /// The suggestion as the row carries it.
@@ -126,9 +127,8 @@ pub fn validate(
     if files_size > MAX_FILES_BYTES {
         bail!("--system-prompt-files takes {files_size} bytes, the limit is {MAX_FILES_BYTES}");
     }
-    if (system_prompt.is_some() || system_prompt_files.is_some())
-        && !mirror.takes_user_system_prompt(chat_id, agent_kind)
-    {
+    let takes_prompt = mirror.takes_user_system_prompt(chat_id, agent_kind);
+    if (system_prompt.is_some() || system_prompt_files.is_some()) && !takes_prompt {
         bail!("--system-prompt and --system-prompt-files are for claude only, and not in a sandboxed chat");
     }
 
@@ -147,6 +147,30 @@ pub fn validate(
         .transpose()?;
     if auto_compact_tokens.is_some() && !adapter.is_resident() {
         bail!("--auto-compact is for claude and codex only");
+    }
+
+    if (req.always_on || req.background) && !req.force {
+        let mut missing = Vec::new();
+        if system_prompt.is_none() && system_prompt_files.is_none() && takes_prompt {
+            missing.push("--system-prompt (or --system-prompt-files) with its standing brief so a compaction can't lose it, keeping --message to the kickoff");
+        }
+        if auto_compact_tokens.is_none() && adapter.is_resident() {
+            // 200k: a client preset inside the backend's 20k-2M. On 200k-window
+            // models claude compacts on its own first, so it matters for
+            // 1M-window models and codex.
+            missing.push("--auto-compact (e.g. 200k) so its context stays bounded");
+        }
+        if !missing.is_empty() {
+            let flag = if req.always_on {
+                "--always-on"
+            } else {
+                "--background"
+            };
+            bail!(
+                "a chat with {flag} keeps working on its own: pass {}. Nothing was suggested; add --force to suggest it as it is.",
+                missing.join(", and ")
+            );
+        }
     }
 
     Ok((
@@ -557,6 +581,7 @@ mod tests {
 
         let always_on = SuggestChatRequest {
             always_on: true,
+            force: true,
             ..message("m")
         };
         assert!(f.validate(&claude, always_on.clone()).is_ok());
@@ -595,6 +620,83 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_that_keeps_working_needs_a_brief_and_auto_compact() {
+        let mut f = Fixture::new();
+        let project = f.project("/work/app");
+        let claude = f.chat(f.owner, &project, "claude", None);
+        let codex = f.chat(f.owner, &project, "codex", None);
+        let cursor = f.chat(f.owner, &project, "cursor", None);
+        f.mirror.upsert_member("row".into(), f.member, true);
+        let sandboxed = f.chat(f.member, &project, "claude", None);
+        let rules = f.file("rules.md", "be terse");
+
+        let background =
+            |text: Option<&str>, files: Option<&str>, compact: Option<&str>| SuggestChatRequest {
+                background: true,
+                system_prompt: text.map(str::to_string),
+                system_prompt_files: files.map(str::to_string),
+                auto_compact: compact.map(str::to_string),
+                ..message("m")
+            };
+        let bare = || background(None, None, None);
+        let always_on = |req: SuggestChatRequest| SuggestChatRequest {
+            always_on: true,
+            background: false,
+            ..req
+        };
+        let names = |chat: &str, req| {
+            let err = f.error(chat, req);
+            (
+                err.contains("--system-prompt"),
+                err.contains("--auto-compact"),
+            )
+        };
+
+        assert_eq!(
+            f.error(&claude, bare()),
+            "a chat with --background keeps working on its own: pass --system-prompt (or --system-prompt-files) with its standing brief so a compaction can't lose it, keeping --message to the kickoff, and --auto-compact (e.g. 200k) so its context stays bounded. Nothing was suggested; add --force to suggest it as it is."
+        );
+        assert_eq!(
+            names(&claude, background(Some("be terse"), None, None)),
+            (false, true)
+        );
+        assert_eq!(
+            names(&claude, background(None, None, Some("200k"))),
+            (true, false)
+        );
+        assert!(f
+            .validate(&claude, background(Some("be terse"), None, Some("200k")))
+            .is_ok());
+        assert!(f
+            .validate(&claude, background(None, Some(&rules), Some("200k")))
+            .is_ok());
+        let forced = SuggestChatRequest {
+            force: true,
+            ..bare()
+        };
+        assert!(f.validate(&claude, forced).is_ok());
+
+        assert!(f
+            .error(&claude, always_on(bare()))
+            .starts_with("a chat with --always-on keeps working on its own: pass --system-prompt"));
+        assert!(f
+            .validate(
+                &claude,
+                always_on(background(Some("be terse"), None, Some("200k")))
+            )
+            .is_ok());
+
+        for chat in [&codex, &sandboxed] {
+            assert_eq!(names(chat, bare()), (false, true));
+            assert!(f
+                .validate(chat, background(None, None, Some("200k")))
+                .is_ok());
+        }
+        assert!(f.validate(&cursor, bare()).is_ok());
+        assert!(f.validate(&claude, message("m")).is_ok());
+    }
+
+    #[test]
     fn auto_compact_takes_suffixes() {
         assert_eq!(parse_auto_compact("20000").unwrap(), 20_000);
         assert_eq!(parse_auto_compact("50k").unwrap(), 50_000);
@@ -616,6 +718,7 @@ mod tests {
                     title: Some("Login bug".to_string()),
                     always_on: true,
                     auto_compact: Some("200k".to_string()),
+                    force: true,
                     ..message("fix it")
                 },
             )

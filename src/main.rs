@@ -3614,8 +3614,9 @@ const SUGGEST_CHAT_USAGE: &str =
 Suggest a new chat to the user: the app shows it at once and, if they accept,
 opens the new-chat screen filled with these values, which they can edit
 before sending. Nothing starts without them, and you won't hear back.
-  --message       the first message. Make it self-contained: the new agent
-                  sees nothing of this conversation
+  --message       the first message: the kickoff. Make it self-contained: the
+                  new agent sees nothing of this conversation. Standing
+                  instructions go in --system-prompt
   --project       the full path of the directory to start the agent in
                   (default: this chat's); one that isn't a project on this
                   machine fails and lists them
@@ -3627,12 +3628,17 @@ before sending. Nothing starts without them, and you won't hear back.
                   picks the user's agent of that kind with this model
   --worktree      run it in its own git worktree
   --title         chat title (default: from the message)
-  --system-prompt, --system-prompt-files
-                  system prompt (claude only); files must exist
+  --system-prompt standing instructions, survive compaction (claude only)
+  --system-prompt-files
+                  the chat's playbook, comma-separated (claude only); files
+                  must exist. Survives compaction, and file edits reach the
+                  chat at its next restart (files are read at spawn, not per
+                  turn)
   --always-on     keep the agent running between turns (claude/codex,
                   machine owner only)
   --background    start it in Background
-  --auto-compact  compact when the context passes this size (claude/codex)
+  --auto-compact  compact when the context passes this size (claude/codex);
+                  set it for any long-running chat
   --attach        a file for the first message, repeatable";
 
 fn suggest_chat_usage_and_exit(code: i32) -> ! {
@@ -3656,6 +3662,8 @@ async fn run_suggest_chat_cli(args: &[String]) {
             req.always_on = true;
         } else if s == "--background" {
             req.background = true;
+        } else if s == "--force" {
+            req.force = true;
         } else if let Some(v) = take_flag(s, "--message", &mut it) {
             message = Some(v);
         } else if let Some(v) = take_flag(s, "--project", &mut it) {

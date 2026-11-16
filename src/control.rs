@@ -1904,7 +1904,7 @@ mod tests {
     /// A CLI older or newer than the daemon may omit or add flags.
     #[test]
     fn a_suggest_chat_request_survives_the_socket() {
-        let line = r#"{"action":"suggest_chat","chat_id":"c","suggestion":{"message":"m","attach":["/a"],"always_on":true,"later_flag":1}}"#;
+        let line = r#"{"action":"suggest_chat","chat_id":"c","suggestion":{"message":"m","attach":["/a"],"always_on":true,"force":true,"later_flag":1}}"#;
         let Ok(ControlRequest::SuggestChat {
             chat_id,
             suggestion,
@@ -1920,7 +1920,7 @@ mod tests {
             ),
             ("c", "m", vec!["/a".to_string()])
         );
-        assert!(suggestion.always_on && suggestion.project.is_none());
+        assert!(suggestion.always_on && suggestion.force && suggestion.project.is_none());
     }
 
     fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
