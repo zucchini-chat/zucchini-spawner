@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::adapter::{AgentEvent, AgentKind, PeerSender, TurnContext};
 use crate::envelope::{EnvelopeAttachment, MessageEnvelope};
+use crate::prompt_files::PromptFile;
 use crate::prune::PendingPrunes;
 use crate::sys;
 use crate::tunnel::TunnelDef;
@@ -161,6 +162,9 @@ pub struct SessionState {
     /// The reader left its stdout loop: the process is exiting and takes no
     /// more turns. Set before its `Done`.
     pub closed: bool,
+    /// The process got past startup (`agent_started`). One that never did
+    /// failed with its own error row, so its turns are not re-queued.
+    pub(crate) started: bool,
     /// When the reader last emitted the idle edge; cleared by a busy edge.
     /// Only a resident with one can be evicted (`warm.rs`).
     pub idle_since: Option<tokio::time::Instant>,
@@ -312,6 +316,14 @@ impl SessionState {
     fn user_queued_count(&self) -> usize {
         self.unconsumed.iter().filter(|t| !t.internal).count()
     }
+    /// The user's turns left unconsumed, for a respawn to re-queue. An internal
+    /// `/rename` is not: the respawn passes `--name` from the current title.
+    fn take_user_turns(&mut self) -> Vec<QueuedTurn> {
+        std::mem::take(&mut self.unconsumed)
+            .into_iter()
+            .filter(|t| !t.internal)
+            .collect()
+    }
     #[cfg(test)]
     pub(crate) fn has_live_task(&self, id: &str) -> bool {
         self.live_tasks.iter().any(|t| t.id == id)
@@ -338,6 +350,11 @@ impl SessionState {
     /// Mid-turn or hosting background tasks — what a hard abort interrupts.
     fn working(&self) -> bool {
         self.in_turn() || !self.live_tasks.is_empty()
+    }
+    /// What an exit on its own cuts: the work in progress, plus the queued
+    /// turns of a process that never started, as nothing re-queues them.
+    pub(crate) fn exit_interrupts(&self) -> bool {
+        self.working() || (!self.started && self.running())
     }
     /// The "Waiting" sub-state — busy with no turn in flight, only a background
     /// task / monitor still armed. NOT emitted on the wire (the client
@@ -981,11 +998,13 @@ pub enum AgentResponse {
     },
     /// One-shot path: the per-turn process exited. `has_result=false` ⇒ it
     /// died without emitting a `result` (caller synthesizes `INTERRUPTED_RESULT`).
-    /// RESIDENT path reuses this for process EXIT (EOF / crash / hard teardown):
+    /// RESIDENT path reuses this for a SPONTANEOUS process exit (EOF / crash):
     /// the reader sets `has_result=false` when the process exited while still
-    /// busy (turn in flight or tasks armed) so the caller publishes
-    /// `INTERRUPTED_RESULT`, `true` when it exited while Idle. Either way the
-    /// caller clears `agent_running` (→ false / idle) and drops the session.
+    /// working (turn in flight or tasks armed), or before startup with turns
+    /// queued (`SessionState::exit_interrupts`), so the caller publishes
+    /// `INTERRUPTED_RESULT`, `true` otherwise. The caller drops the session,
+    /// respawns it with the turns it left queued (`Supervisor::remove_finished`)
+    /// and clears `agent_running` when nothing runs.
     Done {
         topic: String,
         has_result: bool,
@@ -1346,6 +1365,9 @@ pub struct Supervisor {
     /// Chats whose resident process we last published as alive
     /// (`chats.agent_alive`); see `alive_changes`.
     alive_published: HashSet<String>,
+    /// Chats respawned after their resident died on its own, until their next
+    /// `result`: another death in that streak doesn't respawn them.
+    crash_respawned: HashSet<String>,
 }
 
 impl Supervisor {
@@ -1383,6 +1405,7 @@ impl Supervisor {
             live_sessions: Arc::new(StdMutex::new(HashMap::new())),
             pending_prunes: PendingPrunes::default(),
             alive_published: HashSet::new(),
+            crash_respawned: HashSet::new(),
         }
     }
 
@@ -1446,12 +1469,11 @@ impl Supervisor {
                 // Closes stdin (writer) and SIGTERMs the group (reader).
                 session.cancel.cancel();
                 await_agent_exit(session.reader, topic).await;
-                // An internal `/rename` is not re-queued: the respawn passes
-                // `--name` from the current title anyway.
-                std::mem::take(&mut session.state.lock().expect("SessionState mutex").unconsumed)
-                    .into_iter()
-                    .filter(|t| !t.internal)
-                    .collect()
+                session
+                    .state
+                    .lock()
+                    .expect("SessionState mutex")
+                    .take_user_turns()
             }
             None => Vec::new(),
         };
@@ -1496,15 +1518,44 @@ impl Supervisor {
 
     /// Drop the chat's entry on its `Done`. For a resident only the session
     /// that closed, so a late `Done` from a torn-down session can't drop (and
-    /// orphan) its replacement.
-    pub fn remove_finished(&mut self, topic: &str) {
-        if let Some(AgentEntry::Resident(s)) = self.agents.get(topic) {
-            if !s.state.lock().expect("SessionState mutex").closed {
-                return;
+    /// orphan) its replacement. `None` when nothing was dropped (also during a
+    /// shutdown: `cancel_all` emptied the map); else the user's turns the
+    /// process left unconsumed, for a respawn to re-queue - none if it never
+    /// started.
+    pub fn remove_finished(&mut self, topic: &str) -> Option<Vec<QueuedTurn>> {
+        let turns = match self.agents.get(topic)? {
+            AgentEntry::Resident(s) => {
+                let mut st = s.state.lock().expect("SessionState mutex");
+                if !st.closed {
+                    return None;
+                }
+                if st.started {
+                    st.take_user_turns()
+                } else {
+                    Vec::new()
+                }
             }
-        }
+            AgentEntry::OneShot { .. } => Vec::new(),
+        };
         self.agents.remove(topic);
         self.sync_live_sessions();
+        Some(turns)
+    }
+
+    pub fn crash_respawned(&self, topic: &str) -> bool {
+        self.crash_respawned.contains(topic)
+    }
+
+    /// Respawn a resident that died on its own with the turns it left
+    /// unconsumed, once until the chat's next `result` (`end_crash_streak`).
+    pub fn respawn_after_crash(&mut self, req: SpawnRequest, more: Vec<String>) {
+        self.crash_respawned.insert(req.chat_id.clone());
+        self.spawn_agent_then(req, more);
+    }
+
+    /// A turn ended or the chat is gone: the next crash may respawn again.
+    pub fn end_crash_streak(&mut self, topic: &str) {
+        self.crash_respawned.remove(topic);
     }
 
     /// True when the chat has a tracked agent that hasn't finished. For a
@@ -1957,10 +2008,12 @@ impl Supervisor {
         self.agents.insert(topic, AgentEntry::Resident(session));
     }
 
+    /// Drop finished one-shots. A resident stays until its own `Done` (which
+    /// re-queues a dead process's turns) or a teardown removes it.
     pub fn cleanup(&mut self) {
         self.agents.retain(|_, entry| match entry {
             AgentEntry::OneShot { handle, .. } => !handle.is_finished(),
-            AgentEntry::Resident(s) => !s.reader.is_finished(),
+            AgentEntry::Resident(_) => true,
         });
         self.sync_live_sessions();
     }
@@ -2409,7 +2462,7 @@ fn default_spawn_fn(
 /// `SessionIdHarvested`/`ToolResult` exactly as the one-shot path does
 /// (attachment-followup logic preserved; its lifetime is now the session). On
 /// process exit it emits one `Done{has_result}` (`has_result=false` ⇒ exited
-/// while busy ⇒ caller publishes `INTERRUPTED_RESULT`).
+/// while working ⇒ caller publishes `INTERRUPTED_RESULT`).
 fn default_resident_spawn_fn(
     req: SpawnRequest,
     tx: mpsc::Sender<AgentResponse>,
@@ -2500,6 +2553,25 @@ fn default_resident_spawn_fn(
             model: model.as_deref(),
             session_name: session_name.as_deref(),
             user_system_prompt: user_system_prompt.as_deref(),
+            system_prompt_file: None,
+        };
+        let system_prompt = lock_adapter(&adapter).session_system_prompt(&ctx);
+        // Deleted when this reader exits; a startup retry reuses it.
+        let system_prompt_file = match system_prompt
+            .map(|sys| PromptFile::write(&topic, &sys))
+            .transpose()
+        {
+            Ok(file) => file,
+            Err(e) => {
+                error!(topic = %topic, "failed to write the system prompt file: {}", e);
+                close_session(&state_for_reader);
+                fail_agent(&tx, &topic, format!("agent prepare failed: {}", e)).await;
+                return;
+            }
+        };
+        let ctx = crate::adapter::SessionContext {
+            system_prompt_file: system_prompt_file.as_ref().map(PromptFile::path),
+            ..ctx
         };
         let native = if cfg!(windows) {
             lock_adapter(&adapter).prepare_session_native(&ctx)
@@ -2696,6 +2768,7 @@ fn default_resident_spawn_fn(
                                     if started {
                                         agent_started.store(true, Ordering::Relaxed);
                                         ANY_AGENT_STARTED.store(true, Ordering::Relaxed);
+                                        state_for_reader.lock().expect("SessionState mutex").started = true;
                                     }
                                     let mut renaming = InternalLine::default();
                                     // Captured with the event that caused them (a
@@ -2876,20 +2949,20 @@ fn default_resident_spawn_fn(
 
         // Deliberate teardown ⇒ no `Done` (caller owns the post-state; see the
         // `cancelled` declaration above). SPONTANEOUS exit ⇒ emit `Done`:
-        // `has_result` repurposed as "exited cleanly" — true when the process
-        // died while fully Idle (no in-flight turn, no armed tasks), false when
-        // it died mid-turn / with tasks armed ⇒ caller publishes
-        // INTERRUPTED_RESULT. Either way the caller clears the run-state columns
-        // and drops the session; the next message respawns with `--resume`.
+        // `has_result` repurposed as "cut nothing" — false when the process
+        // died mid-turn / with tasks armed, or before startup with turns
+        // queued ⇒ caller publishes INTERRUPTED_RESULT. A started process's
+        // queued turns are cut by nothing: the caller re-queues them on a
+        // fresh `--resume` process.
         if !cancelled {
-            let was_idle = state_for_reader
+            let interrupted = state_for_reader
                 .lock()
                 .expect("SessionState mutex")
-                .is_idle();
+                .exit_interrupts();
             let _ = tx
                 .send(AgentResponse::Done {
                     topic,
-                    has_result: was_idle,
+                    has_result: !interrupted,
                 })
                 .await;
         }
@@ -4582,6 +4655,76 @@ mod live_session_tests {
             .map(|t| t.prompt)
             .collect();
         assert_eq!(prompts, vec!["hi", "second"]);
+    }
+
+    /// A resident that died on its own hands its queued user turns back on
+    /// its `Done`, for the respawn; a `/rename` is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_session_hands_back_its_queued_turns() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(claude_req("chat"));
+        assert!(sup.rename_resident("chat", Some("new title")));
+        assert!(sup.send_user_turn(&SpawnRequest {
+            prompt: "second".to_string(),
+            ..claude_req("chat")
+        }));
+        {
+            let g = exposed.lock().unwrap();
+            let mut st = g["chat"].lock().unwrap();
+            st.started = true;
+            st.closed = true;
+        }
+        let prompts: Vec<String> = sup
+            .remove_finished("chat")
+            .expect("the closed session is dropped")
+            .into_iter()
+            .map(|t| t.prompt)
+            .collect();
+        assert_eq!(prompts, vec!["hi", "second"]);
+        assert!(sup.is_empty());
+    }
+
+    /// A late `Done` (its session already replaced) hands back nothing; a
+    /// process that never started is dropped without its turns.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_started_closed_session_hands_back_turns() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        sup.spawn_agent(claude_req("chat"));
+        exposed.lock().unwrap()["chat"].lock().unwrap().started = true;
+        assert!(sup.remove_finished("chat").is_none(), "replacement kept");
+        assert_eq!(sup.unconsumed_prompts("chat"), vec!["hi"]);
+
+        exposed.lock().unwrap()["chat"].lock().unwrap().started = false;
+        exposed.lock().unwrap()["chat"].lock().unwrap().closed = true;
+        assert_eq!(sup.remove_finished("chat").map(|t| t.len()), Some(0));
+        assert!(sup.remove_finished("chat").is_none(), "nothing left");
+    }
+
+    /// A resident whose reader died with its `Done` still queued survives
+    /// `cleanup`, so that `Done` hands back the dead process's turns.
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_keeps_a_dead_resident_for_its_done() {
+        let resident_fn: ResidentSpawnFn = Arc::new(|_req, _tx, _cancel, _pending| {
+            let state = Arc::new(StdMutex::new(SessionState::default()));
+            let dying = Arc::clone(&state);
+            let reader = tokio::spawn(async move {
+                let mut st = dying.lock().unwrap();
+                st.started = true;
+                st.closed = true;
+            });
+            ResidentHandles {
+                wake: Arc::new(Notify::new()),
+                reader,
+                state,
+            }
+        });
+        let one_shot: SpawnFn = Arc::new(|_req, _tx, _token, _pending| tokio::spawn(async {}));
+        let (resp_tx, _resp_rx) = mpsc::channel::<AgentResponse>(64);
+        let mut sup = Supervisor::with_spawn_fns(resp_tx, one_shot, resident_fn);
+        sup.spawn_agent(claude_req("chat"));
+        tokio::task::yield_now().await;
+        sup.cleanup();
+        assert_eq!(sup.remove_finished("chat").map(|t| t.len()), Some(1));
     }
 
     fn set_idle(exposed: &Exposed, chat: &str) {

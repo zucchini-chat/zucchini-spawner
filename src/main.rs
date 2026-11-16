@@ -12,6 +12,7 @@ mod net;
 mod orphans;
 mod power;
 mod powersync;
+mod prompt_files;
 mod prune;
 mod session_name;
 mod shell;
@@ -661,14 +662,23 @@ pub(crate) async fn handle_agent_response(
             // armed — must clear the indicator); for one-shot it's the normal
             // busy→idle flip. A late `Done` from a torn-down resident leaves its
             // replacement and its indicator alone.
-            let had_agent = supervisor.has_agent(&topic);
-            supervisor.remove_finished(&topic);
-            if had_agent && !supervisor.has_agent(&topic) {
+            if let Some(unconsumed) = supervisor.remove_finished(&topic) {
                 // This `Done` is the one that ended the tracked process, and
                 // anything it had armed died with it. A late `Done` from a
                 // session a respawn already replaced leaves its successor's task
                 // list alone.
                 clear_live_tasks(write_tx, &topic).await;
+                // Before the idle check: the respawn keeps the chat running.
+                let interrupted = !has_result;
+                requeue_after_crash(
+                    &topic,
+                    unconsumed,
+                    interrupted,
+                    mirror,
+                    supervisor,
+                    write_tx,
+                )
+                .await;
             }
             if !supervisor.is_running(&topic) {
                 send_run_state(write_tx, topic.clone(), false).await;
@@ -734,6 +744,7 @@ pub(crate) async fn handle_agent_response(
             }
         }
         AgentResponse::TurnEnded { topic } => {
+            supervisor.end_crash_streak(&topic);
             if let Some(chat) = mirror.chats.get(&topic) {
                 supervisor.after_turn(
                     &topic,
@@ -878,6 +889,7 @@ async fn delete_chat(chat_id: &str, mirror: &mut Mirror, supervisor: &mut Superv
     tunnel::chat_deleted(chat_id);
     supervisor.abort_agent(chat_id).await;
     supervisor.forget_alive(chat_id);
+    supervisor.end_crash_streak(chat_id);
 }
 
 /// Kill a member's agents after their access changed, so a running turn can't
@@ -2199,6 +2211,72 @@ async fn apply_prune_group(
     }
     let unconsumed = turns_to_requeue(aborted, req.agent_kind, req.agent_session_id.as_deref());
     supervisor.spawn_agent_then(req, unconsumed);
+}
+
+const CRASH_NOTE: &str = "[zucchini] Your process exited unexpectedly and was restarted with this session resumed: what ran in it (background tasks, Monitor tools, MCP state such as a browser) is gone - check before relying on it.";
+
+/// `CRASH_NOTE`, plus the chat's watches and tunnels, which the spawner runs
+/// and a crash leaves alone.
+fn crash_note(chat_id: &str) -> String {
+    match still_running_from_before(chat_id) {
+        Some(still) => format!("{CRASH_NOTE} {still}"),
+        None => CRASH_NOTE.to_string(),
+    }
+}
+
+/// A resident died on its own and left `turns` unconsumed: respawn it
+/// (`--resume`) with them, the first one that is no command noting the crash.
+/// Once per crash streak: if it dies again before a `result`, they are dropped
+/// with an error row. A turn the transcript already holds was in flight, so it
+/// gets the interrupted row, unless the chat got one (`interrupted`).
+async fn requeue_after_crash(
+    chat_id: &str,
+    turns: Vec<QueuedTurn>,
+    interrupted: bool,
+    mirror: &Mirror,
+    supervisor: &mut Supervisor,
+    write_tx: &mpsc::Sender<WriteEvent>,
+) {
+    let Some(chat) = mirror.chats.get(chat_id) else {
+        return;
+    };
+    let kind = chat.agent_kind;
+    let queued = turns.len();
+    let mut turns = turns_to_requeue(turns, kind, chat.agent_session_id.as_deref());
+    if turns.len() < queued && !interrupted {
+        send_agent_line(write_tx, mirror, chat_id, INTERRUPTED_RESULT.to_string()).await;
+    }
+    if turns.is_empty() {
+        return;
+    }
+    let adapter = kind.make_adapter();
+    if let Some(turn) = turns.iter_mut().find(|t| !adapter.is_command_turn(t)) {
+        *turn = format!("{}\n\n{turn}", crash_note(chat_id));
+    }
+    let count = turns.len();
+    if supervisor.crash_respawned(chat_id) {
+        warn!(chat_id = %chat_id, count, "resident died on its own again, dropping its queued turns");
+        let error = undelivered_error(count, "the agent exited again");
+        send_agent_line(write_tx, mirror, chat_id, error).await;
+        return;
+    }
+    let first = turns.remove(0);
+    let Some(req) = chat_spawn_request(mirror, chat_id, first) else {
+        warn!(chat_id = %chat_id, count, "resident died on its own and cannot be respawned, dropping its queued turns");
+        let error = undelivered_error(count, "the agent exited and could not be restarted");
+        send_agent_line(write_tx, mirror, chat_id, error).await;
+        return;
+    };
+    info!(chat_id = %chat_id, count, "resident died on its own, respawning with its queued turns");
+    supervisor.respawn_after_crash(req, turns);
+}
+
+fn undelivered_error(count: usize, reason: &str) -> String {
+    if count == 1 {
+        format!("Error: 1 queued message was not delivered: {reason}. Send it again.")
+    } else {
+        format!("Error: {count} queued messages were not delivered: {reason}. Send them again.")
+    }
 }
 
 /// Prompts an aborted resident never consumed, minus those its transcript
@@ -3830,6 +3908,7 @@ async fn main() {
     let instance_lock = acquire_single_instance_lock();
     if instance_lock.is_some() {
         orphans::sweep();
+        prompt_files::clear();
         sys::ensure_supervisor_task();
     }
 
@@ -6330,6 +6409,25 @@ mod tests {
             self.reader_line(events).await;
         }
 
+        /// The live resident's process, past its startup, exits on its own:
+        /// its reader closes the session.
+        fn close_started_session(&self) {
+            let session = self.session();
+            let mut st = session.lock().unwrap();
+            st.started = true;
+            st.closed = true;
+        }
+
+        /// `close_started_session`, then the reader's `Done`.
+        async fn crash(&mut self, has_result: bool) {
+            self.close_started_session();
+            self.respond(AgentResponse::Done {
+                topic: self.chat_id.clone(),
+                has_result,
+            })
+            .await;
+        }
+
         /// The first turn was consumed and is in flight.
         fn consume_first_turn(&self) {
             let s = self.session();
@@ -7741,18 +7839,36 @@ mod tests {
         );
     }
 
+    /// claude persisted the first turn (a user entry, or mid-turn a
+    /// `queued_command`) before the reader saw it: a crash re-queue drops it
+    /// and takes it as cut. Tested here, not by a crash: `turns_to_requeue`
+    /// reads the real CLI home.
     #[tokio::test]
     async fn requeue_skips_turns_the_transcript_already_holds() {
         let mut c = ResidentChat::new();
-        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
-            .await;
-        let turns = c.supervisor.abort_agent(&c.chat_id).await;
+        c.window(vec![
+            c.project(),
+            c.chat(2, ""),
+            c.message(1, "first"),
+            c.message(2, "second"),
+        ])
+        .await;
+        c.close_started_session();
+        let turns = c.supervisor.remove_finished(&c.chat_id).unwrap();
         let uuid = turns[0].uuid.clone();
-        assert_eq!(unpersisted_prompts(turns.clone(), ""), vec!["first"]);
+        assert_eq!(
+            unpersisted_prompts(turns.clone(), ""),
+            vec!["first", "second"]
+        );
+        let user_entry = format!(r#"{{"type":"user","uuid":"{uuid}"}}"#);
+        assert_eq!(
+            unpersisted_prompts(turns.clone(), &user_entry),
+            vec!["second"]
+        );
         let queued_command = format!(
             r#"{{"type":"attachment","attachment":{{"type":"queued_command","source_uuid":"{uuid}"}}}}"#
         );
-        assert!(unpersisted_prompts(turns, &queued_command).is_empty());
+        assert_eq!(unpersisted_prompts(turns, &queued_command), vec!["second"]);
     }
 
     #[tokio::test]
@@ -7779,6 +7895,166 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    fn idle_written(writes: &[WriteEvent]) -> bool {
+        writes.iter().any(|w| {
+            matches!(
+                w,
+                WriteEvent::ChatRunning {
+                    agent_running: false,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn noted(prompt: &str) -> String {
+        format!("{CRASH_NOTE}\n\n{prompt}")
+    }
+
+    /// A turn only queued when the resident died is cut by nothing: a fresh
+    /// `--resume` process takes it, with a note, and the chat stays running.
+    #[tokio::test]
+    async fn a_crash_respawns_with_the_queued_turn() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.writes();
+        c.crash(true).await;
+        assert_eq!(
+            c.spawned_prompts(),
+            vec!["first".to_string(), noted("first")]
+        );
+        assert_eq!(c.unconsumed(), vec![noted("first")]);
+        let writes = c.writes();
+        assert!(!idle_written(&writes), "{writes:?}");
+        assert!(!writes.iter().any(is_interrupted), "{writes:?}");
+        assert_eq!(live_task_blobs(&writes), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn a_crash_mid_turn_is_interrupted_and_respawns_with_the_queued_turn() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.window(vec![c.chat(3, ""), c.message(2, "second")]).await;
+        c.writes();
+        c.crash(false).await;
+        assert_eq!(
+            c.spawned_prompts(),
+            vec!["first".to_string(), noted("second")]
+        );
+        let writes = c.writes();
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+        assert!(!idle_written(&writes), "{writes:?}");
+    }
+
+    /// One crash respawn until the chat's next `result`: another death drops
+    /// its queued turns with an error row.
+    #[tokio::test]
+    async fn a_second_crash_before_a_result_drops_the_queued_turns() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.crash(true).await;
+        c.window(vec![c.chat(3, ""), c.message(2, "second")]).await;
+        c.writes();
+        c.crash(true).await;
+        assert_eq!(c.spawned_prompts().len(), 2, "no second respawn");
+        assert!(!c.supervisor.has_agent(&c.chat_id));
+        let writes = c.writes();
+        assert!(idle_written(&writes), "{writes:?}");
+        let rows: Vec<_> = writes
+            .iter()
+            .filter_map(|w| match w {
+                WriteEvent::PutMessage { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["Error: 2 queued messages were not delivered: the agent exited again. Send them again."]
+        );
+
+        c.window(vec![c.chat(5, ""), c.message(3, "third")]).await;
+        c.respond(AgentResponse::TurnEnded {
+            topic: c.chat_id.clone(),
+        })
+        .await;
+        c.crash(true).await;
+        assert_eq!(c.spawned_prompts().last(), Some(&noted("third")));
+    }
+
+    #[tokio::test]
+    async fn a_crash_that_cannot_respawn_drops_the_queued_turn() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.mirror.projects.remove(&c.project_id);
+        c.writes();
+        c.crash(true).await;
+        assert_eq!(c.spawned_prompts().len(), 1, "no respawn");
+        assert!(!c.supervisor.has_agent(&c.chat_id));
+        assert_eq!(
+            c.message_contents(),
+            vec!["Error: 1 queued message was not delivered: the agent exited and could not be restarted. Send it again."]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_process_that_never_started_is_not_respawned() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.writes();
+        let has_result = {
+            let session = c.session();
+            let mut st = session.lock().unwrap();
+            st.closed = true;
+            !st.exit_interrupts()
+        };
+        c.respond(AgentResponse::Done {
+            topic: c.chat_id.clone(),
+            has_result,
+        })
+        .await;
+        assert_eq!(c.spawned_prompts(), vec!["first"]);
+        let writes = c.writes();
+        assert!(idle_written(&writes), "{writes:?}");
+        assert!(writes.iter().any(is_interrupted), "{writes:?}");
+    }
+
+    /// A command ships verbatim, so it carries no note.
+    #[tokio::test]
+    async fn a_crash_requeues_a_command_without_the_note() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "/compact")])
+            .await;
+        c.crash(true).await;
+        assert_eq!(c.spawned_prompts(), vec!["/compact", "/compact"]);
+    }
+
+    /// Shutdown cancels the agents first, so a crash's `Done` routed during
+    /// the drain finds no session and spawns nothing.
+    #[tokio::test]
+    async fn a_crash_during_shutdown_does_not_respawn() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.close_started_session();
+        c.resp_tx
+            .send(AgentResponse::Done {
+                topic: c.chat_id.clone(),
+                has_result: true,
+            })
+            .await
+            .unwrap();
+        let mirror = c.shared_mirror();
+        shutdown_agents(&mut c.supervisor, &mut c.resp_rx, &mirror, &c.write_tx).await;
+        assert_eq!(c.spawned_prompts(), vec!["first"]);
+        assert!(!c.supervisor.has_agent(&c.chat_id));
     }
 
     #[tokio::test]

@@ -1811,6 +1811,7 @@ mod tests {
             model: None,
             session_name: None,
             user_system_prompt: None,
+            system_prompt_file: None,
         }
     }
 

@@ -307,6 +307,8 @@ pub struct SessionContext<'a> {
     /// appended to the system prompt after the spawner's own instructions.
     /// Always `None` for an adapter without `takes_user_system_prompt`.
     pub user_system_prompt: Option<&'a str>,
+    /// Where the spawn wrote `AgentAdapter::session_system_prompt`.
+    pub system_prompt_file: Option<&'a Path>,
 }
 
 /// A shell-free spawn recipe for an adapter that can launch its CLI directly
@@ -548,6 +550,14 @@ pub trait AgentAdapter: Send + Sync {
         unreachable!("prepare_session_command called on a one-shot adapter")
     }
 
+    /// Resident: the text the CLI appends to its system prompt. The spawn
+    /// writes it to a private file (`SessionContext::system_prompt_file`),
+    /// which the session command names, so it stays out of the argv. `None`:
+    /// no file.
+    fn session_system_prompt(&self, _ctx: &SessionContext<'_>) -> Option<String> {
+        None
+    }
+
     /// One-shot: a shell-free spawn recipe for Windows-native launch (no bash).
     /// `None` (default) ⇒ the Supervisor uses the `prepare_command` login-shell
     /// path. Only claude overrides this today.
@@ -586,7 +596,7 @@ pub trait AgentAdapter: Send + Sync {
     /// (`agent_session_id.is_none()`); on resume the suffix is already baked into
     /// the reconstructed history, so re-appending would pollute every turn.
     ///
-    /// Default `None`. Claude injects via `--append-system-prompt` instead;
+    /// Default `None`. Claude appends it to its system prompt instead;
     /// hermes doesn't support prune-context. Cursor supports it but doesn't use
     /// this hook — it has no resumable conversation history to bake a suffix into
     /// (`--resume` rebuilds from the local store), so it re-sends the prune nudge
@@ -874,8 +884,8 @@ pub fn worktree_instructions(worktree_abs: &str, parent_repo: &str) -> String {
 /// The capability instructions every adapter conveys — the Zucchini tools list
 /// (attach-file, scheduled-messages, watch, tunnel, suggest-chat, then the adapter's `more_tools`
 /// items) and (when `worktree` is `Some`) the worktree rule. One helper so the
-/// texts can't drift across conveyance mechanisms: claude's
-/// `--append-system-prompt`, cursor's stdin preamble, and the first-message
+/// texts can't drift across conveyance mechanisms: claude's appended system
+/// prompt, cursor's stdin preamble, and the first-message
 /// prepend (codex/gemini/hermes, no system-prompt injection point). `worktree`
 /// is `Some` only when the turn runs in a worktree the agent must stay inside;
 /// `None` omits the rule. The volatile time line is NOT part of this block — see
@@ -1368,7 +1378,7 @@ mod tests {
 
     /// Only gemini/codex (no `--append-system-prompt` hook) carry the prune nudge
     /// on the first user message. The rest must return `None`: a non-`None` would
-    /// double-inject (claude via `--append-system-prompt`, cursor via its every-turn
+    /// double-inject (claude via its appended system prompt, cursor via its every-turn
     /// stdin preamble) or inject a no-op nudge (hermes has no prune support). Gemini
     /// and codex each use a tool-name-corrected variant (native names / Bash, not Read).
     #[test]

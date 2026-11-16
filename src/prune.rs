@@ -667,7 +667,7 @@ pub fn prune_reminder_output(payload: &str) -> Option<String> {
     // Suppress the nudge for Task sub-agent tool calls. The `--settings` hook is
     // session-global, so it fires on sidechain (sub-agent) tool results too — but
     // a sub-agent must NOT prune: it has no `prune-context` how-to (that lives
-    // only in the MAIN agent's `--append-system-prompt`), its context is
+    // only in the MAIN agent's appended system prompt), its context is
     // ephemeral (dies on return to the parent), and the `prune-context` CLI
     // resolves its target transcript by `chat_id` → a sub-agent acting on the
     // nudge would prune the PARENT's context. claude tags a sub-agent's

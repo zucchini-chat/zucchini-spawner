@@ -5,21 +5,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Unix: the whole command is one `bash -lic` argument and Linux caps a single
-/// argument at 128 KB.
-const UNIX_MAX_BYTES: usize = 64 * 1024;
-/// CreateProcess caps the command line at 32,767 chars; the rest is the
-/// spawner's own flags and instructions
-/// (`claude::tests::a_full_user_prompt_fits_the_windows_command_line`).
-pub(crate) const WINDOWS_MAX_BYTES: usize = 20 * 1024;
-
-/// Cap on what a rendered prompt adds to the command, escaping included
-/// (`command_bytes`), and on each file read for it.
-pub const MAX_BYTES: usize = if cfg!(windows) {
-    WINDOWS_MAX_BYTES
-} else {
-    UNIX_MAX_BYTES
-};
+/// Cap on a rendered prompt and on each file read for it.
+pub const MAX_BYTES: usize = 64 * 1024;
 
 /// Cap on the text an agent sets (`system-prompt set`), the clients' cap on
 /// what the user types: its ciphertext must stay under the backend's limit.
@@ -92,7 +79,7 @@ impl UserSystemPrompt {
             "The user set these instructions for this chat:\n\n{}",
             blocks.join("\n\n")
         );
-        let size = command_bytes(&rendered);
+        let size = rendered.len();
         if size > MAX_BYTES {
             return Err(format!(
                 "system prompt with its files takes {} KB, the limit is {} KB",
@@ -102,22 +89,6 @@ impl UserSystemPrompt {
         }
         Ok(Some(rendered))
     }
-}
-
-/// What `s` occupies in the command.
-fn command_bytes(s: &str) -> usize {
-    if cfg!(windows) {
-        windows_arg_bytes(s)
-    } else {
-        // `shell_escape` turns each `'` into four bytes.
-        s.len() + 3 * s.matches('\'').count()
-    }
-}
-
-/// Upper bound on `s` as part of a Windows command line: argv quoting
-/// backslash-escapes each `"` and doubles the backslashes in front of one.
-pub(crate) fn windows_arg_bytes(s: &str) -> usize {
-    s.len() + s.matches(['"', '\\']).count()
 }
 
 fn read_file(entry: &str, project: Option<&Path>, home: Option<&Path>) -> Result<String, String> {
@@ -314,12 +285,6 @@ mod tests {
     }
 
     #[test]
-    fn windows_escaping_counts_quotes_and_backslashes() {
-        assert_eq!(windows_arg_bytes("plain"), 5);
-        assert_eq!(windows_arg_bytes(r#"a "b" c:\d\"#), 11 + 4);
-    }
-
-    #[test]
     fn the_cap_covers_files_and_text_together() {
         let d = Dirs::new();
         d.write("project/half.md", "x".repeat(MAX_BYTES / 2));
@@ -332,13 +297,5 @@ mod tests {
             big_err.starts_with("system prompt file `big.md`: over the "),
             "{big_err}"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_cap_counts_shell_escaping() {
-        let d = Dirs::new();
-        assert!(d.render("", &"x".repeat(MAX_BYTES / 2)).is_ok());
-        assert!(d.render("", &"'".repeat(MAX_BYTES / 2)).is_err());
     }
 }
