@@ -13,7 +13,7 @@
 //! PowerSync's checksum is defense-in-depth we can add later.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{future::BoxFuture, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,11 @@ use crate::power::WakeSignal;
 const TOKEN_REFRESH_THRESHOLD_SECS: i64 = 60;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// A stream that stayed up this long reconnects at once with the backoff reset,
+/// whatever ended it: Cloudflare resets long-lived streams several times a day, and
+/// only quick failures should escalate the backoff.
+const HEALTHY_STREAM: Duration = Duration::from_secs(30);
 
 /// Max silence on the stream — no frame of any kind — before we treat the connection
 /// as dead and force a reconnect from the saved cursor.
@@ -211,32 +216,34 @@ async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
     info!(buckets = buckets.len(), "starting sync stream");
 
     loop {
-        let exit = connect_and_stream(&http, &config, &mut buckets, &tx).await;
+        let mut opened = None;
+        let exit = connect_and_stream(&http, &config, &mut buckets, &tx, &mut opened).await;
+        let lived = opened.map_or(Duration::ZERO, |t| t.elapsed());
 
         if tx.is_closed() {
             info!("receiver dropped, stopping sync");
             return;
         }
 
+        let delay = next_delay(lived, &mut backoff);
         match exit {
-            Ok(reason) => {
-                backoff = INITIAL_BACKOFF;
-                match reason {
-                    ConnectExit::Wake => {
-                        info!("sync stream aborted by wake signal, reconnecting immediately");
-                        continue;
-                    }
-                    ConnectExit::IdleTimeout => {
-                        warn!(
-                            timeout = ?FRAME_IDLE_TIMEOUT,
-                            "no sync frame within idle timeout (stalled read half), reconnecting immediately"
-                        );
-                        continue;
-                    }
-                    ConnectExit::TokenRefresh => info!("sync stream ended for token refresh"),
-                    ConnectExit::Eof => info!("sync stream ended cleanly"),
+            Ok(reason) => match reason {
+                ConnectExit::Wake => {
+                    backoff = INITIAL_BACKOFF;
+                    info!("sync stream aborted by wake signal, reconnecting immediately");
+                    continue;
                 }
-            }
+                ConnectExit::IdleTimeout => {
+                    backoff = INITIAL_BACKOFF;
+                    warn!(
+                        timeout = ?FRAME_IDLE_TIMEOUT,
+                        "no sync frame within idle timeout (stalled read half), reconnecting immediately"
+                    );
+                    continue;
+                }
+                ConnectExit::TokenRefresh => info!("sync stream ended for token refresh"),
+                ConnectExit::Eof => info!("sync stream ended cleanly"),
+            },
             Err(e) => {
                 // Auth permanently revoked — main's revoked-handler is already
                 // running the self-uninstall in parallel. Stop here so we don't
@@ -245,14 +252,19 @@ async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
                     info!(error = %e, "sync stream stopping (spawner revoked)");
                     return;
                 }
-                warn!(error = %e, ?backoff, "sync stream failed, backing off");
+                let error = format!("{e:#}");
+                match delay {
+                    None => warn!(%error, ?lived, "sync stream dropped, reconnecting"),
+                    Some(delay) => {
+                        warn!(%error, ?lived, backoff = ?delay, "sync stream failed, backing off");
+                    }
+                }
             }
         }
 
+        let Some(delay) = delay else { continue };
         tokio::select! {
-            () = tokio::time::sleep(backoff) => {
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
+            () = tokio::time::sleep(delay) => {}
             () = config.wake_signal.notified() => {
                 info!("wake signal during backoff, reconnecting immediately");
                 backoff = INITIAL_BACKOFF;
@@ -265,11 +277,24 @@ async fn run(config: SyncConfig, tx: mpsc::Sender<SyncEvent>) {
     }
 }
 
+/// The wait before reconnecting after a stream that lived `lived` and ended with an
+/// error, EOF or token refresh; `None` reconnects at once.
+fn next_delay(lived: Duration, backoff: &mut Duration) -> Option<Duration> {
+    if lived >= HEALTHY_STREAM {
+        *backoff = INITIAL_BACKOFF;
+        return None;
+    }
+    let delay = *backoff;
+    *backoff = (delay * 2).min(MAX_BACKOFF);
+    Some(delay)
+}
+
 async fn connect_and_stream(
     http: &reqwest::Client,
     config: &SyncConfig,
     buckets: &mut HashMap<String, String>,
     tx: &mpsc::Sender<SyncEvent>,
+    opened: &mut Option<Instant>,
 ) -> Result<ConnectExit, anyhow::Error> {
     let token = (config.fetch_token)().await?;
 
@@ -307,6 +332,7 @@ async fn connect_and_stream(
         };
         anyhow::bail!("sync stream HTTP {}: {}", status, text);
     }
+    *opened = Some(Instant::now());
 
     let byte_stream = resp
         .bytes_stream()
@@ -431,5 +457,29 @@ async fn connect_and_stream(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const QUICK: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn quick_failures_back_off_up_to_the_cap() {
+        let mut backoff = INITIAL_BACKOFF;
+        let delays: Vec<u64> = (0..7)
+            .map(|_| next_delay(QUICK, &mut backoff).unwrap().as_secs())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+    }
+
+    #[test]
+    fn healthy_stream_reconnects_at_once_and_resets_backoff() {
+        let mut backoff = MAX_BACKOFF;
+        assert_eq!(next_delay(HEALTHY_STREAM, &mut backoff), None);
+        assert_eq!(backoff, INITIAL_BACKOFF);
+        assert_eq!(next_delay(QUICK, &mut backoff), Some(INITIAL_BACKOFF));
     }
 }
