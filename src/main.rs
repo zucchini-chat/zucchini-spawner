@@ -960,10 +960,20 @@ async fn publish_queued_turn(
     if let LiveTasksChange::Changed(tasks) = supervisor.live_tasks_change(&chat_id) {
         send_live_tasks(write_tx, mirror, chat_id.clone(), tasks).await;
     }
-    send_run_state(write_tx, chat_id.clone(), true).await;
-    if let Some(running) = supervisor.turn_running_change(&chat_id) {
-        send_turn_running(write_tx, chat_id, running).await;
+    let turn_running = supervisor.turn_running_change(&chat_id);
+    if turn_running == Some(true) {
+        send_turn_start(write_tx, chat_id).await;
+    } else {
+        send_run_state(write_tx, chat_id.clone(), true).await;
+        if let Some(running) = turn_running {
+            send_turn_running(write_tx, chat_id, running).await;
+        }
     }
+}
+
+/// `agent_running` and `turn_running` true in one patch.
+async fn send_turn_start(write_tx: &mpsc::Sender<WriteEvent>, chat_id: String) {
+    let _ = write_tx.send(WriteEvent::TurnStarted { chat_id }).await;
 }
 
 /// Write `chats.turn_running`. Only ever sent after the `agent_running` write
@@ -1773,14 +1783,14 @@ async fn start_turn(
         // abort-then-respawn path already had agent_running=true, so only PATCH
         // when transitioning idle→running. One-shot adapters never arm
         // background tasks, so they're simply busy until the turn ends.
-        if !was_running {
-            let _ = write_tx
-                .send(WriteEvent::chat_running(chat_id.clone(), true))
-                .await;
+        // A one-shot's turn is its whole run, so `turn_running` is written on
+        // every spawn: the chat may have been a resident's, left with tasks
+        // armed and no turn.
+        if was_running {
+            send_turn_running(write_tx, chat_id.clone(), true).await;
+        } else {
+            send_turn_start(write_tx, chat_id.clone()).await;
         }
-        // A one-shot's turn is its whole run. Written on every spawn: the
-        // chat may have been a resident's, left with tasks armed and no turn.
-        send_turn_running(write_tx, chat_id.clone(), true).await;
         // A fresh turn: anything parked is a torn-down session's (the resident
         // path's `abort_agent` drops it too).
         supervisor.pending_prunes().lock().await.remove(&chat_id);
@@ -4677,7 +4687,8 @@ mod tests {
             if let WriteEvent::ChatRunning {
                 agent_running: true,
                 ..
-            } = ev
+            }
+            | WriteEvent::TurnStarted { .. } = ev
             {
                 saw_running_true = true;
             }
@@ -7671,13 +7682,25 @@ mod tests {
         assert_eq!(c.unconsumed(), vec!["first", "second"]);
         let writes = c.writes();
         assert!(!writes.iter().any(is_interrupted), "{writes:?}");
-        assert!(writes.iter().any(|w| matches!(
-            w,
-            WriteEvent::ChatRunning {
-                agent_running: true,
-                ..
-            }
-        )));
+        assert_eq!(run_flags(&writes), vec![("start", true)]);
+    }
+
+    /// A turn queued on a warm idle resident runs at once: one patch starts
+    /// it, and no message is listed as waiting.
+    #[tokio::test]
+    async fn a_turn_queued_on_an_idle_resident_starts_it_in_one_patch() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.reader_raw(RESULT_LINE).await;
+        assert!(!c.supervisor.is_running(&c.chat_id));
+        c.writes();
+
+        c.window(vec![c.chat(2, ""), c.message(2, "second")]).await;
+        let writes = c.writes();
+        assert_eq!(run_flags(&writes), vec![("start", true)]);
+        assert!(live_task_blobs(&writes).is_empty(), "{writes:?}");
     }
 
     /// The queued count must reach the clients AT the enqueue edge: the reader
@@ -8458,6 +8481,7 @@ mod tests {
             .filter_map(|w| match w {
                 WriteEvent::ChatRunning { agent_running, .. } => Some(("agent", *agent_running)),
                 WriteEvent::ChatTurnRunning { turn_running, .. } => Some(("turn", *turn_running)),
+                WriteEvent::TurnStarted { .. } => Some(("start", true)),
                 _ => None,
             })
             .collect()
@@ -8772,6 +8796,50 @@ mod tests {
             .any(|w| matches!(w, WriteEvent::ContextTokens { tokens: 1_000, .. })));
     }
 
+    /// The gauge moves during a turn: every usage report is written at once.
+    #[tokio::test]
+    async fn usage_reported_mid_turn_is_written_at_once() {
+        let mut c = ResidentChat::new();
+        c.window(vec![c.project(), c.chat(1, ""), c.message(1, "first")])
+            .await;
+        c.consume_first_turn();
+        c.writes();
+        let topic = c.chat_id.clone();
+        for tokens in [1_000, 2_000] {
+            let topic = topic.clone();
+            c.respond(AgentResponse::ContextTokens { topic, tokens })
+                .await;
+        }
+        c.respond(AgentResponse::CompactBoundary {
+            topic: topic.clone(),
+            post_tokens: 500,
+        })
+        .await;
+        c.respond(AgentResponse::ContextTokens {
+            topic,
+            tokens: 3_000,
+        })
+        .await;
+        let gauge: Vec<_> = c
+            .writes()
+            .into_iter()
+            .filter_map(|w| match w {
+                WriteEvent::ContextTokens { tokens, .. } => Some(("tokens", tokens)),
+                WriteEvent::CompactBoundary { post_tokens, .. } => Some(("boundary", post_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gauge,
+            vec![
+                ("tokens", 1_000),
+                ("tokens", 2_000),
+                ("boundary", 500),
+                ("tokens", 3_000)
+            ]
+        );
+    }
+
     fn always_on_null_session_chat(c: &ResidentChat, last_seq: i64) -> SyncEvent {
         chat_with(c, last_seq, json!({ "always_on": 1 }))
     }
@@ -9057,6 +9125,7 @@ mod tests {
             .iter()
             .filter_map(|w| match w {
                 WriteEvent::ChatTurnRunning { turn_running, .. } => Some(*turn_running),
+                WriteEvent::TurnStarted { .. } => Some(true),
                 _ => None,
             })
             .collect()
@@ -9185,14 +9254,15 @@ mod tests {
         assert!(turn_running_writes(&c.writes()).is_empty());
     }
 
-    /// A per-turn adapter's turn is its whole run, and every spawn says so.
+    /// A per-turn adapter's turn is its whole run, and every spawn says so, in
+    /// the patch that raises `agent_running`.
     #[tokio::test]
     async fn a_one_shot_spawn_writes_turn_running() {
         let mut c = ResidentChat::new();
         let cursor_chat = chat_with(&c, 1, json!({ "agent_kind": "cursor" }));
         c.window(vec![c.project(), cursor_chat, c.message(1, "first")])
             .await;
-        assert_eq!(turn_running_writes(&c.writes()), vec![true]);
+        assert_eq!(run_flags(&c.writes()), vec![("start", true)]);
     }
 
     /// A scheduled slash command landing mid-turn is queued behind the turn; the

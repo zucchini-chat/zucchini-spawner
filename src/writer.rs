@@ -6,7 +6,7 @@
 //! the request succeeds. Items stay in the channel until the POST that carries
 //! them returns 2xx, so a network flap doesn't lose messages.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -72,6 +72,10 @@ pub enum WriteEvent {
     ChatTurnRunning {
         chat_id: String,
         turn_running: bool,
+    },
+    /// A turn starts: `agent_running` and `turn_running` true in one PATCH.
+    TurnStarted {
+        chat_id: String,
     },
     /// The chat's watches and what its resident agent has armed right now
     /// (`chats.live_tasks`), E2E-encrypted like a message body. `tasks` is the
@@ -339,6 +343,13 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
             }
             turn_running_patch(chat_id, *turn_running)?
         }
+        WriteEvent::TurnStarted { chat_id } => {
+            let mut data = serde_json::json!({ "agent_running": true });
+            if BACKEND_HAS_TURN_RUNNING {
+                data["turn_running"] = serde_json::Value::Bool(true);
+            }
+            chats_patch(chat_id, "TurnStarted", data)?
+        }
         WriteEvent::ChatLiveTasks {
             chat_id,
             user_id,
@@ -588,6 +599,79 @@ fn chats_patch(chat_id: &str, label: &str, data: serde_json::Value) -> Option<Ba
     }
 }
 
+/// Per chat id, what the writer last queued for the columns only the spawner
+/// writes (`live_tasks` `None`: NULL), so an event that repeats it is dropped:
+/// every chats write re-ships the whole row to every device. In memory only,
+/// so a restart writes each value once more.
+#[derive(Default)]
+struct LastQueued {
+    live_tasks: HashMap<String, Option<String>>,
+    context_tokens: HashMap<String, i64>,
+    agent_session_id: HashMap<String, String>,
+}
+
+impl LastQueued {
+    /// `event`'s op, unless it repeats what was last queued.
+    fn encode(&mut self, event: &WriteEvent, keys: &KeyStore) -> Option<BatchOp> {
+        if self.repeats(event) {
+            return None;
+        }
+        let op = encode_event(event, keys)?;
+        self.record(event);
+        Some(op)
+    }
+
+    fn repeats(&self, event: &WriteEvent) -> bool {
+        match event {
+            WriteEvent::ChatLiveTasks { chat_id, tasks, .. } => {
+                self.live_tasks.get(chat_id) == Some(tasks)
+            }
+            WriteEvent::ContextTokens { chat_id, tokens } => {
+                self.context_tokens.get(chat_id) == Some(tokens)
+            }
+            WriteEvent::AgentSessionId {
+                chat_id,
+                session_id,
+            } => self.agent_session_id.get(chat_id) == Some(session_id),
+            _ => false,
+        }
+    }
+
+    fn record(&mut self, event: &WriteEvent) {
+        match event {
+            WriteEvent::ChatLiveTasks { chat_id, tasks, .. } => {
+                self.live_tasks.insert(chat_id.clone(), tasks.clone());
+            }
+            WriteEvent::ContextTokens { chat_id, tokens } => {
+                self.context_tokens.insert(chat_id.clone(), *tokens);
+            }
+            // The backend computes the value.
+            WriteEvent::CompactBoundary { chat_id, .. } => {
+                self.context_tokens.remove(chat_id);
+            }
+            WriteEvent::AgentSessionId {
+                chat_id,
+                session_id,
+            } => {
+                self.agent_session_id
+                    .insert(chat_id.clone(), session_id.clone());
+            }
+            WriteEvent::SessionReset { chat_id } => {
+                self.agent_session_id.remove(chat_id);
+                self.context_tokens.remove(chat_id);
+            }
+            // A fresh row under an id the importer reuses.
+            WriteEvent::PutChat { id, .. } => {
+                let id = id.to_string();
+                self.live_tasks.remove(&id);
+                self.context_tokens.remove(&id);
+                self.agent_session_id.remove(&id);
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn run(
     config: WriterConfig,
     keys: Arc<KeyStore>,
@@ -604,9 +688,10 @@ async fn run(
     let mut pending: VecDeque<BatchOp> = VecDeque::new();
     let mut backoff = INITIAL_BACKOFF;
     let mut channel_closed = false;
+    let mut last_queued = LastQueued::default();
 
-    let enqueue = |ev: WriteEvent, queue: &mut VecDeque<BatchOp>| {
-        if let Some(op) = encode_event(&ev, &keys) {
+    let mut enqueue = |ev: WriteEvent, queue: &mut VecDeque<BatchOp>| {
+        if let Some(op) = last_queued.encode(&ev, &keys) {
             queue.push_back(op);
             pending_counter.fetch_add(1, Ordering::Relaxed);
         }
@@ -636,6 +721,9 @@ async fn run(
                     break;
                 }
             }
+        }
+        if pending.is_empty() {
+            continue;
         }
 
         let batch: Vec<BatchOp> = pending.iter().take(MAX_OPS_PER_BATCH).cloned().collect();
@@ -790,6 +878,114 @@ mod live_tasks_tests {
             op.data.expect("data"),
             serde_json::json!({ "turn_running": true })
         );
+    }
+
+    #[test]
+    fn a_turn_start_is_one_patch_with_both_flags() {
+        let ev = WriteEvent::TurnStarted {
+            chat_id: Uuid::now_v7().to_string(),
+        };
+        let op = encode_event(&ev, &KeyStore::new()).expect("op");
+        assert_eq!((op.op, op.table), ("PATCH", "chats"));
+        let mut expected = serde_json::json!({ "agent_running": true });
+        if BACKEND_HAS_TURN_RUNNING {
+            expected["turn_running"] = serde_json::Value::Bool(true);
+        }
+        assert_eq!(op.data.expect("data"), expected);
+    }
+
+    #[test]
+    fn a_value_column_write_that_repeats_the_last_one_is_dropped() {
+        let user_id = Uuid::now_v7();
+        let keys = keys_for(user_id);
+        let chat_id = Uuid::now_v7().to_string();
+        let tasks = |owner: Option<Uuid>, blob: Option<&str>| WriteEvent::ChatLiveTasks {
+            chat_id: chat_id.clone(),
+            user_id: owner,
+            tasks: blob.map(str::to_string),
+        };
+        let tokens = |tokens| WriteEvent::ContextTokens {
+            chat_id: chat_id.clone(),
+            tokens,
+        };
+        let session = |id: &str| WriteEvent::AgentSessionId {
+            chat_id: chat_id.clone(),
+            session_id: id.into(),
+        };
+        let mut last = LastQueued::default();
+        for ev in [
+            tasks(None, None),
+            tasks(Some(user_id), Some(r#"{"q":1}"#)),
+            tokens(1_000),
+            session("s1"),
+        ] {
+            assert!(last.encode(&ev, &keys).is_some(), "{ev:?}");
+            assert!(last.encode(&ev, &keys).is_none(), "{ev:?}");
+        }
+        assert!(last.encode(&tasks(None, None), &keys).is_some());
+        assert!(last.encode(&tokens(2_000), &keys).is_some());
+        assert!(last.encode(&session("s2"), &keys).is_some());
+
+        let other_chat = WriteEvent::ContextTokens {
+            chat_id: Uuid::now_v7().to_string(),
+            tokens: 2_000,
+        };
+        assert!(last.encode(&other_chat, &keys).is_some());
+
+        // Dropped by the encoder, so not recorded either.
+        let unsealable = tasks(Some(Uuid::now_v7()), Some("{}"));
+        assert!(last.encode(&unsealable, &keys).is_none());
+        assert!(last
+            .encode(&tasks(Some(user_id), Some("{}")), &keys)
+            .is_some());
+
+        let reset = WriteEvent::SessionReset {
+            chat_id: chat_id.clone(),
+        };
+        assert!(last.encode(&reset, &keys).is_some());
+        assert!(last.encode(&session("s2"), &keys).is_some());
+        assert!(last.encode(&tokens(2_000), &keys).is_some());
+
+        let boundary = WriteEvent::CompactBoundary {
+            chat_id: chat_id.clone(),
+            post_tokens: 500,
+        };
+        assert!(last.encode(&boundary, &keys).is_some());
+        assert!(
+            last.encode(&tokens(2_000), &keys).is_some(),
+            "the backend computed what the boundary left"
+        );
+
+        let running = WriteEvent::chat_running(chat_id.clone(), true);
+        assert!(last.encode(&running, &keys).is_some());
+        assert!(
+            last.encode(&running, &keys).is_some(),
+            "edges are not values"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_whose_events_were_all_dropped_is_not_posted() {
+        let token_fetches = Arc::new(AtomicUsize::new(0));
+        let fetches = Arc::clone(&token_fetches);
+        let config = WriterConfig {
+            base_url: "http://127.0.0.1:9".into(),
+            fetch_token: Box::new(move || {
+                fetches.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Err::<String, _>(anyhow::anyhow!("offline")) })
+            }),
+        };
+        let (tx, rx) = mpsc::channel(4);
+        let unsealable = WriteEvent::ChatLiveTasks {
+            chat_id: Uuid::now_v7().to_string(),
+            user_id: Some(Uuid::now_v7()),
+            tasks: Some("{}".into()),
+        };
+        tx.send(unsealable).await.expect("send");
+        drop(tx);
+        let pending = Arc::new(AtomicUsize::new(0));
+        run(config, Arc::new(KeyStore::new()), rx, pending).await;
+        assert_eq!(token_fetches.load(Ordering::Relaxed), 0);
     }
 
     /// Until the backend knows the column the write must not reach the queue:

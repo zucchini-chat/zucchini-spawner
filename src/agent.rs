@@ -285,6 +285,9 @@ pub struct QueuedTurn {
     /// Queued by the spawner, not the user (`/rename`): invisible to
     /// `running()` and dropped rather than re-queued by a respawn.
     internal: bool,
+    /// A user turn queued while a turn ran or another user turn waited, so it
+    /// waits too: only these count in the `q` of the `live_tasks` blob.
+    behind_turn: bool,
 }
 
 impl SessionState {
@@ -308,13 +311,13 @@ impl SessionState {
     /// A turn of the USER's is queued. An internal `/rename` doesn't count: it
     /// is the spawner's own, so it doesn't make the session busy.
     fn user_queued(&self) -> bool {
-        self.user_queued_count() > 0
+        self.unconsumed.iter().any(|t| !t.internal)
     }
-    /// How many of the user's turns are queued — the `q` of the `live_tasks`
-    /// blob. Same predicate as `user_queued`, so an internal `/rename` is never
-    /// counted as a message the user is waiting on.
-    fn user_queued_count(&self) -> usize {
-        self.unconsumed.iter().filter(|t| !t.internal).count()
+    /// The `q` of the `live_tasks` blob: the user's turns queued behind a
+    /// running turn. One queued on an idle session runs at once, and an
+    /// internal `/rename` is no message the user is waiting on.
+    fn waiting_turns(&self) -> usize {
+        self.unconsumed.iter().filter(|t| t.behind_turn).count()
     }
     /// The user's turns left unconsumed, for a respawn to re-queue. An internal
     /// `/rename` is not: the respawn passes `--name` from the current title.
@@ -614,14 +617,14 @@ const MAX_LIVE_TASKS: usize = 20;
 const MAX_LIVE_TASK_DESCRIPTION_CHARS: usize = 200;
 
 /// The PLAINTEXT `chats.live_tasks` blob for a session — `{"t":[…],"q":N}` —
-/// or `None` (⇒ column NULL) when nothing is armed and no user turn is queued.
+/// or `None` (⇒ column NULL) when nothing is armed and no user turn waits.
 /// `t` is omitted when empty, `q` when 0; per task `i` id, `d` description,
 /// `k` kind, `a` subagent type (omitted when absent), `c` a subagent's
 /// `tool_use_id` (omitted when unknown), `s0` start epoch ms.
 /// The prompts themselves never ride along: they're already in the timeline as
 /// user bubbles right above the pill.
 pub fn live_tasks_payload(state: &SessionState) -> Option<String> {
-    let queued = state.user_queued_count();
+    let queued = state.waiting_turns();
     if state.live_tasks.is_empty() && queued == 0 {
         return None;
     }
@@ -1281,10 +1284,12 @@ impl ResidentSession {
         if internal {
             st.queue_internal(uuid.clone());
         }
+        let behind_turn = !internal && st.in_foreground();
         st.unconsumed.push(QueuedTurn {
             own_turn: adapter.is_command_turn(&text),
             alone: adapter.command_runs_alone(&text),
             internal,
+            behind_turn,
             uuid,
             prompt,
             text,
@@ -3632,12 +3637,24 @@ mod reduce_tests {
             live_tasks_payload(&s).is_none(),
             "an internal turn alone is not worth a blob"
         );
-        s.unconsumed.push(queued("user-1"));
-        s.unconsumed.push(queued("user-2"));
+        s.unconsumed.push(waiting("user-1"));
+        s.unconsumed.push(waiting("user-2"));
         let blob: serde_json::Value =
             serde_json::from_str(&live_tasks_payload(&s).expect("queued")).expect("valid JSON");
         assert_eq!(blob["q"], 2);
         assert!(blob.get("t").is_none(), "nothing armed, no `t`");
+    }
+
+    /// A turn queued on an idle session runs at once: it is busy, but no
+    /// message waits, so the blob stays NULL.
+    #[test]
+    fn q_counts_only_turns_queued_behind_a_running_one() {
+        let mut s = SessionState::default();
+        s.unconsumed.push(queued("user-1"));
+        assert!(s.in_foreground());
+        assert!(live_tasks_payload(&s).is_none());
+        s.unconsumed.push(waiting("user-2"));
+        assert_eq!(live_tasks_payload(&s).as_deref(), Some(r#"{"q":1}"#));
     }
 
     /// Caps: the OLDEST 20 tasks ride, and a pathological description is cut to
@@ -3691,7 +3708,7 @@ mod reduce_tests {
         for i in 0..25 {
             s.live_tasks.push(live_task(&format!("t{i}")));
         }
-        s.unconsumed.push(queued("user-1"));
+        s.unconsumed.push(waiting("user-1"));
         let watches = [watch_def("mail"), watch_def("deploys")];
         let merged =
             live_tasks_with_daemon_tasks(live_tasks_payload(&s), &[], &watches).expect("a blob");
@@ -3774,6 +3791,15 @@ mod reduce_tests {
             own_turn: false,
             alone: false,
             internal: false,
+            behind_turn: false,
+        }
+    }
+
+    /// A user turn queued behind a running one.
+    fn waiting(uuid: &str) -> QueuedTurn {
+        QueuedTurn {
+            behind_turn: true,
+            ..queued(uuid)
         }
     }
 
