@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::try_join_all;
+use hyper::body::Bytes;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
@@ -49,59 +50,22 @@ struct UploadUrlReq {
     size: i64,
 }
 
+/// A presigned R2 PUT URL for one new blob.
 #[derive(Deserialize)]
-struct UploadUrlRes {
-    blob_key: Uuid,
-    url: String,
-}
-
-/// 24-byte XChaCha20 nonce + 16-byte Poly1305 tag. Same constant lives in
-/// `BlobClient.swift` (`aeadOverhead`); kept in sync manually because the two
-/// codebases don't share a crypto wire-format header.
-pub const AEAD_OVERHEAD: i64 = 40;
-
-/// Result of `mint_url` — everything the caller needs to push an
-/// `EnvelopeAttachment` into the per-chat mailbox immediately, while the
-/// slow R2 PUT runs in the background.
-pub struct MintedUpload {
+pub struct UploadUrl {
     pub blob_key: Uuid,
-    pub presigned_url: String,
-    pub name: String,
-    pub plaintext_size: i64,
+    pub url: String,
 }
 
-impl MintedUpload {
-    pub fn attachment(&self) -> EnvelopeAttachment {
-        EnvelopeAttachment {
-            blob_key: self.blob_key,
-            size: self.plaintext_size,
-            name: self.name.clone(),
-        }
-    }
-}
-
-/// Stat the file, mint a presigned R2 PUT URL via
-/// `POST /api/blobs/upload-url`, and return everything iOS needs to render
-/// the attachment pill (`blob_key` + `name` + `plaintext_size`) plus the URL
-/// the caller will PUT ciphertext to in the background.
-///
-/// Cheap: one `stat` + one authenticated POST to the backend. No file read,
-/// no AEAD, no R2 round-trip — those happen in `put_ciphertext`. Splitting
-/// the upload this way is what lets the agent-side `attach-file` control
-/// handler push the envelope into the mailbox before the upload starts, so
-/// the CLI process (and therefore the LLM's shell tool) unblocks ~immediately.
+/// Mint a presigned R2 PUT URL for `ciphertext_size` bytes via
+/// `POST /api/blobs/upload-url`.
 pub async fn mint_url(
     http: &reqwest::Client,
     api_base_url: &str,
     fetch_token: &TokenFetcher,
-    file_path: &Path,
-) -> Result<MintedUpload> {
-    let meta = tokio::fs::metadata(file_path)
-        .await
-        .with_context(|| format!("stat attachment {}", file_path.display()))?;
-    let plaintext_size = i64::try_from(meta.len()).context("attachment too large")?;
-    let ciphertext_size = plaintext_size + AEAD_OVERHEAD;
-
+    ciphertext_size: usize,
+) -> Result<UploadUrl> {
+    let ciphertext_size = i64::try_from(ciphertext_size).context("attachment too large")?;
     let token = fetch_token().await?;
     let endpoint = format!(
         "{}/api/blobs/upload-url",
@@ -121,37 +85,26 @@ pub async fn mint_url(
         let body = crate::net::capture_response_failure("POST", &endpoint, resp).await;
         return Err(anyhow!("/api/blobs/upload-url {}: {}", status, body));
     }
-    let presigned: UploadUrlRes = resp.json().await.context("parse UploadUrlRes")?;
-
-    let name = file_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("attachment")
-        .to_string();
-    Ok(MintedUpload {
-        blob_key: presigned.blob_key,
-        presigned_url: presigned.url,
-        name,
-        plaintext_size,
-    })
+    resp.json().await.context("parse UploadUrl")
 }
 
-/// PUT ciphertext bytes to the presigned R2 URL minted by `mint_url`. The
-/// slow part of the upload — runs in a detached `tokio::spawn` so the
-/// control-socket reply can fire before the body bytes finish travelling.
+/// PUT ciphertext bytes to the presigned R2 URL minted by `mint_url`.
 /// `content_length` is required: R2 enforces it against the body we send,
 /// and the backend baked the same value into the presign signature.
 pub async fn put_ciphertext(
     http: &reqwest::Client,
     presigned_url: &str,
-    ciphertext: Vec<u8>,
+    ciphertext: Bytes,
 ) -> Result<()> {
     let put = http
         .put(presigned_url)
+        .timeout(put_timeout(ciphertext.len()))
         .header("content-length", ciphertext.len().to_string())
         .body(ciphertext)
         .send()
         .await
+        // The URL is a long presigned one and the error reaches the chat.
+        .map_err(reqwest::Error::without_url)
         .context("PUT presigned R2 url")?;
     let put_status = put.status();
     if !put_status.is_success() {
@@ -159,6 +112,11 @@ pub async fn put_ciphertext(
         return Err(anyhow!("R2 PUT {}: {}", put_status, body));
     }
     Ok(())
+}
+
+/// 60 s plus 1 s per 256 KiB, so a big file on a slow uplink isn't cut.
+fn put_timeout(ciphertext_len: usize) -> Duration {
+    Duration::from_secs(60 + (ciphertext_len / (256 * 1024)) as u64)
 }
 
 pub struct DownloadedAttachment {

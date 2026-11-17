@@ -2992,7 +2992,7 @@ fn skip_legacy_chat_id<'a>(arg: &str, it: &mut impl Iterator<Item = &'a String>)
 /// success, 1 on any failure. The CLI itself does no crypto or HTTP — the
 /// daemon owns the JWT and K_user.
 async fn run_attach_file_cli(args: &[String]) {
-    const USAGE: &str = "usage: zucchini-spawner attach-file <absolute-path>\n  Attaches the file to your next message in this chat; run it before writing that message.";
+    const USAGE: &str = "usage: zucchini-spawner attach-file <absolute-path>\n  Attaches the file to your next message in this chat; run it before writing that message.\n  Waits until the file is uploaded; a big file can take minutes, so give the command a longer timeout.";
 
     let mut path: Option<String> = None;
     let mut it = args.iter();

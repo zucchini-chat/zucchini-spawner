@@ -33,13 +33,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use hyper::body::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::agent::PendingAttachments;
 use crate::blobs;
 use crate::crypto::KeyStore;
+use crate::envelope::EnvelopeAttachment;
 use crate::prune::{PendingPrunes, PruneRequest};
 use crate::state::{ChatState, Mirror, SharedMirror};
 use crate::suggest_chat::{ChatSuggestion, SuggestChatRequest};
@@ -758,122 +760,133 @@ async fn attach_file(
         .get(&user_id)
         .with_context(|| format!("no key for user {user_id}"))?;
 
-    // Clone the per-chat mailbox sender up front. Doing it once at the top
-    // (a) confirms the agent is running before we mint an upload URL, and
-    // (b) gives us a Sender we can push on without re-locking after the
-    // mint. The std-Mutex section is microseconds — no async work under
-    // the guard.
-    let attach_tx = {
-        let g = state.pending.lock().expect("PendingAttachments mutex");
-        g.get(chat_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("no running agent for chat {chat_id} (start a turn first)"))?
+    // Bound to the agent that asked: if it stops during the upload, its
+    // mailbox closes, and the chat's next agent must not get the file.
+    let attach_tx = state
+        .pending
+        .lock()
+        .expect("PendingAttachments mutex")
+        .get(chat_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("no running agent for chat {chat_id} (start a turn first)"))?;
+
+    let file = seal_file(key, Path::new(path)).await?;
+    let attachment = match upload_with_retries(&file, state).await {
+        Ok(attachment) => attachment,
+        Err(cause) => {
+            error!(chat_id, path, error = %format!("{cause:#}"), "attach-file upload failed");
+            sentry::with_scope(
+                |scope| {
+                    scope.set_tag("chat_id", chat_id);
+                    scope.set_tag("path", path);
+                },
+                || sentry::capture_message(&format!("attach-file {cause:#}"), sentry::Level::Error),
+            );
+            // The cause may carry a whole HTTP error page; the log above keeps it all.
+            let mut short_cause = format!("{cause:#}");
+            if let Some((cut, _)) = short_cause.char_indices().nth(crate::net::BODY_SNIPPET_LEN) {
+                short_cause.truncate(cut);
+                short_cause.push('…');
+            }
+            let text = format!(
+                "Couldn't attach {}: the upload failed {UPLOAD_TRIES} times ({short_cause}).",
+                file.name
+            );
+            let row = crate::agent::peer_message_frame_json(crate::NOTICE_SENDER, &text, None);
+            let _ = state
+                .write_tx
+                .send(WriteEvent::agent_line(chat_id.to_string(), user_id, row))
+                .await;
+            return Err(anyhow!(
+                "couldn't upload {} after {UPLOAD_TRIES} tries: {short_cause}. Nothing was attached.",
+                file.name
+            ));
+        }
     };
 
-    let minted = mint_upload(Path::new(path), state).await?;
-
-    // Push the envelope into the per-chat mailbox before the upload starts.
-    // `agent.rs::attach_followup_for` drains this on the next assistant text
-    // frame and emits a follow-up attachment row; we want the envelope queued
-    // by then, not stuck behind a 200 MB R2 PUT.
-    if attach_tx.send(minted.attachment()).is_err() {
-        // Agent exited between the lock-section above and now. Vanishingly
-        // unlikely (microseconds) but possible. The presigned URL is
-        // already minted; nothing on R2 will reference it. Surface a
-        // CLI-side error so the agent knows the attach failed.
+    let blob_key = attachment.blob_key;
+    if attach_tx.send(attachment).is_err() {
         return Err(anyhow!(
-            "agent on chat {chat_id} exited before envelope could be queued"
+            "the agent on chat {chat_id} stopped during the upload; nothing was attached"
         ));
     }
-    let blobs::MintedUpload {
-        blob_key,
-        presigned_url,
-        name,
-        plaintext_size,
-    } = minted;
-    debug!(chat_id, %blob_key, name = %name, "queued attachment for next assistant frame");
-
-    // Detached upload, so the CLI / shell tool / LLM all unblock
-    // ~immediately. A failure is only reported: the envelope was already
-    // pushed, and the iOS retry-on-404 loop (BlobClient.swift) will
-    // eventually surface it as a permanent 404 to the user, which is the
-    // agreed UX per the task spec.
-    let http = state.http.clone();
-    let chat_id_for_task = chat_id.to_string();
-    let path_for_task = Path::new(path).to_path_buf();
-    let name_for_task = name.clone();
-    tokio::spawn(async move {
-        match upload(http, key, path_for_task.clone(), presigned_url).await {
-            Ok(()) => {
-                info!(
-                    chat_id = %chat_id_for_task,
-                    %blob_key,
-                    name = %name_for_task,
-                    size = plaintext_size,
-                    "uploaded agent attachment (background)"
-                );
-            }
-            Err(e) => {
-                error!(
-                    chat_id = %chat_id_for_task,
-                    %blob_key,
-                    path = %path_for_task.display(),
-                    error = %format!("{e:#}"),
-                    "background attach-file upload failed"
-                );
-                sentry::with_scope(
-                    |scope| {
-                        scope.set_tag("chat_id", &chat_id_for_task);
-                        scope.set_tag("blob_key", blob_key.to_string());
-                        scope.set_tag("path", path_for_task.display().to_string());
-                    },
-                    || {
-                        sentry::capture_message(
-                            &format!("attach-file {e:#}"),
-                            sentry::Level::Error,
-                        );
-                    },
-                );
-            }
-        }
-    });
-
-    Ok((blob_key, name))
+    info!(chat_id, %blob_key, name = %file.name, size = file.size, "uploaded agent attachment");
+    Ok((blob_key, file.name))
 }
 
-/// Mints the presigned PUT URL for `path` — fast (one stat + one backend RTT)
-/// and the only step that produces `blob_key` + `name` (what the CLI prints +
-/// iOS renders on the pill). Per task spec: NO path confinement. The user (or
-/// their agent) asked for this file; the daemon already runs as that user. UI
-/// / agent prompt is responsible for not asking for sensitive paths.
-async fn mint_upload(path: &Path, state: &ControlState) -> Result<blobs::MintedUpload> {
-    blobs::mint_url(
-        &state.http,
-        &state.api_base_url,
-        state.fetch_token.as_ref(),
-        path,
-    )
-    .await
-    .with_context(|| format!("mint upload-url for {}", path.display()))
+/// A file read and sealed under its chat owner's key, ready to upload.
+struct SealedFile {
+    name: String,
+    /// Plaintext bytes, what the attachment pill shows.
+    size: i64,
+    ciphertext: Bytes,
 }
 
-/// Reads `path`, seals it under `key` and PUTs it to the minted URL. The file
-/// is read here, not at the mint: a 200 MB read takes real wall-clock.
-async fn upload(
-    http: reqwest::Client,
-    key: Arc<crate::crypto::KUser>,
-    path: PathBuf,
-    presigned_url: String,
-) -> Result<()> {
-    let plaintext = tokio::fs::read(&path).await.context("read failed")?;
+/// Reads `path` and seals it under `key`. No path confinement: the daemon
+/// runs as the user, who (or whose agent) asked for this file.
+async fn seal_file(key: Arc<crate::crypto::KUser>, path: &Path) -> Result<SealedFile> {
+    let plaintext = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    let size = i64::try_from(plaintext.len()).context("attachment too large")?;
     // `crypto::encrypt` is sync CPU-bound — offload so we don't stall a
     // tokio worker on multi-hundred-MB files.
     let ciphertext = tokio::task::spawn_blocking(move || crate::crypto::encrypt(&key, &plaintext))
         .await
         .context("encrypt panicked")?;
-    blobs::put_ciphertext(&http, &presigned_url, ciphertext)
-        .await
-        .context("R2 PUT failed")
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    Ok(SealedFile {
+        name,
+        size,
+        ciphertext: ciphertext.into(),
+    })
+}
+
+/// Pauses before the second and the third upload try.
+const UPLOAD_RETRY_PAUSES: [std::time::Duration; 2] = if cfg!(test) {
+    [std::time::Duration::from_millis(10); 2]
+} else {
+    [
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(15),
+    ]
+};
+const UPLOAD_TRIES: usize = UPLOAD_RETRY_PAUSES.len() + 1;
+
+/// Uploads `file` in up to `UPLOAD_TRIES` tries; the error is the last try's.
+async fn upload_with_retries(
+    file: &SealedFile,
+    state: &ControlState,
+) -> Result<EnvelopeAttachment> {
+    for pause in UPLOAD_RETRY_PAUSES {
+        match upload_once(file, state).await {
+            Ok(attachment) => return Ok(attachment),
+            Err(e) => warn!(name = %file.name, error = %format!("{e:#}"), "upload try failed"),
+        }
+        tokio::time::sleep(pause).await;
+    }
+    upload_once(file, state).await
+}
+
+/// Each try mints a fresh URL, so an expired one needs no handling.
+async fn upload_once(file: &SealedFile, state: &ControlState) -> Result<EnvelopeAttachment> {
+    let url = blobs::mint_url(
+        &state.http,
+        &state.api_base_url,
+        state.fetch_token.as_ref(),
+        file.ciphertext.len(),
+    )
+    .await?;
+    blobs::put_ciphertext(&state.http, &url.url, file.ciphertext.clone()).await?;
+    Ok(EnvelopeAttachment {
+        blob_key: url.blob_key,
+        size: file.size,
+        name: file.name.clone(),
+    })
 }
 
 /// How long `suggest-chat` waits for the boot probes (a few seconds after start).
@@ -925,16 +938,13 @@ async fn suggest_chat(
     // Uploaded before the row is written: the new chat's first message
     // references the blobs as they are, and nothing re-fetches them.
     for path in req.attach.iter().map(Path::new) {
-        let minted = mint_upload(path, state).await?;
-        let attachment = minted.attachment();
-        upload(
-            state.http.clone(),
-            Arc::clone(&key),
-            path.to_path_buf(),
-            minted.presigned_url,
-        )
-        .await
-        .with_context(|| format!("--attach {}", path.display()))?;
+        let file = seal_file(Arc::clone(&key), path).await?;
+        let attachment = upload_with_retries(&file, state).await.with_context(|| {
+            format!(
+                "--attach {}: couldn't upload it after {UPLOAD_TRIES} tries",
+                path.display()
+            )
+        })?;
         suggestion.attachments.push(attachment);
     }
     let row = WriteEvent::agent_line(chat_id.to_string(), user_id, suggestion.frame_json());
@@ -2033,5 +2043,238 @@ mod tests {
         // Present-but-empty (`--at ""`) is NOT the queue sentinel — only an
         // omitted flag (`None`) is. Empty must fail loudly, not become NULL.
         assert!(normalize_deliver_at(Some(String::new()), None).is_err());
+    }
+
+    const MINT: &str = "/api/blobs/upload-url";
+
+    struct FakeBlobs {
+        base: String,
+        put_statuses: Vec<u16>,
+        /// Runs at each PUT before it answers.
+        on_put: Box<dyn Fn() + Send + Sync>,
+        /// Every request's path and body, in order.
+        requests: std::sync::Mutex<Vec<(String, Bytes)>>,
+    }
+
+    impl FakeBlobs {
+        fn paths(&self) -> Vec<String> {
+            let requests = self.requests.lock().unwrap();
+            requests.iter().map(|(path, _)| path.clone()).collect()
+        }
+
+        fn body(&self, index: usize) -> Bytes {
+            self.requests.lock().unwrap()[index].1.clone()
+        }
+
+        /// The n-th mint (n from 1) returns blob key `n` and URL `/put/<n>`,
+        /// whose PUT answers `put_statuses[n - 1]`.
+        fn answer(&self, path: String, body: Bytes) -> (u16, String) {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push((path.clone(), body));
+            if path == MINT {
+                let n = requests.iter().filter(|(p, _)| p == MINT).count();
+                let res = serde_json::json!({
+                    "blob_key": uuid::Uuid::from_u128(n as u128),
+                    "url": format!("{}/put/{n}", self.base),
+                });
+                return (200, res.to_string());
+            }
+            drop(requests);
+            (self.on_put)();
+            let n: usize = path.strip_prefix("/put/").unwrap().parse().unwrap();
+            (self.put_statuses[n - 1], String::new())
+        }
+    }
+
+    async fn fake_blob_backend(
+        put_statuses: Vec<u16>,
+        on_put: impl Fn() + Send + Sync + 'static,
+    ) -> Arc<FakeBlobs> {
+        use http_body_util::{BodyExt, Full};
+        use hyper::{Request, Response, StatusCode};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fake = Arc::new(FakeBlobs {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            put_statuses,
+            on_put: Box::new(on_put),
+            requests: std::sync::Mutex::default(),
+        });
+        let server = Arc::clone(&fake);
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let conn = Arc::clone(&server);
+                let service =
+                    hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let srv = Arc::clone(&conn);
+                        async move {
+                            let path = req.uri().path().to_string();
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let (status, body) = srv.answer(path, body);
+                            let mut resp = Response::new(Full::new(Bytes::from(body)));
+                            *resp.status_mut() = StatusCode::from_u16(status).unwrap();
+                            Ok::<_, std::convert::Infallible>(resp)
+                        }
+                    });
+                tokio::spawn(
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(tcp), service),
+                );
+            }
+        });
+        fake
+    }
+
+    /// A synced chat whose user has a key and whose agent runs with
+    /// `mailbox_tx` as its mailbox; the receiver gets the rows written.
+    fn attach_state(
+        mailbox_tx: tokio::sync::mpsc::UnboundedSender<EnvelopeAttachment>,
+    ) -> (
+        ControlState,
+        String,
+        tokio::sync::mpsc::Receiver<WriteEvent>,
+    ) {
+        let user = uuid::Uuid::now_v7();
+        let keys = KeyStore::with_keys([(user, [7u8; 32])]);
+        let mut mirror = Mirror::default();
+        mirror.set_user_id(user);
+        let chat_id = uuid::Uuid::now_v7().to_string();
+        let row = serde_json::json!({
+            "id": chat_id,
+            "project_id": uuid::Uuid::now_v7().to_string(),
+            "user_id": user.to_string(),
+            "last_seq": 0,
+        });
+        mirror.upsert_chat(chat_id.clone(), &row.to_string(), &keys);
+        let pending: PendingAttachments = Arc::default();
+        pending.lock().unwrap().insert(chat_id.clone(), mailbox_tx);
+        let (write_tx, written) = tokio::sync::mpsc::channel(8);
+        let state = ControlState {
+            fetch_token: Arc::new(Box::new(|| Box::pin(async { Ok("jwt".to_string()) }))),
+            keys: Arc::new(keys),
+            pending,
+            mirror: Arc::new(tokio::sync::RwLock::new(mirror)),
+            write_tx,
+            ..test_state(Arc::default())
+        };
+        (state, chat_id, written)
+    }
+
+    fn temp_file(contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("zs-attach-{}.txt", uuid::Uuid::now_v7()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn an_attachment_is_queued_only_after_a_retried_upload_succeeds() {
+        let (mailbox_tx, mut mailbox) = tokio::sync::mpsc::unbounded_channel();
+        let (mut state, chat_id, mut written) = attach_state(mailbox_tx);
+        let fake = fake_blob_backend(vec![500, 200], || {}).await;
+        state.api_base_url = fake.base.clone();
+        let path = temp_file("hello");
+
+        let (blob_key, name) = attach_file(&chat_id, path.to_str().unwrap(), &state)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(blob_key, uuid::Uuid::from_u128(2));
+        assert_eq!(fake.paths(), [MINT, "/put/1", MINT, "/put/2"]);
+        let minted: serde_json::Value = serde_json::from_slice(&fake.body(2)).unwrap();
+        let uploaded = fake.body(3);
+        assert_eq!(minted["size"], uploaded.len());
+        let key = crate::crypto::KUser::from_bytes([7u8; 32]);
+        assert_eq!(
+            crate::crypto::decrypt_bytes(&key, &uploaded).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            mailbox.try_recv().unwrap(),
+            EnvelopeAttachment {
+                blob_key,
+                size: 5,
+                name
+            }
+        );
+        assert!(mailbox.is_empty());
+        assert!(written.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_fails_the_command_and_tells_the_chat() {
+        let (mailbox_tx, mailbox) = tokio::sync::mpsc::unbounded_channel();
+        let (mut state, chat_id, mut written) = attach_state(mailbox_tx);
+        let fake = fake_blob_backend(vec![500; UPLOAD_TRIES], || {}).await;
+        state.api_base_url = fake.base.clone();
+        let path = temp_file("hello");
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+
+        let err = attach_file(&chat_id, path.to_str().unwrap(), &state)
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_file(&path);
+
+        let err = format!("{err:#}");
+        assert!(
+            err.starts_with(&format!("couldn't upload {name} after 3 tries: R2 PUT 500"))
+                && err.ends_with("Nothing was attached."),
+            "got: {err}"
+        );
+        assert_eq!(
+            fake.paths(),
+            [MINT, "/put/1", MINT, "/put/2", MINT, "/put/3"]
+        );
+        assert!(mailbox.is_empty());
+        let Ok(WriteEvent::PutMessage {
+            chat_id: row_chat,
+            sender,
+            content,
+            ..
+        }) = written.try_recv()
+        else {
+            panic!("no row written");
+        };
+        let frame: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!((row_chat.as_str(), sender), (chat_id.as_str(), "agent"));
+        assert_eq!(frame["subtype"], "peer_message");
+        assert_eq!(frame["name"], crate::NOTICE_SENDER);
+        let body = frame["body"].as_str().unwrap();
+        assert!(
+            body.starts_with(&format!(
+                "Couldn't attach {name}: the upload failed 3 times (R2 PUT 500"
+            )),
+            "got: {body}"
+        );
+        assert!(written.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_agent_stopped_during_the_upload_gets_nothing() {
+        let (old_tx, old_mailbox) = tokio::sync::mpsc::unbounded_channel();
+        let (mut state, chat_id, mut written) = attach_state(old_tx);
+        let (new_tx, new_mailbox) = tokio::sync::mpsc::unbounded_channel();
+        let old_mailbox = std::sync::Mutex::new(old_mailbox);
+        let pending = Arc::clone(&state.pending);
+        let chat = chat_id.clone();
+        // Stop ends the agent, and the next message starts a new one.
+        let fake = fake_blob_backend(vec![200], move || {
+            old_mailbox.lock().unwrap().close();
+            pending.lock().unwrap().insert(chat.clone(), new_tx.clone());
+        })
+        .await;
+        state.api_base_url = fake.base.clone();
+        let path = temp_file("hello");
+
+        let err = attach_file(&chat_id, path.to_str().unwrap(), &state)
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            err.to_string(),
+            format!("the agent on chat {chat_id} stopped during the upload; nothing was attached")
+        );
+        assert!(new_mailbox.is_empty());
+        assert!(written.try_recv().is_err());
     }
 }

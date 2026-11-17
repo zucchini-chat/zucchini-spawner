@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use sentry::protocol::{Event, Level, Value};
 
 /// Longest response-body prefix we attach to the event.
-const BODY_SNIPPET_LEN: usize = 500;
+pub(crate) const BODY_SNIPPET_LEN: usize = 500;
 
 /// Report a failed HTTP *response* (non-2xx) to Sentry and return its body.
 /// Reads the body itself (consuming the response) and clamps the snippet. No-op
