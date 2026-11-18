@@ -303,6 +303,11 @@ pub(crate) fn encode_event(event: &WriteEvent, keys: &KeyStore) -> Option<BatchO
             if BACKEND_HAS_MESSAGE_SUBAGENT {
                 mark_subagent_row(&mut data, sender, content);
             }
+            if *sender == "agent" && data.get("subagent").is_none() {
+                if let Some(preview) = sealed_list_preview(&k, content) {
+                    data["preview"] = serde_json::Value::String(preview);
+                }
+            }
             BatchOp {
                 op: "PUT",
                 table: "messages",
@@ -548,6 +553,17 @@ pub(crate) fn mark_subagent_row(data: &mut serde_json::Value, sender: &str, cont
     if sender == "agent" && is_subagent_frame(content) {
         data["subagent"] = serde_json::Value::Bool(true);
     }
+}
+
+/// Mirrors `MAX_PREVIEW_BYTES` in `backend-powersync/backend/src/writes.rs`,
+/// which ignores a longer `preview`.
+const MAX_SEALED_PREVIEW_BYTES: usize = 2048;
+
+/// The row's `list_preview`, sealed like its body; the backend keeps it in
+/// `chats.last_agent_body` instead of the body (the body when there is none).
+fn sealed_list_preview(k: &KUser, content: &str) -> Option<String> {
+    let sealed = encrypt_field_b64(k, &crate::list_preview::list_preview(content)?);
+    (sealed.len() <= MAX_SEALED_PREVIEW_BYTES).then_some(sealed)
 }
 
 /// Frames can be MBs, so only a frame with a string `parent_tool_use_id`
@@ -1072,6 +1088,42 @@ mod live_tasks_tests {
             op.data.expect("data").get("subagent"),
             BACKEND_HAS_MESSAGE_SUBAGENT.then_some(&serde_json::Value::Bool(true))
         );
+    }
+
+    #[test]
+    fn an_agent_row_that_updates_the_chat_row_carries_its_sealed_list_preview() {
+        let user_id = Uuid::now_v7();
+        let keys = keys_for(user_id);
+        let key = keys.get(&user_id).expect("seeded key");
+        let preview = |sender: &'static str, content: &str| {
+            let ev = WriteEvent::PutMessage {
+                id: None,
+                chat_id: Uuid::now_v7().to_string(),
+                user_id,
+                sender,
+                content: content.to_string(),
+                created_at: None,
+                imported: false,
+            };
+            let data = encode_event(&ev, &keys).expect("op").data.expect("data");
+            data.get("preview")
+                .map(|p| decrypt_field_b64(&key, p.as_str().expect("string")).expect("decrypts"))
+        };
+        let frame = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":3}},"parent_tool_use_id":null,"session_id":"s1"}"#;
+        let expected = crate::list_preview::list_preview(frame);
+        assert!(expected.is_some());
+        assert_eq!(preview("agent", frame), expected);
+
+        assert!(crate::list_preview::list_preview(SUBAGENT_FRAME).is_some());
+        assert_eq!(preview("agent", SUBAGENT_FRAME), None);
+        assert_eq!(preview("user", frame), None);
+        assert_eq!(preview("agent", crate::adapter::INTERRUPTED_RESULT), None);
+
+        let blocks = vec![serde_json::json!({ "type": "text", "text": "x".repeat(300) }); 12];
+        let long = serde_json::json!({ "type": "assistant", "message": { "content": blocks } })
+            .to_string();
+        assert!(crate::list_preview::list_preview(&long).is_some());
+        assert_eq!(preview("agent", &long), None, "past the backend's cap");
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod control;
 mod crypto;
 mod envelope;
 mod hermes_support;
+mod list_preview;
 mod net;
 mod orphans;
 mod power;
