@@ -1,6 +1,6 @@
 # zucchini-spawner
 
-The Rust daemon that runs coding agents on a developer's machine in response to messages from the [Zucchini Chat](https://zucchini.chat) iOS and Android apps.
+The Rust daemon that runs AI agents on your machine in response to messages from the [Zucchini Chat](https://zucchini.chat) iOS and Android apps.
 
 ## How it fits in
 
