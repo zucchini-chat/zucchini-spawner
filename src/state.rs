@@ -183,6 +183,12 @@ pub struct Mirror {
     /// alive yet (`main.rs::reconcile_always_on`).
     #[serde(skip)]
     pub always_on_starts: HashMap<String, u32>,
+    /// Per chat, the sealed `system_prompt` an agent's `system-prompt` write
+    /// is waiting to see synced back (`control.rs::write_system_prompt`): a
+    /// row that brings it is the agent's own change. The chat's compaction
+    /// drops it.
+    #[serde(skip)]
+    pub agent_prompt_writes: HashMap<String, Option<String>>,
 }
 
 fn serialize_kept_chats<S: serde::Serializer>(

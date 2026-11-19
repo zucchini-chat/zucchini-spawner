@@ -155,6 +155,14 @@ pub enum ControlRequest {
     /// with `text`, plaintext here; blank clears it. The file list stays the
     /// user's. Refused where the spawner ignores the prompt.
     SetSystemPrompt { chat_id: String, text: String },
+    /// Replace `old` in `chat_id`'s system prompt text with `new`, or without
+    /// `old` add `new` as a line at its end (`edited_text`). A variant of its
+    /// own, so a daemon that predates it fails the request.
+    EditSystemPrompt {
+        chat_id: String,
+        old: Option<String>,
+        new: String,
+    },
     /// Write a `chat_suggestion` row into `chat_id` (`suggest_chat.rs`).
     SuggestChat {
         chat_id: String,
@@ -338,6 +346,10 @@ pub struct ControlState {
     pub write_tx: tokio::sync::mpsc::Sender<WriteEvent>,
     /// Which agents this machine has, once the boot probes are in.
     pub probe_statuses: crate::ProbeStatusesCache,
+    /// Held by a system-prompt `edit`/`set` from its read of the text until
+    /// its write syncs back (or the wait for it times out), so parallel
+    /// edits each build on the last one.
+    pub system_prompt_writes: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Bind the listener and spawn the accept loop. Stale-socket cleanup + the
@@ -506,7 +518,11 @@ async fn dispatch(req: ControlRequest, state: &ControlState) -> ControlResponse 
             system_prompt_response(get_system_prompt(&chat_id, state).await)
         }
         ControlRequest::SetSystemPrompt { chat_id, text } => {
-            system_prompt_response(set_system_prompt(&chat_id, &text, state).await)
+            system_prompt_response(write_system_prompt(&chat_id, state, |_| Ok(text)).await)
+        }
+        ControlRequest::EditSystemPrompt { chat_id, old, new } => {
+            let edit = |text: Option<&str>| edited_text(text, old.as_deref(), &new);
+            system_prompt_response(write_system_prompt(&chat_id, state, edit).await)
         }
         ControlRequest::SuggestChat {
             chat_id,
@@ -1091,7 +1107,7 @@ fn prompt_with_text(
     Ok((chat.user_id, prompt, project_path))
 }
 
-/// How long `set` waits for its write to sync back into the mirror.
+/// How long an agent's write waits to sync back into the mirror.
 const SYSTEM_PROMPT_SYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Waits until the mirror holds `sealed` as `chat_id`'s `system_prompt`: from
@@ -1119,17 +1135,27 @@ async fn await_synced_system_prompt(
     }
 }
 
-/// Seals `text` under the chat owner's key and patches `chats.system_prompt`.
-/// The row syncing back is what the mirror and the resident's retire act on
-/// (`main.rs::retire_stale_prompt`). A prompt that wouldn't render is refused:
-/// it would fail the chat's every spawn.
-async fn set_system_prompt(
+/// Turns `chat_id`'s text into `new_text(current text)`, seals it under the
+/// chat owner's key and patches `chats.system_prompt`, one write at a time
+/// (`ControlState::system_prompt_writes`). The row syncing back is what the
+/// mirror and the resident act on; while this waits for it,
+/// `Mirror::agent_prompt_writes` marks it as the agent's own, which the
+/// resident takes only after its next compaction
+/// (`Supervisor::defer_agent_prompt`). A prompt that wouldn't render is
+/// refused: it would fail the chat's every spawn.
+async fn write_system_prompt(
     chat_id: &str,
-    text: &str,
     state: &ControlState,
+    new_text: impl FnOnce(Option<&str>) -> Result<String>,
 ) -> Result<SystemPromptInfo> {
-    let (user_id, prompt, project_path) =
-        prompt_with_text(chat_id, text, &*state.mirror.read().await)?;
+    let _writing = state.system_prompt_writes.lock().await;
+    let (user_id, prompt, project_path) = {
+        let mirror = state.mirror.read().await;
+        let text = &system_prompt_chat(chat_id, &mirror)?
+            .user_system_prompt
+            .text;
+        prompt_with_text(chat_id, &new_text(text.as_deref())?, &mirror)?
+    };
     prompt
         .render(project_path.as_deref())
         .map_err(|e| anyhow!(e))?;
@@ -1150,14 +1176,62 @@ async fn set_system_prompt(
         "id": chat_id,
         "data": { "system_prompt": sealed },
     });
-    post_write(op, state).await?;
-    info!(chat_id, size, "system prompt text set by the agent");
-    let synced = await_synced_system_prompt(chat_id, sealed.as_deref(), &state.mirror).await?;
+    // Before the PATCH, so a fast sync-back already finds it.
+    state
+        .mirror
+        .write()
+        .await
+        .agent_prompt_writes
+        .insert(chat_id.to_string(), sealed.clone());
+    let synced = match post_write(op, state).await {
+        Ok(()) => {
+            info!(chat_id, size, "system prompt text set by the agent");
+            await_synced_system_prompt(chat_id, sealed.as_deref(), &state.mirror).await
+        }
+        Err(e) => Err(e),
+    };
+    state
+        .mirror
+        .write()
+        .await
+        .agent_prompt_writes
+        .remove(chat_id);
     Ok(SystemPromptInfo {
         files: prompt.files,
         text: prompt.text,
-        sync_pending: !synced,
+        sync_pending: !synced?,
     })
+}
+
+/// `text` with `new` in place of `old`, which must occur in it exactly once;
+/// without `old`, `text` with `new` added as a line at its end.
+fn edited_text(text: Option<&str>, old: Option<&str>, new: &str) -> Result<String> {
+    let text = text.unwrap_or_default();
+    match old {
+        None => {
+            let new = new.trim_end();
+            if new.is_empty() {
+                return Err(anyhow!("nothing to add: --new is empty"));
+            }
+            Ok(if text.is_empty() {
+                new.to_string()
+            } else {
+                format!("{text}\n{new}")
+            })
+        }
+        Some("") => Err(anyhow!("--old is empty: leave it out to add a line")),
+        Some(old) => match text
+            .as_bytes()
+            .windows(old.len())
+            .filter(|w| *w == old.as_bytes())
+            .count()
+        {
+            1 => Ok(text.replacen(old, new, 1)),
+            n => Err(anyhow!(
+                "--old must occur in the text exactly once, it occurs {n} times"
+            )),
+        },
+    }
 }
 
 /// The owner of `chat_id`, for a chat allowed to run watches and tunnels: a
@@ -1731,6 +1805,19 @@ pub async fn set_system_prompt_via_socket(chat_id: &str, text: String) -> Result
     .await
 }
 
+pub async fn edit_system_prompt_via_socket(
+    chat_id: &str,
+    old: Option<String>,
+    new: String,
+) -> Result<SystemPromptInfo> {
+    system_prompt_request(ControlRequest::EditSystemPrompt {
+        chat_id: chat_id.to_string(),
+        old,
+        new,
+    })
+    .await
+}
+
 pub async fn suggest_chat_via_socket(
     chat_id: &str,
     suggestion: SuggestChatRequest,
@@ -1758,6 +1845,7 @@ pub(crate) fn test_state(live_sessions: crate::agent::LiveSessions) -> ControlSt
         pending_prunes: Arc::default(),
         write_tx: tokio::sync::mpsc::channel(1).0,
         probe_statuses: Arc::default(),
+        system_prompt_writes: Arc::default(),
     }
 }
 
@@ -1909,6 +1997,41 @@ mod tests {
         let (_, prompt, _) = prompt_with_text(&with_files, "be terse", &mirror).unwrap();
         assert_eq!(prompt.files.as_deref(), Some("rules.md"));
         assert!(prompt_with_text(&undecryptable, "be terse", &mirror).is_err());
+    }
+
+    #[test]
+    fn an_edit_replaces_one_occurrence_or_adds_a_line() {
+        let text = Some("be terse\nuse metric");
+        let edit = |old, new| edited_text(text, old, new).map_err(|e| e.to_string());
+        assert_eq!(
+            edit(Some("metric"), "imperial").unwrap(),
+            "be terse\nuse imperial"
+        );
+        assert_eq!(edit(Some("\nuse metric"), "").unwrap(), "be terse");
+        assert!(edit(Some("verbose"), "x").unwrap_err().contains("0 times"));
+        assert!(edit(Some("e"), "x").unwrap_err().contains("5 times"));
+        let overlapping = edited_text(Some("aaa"), Some("aa"), "b").unwrap_err();
+        assert!(overlapping.to_string().contains("2 times"));
+        assert!(edit(Some(""), "x").is_err());
+        assert_eq!(
+            edit(None, "  - reply in English \n").unwrap(),
+            "be terse\nuse metric\n  - reply in English"
+        );
+        assert!(edit(None, " \n").is_err());
+        assert_eq!(edited_text(None, None, "be terse").unwrap(), "be terse");
+        assert!(edited_text(None, Some("be terse"), "x").is_err());
+    }
+
+    /// An edit goes out under its own action, not as a `set`.
+    #[test]
+    fn an_edit_has_its_own_action() {
+        let edit = ControlRequest::EditSystemPrompt {
+            chat_id: "c".into(),
+            old: None,
+            new: "t".into(),
+        };
+        let line = serde_json::to_string(&edit).unwrap();
+        assert!(line.contains(r#""action":"edit_system_prompt""#));
     }
 
     /// A CLI older or newer than the daemon may omit or add flags.

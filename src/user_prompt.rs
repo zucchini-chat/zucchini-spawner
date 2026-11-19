@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// Cap on a rendered prompt and on each file read for it.
 pub const MAX_BYTES: usize = 64 * 1024;
 
-/// Cap on the text an agent sets (`system-prompt set`), the clients' cap on
+/// Cap on the text an agent sets (`system-prompt edit`), the clients' cap on
 /// what the user types: its ciphertext must stay under the backend's limit.
 pub const MAX_TEXT_BYTES: usize = 8000;
 

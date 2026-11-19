@@ -190,6 +190,11 @@ pub struct SessionState {
     /// The context usage last reported, as the client's gauge shows it.
     pub(crate) context_tokens: Option<i64>,
     pub(crate) auto_compact: AutoCompact,
+    /// The user system prompt the agent's own edit made
+    /// (`Supervisor::defer_agent_prompt`), which this process counts as running
+    /// with until its next compaction (`Supervisor::drop_deferred_prompt`): the compaction rewrites the
+    /// cached context anyway, so the restart costs little then.
+    pub(crate) deferred_prompt: Option<UserSystemPrompt>,
     /// Per live subagent (task id): the line its next `subagents wait` returns
     /// at once, for an event no wait has returned on yet (`crate::subagents`).
     pub(crate) subagent_wakes: HashMap<String, String>,
@@ -1215,6 +1220,12 @@ impl SessionKnobs {
     }
 }
 
+/// The session runs with `prompt`, or takes it after its next compaction
+/// (`SessionState::deferred_prompt`).
+fn runs_with_prompt(knobs: &SessionKnobs, st: &SessionState, prompt: &UserSystemPrompt) -> bool {
+    knobs.user_system_prompt == *prompt || st.deferred_prompt.as_ref() == Some(prompt)
+}
+
 /// `Some(running)` for a session `Supervisor::retire_stale_prompt` may abort.
 fn stale_prompt_retirable(
     knobs: &SessionKnobs,
@@ -1222,7 +1233,7 @@ fn stale_prompt_retirable(
     current: &UserSystemPrompt,
     kill_tasks: bool,
 ) -> Option<bool> {
-    let retirable = knobs.user_system_prompt != *current
+    let retirable = !runs_with_prompt(knobs, st, current)
         && st.between_turns()
         && (kill_tasks || st.live_tasks.is_empty());
     retirable.then(|| st.running())
@@ -1592,8 +1603,8 @@ impl Supervisor {
 
     /// Deliver `req` as a new user turn to the chat's live resident process via
     /// stdin. `false` — the caller respawns instead — when there's no live
-    /// session, its spawn knobs differ (another user system prompt only once
-    /// no turn would be cut), or it's a claude slash command while a
+    /// session, its spawn knobs differ (a user system prompt it doesn't run
+    /// with only once no turn would be cut), or it's a claude slash command while a
     /// turn is in flight (that one interrupts, as before; a command queued
     /// behind other turns — or any codex `/compact` — is held by the writer
     /// until it can run on its own). A running `/compact` is never interrupted:
@@ -1613,23 +1624,21 @@ impl Supervisor {
         let Some(AgentEntry::Resident(s)) = self.agents.get(&req.chat_id) else {
             return false;
         };
-        let (closed, in_flight, between_turns) = {
+        let (closed, in_flight, prompt_fits) = {
             let st = s.state.lock().expect("SessionState mutex");
             (
                 st.closed,
                 // A wake that hasn't begun is no turn to cut: a respawn would
                 // lose its notification, so a command waits for it.
                 st.turn_begun() && !st.command_in_flight,
-                st.between_turns(),
+                // A stale prompt alone never cuts a turn: `retire_stale_prompt`
+                // applies it once this one is over.
+                !st.between_turns() || runs_with_prompt(&s.knobs, &st, &req.user_system_prompt),
             )
         };
         let mut knobs = SessionKnobs::of(req);
-        if !between_turns {
-            // A stale prompt alone never cuts a turn: `retire_stale_prompt`
-            // applies it once this one is over.
-            knobs.user_system_prompt = s.knobs.user_system_prompt.clone();
-        }
-        if closed || s.reader.is_finished() || s.knobs != knobs {
+        knobs.user_system_prompt = s.knobs.user_system_prompt.clone();
+        if closed || s.reader.is_finished() || s.knobs != knobs || !prompt_fits {
             return false;
         }
         let adapter = req.agent_kind.make_adapter();
@@ -1849,10 +1858,10 @@ impl Supervisor {
         stale_prompt_retirable(&s.knobs, &st, current, kill_tasks).is_some()
     }
 
-    /// Hard-abort the chat's resident if it was spawned with another user
-    /// system prompt than `current` and is between turns; its next spawn
-    /// renders the current one. With armed background tasks it goes only when
-    /// `kill_tasks`. `Some(was_running)` if torn down.
+    /// Hard-abort the chat's resident if it doesn't run with the user system
+    /// prompt `current` (`runs_with_prompt`) and is between turns; its next
+    /// spawn renders the current one. With armed background tasks it goes
+    /// only when `kill_tasks`. `Some(was_running)` if torn down.
     pub async fn retire_stale_prompt(
         &mut self,
         topic: &str,
@@ -1863,6 +1872,28 @@ impl Supervisor {
             stale_prompt_retirable(knobs, st, current, kill_tasks)
         })
         .await
+    }
+
+    /// The agent's own edit turned the chat's user system prompt from `old`
+    /// into `new`. A resident that runs with `old` is not retired for it
+    /// before its next compaction; one still owing a retire for an earlier
+    /// change keeps owing it.
+    pub fn defer_agent_prompt(&self, topic: &str, old: &UserSystemPrompt, new: &UserSystemPrompt) {
+        let Some(AgentEntry::Resident(s)) = self.agents.get(topic) else {
+            return;
+        };
+        let mut st = s.state.lock().expect("SessionState mutex");
+        if runs_with_prompt(&s.knobs, &st, old) {
+            st.deferred_prompt = Some(new.clone());
+        }
+    }
+
+    /// A prompt `defer_agent_prompt` held back is now due: the resident
+    /// compacted, or the prompt changed by other than the agent's own edit.
+    pub fn drop_deferred_prompt(&self, topic: &str) {
+        if let Some(AgentEntry::Resident(s)) = self.agents.get(topic) {
+            s.state.lock().expect("SessionState mutex").deferred_prompt = None;
+        }
     }
 
     /// Rename the live resident to `name` (chat renamed in the app) with an
@@ -4984,6 +5015,52 @@ mod live_session_tests {
             Some(true)
         );
         assert!(!sup.has_agent("chat"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agents_own_prompt_edit_waits_for_a_compaction() {
+        let (mut sup, exposed) = supervisor_with_exposed_sessions();
+        let [v0, v1, v2] = ["v0", "v1", "v2"].map(prompt_text);
+        let spawn = |supervisor: &mut Supervisor| {
+            supervisor.spawn_agent(SpawnRequest {
+                user_system_prompt: v0.clone(),
+                ..claude_req("chat")
+            });
+            set_idle(&exposed, "chat");
+        };
+        let message = SpawnRequest {
+            user_system_prompt: v2.clone(),
+            ..claude_req("chat")
+        };
+
+        spawn(&mut sup);
+        sup.defer_agent_prompt("chat", &v0, &v1);
+        sup.defer_agent_prompt("chat", &v1, &v2);
+        assert_eq!(sup.retire_stale_prompt("chat", &v2, true).await, None);
+        assert!(sup.send_user_turn(&message), "joins the resident");
+        set_idle(&exposed, "chat");
+        sup.drop_deferred_prompt("chat");
+        assert!(!sup.send_user_turn(&message), "compacted: respawns");
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &v2, true).await,
+            Some(false)
+        );
+
+        spawn(&mut sup);
+        sup.defer_agent_prompt("chat", &v0, &v1);
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &v2, true).await,
+            Some(false),
+            "an app edit on top"
+        );
+
+        spawn(&mut sup);
+        sup.defer_agent_prompt("chat", &v1, &v2);
+        assert_eq!(
+            sup.retire_stale_prompt("chat", &v2, true).await,
+            Some(false),
+            "it still owed a retire for v1"
+        );
     }
 
     /// A task that ends outside a turn starts a wake claude announces only by

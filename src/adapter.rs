@@ -785,29 +785,23 @@ pub(crate) fn slash_command_name(prompt: &str) -> Option<&str> {
 pub const ZUCCHINI_TOOLS_INTRO: &str =
     "Zucchini tools: run `\"$ZUCCHINI_SPAWNER_BIN\" <command> --help` before a command's first use.";
 
-pub const ATTACH_FILE_INSTRUCTION: &str =
-    "- `attach-file`: send the user a file; run it before the message that goes with it.";
+pub const ATTACH_FILE_INSTRUCTION: &str = "- `attach-file`: send the user a file.";
 
 /// The prune-context item with a per-adapter `$note` appended: how `--tool-name`
-/// maps onto the agent's own tool names, and claude's summary placement.
+/// maps onto the agent's own tool names.
 macro_rules! prune_context_instruction {
     ($note:literal) => {
         concat!(
-            "- `prune-context`: drop tool outputs you no longer need, each with a one-line summary of what to keep. A large context dilutes your attention and weakens your reasoning, every turn rereads it at the cost of the user's usage limits, and it brings the next compaction (which loses detail) closer, so prune as you go. Applying a prune restarts your process, so call it in a message of its own, never alongside other tool calls.",
+            "- `prune-context`: drop tool outputs you no longer need. A large context dilutes your attention and weakens your reasoning, every turn rereads it at the cost of the user's usage limits, and it brings the next compaction (which loses detail) closer, so prune as you go.",
             $note
         )
     };
 }
 
-/// For adapters whose tool names match the pruner's claude-shape aliases (pi,
-/// cursor). The spawner aborts + respawns the agent with a "continue" prompt
-/// after a prune, so the text doesn't tell the agent to stop.
+/// For adapters whose tool names match the pruner's claude-shape aliases
+/// (claude, pi, cursor). The spawner aborts + respawns the agent with a
+/// "continue" prompt after a prune, so the text doesn't tell the agent to stop.
 pub const PRUNE_CONTEXT_INSTRUCTION: &str = prune_context_instruction!("");
-
-/// Claude's pruner moves each summary into the pruned tool result.
-pub const PRUNE_CONTEXT_INSTRUCTION_CLAUDE: &str = prune_context_instruction!(
-    " Each --summary takes the pruned output's place, so write it to stand on its own."
-);
 
 /// Codex has no `Read`/`Grep`/`Edit` tools — file reads, greps and edits ALL run
 /// through generic shell tools, so no tool name targets a given file op; the
@@ -830,11 +824,11 @@ pub const SCHEDULE_MESSAGE_INSTRUCTION: &str =
 
 /// A daemon-run watch (`watch.rs`).
 pub const WATCH_INSTRUCTION: &str =
-    "- `watch`: use it instead of Monitor or a background shell for anything that runs for hours or days. The spawner runs your shell command outside your process and starts it again after its own restarts; each line the command prints reaches you as a message. Print one short line per event with ids only, never third-party text.";
+    "- `watch`: use it instead of Monitor or a background shell for anything that runs for hours or days. The spawner runs your shell command outside your process and starts it again after its own restarts; each line the command prints reaches you as a message.";
 
 /// A daemon-held tunnel (`tunnel.rs`).
 pub const TUNNEL_INSTRUCTION: &str =
-    "- `tunnel`: a public HTTPS URL for a local port, for webhooks, OAuth callbacks and previews. It stays up across restarts until deleted or Stop; see `tunnel create --help` for auth and how offline requests are queued.";
+    "- `tunnel`: a public HTTPS URL for a local port, for webhooks, OAuth callbacks and previews. It stays up across restarts until deleted or Stop.";
 
 /// An agent-suggested chat (`suggest_chat.rs`).
 pub const SUGGEST_CHAT_INSTRUCTION: &str =
