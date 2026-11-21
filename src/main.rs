@@ -3480,9 +3480,13 @@ commands:
                       OAuth callbacks or previews. The URL survives spawner restarts;
                       the tunnel lasts until deleted or the user presses Stop. At
                       most 10 per chat. Without --auth anyone with the URL gets in.
-    --auth token      require a generated token: `Authorization: Bearer <token>`,
-                      or `?zt=<token>` in the URL (browsers, WebSocket)
-    --auth basic      require a generated user and password (browsers prompt)
+    --auth token      require a generated token; the one to use by default. create
+                      prints a link that opens logged in, for the user to tap or
+                      share (dashboards, previews). API clients send `Authorization:
+                      Bearer <token>`, webhooks and WebSockets add `?zt=<token>`
+    --auth basic      require a generated user and password that the user types in
+                      the browser; only when the user asks for it or a client speaks
+                      nothing but Basic auth (git, WebDAV)
     --keep-host       pass the Host header through; by default it becomes
                       localhost:<PORT> and the original goes in X-Forwarded-Host
     --no-queue        answer 503 while offline instead of queueing
@@ -3664,9 +3668,11 @@ const SUGGEST_CHAT_USAGE: &str =
 Suggest a new chat to the user: the app shows it at once and, if they accept,
 opens the new-chat screen filled with these values, which they can edit
 before sending. Nothing starts without them, and you won't hear back.
-  --message       the first message: the kickoff. Make it self-contained: the
-                  new agent sees nothing of this conversation. Standing
-                  instructions go in --system-prompt
+  --message       the first message, sent as the user's own (they can edit
+                  it), so write it in their voice: \"Build X, explain Y to
+                  me, then do Z\" - or just \"Let's start\" if the system
+                  prompt holds the goal. The new agent sees nothing of
+                  this conversation: these two must say everything
   --project       the full path of the directory to start the agent in
                   (default: this chat's); one that isn't a project on this
                   machine fails and lists them
@@ -3678,12 +3684,14 @@ before sending. Nothing starts without them, and you won't hear back.
                   picks the user's agent of that kind with this model
   --worktree      run it in its own git worktree
   --title         chat title (default: from the message)
-  --system-prompt standing instructions, survive compaction (claude only)
+  --system-prompt what must survive compaction, written as a brief, not as
+                  the user: the goal, the agent's role, rules, how to talk
+                  to the user - \"This chat's goal is X. You are Y. Never Z.
+                  Always W.\"
   --system-prompt-files
-                  the chat's playbook, comma-separated (claude only); files
-                  must exist. Survives compaction, and file edits reach the
-                  chat at its next restart (files are read at spawn, not per
-                  turn)
+                  the chat's playbook, comma-separated; files must exist.
+                  Survives compaction, and file edits reach the chat at its
+                  next restart (files are read at spawn, not per turn)
   --always-on     keep the agent running between turns (claude/codex,
                   machine owner only)
   --background    start it in Background

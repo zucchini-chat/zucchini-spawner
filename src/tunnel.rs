@@ -85,12 +85,22 @@ impl Auth {
     fn describe(&self) -> String {
         match self {
             Auth::Token { token } => format!(
-                "token {token} (send `Authorization: Bearer {token}`, or add `?{TOKEN_PARAM}={token}` to the URL in a browser or for a WebSocket)"
+                "token {token} (API clients send `Authorization: Bearer {token}`, webhooks and WebSockets add `?{TOKEN_PARAM}={token}` to the URL)"
             ),
             Auth::Basic { user, password } => {
                 format!("basic, user {user}, password {password} (browsers prompt for it)")
             }
         }
+    }
+}
+
+/// The link to hand a person: a token tunnel's logs the browser in.
+fn user_link(url: &str, auth: Option<&Auth>) -> String {
+    match auth {
+        Some(Auth::Token { token }) => {
+            format!("{}/?{TOKEN_PARAM}={token}", url.trim_end_matches('/'))
+        }
+        _ => url.to_string(),
     }
 }
 
@@ -190,7 +200,7 @@ impl TunnelDef {
             "i": self.id,
             "d": self.description(),
             "k": "tunnel",
-            "u": self.url(),
+            "u": user_link(self.url(), self.auth.as_ref()),
             "s0": self.created_at.saturating_mul(1000),
         })
     }
@@ -232,6 +242,12 @@ impl TunnelInfo {
         let mut out = format!("{} → localhost:{}  (id {})\n", self.url, self.port, self.id);
         if let Some(auth) = &self.auth {
             out.push_str(&format!("auth: {}\n", auth.describe()));
+        }
+        let link = user_link(&self.url, self.auth.as_ref());
+        if link != self.url {
+            out.push_str(&format!(
+                "give the user this link, it opens logged in (anyone with it gets in): {link}\n"
+            ));
         }
         if self.keep_host {
             out.push_str("keeps the Host header\n");
@@ -1897,6 +1913,22 @@ mod tests {
             .decode("3oButUjqjfYwFAGg6i7/BRR4CqU4reHAIhBQ4/zu51w=")
             .unwrap();
         assert_eq!(tunnel_id(&pubkey), "bnw26ze2znzx4jjlz52gsy5y7u");
+    }
+
+    #[test]
+    fn a_token_tunnels_link_logs_in_and_others_are_the_plain_url() {
+        let mut def = TunnelDef::for_test("c", Uuid::nil());
+        let url = def.url().to_string();
+        assert_eq!(def.live_task()["u"], url);
+        def.auth = Some(Auth::generate("basic").unwrap());
+        assert_eq!(def.live_task()["u"], url);
+        assert!(!def.info(true).summary().contains("opens logged in"));
+
+        let auth = Auth::generate("token").unwrap();
+        def.auth = Some(auth.clone());
+        let link = def.live_task()["u"].as_str().unwrap().to_string();
+        assert!(check(&auth, &[], link.strip_prefix(&url).unwrap()).0);
+        assert!(def.info(true).summary().contains(&link));
     }
 
     fn check(
