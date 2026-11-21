@@ -1037,7 +1037,12 @@ mod tests {
         let n = unsafe {
             windows_sys::Win32::System::Console::GetConsoleProcessList(pids.as_mut_ptr(), MAX_PIDS)
         };
+        let ran_through_sample = child.try_wait().expect("try_wait").is_none();
         let _ = child.kill().await;
+        assert!(
+            ran_through_sample,
+            "child exited before the console sample, so the check proves nothing"
+        );
         pids[..n.min(MAX_PIDS) as usize].contains(&pid)
     }
 
