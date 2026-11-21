@@ -11,6 +11,7 @@ mod hermes_support;
 mod list_preview;
 mod net;
 mod orphans;
+mod peer_recovery;
 mod power;
 mod powersync;
 mod prompt_files;
@@ -3888,6 +3889,12 @@ async fn async_main() {
             subagents::run_stop_hook_cli(env_chat_id()).await;
             return;
         }
+        if first == "session-start-hook" {
+            // claude `SessionStart` hook (wired via `--settings`; see
+            // `peer_recovery.rs`). Exit 0 on any failure, like the ones above.
+            peer_recovery::run_hook_cli();
+            return;
+        }
         if first == "subagents" {
             subagents::run_cli(&raw_args[1..], env_chat_id()).await;
             return;
@@ -3949,7 +3956,7 @@ async fn async_main() {
         let is_help = first == "--help" || first == "-h";
         eprintln!(
             "zucchini-spawner — run with NO arguments to start the daemon.\n\
-             subcommands: attach-file, prune-context, prune-reminder-hook, subagent-stop-hook, subagents, scheduled-messages, watch, tunnel, system-prompt, hermes-turn\n\
+             subcommands: attach-file, prune-context, prune-reminder-hook, subagent-stop-hook, session-start-hook, subagents, scheduled-messages, watch, tunnel, system-prompt, hermes-turn\n\
              flags: --version|-V, --help|-h"
         );
         std::process::exit(if is_help { 0 } else { 2 });

@@ -296,18 +296,28 @@ fn claude_flag_args(
     // (`crate::subagents`). Sandboxed: the default permission mode denies the
     // Bash call the hook asks for, so the subagent would only loop.
     if resident && !is_sandboxed {
-        settings["hooks"]["SubagentStop"] = serde_json::json!([{
-            "hooks": [{
-                "type": "command",
-                "command": "\"$ZUCCHINI_SPAWNER_BIN\" subagent-stop-hook",
-                "timeout": 10
-            }]
-        }]);
+        settings["hooks"]["SubagentStop"] = spawner_hook("subagent-stop-hook");
+    }
+    // A resume recovers the peer messages the killed process never read
+    // (`crate::peer_recovery`). Sandboxed spawns can't `SendMessage` a reply.
+    if !is_sandboxed {
+        settings["hooks"]["SessionStart"] = spawner_hook("session-start-hook");
     }
     args.push(CliArg::Lit("--settings"));
     args.push(CliArg::Val(settings.to_string()));
 
     args
+}
+
+/// A `--settings` hook entry that runs this binary's `subcommand`.
+fn spawner_hook(subcommand: &str) -> serde_json::Value {
+    serde_json::json!([{
+        "hooks": [{
+            "type": "command",
+            "command": format!("\"$ZUCCHINI_SPAWNER_BIN\" {subcommand}"),
+            "timeout": 10
+        }]
+    }])
 }
 
 /// The worktree directory name: the chat id's prefix keeps it short.
@@ -814,16 +824,21 @@ fn peer_sender(origin: &serde_json::Value) -> Option<PeerSender> {
 /// The `<task-id>`s a task-notification echo's content reports; a batched one
 /// carries several. The content is a string or an array of text blocks.
 fn notified_task_ids(content: &serde_json::Value) -> Vec<String> {
-    let blocks = content.as_array().into_iter().flatten();
-    let texts = content
-        .as_str()
-        .into_iter()
-        .chain(blocks.filter_map(|block| block["text"].as_str()));
-    texts
+    content_texts(content)
         .flat_map(|text| text.split("<task-id>").skip(1))
         .filter_map(|rest| rest.split_once("</task-id>"))
         .map(|(id, _)| id.trim().to_string())
         .collect()
+}
+
+/// A message content's texts: the string itself, or each block's `text` (a
+/// `tool_result` block has none, its output sits under `content`).
+pub(crate) fn content_texts(content: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let blocks = content.as_array().into_iter().flatten();
+    content
+        .as_str()
+        .into_iter()
+        .chain(blocks.filter_map(|block| block["text"].as_str()))
 }
 
 /// Cumulative for the current turn — caller overwrites `chats.context_tokens`
@@ -3168,12 +3183,14 @@ mod tests {
         assert!(cmd.contains("prune-reminder-hook"), "got: {}", cmd);
         assert!(cmd.contains("PostToolUse"), "got: {}", cmd);
         assert!(!cmd.contains("SubagentStop"), "no session to hold: {cmd}");
+        assert!(cmd.contains("session-start-hook"), "got: {cmd}");
     }
 
-    /// A resident holds a stopping subagent through its `SubagentStop` hook,
-    /// except sandboxed, where the subagent can't run the wait it is told to.
+    /// A resident holds a stopping subagent through its `SubagentStop` hook
+    /// and recovers unread peer messages through its `SessionStart` one,
+    /// except sandboxed, where neither can do its job.
     #[test]
-    fn resident_settings_add_the_subagent_stop_hook_unless_sandboxed() {
+    fn resident_settings_add_the_spawner_hooks_unless_sandboxed() {
         let settings = |ctx: &crate::adapter::SessionContext<'_>| -> serde_json::Value {
             let argv = ClaudeAdapter::new()
                 .prepare_session_native(ctx)
@@ -3192,6 +3209,14 @@ mod tests {
             }]}])
         );
         assert_eq!(
+            owner["SessionStart"],
+            serde_json::json!([{"hooks": [{
+                "type": "command",
+                "command": "\"$ZUCCHINI_SPAWNER_BIN\" session-start-hook",
+                "timeout": 10
+            }]}])
+        );
+        assert_eq!(
             owner["PostToolUse"][0]["hooks"][0]["command"],
             "\"$ZUCCHINI_SPAWNER_BIN\" prune-reminder-hook"
         );
@@ -3201,6 +3226,7 @@ mod tests {
         };
         let member = &settings(&sandboxed)["hooks"];
         assert!(member.get("SubagentStop").is_none(), "{member}");
+        assert!(member.get("SessionStart").is_none(), "{member}");
         assert!(member.get("PostToolUse").is_some(), "{member}");
     }
 
