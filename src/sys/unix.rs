@@ -76,9 +76,15 @@ pub fn login_shell_program() -> String {
 /// shell won't source. Callers chain `.stdout/.stderr/.stdin/.env/.current_dir`
 /// and `configure_new_process_group` as needed.
 pub fn login_shell_command(cmd_string: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(login_shell_program());
+    let mut cmd = new_command(login_shell_program());
     cmd.arg("-lic").arg(cmd_string);
     cmd
+}
+
+/// A `Command` for `program`, the base of every child the daemon starts. Plain
+/// on unix; the Windows twin keeps the child off our console.
+pub fn new_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    tokio::process::Command::new(program)
 }
 
 // ---------------------------------------------------------------------------

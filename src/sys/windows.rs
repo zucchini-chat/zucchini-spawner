@@ -141,8 +141,19 @@ pub fn login_shell_program() -> String {
 /// site funnels through. Callers chain `.stdout/.stderr/.stdin/.env/
 /// .current_dir` and `configure_new_process_group` as needed.
 pub fn login_shell_command(cmd_string: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(login_shell_program());
+    let mut cmd = new_command(login_shell_program());
     cmd.arg("-lic").arg(cmd_string);
+    cmd
+}
+
+/// A `Command` for `program` with `CREATE_NO_WINDOW`, the base of every child
+/// the daemon starts. Without it the child attaches to our console, and under
+/// the task's `conhost --headless` anything it leaves behind (an rc's
+/// `(sleep 600 &)`, an `ssh-agent`) keeps that conhost, and so the task,
+/// running after we exit: the keep-alive trigger then can't start us again.
+pub fn new_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
 }
 
@@ -150,12 +161,11 @@ pub fn login_shell_command(cmd_string: &str) -> tokio::process::Command {
 // Process-group teardown — Job Object (step 4)
 // ---------------------------------------------------------------------------
 
-/// The creation flags every background spawn in this binary uses — the single
-/// source of truth so no site (`configure_new_process_group`, the self-uninstall
-/// spawn in `uninstall.rs`) hand-ORs its own copy and silently drifts.
-/// `CREATE_NO_WINDOW` suppresses the console the child would otherwise allocate
-/// (the spawner runs as a Windows Service / detached, with no console of its own
-/// to inherit). `CREATE_NEW_PROCESS_GROUP` matches the unix `setpgid` intent of
+/// The creation flags of a child in a group of its own — the single source of
+/// truth so no site (`configure_new_process_group`, the self-uninstall spawn in
+/// `uninstall.rs`) hand-ORs its own copy and silently drifts. They include
+/// [`new_command`]'s `CREATE_NO_WINDOW`, as `creation_flags` replaces, not adds.
+/// `CREATE_NEW_PROCESS_GROUP` matches the unix `setpgid` intent of
 /// putting the child in its own group — but on Windows the *killing* is done by
 /// the Job Object (assigned in `adopt`), not by the process group; the new group
 /// only detaches the child from our Ctrl-C/Break.
@@ -760,7 +770,7 @@ if ($changed) { Set-ScheduledTask -TaskName $name -Trigger $triggers -Action $ac
 "#;
 
 pub fn ensure_supervisor_task() {
-    let mut cmd = tokio::process::Command::new("powershell.exe");
+    let mut cmd = new_command("powershell.exe");
     cmd.args([
         "-NoProfile",
         "-ExecutionPolicy",
@@ -768,7 +778,6 @@ pub fn ensure_supervisor_task() {
         "-Command",
         ENSURE_SUPERVISOR_TASK_PS1,
     ])
-    .creation_flags(SPAWN_CREATION_FLAGS)
     .stdin(std::process::Stdio::null());
     tokio::spawn(async move {
         match cmd.output().await {
@@ -1009,6 +1018,45 @@ impl AsyncWrite for IpcStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `cmd`'s child attaches to this process's console. Without a
+    /// console nothing does, so callers check a plain `Command` first.
+    async fn joins_our_console(mut cmd: tokio::process::Command) -> bool {
+        let mut child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn");
+        let pid = child.id().unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        const MAX_PIDS: u32 = 256;
+        let mut pids = [0u32; MAX_PIDS as usize];
+        // SAFETY: FFI; writes at most `MAX_PIDS` pids into the buffer.
+        let n = unsafe {
+            windows_sys::Win32::System::Console::GetConsoleProcessList(pids.as_mut_ptr(), MAX_PIDS)
+        };
+        let _ = child.kill().await;
+        pids[..n.min(MAX_PIDS) as usize].contains(&pid)
+    }
+
+    #[tokio::test]
+    async fn daemon_children_stay_off_our_console() {
+        let mut plain = tokio::process::Command::new("cmd");
+        plain.args(["/C", "ping -n 3 127.0.0.1"]);
+        if !joins_our_console(plain).await {
+            eprintln!("no console to share; skipped");
+            return;
+        }
+        let mut native = new_command("cmd");
+        native.args(["/C", "ping -n 3 127.0.0.1"]);
+        assert!(!joins_our_console(native).await, "new_command");
+        assert!(
+            !joins_our_console(login_shell_command("sleep 3")).await,
+            "login_shell_command"
+        );
+    }
 
     /// Regression for the empty-DACL brick: with the old `NO_INHERITANCE`
     /// directory ACE, hardening the install dir left children with empty DACLs

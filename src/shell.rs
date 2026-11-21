@@ -47,7 +47,7 @@ pub fn native_command(spawn: &NativeSpawn) -> std::io::Result<tokio::process::Co
             format!("`{}` not found on PATH: {e}", spawn.program),
         )
     })?;
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = sys::new_command(program);
     cmd.args(&spawn.args);
     if let Some(cwd) = &spawn.cwd {
         cmd.current_dir(cwd);
