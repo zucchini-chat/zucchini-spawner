@@ -3843,8 +3843,14 @@ fn acquire_single_instance_lock() -> Option<sys::InstanceLock> {
     }
 }
 
+fn main() {
+    // Before the runtime starts any thread that could spawn a child.
+    sys::disinherit_std_handles();
+    async_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return;
@@ -3949,7 +3955,7 @@ async fn main() {
         std::process::exit(if is_help { 0 } else { 2 });
     }
 
-    let _sentry_guard = sentry::init((
+    let sentry_guard = sentry::init((
         SENTRY_DSN,
         sentry::ClientOptions {
             release: sentry::release_name!(),
@@ -4145,7 +4151,7 @@ async fn main() {
 
     let (update_tx, mut update_rx) = mpsc::channel::<String>(1);
     tokio::spawn(updater::run_update_loop(update_tx));
-    let mut update_pending: Option<String> = None;
+    let mut update_retry = updater::UpdateRetry::new(updater::check_interval());
 
     let blob_downloader = {
         let (base_url, fetch_token) = base_and_token(prod.as_ref(), DEV_API_BASE_URL);
@@ -4290,9 +4296,9 @@ async fn main() {
                 run_uninstall(&mut supervisor, &heartbeat_cancel, &writer).await;
                 break 'main_loop;
             }
-            Some(new_version) = update_rx.recv(), if update_pending.is_none() => {
+            Some(new_version) = update_rx.recv() => {
                 info!(new_version = %new_version, "update available, will apply when idle");
-                update_pending = Some(new_version);
+                update_retry.offer(new_version);
                 supervisor.cleanup();
             }
             Some(()) = probe_ready_rx.recv() => {
@@ -4468,7 +4474,7 @@ async fn main() {
         // heartbeats, agents, watches and tunnels, drain the writer and exit
         // for launchd/systemd to respawn it. A failed update tears nothing down
         // and the daemon runs on.
-        if let Some(new_version) = update_pending.as_ref() {
+        if let Some(new_version) = update_retry.due(Instant::now()) {
             if !supervisor.any_running() {
                 info!(
                     current = env!("CARGO_PKG_VERSION"),
@@ -4497,8 +4503,8 @@ async fn main() {
                             break 'main_loop;
                         }
                         Err(e) => {
-                            error!("update failed: {}", e);
-                            update_pending = None;
+                            let retry_in = update_retry.failed(Instant::now());
+                            error!(retry_in_secs = retry_in.as_secs(), "update failed: {}", e);
                         }
                     }
                 }
@@ -4510,6 +4516,10 @@ async fn main() {
         h.cancel.cancel();
     }
     info!("zucchini-spawner exiting");
+    drop(sentry_guard);
+    // Dropping the runtime would wait for blocking-pool reads of child pipes,
+    // forever if a leftover process still holds one.
+    std::process::exit(0);
 }
 
 #[cfg(test)]

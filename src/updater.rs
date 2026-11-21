@@ -12,7 +12,7 @@
 //! loop would re-apply the same dev tag on every boot.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 
@@ -22,6 +22,7 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_MARKER: &str = concat!("zucchini-spawner-release:", env!("CARGO_PKG_VERSION"), ";");
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const RETRY_WHEN_BUSY: Duration = Duration::from_secs(60);
+const MAX_FAILED_UPDATE_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
 // The main loop waits on the download, so a stalled one must not hold it.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PROD_INSTALL_BASE: &str = "https://api.zucchini.chat/install";
@@ -46,7 +47,7 @@ fn base_url() -> String {
         .unwrap_or_else(|| PROD_INSTALL_BASE.to_string())
 }
 
-fn check_interval() -> Duration {
+pub fn check_interval() -> Duration {
     std::env::var("SPAWNER_UPDATE_CHECK_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -201,6 +202,48 @@ async fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// The version waiting to be installed, and when a failed install of it may be
+/// tried again: the wait doubles after each failure, up to 6 h.
+pub struct UpdateRetry {
+    pending: Option<String>,
+    first_wait: Duration,
+    wait: Duration,
+    not_before: Option<Instant>,
+}
+
+impl UpdateRetry {
+    pub fn new(first_wait: Duration) -> Self {
+        let first_wait = first_wait.min(MAX_FAILED_UPDATE_WAIT);
+        UpdateRetry {
+            pending: None,
+            first_wait,
+            wait: first_wait,
+            not_before: None,
+        }
+    }
+
+    /// Due at once with the wait reset.
+    pub fn offer(&mut self, version: String) {
+        self.pending = Some(version);
+        self.wait = self.first_wait;
+        self.not_before = None;
+    }
+
+    pub fn due(&self, now: Instant) -> Option<&str> {
+        self.pending
+            .as_deref()
+            .filter(|_| self.not_before.is_none_or(|t| now >= t))
+    }
+
+    /// Returns how long until the next try.
+    pub fn failed(&mut self, now: Instant) -> Duration {
+        let wait = self.wait;
+        self.not_before = Some(now + wait);
+        self.wait = (wait * 2).min(MAX_FAILED_UPDATE_WAIT);
+        wait
+    }
+}
+
 pub async fn run_update_loop(update_tx: mpsc::Sender<String>) -> ! {
     let base = base_url();
     let interval = check_interval();
@@ -221,9 +264,7 @@ pub async fn run_update_loop(update_tx: mpsc::Sender<String>) -> ! {
             Some(remote) => {
                 if remote != last {
                     info!(current = %last, remote = %remote, "version changed, requesting update");
-                    // Update `last` regardless of send outcome so a stuck consumer
-                    // doesn't make us re-announce on every tick. If a later apply
-                    // fails, the next remote change re-triggers.
+                    // Announced once: the main loop retries a failed update itself.
                     let _ = update_tx.send(remote.clone()).await;
                     last = remote;
                 } else {
@@ -235,5 +276,64 @@ pub async fn run_update_loop(update_tx: mpsc::Sender<String>) -> ! {
                 tokio::time::sleep(RETRY_WHEN_BUSY).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIRST: Duration = Duration::from_secs(10 * 60);
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn nothing_pending_is_never_due() {
+        assert_eq!(UpdateRetry::new(FIRST).due(Instant::now()), None);
+    }
+
+    #[test]
+    fn a_fresh_offer_is_due_at_once() {
+        let mut retry = UpdateRetry::new(FIRST);
+        retry.offer("4.0.1".into());
+        assert_eq!(retry.due(Instant::now()), Some("4.0.1"));
+    }
+
+    #[test]
+    fn a_failed_update_waits_before_the_next_try() {
+        let t0 = Instant::now();
+        let mut retry = UpdateRetry::new(FIRST);
+        retry.offer("4.0.1".into());
+        assert_eq!(retry.failed(t0), FIRST);
+        assert_eq!(retry.due(t0 + 9 * MINUTE), None);
+        assert_eq!(retry.due(t0 + FIRST), Some("4.0.1"));
+    }
+
+    #[test]
+    fn the_wait_doubles_up_to_six_hours() {
+        let t0 = Instant::now();
+        let mut retry = UpdateRetry::new(FIRST);
+        retry.offer("4.0.1".into());
+        let minutes: Vec<u64> = (0..8).map(|_| retry.failed(t0).as_secs() / 60).collect();
+        assert_eq!(minutes, [10, 20, 40, 80, 160, 320, 360, 360]);
+    }
+
+    #[test]
+    fn a_different_version_resets_the_wait_and_is_due_at_once() {
+        let t0 = Instant::now();
+        let mut retry = UpdateRetry::new(FIRST);
+        retry.offer("4.0.1".into());
+        for _ in 0..3 {
+            retry.failed(t0);
+        }
+        retry.offer("4.0.2".into());
+        assert_eq!(retry.due(t0), Some("4.0.2"));
+        assert_eq!(retry.failed(t0), FIRST);
+    }
+
+    #[test]
+    fn a_first_wait_over_six_hours_is_clamped() {
+        let mut retry = UpdateRetry::new(Duration::MAX);
+        retry.offer("4.0.1".into());
+        assert_eq!(retry.failed(Instant::now()), MAX_FAILED_UPDATE_WAIT);
     }
 }

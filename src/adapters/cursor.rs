@@ -891,6 +891,7 @@ async fn is_authenticated() -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .output();
 
     let output = match tokio::time::timeout(STATUS_PROBE_TIMEOUT, run).await {

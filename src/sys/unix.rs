@@ -425,6 +425,9 @@ pub fn sweep_stale_exe() {}
 /// exit; only the Windows Scheduled Task needs this set up at runtime.
 pub fn ensure_supervisor_task() {}
 
+/// Only the Windows launcher waits for EOF on our std handles.
+pub fn disinherit_std_handles() {}
+
 // ---------------------------------------------------------------------------
 // Local IPC — Unix domain sockets (windows: named pipes, step 6)
 // ---------------------------------------------------------------------------

@@ -18,11 +18,12 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_shutdown, CtrlBreak, CtrlC, CtrlShutdown};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_LOCK_VIOLATION, ERROR_PIPE_BUSY, FILETIME, GENERIC_ALL, HANDLE,
     INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
+use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
 use windows_sys::Win32::Security::Authorization::{
     SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS,
     SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
@@ -34,6 +35,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -769,14 +773,33 @@ pub fn ensure_supervisor_task() {
     tokio::spawn(async move {
         match cmd.output().await {
             Ok(out) if out.status.success() => {}
-            Ok(out) => warn!(
+            Ok(out) => error!(
                 status = %out.status,
                 stderr = %String::from_utf8_lossy(&out.stderr),
                 "failed to add the keep-alive trigger to the scheduled task"
             ),
-            Err(e) => warn!(error = %e, "failed to run powershell for the keep-alive trigger"),
+            Err(e) => error!(error = %e, "failed to run powershell for the keep-alive trigger"),
         }
     });
+}
+
+/// Std spawns every child with `bInheritHandles`, so any inheritable handle of
+/// ours reaches it, and a child that outlives us would hold the launcher's
+/// stdout/stderr pipes open: `run.ps1` waits for their EOF, so the task never
+/// ends and the keep-alive trigger can't relaunch us. An explicit
+/// `Stdio::inherit()` still works, since std hands the child a duplicate.
+pub fn disinherit_std_handles() {
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: FFI. `GetStdHandle` returns the process's std handle (or
+        // null/invalid, skipped), not a new one to close; `SetHandleInformation`
+        // only clears its inherit flag, and a failure leaves it as it was.
+        unsafe {
+            let handle = GetStdHandle(id);
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 /// `<exe>.old`, the parking spot for the previous binary after an update.
