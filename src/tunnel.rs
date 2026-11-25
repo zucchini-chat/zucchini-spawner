@@ -52,6 +52,9 @@ const SWITCH_GRACE: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+/// piko pings every 30 s, so a connection this quiet is dead even if no close
+/// ever reached us: yamux has no keepalive of its own.
+const RELAY_SILENCE_LIMIT: Duration = Duration::from_secs(90);
 /// The relay forgets an id unseen this long, queue included.
 const PURGE_GIVE_UP_SECS: i64 = 30 * 24 * 3600;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1307,8 +1310,8 @@ async fn serve(
     retire: CancellationToken,
     grace: Duration,
 ) {
-    let mut conn =
-        yamux::Connection::new(WsIo::new(ws), yamux::Config::default(), yamux::Mode::Client);
+    let io = WsIo::new(ws, RELAY_SILENCE_LIMIT);
+    let mut conn = yamux::Connection::new(io, yamux::Config::default(), yamux::Mode::Client);
     let in_flight = Arc::new(InFlight::default());
     let _close_local = in_flight.closed.clone().drop_guard();
     let mut retire_by: Option<tokio::time::Instant> = None;
@@ -1757,14 +1760,26 @@ fn ct_eq(a: &str, b: &str) -> bool {
 struct WsIo {
     ws: WsStream,
     buf: Bytes,
+    silence_limit: Duration,
+    silence: Pin<Box<tokio::time::Sleep>>,
 }
 
 impl WsIo {
-    fn new(ws: WsStream) -> Self {
+    fn new(ws: WsStream, silence_limit: Duration) -> Self {
         Self {
             ws,
             buf: Bytes::new(),
+            silence_limit,
+            silence: Box::pin(tokio::time::sleep(silence_limit)),
         }
+    }
+
+    /// Fails a stuck read or write once nothing has arrived for the limit.
+    /// Writes count too: yamux stops reading while a pong waits to be sent.
+    fn poll_silence(&mut self, cx: &mut TaskContext<'_>) -> Poll<std::io::Error> {
+        ready!(std::future::Future::poll(self.silence.as_mut(), cx));
+        warn!("tunnel relay went silent, dropping the connection");
+        Poll::Ready(std::io::ErrorKind::TimedOut.into())
     }
 }
 
@@ -1780,7 +1795,12 @@ impl AsyncRead for WsIo {
                 out[..n].copy_from_slice(&self.buf.split_to(n));
                 return Poll::Ready(Ok(n));
             }
-            match ready!(Pin::new(&mut self.ws).poll_next(cx)) {
+            let Poll::Ready(next) = Pin::new(&mut self.ws).poll_next(cx) else {
+                return self.poll_silence(cx).map(Err);
+            };
+            let quiet_until = tokio::time::Instant::now() + self.silence_limit;
+            self.silence.as_mut().reset(quiet_until);
+            match next {
                 Some(Ok(Message::Binary(data))) => self.buf = data,
                 Some(Ok(Message::Close(_))) | None => return Poll::Ready(Ok(0)),
                 Some(Ok(_)) => {}
@@ -1796,7 +1816,10 @@ impl AsyncWrite for WsIo {
         cx: &mut TaskContext<'_>,
         data: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        ready!(Pin::new(&mut self.ws).poll_ready(cx)).map_err(std::io::Error::other)?;
+        let Poll::Ready(ready) = Pin::new(&mut self.ws).poll_ready(cx) else {
+            return self.poll_silence(cx).map(Err);
+        };
+        ready.map_err(std::io::Error::other)?;
         Pin::new(&mut self.ws)
             .start_send(Message::Binary(Bytes::copy_from_slice(data)))
             .map_err(std::io::Error::other)?;
@@ -1804,9 +1827,10 @@ impl AsyncWrite for WsIo {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.ws)
-            .poll_flush(cx)
-            .map_err(std::io::Error::other)
+        let Poll::Ready(flushed) = Pin::new(&mut self.ws).poll_flush(cx) else {
+            return self.poll_silence(cx).map(Err);
+        };
+        Poll::Ready(flushed.map_err(std::io::Error::other))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
@@ -2820,6 +2844,85 @@ mod tests {
 
     type RelayWs = tokio_tungstenite::WebSocketStream<tokio_util::compat::Compat<yamux::Stream>>;
 
+    /// The spawner's and the relay's side of one upstream WebSocket.
+    async fn relay_websocket() -> (WsStream, WsStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (spawner_side, relay_side) =
+            tokio::join!(tokio_tungstenite::connect_async(url), async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let tcp = tokio_tungstenite::MaybeTlsStream::Plain(tcp);
+                tokio_tungstenite::accept_async(tcp).await.unwrap()
+            });
+        (spawner_side.unwrap().0, relay_side)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_relay_connection_is_dropped() {
+        let (spawner_side, _relay_side) = relay_websocket().await;
+        let local = Arc::new(Local {
+            port: 9,
+            auth: None,
+            keep_host: false,
+            origin: String::new(),
+        });
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            2 * RELAY_SILENCE_LIMIT,
+            serve(
+                spawner_side,
+                local,
+                CancellationToken::new(),
+                CancellationToken::new(),
+                SWITCH_GRACE,
+            ),
+        )
+        .await
+        .expect("still serving a relay that went silent");
+        assert!(started.elapsed() >= RELAY_SILENCE_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn relay_traffic_restarts_the_silence_limit() {
+        use futures::{AsyncReadExt, SinkExt};
+        let limit = Duration::from_secs(1);
+        let (spawner_side, mut relay_side) = relay_websocket().await;
+        let mut io = WsIo::new(spawner_side, limit);
+        let mut buf = [0u8; 8];
+        let (read, ()) = tokio::join!(io.read(&mut buf), async {
+            tokio::time::sleep(limit / 2).await;
+            relay_side.send(Message::binary(vec![7])).await.unwrap();
+        });
+        let received = tokio::time::Instant::now();
+        assert_eq!(read.unwrap(), 1);
+        let silent = tokio::time::timeout(3 * limit, io.read(&mut buf))
+            .await
+            .expect("still reading from a relay that went silent")
+            .unwrap_err();
+        assert_eq!(silent.kind(), std::io::ErrorKind::TimedOut);
+        assert!(received.elapsed() >= limit);
+    }
+
+    #[tokio::test]
+    async fn a_write_the_relay_never_takes_fails_at_the_silence_limit() {
+        use futures::AsyncWriteExt;
+        let limit = Duration::from_secs(1);
+        let (spawner_side, _relay_side) = relay_websocket().await;
+        let mut io = WsIo::new(spawner_side, limit);
+        let chunk = vec![0u8; 1 << 16];
+        let stuck = async {
+            loop {
+                if let Err(e) = io.write_all(&chunk).await {
+                    return e;
+                }
+            }
+        };
+        let e = tokio::time::timeout(10 * limit, stuck)
+            .await
+            .expect("still writing to a relay that reads nothing");
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+    }
+
     /// A relay connection `serve`d with `grace` to the local `port`, and a
     /// stream piko would open on it for one request.
     async fn stream_through_serve(
@@ -2831,14 +2934,7 @@ mod tests {
         CancellationToken,
         tokio::task::JoinHandle<()>,
     ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        let (spawner_side, relay_side) =
-            tokio::join!(tokio_tungstenite::connect_async(url), async {
-                let (tcp, _) = listener.accept().await.unwrap();
-                let tcp = tokio_tungstenite::MaybeTlsStream::Plain(tcp);
-                tokio_tungstenite::accept_async(tcp).await.unwrap()
-            });
+        let (spawner_side, relay_side) = relay_websocket().await;
         let local = Arc::new(Local {
             port,
             auth: None,
@@ -2847,14 +2943,14 @@ mod tests {
         });
         let (session, retire) = (CancellationToken::new(), CancellationToken::new());
         let served = tokio::spawn(serve(
-            spawner_side.unwrap().0,
+            spawner_side,
             local,
             session.clone(),
             retire.clone(),
             grace,
         ));
         let mut relay = yamux::Connection::new(
-            WsIo::new(relay_side),
+            WsIo::new(relay_side, RELAY_SILENCE_LIMIT),
             yamux::Config::default(),
             yamux::Mode::Server,
         );
