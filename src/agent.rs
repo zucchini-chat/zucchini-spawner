@@ -609,7 +609,10 @@ pub fn reduce(state: &mut SessionState, ev: &AgentEvent) {
             state.context_tokens = Some(*n);
         }
         // Non-state-bearing events.
-        AgentEvent::Frame(_) | AgentEvent::SessionIdHarvested(_) | AgentEvent::ToolResult => {}
+        AgentEvent::Frame(_)
+        | AgentEvent::TaskFinishedRow(_)
+        | AgentEvent::SessionIdHarvested(_)
+        | AgentEvent::ToolResult => {}
     }
 }
 
@@ -1105,10 +1108,12 @@ impl AgentEvent {
     /// 1:1 to an `AgentResponse` for the given chat topic.
     fn into_response(self, topic: &str, has_result: &mut bool) -> Option<AgentResponse> {
         Some(match self {
-            AgentEvent::Frame(content) => AgentResponse::Line {
-                topic: topic.to_string(),
-                content,
-            },
+            AgentEvent::Frame(content) | AgentEvent::TaskFinishedRow(content) => {
+                AgentResponse::Line {
+                    topic: topic.to_string(),
+                    content,
+                }
+            }
             AgentEvent::ContextTokens(tokens) => AgentResponse::ContextTokens {
                 topic: topic.to_string(),
                 tokens,
@@ -2856,7 +2861,7 @@ fn default_resident_spawn_fn(
                                         }
                                         match ev {
                                             _ if swallow => {}
-                                            AgentEvent::Frame(content) => {
+                                            AgentEvent::Frame(content) | AgentEvent::TaskFinishedRow(content) => {
                                                 let followup = attach_followup_for(&topic, &content, &mut attach_rx);
                                                 send_or_cancel!(AgentResponse::Line { topic: topic.clone(), content });
                                                 if let Some(f) = followup {

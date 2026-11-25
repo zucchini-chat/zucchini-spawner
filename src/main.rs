@@ -6455,7 +6455,8 @@ mod tests {
                 let topic = self.chat_id.clone();
                 match ev {
                     _ if swallow => {}
-                    adapter::AgentEvent::Frame(content) => {
+                    adapter::AgentEvent::Frame(content)
+                    | adapter::AgentEvent::TaskFinishedRow(content) => {
                         self.respond(AgentResponse::Line { topic, content }).await
                     }
                     adapter::AgentEvent::ContextTokens(tokens) => {
@@ -8080,6 +8081,40 @@ mod tests {
 
         let writes = c.writes();
         assert!(writes.is_empty(), "the rename is silent: {writes:?}");
+    }
+
+    /// A background task that ends while a `/rename` runs still gets its
+    /// `task_finished` row: only the rename's own output is dropped.
+    #[tokio::test]
+    async fn a_task_ending_during_a_rename_still_writes_its_row() {
+        let mut c = ResidentChat::new();
+        c.window(vec![
+            c.titled_chat(1, "cover letters"),
+            c.project(),
+            c.message(1, "first"),
+        ])
+        .await;
+        c.consume_first_turn();
+        c.reader_raw(r#"{"type":"system","subtype":"task_started","task_id":"bt6sv3hno","run_id":"0mwwburw3-48bb027b","description":"bg exit0","is_backgrounded":true,"task_type":"local_bash"}"#).await;
+        c.reader_line(vec![adapter::AgentEvent::Result]).await;
+        c.window(vec![c.titled_chat(1, "my voice writer")]).await;
+        let uuid = c.session().lock().unwrap().unconsumed[0].uuid.clone();
+        c.writes();
+
+        for line in [
+            format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"started","session_id":"s1"}}"#),
+            r#"{"type":"system","subtype":"task_updated","task_id":"bt6sv3hno","run_id":"0mwwburw3-48bb027b","patch":{"status":"completed"}}"#.to_string(),
+            r#"{"type":"system","subtype":"task_notification","task_id":"bt6sv3hno","run_id":"0mwwburw3-48bb027b","status":"completed","summary":"Background command \"bg exit0\" completed (exit code 0)"}"#.to_string(),
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Session renamed to: my voice writer"}]}}"#.to_string(),
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#.to_string(),
+        ] {
+            c.reader_raw(&line).await;
+        }
+
+        let rows = c.message_rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["subtype"], "task_finished");
+        assert_eq!(rows[0]["description"], "bg exit0");
     }
 
     #[tokio::test]

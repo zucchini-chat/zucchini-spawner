@@ -64,7 +64,33 @@ pub struct ClaudeAdapter {
     /// The `to` of each `SendMessage` call, by its `tool_use` id, until its
     /// `tool_result` says whether the message went out.
     pending_sends: HashMap<String, String>,
+    /// `tool_use` ids of Monitor calls, until that call's `task_started` or
+    /// `tool_result`: only the call tells a Monitor from a background Bash.
+    monitor_calls: HashSet<String>,
+    /// Each task's current run, by task id, until its `task_notification`.
+    task_runs: HashMap<String, TaskRun>,
+    /// The `parent_tool_use_id` each subagent's frames carry, by its agent id:
+    /// a task it armed ends on its page. Until one of its frames is read (a
+    /// frame over `MAX_STREAM_FRAME_BYTES` isn't), the call of its first
+    /// `task_started` in this process: its Agent call, unless it was resumed
+    /// after a respawn.
+    subagent_calls: HashMap<String, String>,
 }
+
+/// One run of a task, from its `task_started`: what its `task_finished` row
+/// needs.
+struct TaskRun {
+    run_id: Option<String>,
+    kind: &'static str,
+    description: String,
+    backgrounded: bool,
+    owned_by_subagent: bool,
+    parent_task_id: Option<String>,
+}
+
+/// `/api/writes` takes a batch of up to 32 rows under a 2 MB body, with no
+/// per-row cap, so a report is cut far below that.
+const MAX_TASK_SUMMARY_BYTES: usize = 32 * 1024;
 
 impl ClaudeAdapter {
     pub fn new() -> Self {
@@ -74,8 +100,9 @@ impl ClaudeAdapter {
     /// Scan an assistant frame's `tool_use` blocks for what later frames need:
     /// the ids of `prune-context` calls, so the matching `tool_result` (and only
     /// it) can later drive the queued prune's apply; where `SendMessage` calls
-    /// go; and the names Agent calls give their subagents. Caller gates on
-    /// substrings, so the parse only runs on frames that mention one of them.
+    /// go; the names Agent calls give their subagents; and which calls are
+    /// Monitors. Caller gates on substrings, so the parse only runs on frames
+    /// that mention one of them.
     fn record_tool_uses(&mut self, line: &str) {
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
@@ -102,9 +129,172 @@ impl ClaudeAdapter {
                 (Some("Agent"), _, Some(name)) => {
                     self.agent_names.insert(id.to_string(), name);
                 }
+                (Some("Monitor"), _, _) => {
+                    self.monitor_calls.insert(id.to_string());
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Reads a `task_started` system frame into the event the Supervisor
+    /// tracks, and keeps the run for its `task_finished` row. Everything but
+    /// `task_id` is optional: a frame shape drift must still arm the task (a
+    /// never-inserted task wedges the Waiting state), it may just cost the
+    /// client its label. Verbatim shapes in `tmp/monitor_raw.jsonl`
+    /// (backgrounded Bash / Monitor: `task_type: "local_bash"`, no
+    /// `subagent_type`) and `tmp/agent_task_raw.jsonl` (backgrounded subagent:
+    /// `task_type: "local_agent"` + `subagent_type`). Takes the name the
+    /// starting Agent call gave the task out of `agent_names`, and the
+    /// starting Monitor call out of `monitor_calls`.
+    fn task_started(&mut self, line: &str) -> Option<AgentEvent> {
+        #[derive(serde::Deserialize)]
+        struct Frame {
+            task_id: String,
+            #[serde(default)]
+            run_id: Option<serde_json::Value>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            task_type: Option<String>,
+            #[serde(default)]
+            subagent_type: Option<String>,
+            #[serde(default)]
+            tool_use_id: Option<serde_json::Value>,
+            #[serde(default)]
+            owned_by_subagent: Option<bool>,
+            #[serde(default)]
+            is_backgrounded: Option<bool>,
+            #[serde(default)]
+            parent_task_id: Option<String>,
+        }
+        let f = match serde_json::from_str::<Frame>(line) {
+            Ok(f) => f,
+            Err(e) => {
+                debug!("failed to parse task_started frame: {}", e);
+                return None;
+            }
+        };
+        let tool_use_id = nonempty_string(f.tool_use_id);
+        let task_type = f.task_type.unwrap_or_default();
+        let monitor = tool_use_id
+            .as_ref()
+            .is_some_and(|id| self.monitor_calls.remove(id));
+        let run = TaskRun {
+            run_id: nonempty_string(f.run_id),
+            kind: match task_type.as_str() {
+                "local_agent" => "agent",
+                "local_bash" if monitor => "monitor",
+                "local_bash" => "command",
+                _ => "task",
+            },
+            description: f.description.unwrap_or_default(),
+            backgrounded: f.is_backgrounded.unwrap_or(true),
+            owned_by_subagent: f.owned_by_subagent.unwrap_or_default(),
+            parent_task_id: f.parent_task_id.filter(|p| !p.is_empty()),
+        };
+        if let (Some(call), "agent") = (&tool_use_id, run.kind) {
+            self.subagent_calls
+                .entry(f.task_id.clone())
+                .or_insert_with(|| call.clone());
+        }
+        let started = AgentEvent::TaskStarted {
+            id: f.task_id.clone(),
+            description: run.description.clone(),
+            task_type,
+            subagent_type: f.subagent_type.filter(|s| !s.is_empty()),
+            name: tool_use_id
+                .as_ref()
+                .and_then(|id| self.agent_names.remove(id)),
+            tool_use_id,
+            owned_by_subagent: run.owned_by_subagent,
+            backgrounded: run.backgrounded,
+            parent_task_id: run.parent_task_id.clone(),
+        };
+        self.task_runs.insert(f.task_id, run);
+        Some(started)
+    }
+
+    /// A `task_updated` that moves a foreground task to the background (a
+    /// Bash past its timeout).
+    fn task_backgrounded(&mut self, line: &str) {
+        #[derive(serde::Deserialize)]
+        struct Frame {
+            task_id: String,
+            patch: Patch,
+        }
+        #[derive(serde::Deserialize)]
+        struct Patch {
+            #[serde(default)]
+            is_backgrounded: bool,
+        }
+        let Ok(f) = serde_json::from_str::<Frame>(line) else {
+            return;
+        };
+        if let Some(run) = self.task_runs.get_mut(&f.task_id) {
+            run.backgrounded |= f.patch.is_backgrounded;
+        }
+    }
+
+    /// The `task_finished` row of the run a `task_notification` ends, for a
+    /// background run only. A task a subagent armed goes to that subagent's
+    /// page as its frame, so it has none while the subagent's frame call id
+    /// is unknown. A notification of another run leaves the current one.
+    fn task_finished_row(&mut self, line: &str) -> Option<AgentEvent> {
+        #[derive(serde::Deserialize)]
+        struct Frame {
+            task_id: String,
+            #[serde(default)]
+            run_id: Option<serde_json::Value>,
+            #[serde(default)]
+            status: Option<String>,
+            #[serde(default)]
+            summary: Option<String>,
+        }
+        let f: Frame = serde_json::from_str(line).ok()?;
+        let run_id = nonempty_string(f.run_id);
+        let current = &self.task_runs.get(&f.task_id)?.run_id;
+        if matches!((current, &run_id), (Some(current), Some(received)) if current != received) {
+            return None;
+        }
+        let run = self.task_runs.remove(&f.task_id)?;
+        if !run.backgrounded {
+            return None;
+        }
+        let subagent = match &run.parent_task_id {
+            Some(parent) => Some((parent, self.subagent_calls.get(parent)?)),
+            None if run.owned_by_subagent => return None,
+            None => None,
+        };
+        let status = match f.status.as_deref() {
+            Some("failed") => "failed",
+            Some("stopped" | "killed" | "cancelled") => "stopped",
+            _ => "finished",
+        };
+        let summary = f.summary.unwrap_or_default();
+        let mut row = serde_json::json!({
+            "type": "system",
+            "subtype": "task_finished",
+            "task_id": f.task_id,
+            "kind": run.kind,
+            "status": status,
+            "description": run.description,
+            "summary": crate::peer_recovery::cut(&summary, MAX_TASK_SUMMARY_BYTES, "]"),
+        });
+        if let Some((agent_id, call)) = subagent {
+            row["parent_tool_use_id"] = call.as_str().into();
+            row["agent_id"] = agent_id.as_str().into();
+        }
+        Some(AgentEvent::TaskFinishedRow(row.to_string()))
+    }
+}
+
+/// A non-empty string field, else `None`: a field of another type must not
+/// fail the frame's parse.
+fn nonempty_string(field: Option<serde_json::Value>) -> Option<String> {
+    match field {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
+        _ => None,
     }
 }
 
@@ -504,17 +694,24 @@ impl AgentAdapter for ClaudeAdapter {
             tracing::info!(diag = "tasktrace", "raw task frame: {snip}");
         }
 
-        // Pre-skip-filter: thinking-only frames also carry usage. The
-        // token-usage parse stays under MAX_STREAM_FRAME_BYTES — it runs on
-        // EVERY assistant frame, so it must skip pathologically large bodies.
+        // Pre-skip-filter: thinking-only frames also carry usage, and a
+        // subagent's frames name its frame call id. The parse stays under
+        // MAX_STREAM_FRAME_BYTES — it runs on EVERY assistant frame, so it
+        // must skip pathologically large bodies.
         if line.len() < MAX_STREAM_FRAME_BYTES
             && line.starts_with('{')
             && line.contains("\"type\":\"assistant\"")
         {
-            if let Some(tokens) = parse_assistant_usage(&line) {
-                if let Some(t) = self.last_emitted_tokens.observe(tokens) {
-                    out.push(AgentEvent::ContextTokens(t));
+            match parse_assistant_frame(&line) {
+                Some(AssistantFrame::Main(tokens)) => {
+                    if let Some(t) = self.last_emitted_tokens.observe(tokens) {
+                        out.push(AgentEvent::ContextTokens(t));
+                    }
                 }
+                Some(AssistantFrame::Subagent { agent_id, call }) => {
+                    self.subagent_calls.insert(agent_id, call);
+                }
+                None => {}
             }
         }
 
@@ -535,12 +732,14 @@ impl AgentAdapter for ClaudeAdapter {
         // tool_result frame can also echo "prune-context" in its result text,
         // but record_tool_uses only inspects `tool_use` blocks, so
         // restricting to assistant frames just avoids a needless parse).
-        // `SendMessage` and Agent calls feed `crate::subagents`.
+        // `SendMessage` and Agent calls feed `crate::subagents`, Monitor calls
+        // the `task_finished` rows.
         if line.starts_with('{')
             && line.contains("\"type\":\"assistant\"")
             && (line.contains("prune-context")
                 || line.contains("\"name\":\"SendMessage\"")
-                || line.contains("\"name\":\"Agent\""))
+                || line.contains("\"name\":\"Agent\"")
+                || line.contains("\"name\":\"Monitor\""))
         {
             self.record_tool_uses(&line);
         }
@@ -618,7 +817,7 @@ impl AgentAdapter for ClaudeAdapter {
                     // it in `live_tasks` (Waiting state) until its terminal
                     // `task_notification`; the rest of the frame names it for the
                     // client (`chats.live_tasks`).
-                    out.extend(parse_task_started(&line, &mut self.agent_names));
+                    out.extend(self.task_started(&line));
                 } else if line.contains("\"subtype\":\"task_notification\"")
                     || (line.contains("\"subtype\":\"task_updated\"")
                         && task_updated_is_terminal(&line))
@@ -635,6 +834,14 @@ impl AgentAdapter for ClaudeAdapter {
                     if let Some(id) = parse_task_id(&line) {
                         out.push(AgentEvent::TaskFinished(id));
                     }
+                    // Only the notification carries the report.
+                    if line.contains("\"subtype\":\"task_notification\"") {
+                        out.extend(self.task_finished_row(&line));
+                    }
+                } else if line.contains("\"subtype\":\"task_updated\"")
+                    && line.contains("\"is_backgrounded\":true")
+                {
+                    self.task_backgrounded(&line);
                 }
                 skip = true;
             } else if line.contains("\"type\":\"user\"") {
@@ -668,13 +875,16 @@ impl AgentAdapter for ClaudeAdapter {
                 if line.contains("\"type\":\"tool_result\"")
                     && !(self.pending_prune_tool_use_ids.is_empty()
                         && self.pending_sends.is_empty()
-                        && self.agent_names.is_empty())
+                        && self.agent_names.is_empty()
+                        && self.monitor_calls.is_empty())
                 {
                     let mut prune_cue = false;
                     for (id, is_error) in tool_results(&line) {
                         prune_cue |= self.pending_prune_tool_use_ids.remove(&id);
-                        // A failed Agent call starts no task to take its name.
+                        // A failed Agent or Monitor call starts no task to
+                        // take its id.
                         self.agent_names.remove(&id);
+                        self.monitor_calls.remove(&id);
                         if let Some(to) = self.pending_sends.remove(&id).filter(|_| !is_error) {
                             out.push(AgentEvent::SendMessageTo(to));
                         }
@@ -841,9 +1051,18 @@ pub(crate) fn content_texts(content: &serde_json::Value) -> impl Iterator<Item =
         .chain(blocks.filter_map(|block| block["text"].as_str()))
 }
 
-/// Cumulative for the current turn — caller overwrites `chats.context_tokens`
-/// with each emission. Uses a narrow Deserialize struct so serde skips the rest
-/// of the frame (text blocks, tool calls) without allocating it.
+/// What an assistant frame tells the adapter.
+enum AssistantFrame {
+    /// The main session's context tokens, cumulative for the current turn —
+    /// caller overwrites `chats.context_tokens` with each emission.
+    Main(i64),
+    /// A subagent's frame: its agent id and the `parent_tool_use_id` its
+    /// frames carry.
+    Subagent { agent_id: String, call: String },
+}
+
+/// Uses a narrow Deserialize struct so serde skips the rest of the frame
+/// (text blocks, tool calls) without allocating it.
 ///
 /// `message.usage` is `Option<_>` so a claude format drift that ships an
 /// interim assistant frame without `usage` (or renames the field) doesn't
@@ -854,14 +1073,16 @@ pub(crate) fn content_texts(content: &serde_json::Value) -> impl Iterator<Item =
 ///
 /// Subagent (Task) frames carry the parent's tool_use id in top-level
 /// `parent_tool_use_id`; their `usage` describes the subagent's own context,
-/// not the main chat's, so we skip them — otherwise `chats.context_tokens`
+/// not the main chat's, so we skip it — otherwise `chats.context_tokens`
 /// would jitter to the subagent's count and back on every interleaved frame.
-fn parse_assistant_usage(line: &str) -> Option<i64> {
+fn parse_assistant_frame(line: &str) -> Option<AssistantFrame> {
     #[derive(serde::Deserialize)]
     struct Frame {
         message: Message,
         #[serde(default)]
         parent_tool_use_id: Option<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct Message {
@@ -879,11 +1100,14 @@ fn parse_assistant_usage(line: &str) -> Option<i64> {
     }
     match serde_json::from_str::<Frame>(line) {
         Ok(f) => {
-            if f.parent_tool_use_id.is_some() {
-                return None;
+            if let Some(call) = f.parent_tool_use_id {
+                let agent_id = f.agent_id.filter(|id| !id.is_empty() && !call.is_empty())?;
+                return Some(AssistantFrame::Subagent { agent_id, call });
             }
             let u = f.message.usage?;
-            Some(u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens)
+            Some(AssistantFrame::Main(
+                u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens,
+            ))
         }
         Err(e) => {
             debug!("failed to parse assistant frame for usage: {}", e);
@@ -909,58 +1133,6 @@ fn parse_init(line: &str) -> Option<InitFrame> {
         Ok(f) => (f.r#type == "system" && f.subtype == "init").then_some(f),
         Err(e) => {
             debug!("failed to parse init frame: {}", e);
-            None
-        }
-    }
-}
-
-/// Reads a `task_started` system frame into the event the Supervisor tracks.
-/// Everything but `task_id` is optional: a frame shape drift must still arm the
-/// task (a never-inserted task wedges the Waiting state), it may just cost the
-/// client its label. Verbatim shapes in `tmp/monitor_raw.jsonl` (backgrounded
-/// Bash / Monitor: `task_type: "local_bash"`, no `subagent_type`) and
-/// `tmp/agent_task_raw.jsonl` (backgrounded subagent: `task_type:
-/// "local_agent"` + `subagent_type`). Takes the name the starting Agent call
-/// gave the task out of `agent_names`.
-fn parse_task_started(line: &str, agent_names: &mut HashMap<String, String>) -> Option<AgentEvent> {
-    #[derive(serde::Deserialize)]
-    struct Frame {
-        task_id: String,
-        #[serde(default)]
-        description: Option<String>,
-        #[serde(default)]
-        task_type: Option<String>,
-        #[serde(default)]
-        subagent_type: Option<String>,
-        #[serde(default)]
-        tool_use_id: Option<serde_json::Value>,
-        #[serde(default)]
-        owned_by_subagent: Option<bool>,
-        #[serde(default)]
-        is_backgrounded: Option<bool>,
-        #[serde(default)]
-        parent_task_id: Option<String>,
-    }
-    match serde_json::from_str::<Frame>(line) {
-        Ok(f) => {
-            let tool_use_id = match f.tool_use_id {
-                Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id),
-                _ => None,
-            };
-            Some(AgentEvent::TaskStarted {
-                id: f.task_id,
-                description: f.description.unwrap_or_default(),
-                task_type: f.task_type.unwrap_or_default(),
-                subagent_type: f.subagent_type.filter(|s| !s.is_empty()),
-                name: tool_use_id.as_ref().and_then(|id| agent_names.remove(id)),
-                tool_use_id,
-                owned_by_subagent: f.owned_by_subagent.unwrap_or_default(),
-                backgrounded: f.is_backgrounded.unwrap_or(true),
-                parent_task_id: f.parent_task_id.filter(|p| !p.is_empty()),
-            })
-        }
-        Err(e) => {
-            debug!("failed to parse task_started frame: {}", e);
             None
         }
     }
@@ -2362,6 +2534,378 @@ mod tests {
         assert_eq!(run(&mut a, failed), vec!["TaskFinished(t-7)"]);
         let cancelled = r#"{"type":"system","subtype":"task_updated","task_id":"t-8","patch":{"status":"cancelled"}}"#;
         assert_eq!(run(&mut a, cancelled), vec!["TaskFinished(t-8)"]);
+    }
+
+    /// The `task_finished` rows `lines` write, in order.
+    fn task_rows(a: &mut ClaudeAdapter, lines: &[&str]) -> Vec<serde_json::Value> {
+        lines
+            .iter()
+            .flat_map(|line| a.handle_line(line.to_string()))
+            .filter_map(|ev| match ev {
+                AgentEvent::TaskFinishedRow(row) => Some(serde_json::from_str(&row).unwrap()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `task_started` + `task_notification` pair; `extra` goes into the
+    /// started frame.
+    fn task_run(id: &str, extra: &str, status: &str) -> [String; 2] {
+        [
+            format!(
+                r#"{{"type":"system","subtype":"task_started","task_id":"{id}","run_id":"r-{id}","description":"d","is_backgrounded":true{extra}}}"#
+            ),
+            format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"{id}","run_id":"r-{id}","status":"{status}","summary":"s"}}"#
+            ),
+        ]
+    }
+
+    // Verbatim frames from the claude 2.1.332 probe (`tmp/task-finished-probe`).
+    const BG_BASH_STARTED: &str = r#"{"type":"system","subtype":"task_started","task_id":"bt6sv3hno","run_id":"0mwwburw3-48bb027b","tool_use_id":"toolu_01Ag6zy1HQGuUVNZdSw2FmXF","description":"bg exit0","is_backgrounded":true,"task_type":"local_bash","uuid":"ca71e5d4-fa1f-4285-863c-bbee4d83f3ee","session_id":"5f7e4454-87e6-47f3-94ca-19d9459fa9af"}"#;
+    const BG_BASH_UPDATED: &str = r#"{"type":"system","subtype":"task_updated","task_id":"bt6sv3hno","run_id":"0mwwburw3-48bb027b","patch":{"status":"completed","end_time":1795623477191},"uuid":"add0ffbf-e3e2-47cc-b665-476310fb08cf","session_id":"5f7e4454-87e6-47f3-94ca-19d9459fa9af"}"#;
+    const BG_BASH_NOTIFIED: &str = r#"{"type":"system","subtype":"task_notification","task_id":"bt6sv3hno","run_id":"0mwwburw3-48bb027b","tool_use_id":"toolu_01Ag6zy1HQGuUVNZdSw2FmXF","status":"completed","output_file":"/private/tmp/claude-501/-private-tmp-cprobe-taskfin-bash/5f7e4454-87e6-47f3-94ca-19d9459fa9af/tasks/bt6sv3hno.output","summary":"Background command \"bg exit0\" completed (exit code 0)","uuid":"810d8fe0-4d77-4b44-8fc0-d511a266a34b","session_id":"5f7e4454-87e6-47f3-94ca-19d9459fa9af"}"#;
+    const OUTER_STARTED: &str = r#"{"type":"system","subtype":"task_started","task_id":"aa81930fc370f0f7d","run_id":"0mwwbvfdo-3ffe3f8a","tool_use_id":"toolu_01DD231Lj5D1HtsKpbrLboge","description":"outer","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","uuid":"c28155eb-3507-4e08-a7d4-a585286e7e2a","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+    const OUTER_FRAME: &str = r#"{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChPwyrxq3HveV1rCYiqtr","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01BRuU4g6pzKXeQT5zU82NV7","name":"Agent","input":{"description":"inner","subagent_type":"general-purpose","run_in_background":true,"prompt":"Run the Bash command sleep 5 in the foreground, then reply INNER-DONE"},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":5822,"cache_read_input_tokens":6513,"cache_creation":{"ephemeral_5m_input_tokens":5822,"ephemeral_1h_input_tokens":0},"output_tokens":16,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":"toolu_01DD231Lj5D1HtsKpbrLboge","agent_id":"aa81930fc370f0f7d","session_id":"d4488387-e042-46c6-b756-051e30177fb0","uuid":"81b82841-a973-435e-b92e-9bde51b0103d","timestamp":"2026-11-25T16:18:25.997Z","request_id":"req_011ChPwyrsshG1xfbmucHfVm","subagent_type":"general-purpose","task_description":"outer"}"#;
+    const INNER_STARTED: &str = r#"{"type":"system","subtype":"task_started","task_id":"a68ed37d230ddc45a","run_id":"0mwwbvgii-d4326bf7","tool_use_id":"toolu_01BRuU4g6pzKXeQT5zU82NV7","description":"inner","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":2,"parent_task_id":"aa81930fc370f0f7d","task_type":"local_agent","uuid":"b4841ff6-b6ca-4716-a5b2-3a8b4161a4e9","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+    const INNER_NOTIFIED: &str = r#"{"type":"system","subtype":"task_notification","task_id":"a68ed37d230ddc45a","run_id":"0mwwbvgii-d4326bf7","tool_use_id":"toolu_01BRuU4g6pzKXeQT5zU82NV7","status":"completed","output_file":"/private/tmp/claude-501/-private-tmp-cprobe-taskfin-agents/d4488387-e042-46c6-b756-051e30177fb0/tasks/a68ed37d230ddc45a.output","summary":"INNER-DONE","summary_is_report":true,"usage":{"total_tokens":15569,"tool_uses":1,"duration_ms":7988},"uuid":"2f0ae7c0-8e01-46e8-8d8b-4ab6c7308f56","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+    const ALPHA_STARTED: &str = r#"{"type":"system","subtype":"task_started","task_id":"a2705e71a4360bf34","run_id":"0mwwbutdm-485961e0","tool_use_id":"toolu_01AiboDMYZdc3fQtpdddssTN","description":"alpha","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"Reply with exactly ALPHA-DONE followed by a 400-character paragraph about zucchini.","uuid":"60b4d5b3-835b-4111-b7b7-1a7a79be430a","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+    /// `alpha` resumed by a SendMessage call.
+    const ALPHA_RESUMED: &str = r#"{"type":"system","subtype":"task_started","task_id":"a2705e71a4360bf34","run_id":"0mwwc6fbv-1351aadb","tool_use_id":"toolu_011Mh3PQQBresCrcTN2FRgK7","description":"alpha","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","prompt":"Reply with exactly ALPHA-AGAIN.","uuid":"b6c53817-21a9-4fb0-b779-307c6f6acc97","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+
+    /// A background task's end writes one row when its notification is read,
+    /// after the existing `TaskFinished`; the notification's echo or a repeat
+    /// writes nothing.
+    #[test]
+    fn a_background_tasks_end_writes_one_task_finished_row() {
+        let mut a = ClaudeAdapter::new();
+        run(&mut a, BG_BASH_STARTED);
+        assert_eq!(
+            run(&mut a, BG_BASH_UPDATED),
+            vec!["TaskFinished(bt6sv3hno)"]
+        );
+        let events = run(&mut a, BG_BASH_NOTIFIED);
+        assert_eq!(events[0], "TaskFinished(bt6sv3hno)");
+        assert_eq!(events.len(), 2, "{events:?}");
+        let row = events[1]
+            .strip_prefix("TaskFinishedRow(")
+            .and_then(|r| r.strip_suffix(')'))
+            .expect("a row");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(row).unwrap(),
+            serde_json::json!({
+                "type": "system", "subtype": "task_finished", "task_id": "bt6sv3hno",
+                "kind": "command", "status": "finished", "description": "bg exit0",
+                "summary": "Background command \"bg exit0\" completed (exit code 0)",
+            })
+        );
+        assert!(task_rows(&mut a, &[BG_BASH_NOTIFIED]).is_empty());
+    }
+
+    #[test]
+    fn the_row_names_the_tasks_kind_and_status() {
+        let monitor_call = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_m","name":"Monitor","input":{"command":"tail -f log","description":"d"}}]},"parent_tool_use_id":null}"#;
+        for (extra, status, kind, row_status) in [
+            (
+                r#","task_type":"local_agent""#,
+                "completed",
+                "agent",
+                "finished",
+            ),
+            (
+                r#","task_type":"local_bash""#,
+                "failed",
+                "command",
+                "failed",
+            ),
+            (
+                r#","task_type":"local_bash","tool_use_id":"toolu_m""#,
+                "stopped",
+                "monitor",
+                "stopped",
+            ),
+            (
+                r#","task_type":"local_bash""#,
+                "killed",
+                "command",
+                "stopped",
+            ),
+            (
+                r#","task_type":"local_bash""#,
+                "cancelled",
+                "command",
+                "stopped",
+            ),
+            (
+                r#","task_type":"remote_agent""#,
+                "completed",
+                "task",
+                "finished",
+            ),
+            ("", "paused", "task", "finished"),
+        ] {
+            let mut a = ClaudeAdapter::new();
+            let [started, notified] = task_run("t1", extra, status);
+            let rows = task_rows(&mut a, &[monitor_call, &started, &notified]);
+            assert_eq!(rows.len(), 1, "{extra} {status}");
+            assert_eq!(
+                (rows[0]["kind"].as_str(), rows[0]["status"].as_str()),
+                (Some(kind), Some(row_status)),
+                "{extra} {status}"
+            );
+        }
+        let mut a = ClaudeAdapter::new();
+        let bare = r#"{"type":"system","subtype":"task_notification","task_id":"t2"}"#;
+        let rows = task_rows(&mut a, &[&task_run("t2", "", "")[0], bare]);
+        assert_eq!(
+            (rows[0]["status"].as_str(), rows[0]["summary"].as_str()),
+            (Some("finished"), Some(""))
+        );
+    }
+
+    /// Monitor and background Bash share every `task_started` key; only the
+    /// call tells them apart.
+    #[test]
+    fn a_monitor_is_told_apart_by_its_call() {
+        let mut a = ClaudeAdapter::new();
+        let call = r#"{"type":"assistant","message":{"model":"claude-sonnet-5-5","id":"msg_011ChPxH1P5Fx1BEMJ7anPEo","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01Mc6RVnWne2s4jxdU9WwRq5","name":"Monitor","input":{"command":"for i in 1 2; do echo M_A $i; sleep 1; done","description":"monitor exits","timeout_ms":60000},"caller":{"type":"direct"}}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":3073,"cache_read_input_tokens":24500,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":3073},"output_tokens":16,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"5f7e4454-87e6-47f3-94ca-19d9459fa9af","uuid":"05da144c-f100-4b70-846b-a5e5e436207f","timestamp":"2026-11-25T16:22:18.869Z","request_id":"req_011ChPxH1HcNYbG3DGJTaSTZ"}"#;
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"baswlzzru","run_id":"0mwwc0g7e-6656d0db","tool_use_id":"toolu_01Mc6RVnWne2s4jxdU9WwRq5","description":"monitor exits","is_backgrounded":true,"task_type":"local_bash","uuid":"ed7bee06-eafc-4d6c-be36-372a126f204b","session_id":"5f7e4454-87e6-47f3-94ca-19d9459fa9af"}"#;
+        let result = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01Mc6RVnWne2s4jxdU9WwRq5","type":"tool_result","content":"Monitor started (task baswlzzru, expires in 1m unless the source ends first; you get one notice at expiry — re-arm if you still need the watch). You will be notified on each event. Keep working — do not poll or sleep. Events may arrive while you are waiting for the user — an event is not their reply."}]},"parent_tool_use_id":null,"session_id":"5f7e4454-87e6-47f3-94ca-19d9459fa9af","uuid":"10cfdf3f-3e95-4d55-b1e3-e292052f2c32","timestamp":"2026-11-25T16:22:18.891Z","tool_use_result":{"taskId":"baswlzzru","timeoutMs":60000,"persistent":false}}"#;
+        let notified = r#"{"type":"system","subtype":"task_notification","task_id":"baswlzzru","run_id":"0mwwc0g7e-6656d0db","tool_use_id":"toolu_01Mc6RVnWne2s4jxdU9WwRq5","status":"completed","output_file":"/private/tmp/claude-501/-private-tmp-cprobe-taskfin-bash/5f7e4454-87e6-47f3-94ca-19d9459fa9af/tasks/baswlzzru.output","summary":"Monitor \"monitor exits\" stream ended","uuid":"0800e76e-c0cc-4f11-8126-3241ce1b8dee","session_id":"5f7e4454-87e6-47f3-94ca-19d9459fa9af"}"#;
+        let rows = task_rows(&mut a, &[call, started, result, notified]);
+        assert_eq!(rows[0]["kind"], "monitor");
+        assert_eq!(rows[0]["summary"], "Monitor \"monitor exits\" stream ended");
+        assert!(a.monitor_calls.is_empty(), "taken by its task");
+
+        // A call whose result comes back without a task (a refused one) is
+        // dropped.
+        run(&mut a, call);
+        run(&mut a, result);
+        assert!(a.monitor_calls.is_empty(), "dropped with its result");
+    }
+
+    /// A foreground task ends inside its tool call; its notification writes
+    /// nothing, and the run is forgotten.
+    #[test]
+    fn a_foreground_task_writes_no_row() {
+        let mut a = ClaudeAdapter::new();
+        let bash_started = r#"{"type":"system","subtype":"task_started","task_id":"bif86cx0g","run_id":"0mwwc6d1j-7c2649c3","tool_use_id":"toolu_01N6M7VSxqb8P9KW7vfrQrnw","description":"Foreground sleep with short timeout","is_backgrounded":false,"task_type":"local_bash","uuid":"726f1244-6da4-45de-a4f6-563974f14d15","session_id":"5f7e4454-87e6-47f3-94ca-19d9459fa9af"}"#;
+        let bash_notified = r#"{"type":"system","subtype":"task_notification","task_id":"bif86cx0g","run_id":"0mwwc6d1j-7c2649c3","tool_use_id":"toolu_01N6M7VSxqb8P9KW7vfrQrnw","status":"failed","output_file":"","summary":"Foreground sleep with short timeout","uuid":"998cceb7-fe8e-45ed-9563-de505c6e0f04","session_id":"5f7e4454-87e6-47f3-94ca-19d9459fa9af"}"#;
+        let agent_started = r#"{"type":"system","subtype":"task_started","task_id":"a4377d8566a606b65","run_id":"0mwwbw3f1-42d009a5","tool_use_id":"toolu_01FypQzq2FnjYcVNssz5UgMo","description":"fg agent","subagent_type":"general-purpose","is_backgrounded":false,"spawn_depth":1,"task_type":"local_agent","prompt":"Reply with exactly FG-DONE.","uuid":"1e0877d4-529e-444c-9461-204fa92133a8","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+        let agent_updated = r#"{"type":"system","subtype":"task_updated","task_id":"a4377d8566a606b65","run_id":"0mwwbw3f1-42d009a5","patch":{"status":"completed","end_time":1795623536176},"uuid":"3dbbba2e-3d45-4ac4-9bb5-a3599d583dfa","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+        let agent_notified = r#"{"type":"system","subtype":"task_notification","task_id":"a4377d8566a606b65","run_id":"0mwwbw3f1-42d009a5","tool_use_id":"toolu_01FypQzq2FnjYcVNssz5UgMo","status":"completed","output_file":"/private/tmp/claude-501/-private-tmp-cprobe-taskfin-agents/d4488387-e042-46c6-b756-051e30177fb0/tasks/a4377d8566a606b65.output","summary":"FG-DONE","usage":{"total_tokens":13792,"tool_uses":0,"duration_ms":486},"uuid":"9248417d-f2cd-4c70-9c11-a681437b92a3","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+        let lines = [
+            bash_started,
+            bash_notified,
+            agent_started,
+            agent_updated,
+            agent_notified,
+        ];
+        assert!(task_rows(&mut a, &lines).is_empty());
+        assert!(a.task_runs.is_empty());
+    }
+
+    /// A foreground Bash past its timeout is moved to the background, and
+    /// its end is reported like any background task's.
+    #[test]
+    fn a_foreground_bash_moved_to_the_background_writes_a_row() {
+        let mut a = ClaudeAdapter::new();
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"b25bp8wnt","run_id":"0mwwc1m4v-cc218dca","tool_use_id":"toolu_01HuBMwnKGd6s33EkektZc1h","description":"python3 -I -c \"import time; time.sleep(20)\"; echo FG_DONE","is_backgrounded":false,"task_type":"local_bash","uuid":"56d0657c-8715-4148-a83d-781465c7f0cb","session_id":"3fa36893-e09a-4974-ac72-061e870494a3"}"#;
+        let moved = r#"{"type":"system","subtype":"task_updated","task_id":"b25bp8wnt","run_id":"0mwwc1m4v-cc218dca","patch":{"is_backgrounded":true},"uuid":"e7b7e3b0-88ca-4bc9-a149-71ccf3d5f810","session_id":"3fa36893-e09a-4974-ac72-061e870494a3"}"#;
+        let updated = r#"{"type":"system","subtype":"task_updated","task_id":"b25bp8wnt","run_id":"0mwwc1m4v-cc218dca","patch":{"status":"completed","end_time":1795623810343},"uuid":"1682a7d0-db39-403b-8f21-c618f97ce789","session_id":"3fa36893-e09a-4974-ac72-061e870494a3"}"#;
+        let notified = r#"{"type":"system","subtype":"task_notification","task_id":"b25bp8wnt","run_id":"0mwwc1m4v-cc218dca","tool_use_id":"toolu_01HuBMwnKGd6s33EkektZc1h","status":"completed","output_file":"/private/tmp/claude-501/-private-tmp-cprobe-taskfin-bash2/3fa36893-e09a-4974-ac72-061e870494a3/tasks/b25bp8wnt.output","summary":"Background command \"python3 -I -c \"import time; time.sleep(20)\"; echo FG_DONE\" completed (exit code 0)","uuid":"2456f03a-1cb8-49af-af86-3d36050b6666","session_id":"3fa36893-e09a-4974-ac72-061e870494a3"}"#;
+        assert!(run(&mut a, moved).is_empty(), "no run yet, nothing to move");
+        match a.handle_line(started.to_string()).as_slice() {
+            [AgentEvent::TaskStarted {
+                id,
+                task_type,
+                backgrounded,
+                ..
+            }] => {
+                assert_eq!(
+                    (id.as_str(), task_type.as_str()),
+                    ("b25bp8wnt", "local_bash")
+                );
+                assert!(!backgrounded);
+            }
+            other => panic!("expected one TaskStarted, got {other:?}"),
+        }
+        assert!(run(&mut a, moved).is_empty());
+        let rows = task_rows(&mut a, &[updated, notified]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["kind"], "command");
+        assert_eq!(
+            rows[0]["description"],
+            "python3 -I -c \"import time; time.sleep(20)\"; echo FG_DONE"
+        );
+    }
+
+    /// Each run of a task writes its row: a subagent resumed by SendMessage
+    /// runs again under the same task id. A notification of another run
+    /// leaves the current one.
+    #[test]
+    fn each_run_of_a_task_writes_its_own_row() {
+        let mut a = ClaudeAdapter::new();
+        let notified = r#"{"type":"system","subtype":"task_notification","task_id":"a2705e71a4360bf34","run_id":"0mwwbutdm-485961e0","tool_use_id":"toolu_01AiboDMYZdc3fQtpdddssTN","status":"completed","output_file":"/private/tmp/claude-501/-private-tmp-cprobe-taskfin-agents/d4488387-e042-46c6-b756-051e30177fb0/tasks/a2705e71a4360bf34.output","summary":"ALPHA-DONE\n\nZucchini is a summer squash.","summary_is_report":true,"usage":{"total_tokens":14373,"tool_uses":0,"duration_ms":16597},"uuid":"c6bcd143-b77f-4b9d-b8d9-ed2c24c4cd55","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+        let resumed_notified = r#"{"type":"system","subtype":"task_notification","task_id":"a2705e71a4360bf34","run_id":"0mwwc6fbv-1351aadb","tool_use_id":"toolu_011Mh3PQQBresCrcTN2FRgK7","status":"completed","output_file":"/private/tmp/claude-501/-private-tmp-cprobe-taskfin-agents/d4488387-e042-46c6-b756-051e30177fb0/tasks/a2705e71a4360bf34.output","summary":"ALPHA-AGAIN","summary_is_report":true,"usage":{"total_tokens":14435,"tool_uses":0,"duration_ms":613},"uuid":"f3f274ce-23c9-47b0-a44f-42955abe5923","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+        let rows = task_rows(
+            &mut a,
+            &[
+                ALPHA_STARTED,
+                notified,
+                notified,
+                ALPHA_RESUMED,
+                notified,
+                resumed_notified,
+            ],
+        );
+        let summaries: Vec<_> = rows
+            .iter()
+            .map(|r| r["summary"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            summaries,
+            ["ALPHA-DONE\n\nZucchini is a summer squash.", "ALPHA-AGAIN"]
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r["kind"] == "agent" && r["task_id"] == "a2705e71a4360bf34"));
+    }
+
+    /// A task a subagent armed (its subagent, its shell) ends on that
+    /// subagent's page: the row is the subagent's frame, under the call id its
+    /// own frames carry, which the writer marks as a subagent row.
+    #[test]
+    fn a_nested_tasks_row_is_its_subagents_frame() {
+        let mut a = ClaudeAdapter::new();
+        let shell_started = r#"{"type":"system","subtype":"task_started","task_id":"bslk4f5rv","run_id":"0mwwbvh8a-c761616f","owned_by_subagent":true,"tool_use_id":"toolu_011PJ1jpUiBFwBcU1aW66PXs","description":"sub bash","is_backgrounded":true,"parent_task_id":"aa81930fc370f0f7d","task_type":"local_bash","uuid":"ff88be98-e0d1-4288-bff1-6092dac71ce1","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+        let shell_notified = r#"{"type":"system","subtype":"task_notification","task_id":"bslk4f5rv","run_id":"0mwwbvh8a-c761616f","owned_by_subagent":true,"tool_use_id":"toolu_011PJ1jpUiBFwBcU1aW66PXs","status":"completed","output_file":"/private/tmp/claude-501/-private-tmp-cprobe-taskfin-agents/d4488387-e042-46c6-b756-051e30177fb0/tasks/bslk4f5rv.output","summary":"Background command \"sub bash\" completed (exit code 0)","uuid":"0ebd83ac-f4e5-4544-97a6-0a238a3a83f4","session_id":"d4488387-e042-46c6-b756-051e30177fb0"}"#;
+        let rows = task_rows(
+            &mut a,
+            &[
+                OUTER_STARTED,
+                OUTER_FRAME,
+                INNER_STARTED,
+                shell_started,
+                shell_notified,
+                INNER_NOTIFIED,
+            ],
+        );
+        let routes: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["task_id"].as_str(),
+                    r["kind"].as_str(),
+                    r["parent_tool_use_id"].as_str(),
+                    r["agent_id"].as_str(),
+                )
+            })
+            .collect();
+        let outer = (
+            Some("toolu_01DD231Lj5D1HtsKpbrLboge"),
+            Some("aa81930fc370f0f7d"),
+        );
+        assert_eq!(
+            routes,
+            [
+                (Some("bslk4f5rv"), Some("command"), outer.0, outer.1),
+                (Some("a68ed37d230ddc45a"), Some("agent"), outer.0, outer.1),
+            ]
+        );
+        let subagent_mark = |row: &serde_json::Value| {
+            let mut data = serde_json::json!({});
+            crate::writer::mark_subagent_row(&mut data, "agent", &row.to_string());
+            data.get("subagent").cloned()
+        };
+        assert_eq!(subagent_mark(&rows[0]), Some(serde_json::json!(true)));
+        let main = task_rows(&mut a, &[BG_BASH_STARTED, BG_BASH_NOTIFIED]);
+        assert_eq!(subagent_mark(&main[0]), None);
+        assert!(main[0].get("parent_tool_use_id").is_none() && main[0].get("agent_id").is_none());
+    }
+
+    /// `task_run` keys of a shell `alpha` armed.
+    const ARMED_BY_ALPHA: &str = r#","task_type":"local_bash","owned_by_subagent":true,"parent_task_id":"a2705e71a4360bf34""#;
+
+    /// A subagent resumed by SendMessage still carries its Agent call's id
+    /// on its frames; its tasks' rows go there, not to the SendMessage call,
+    /// also when the resume is the first start this process saw (a respawn).
+    #[test]
+    fn a_resumed_subagents_tasks_go_to_its_frame_call_id() {
+        let mut a = ClaudeAdapter::new();
+        run(&mut a, ALPHA_RESUMED);
+        let frame = r#"{"type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_011ChPxdgrRkiGDst1ZeF1tg","type":"message","role":"assistant","content":[{"type":"text","text":"ALPHA-AGAIN"}],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":4,"cache_creation_input_tokens":7905,"cache_read_input_tokens":6513,"cache_creation":{"ephemeral_5m_input_tokens":7905,"ephemeral_1h_input_tokens":0},"output_tokens":8,"service_tier":"standard","inference_geo":"global","speed":"standard"},"input_transformations":[],"diagnostics":null,"context_management":null},"parent_tool_use_id":"toolu_01AiboDMYZdc3fQtpdddssTN","agent_id":"a2705e71a4360bf34","session_id":"d4488387-e042-46c6-b756-051e30177fb0","uuid":"e6404273-46fe-4d73-8f3c-5fa852e199b1","timestamp":"2026-11-25T16:26:58.265Z","request_id":"req_011ChPxdgkj6L12P2Qu29tn1","subagent_type":"general-purpose","task_description":"alpha"}"#;
+        assert_eq!(
+            run(&mut a, frame),
+            vec![format!("Frame({frame})")],
+            "a subagent's usage is not the chat's"
+        );
+        let [started, notified] = task_run("bchild", ARMED_BY_ALPHA, "completed");
+        let rows = task_rows(&mut a, &[&started, &notified]);
+        assert_eq!(
+            rows[0]["parent_tool_use_id"],
+            "toolu_01AiboDMYZdc3fQtpdddssTN"
+        );
+        assert_eq!(rows[0]["agent_id"], "a2705e71a4360bf34");
+    }
+
+    /// Until one of a subagent's frames is read (each may be over
+    /// `MAX_STREAM_FRAME_BYTES`), its tasks' rows take the call of its first
+    /// start in this process, not of a later resume.
+    #[test]
+    fn a_nested_tasks_row_falls_back_to_its_subagents_first_call() {
+        let mut a = ClaudeAdapter::new();
+        let inner = task_rows(&mut a, &[OUTER_STARTED, INNER_STARTED, INNER_NOTIFIED]);
+        assert_eq!(
+            (
+                inner[0]["parent_tool_use_id"].as_str(),
+                inner[0]["agent_id"].as_str()
+            ),
+            (
+                Some("toolu_01DD231Lj5D1HtsKpbrLboge"),
+                Some("aa81930fc370f0f7d")
+            )
+        );
+        let [started, notified] = task_run("bchild", ARMED_BY_ALPHA, "completed");
+        let shell = task_rows(&mut a, &[ALPHA_STARTED, ALPHA_RESUMED, &started, &notified]);
+        assert_eq!(
+            shell[0]["parent_tool_use_id"],
+            "toolu_01AiboDMYZdc3fQtpdddssTN"
+        );
+    }
+
+    /// Never the main timeline for a task a subagent armed: with that
+    /// subagent unknown (neither its frames nor its start read) there is no
+    /// row.
+    #[test]
+    fn a_task_of_an_unknown_subagent_writes_no_row() {
+        let mut a = ClaudeAdapter::new();
+        assert!(task_rows(&mut a, &[INNER_STARTED, INNER_NOTIFIED]).is_empty());
+        let owned = task_run(
+            "b1",
+            r#","task_type":"local_bash","owned_by_subagent":true"#,
+            "completed",
+        );
+        assert!(task_rows(&mut a, &[&owned[0], &owned[1]]).is_empty());
+    }
+
+    #[test]
+    fn a_long_report_is_cut_on_a_char_boundary_with_a_mark() {
+        let mut a = ClaudeAdapter::new();
+        let report = format!("a{}", "é".repeat(20_000));
+        let notified = serde_json::json!({
+            "type": "system", "subtype": "task_notification", "task_id": "t1", "run_id": "r-t1",
+            "status": "completed", "summary": report,
+        })
+        .to_string();
+        let [started, _] = task_run("t1", r#","task_type":"local_agent""#, "");
+        let rows = task_rows(&mut a, &[&started, &notified]);
+        let kept = format!("a{}", "é".repeat(16_383));
+        assert_eq!(
+            rows[0]["summary"],
+            format!("{kept}\n[cut by zucchini: 3617 more chars]")
+        );
+        assert!(kept.len() <= MAX_TASK_SUMMARY_BYTES);
     }
 
     #[test]

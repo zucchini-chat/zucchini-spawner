@@ -391,6 +391,10 @@ pub enum AgentEvent {
     /// from `live_tasks`. A backgrounded top-level task's end owes the session
     /// its notification (`SessionState::owed_notifications`).
     TaskFinished(String),
+    /// Resident claude only — the `task_finished` row of a background task
+    /// run's end. A row like `Frame`, but no internal `/rename` window drops
+    /// it: the task ended whatever turn runs.
+    TaskFinishedRow(String),
     /// Resident codex only — a shell command started. It can outlive its turn
     /// (and a prune restart kills it), so the prune guard counts it; it never
     /// makes the chat busy — a dev server would keep it busy forever.
@@ -1244,6 +1248,7 @@ pub(crate) fn stringify_events(events: SmallVec<[AgentEvent; 2]>) -> Vec<String>
             AgentEvent::Result => "Result".to_string(),
             AgentEvent::TaskStarted { id, .. } => format!("TaskStarted({})", id),
             AgentEvent::TaskFinished(s) => format!("TaskFinished({})", s),
+            AgentEvent::TaskFinishedRow(s) => format!("TaskFinishedRow({s})"),
             AgentEvent::CommandStarted { id, .. } => format!("CommandStarted({id})"),
             AgentEvent::CommandFinished(id) => format!("CommandFinished({id})"),
             AgentEvent::UserTurnConsumed(s) => format!("UserTurnConsumed({})", s),

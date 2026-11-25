@@ -55,6 +55,7 @@ fn slim_frame(mut frame: Map<String, Value>) -> Option<Value> {
             Some("peer_message") => &["subtype", "name", "body"],
             Some("status") => &["subtype", "status"],
             Some("chat_suggestion") => &["subtype", "title", "message"],
+            Some("task_finished") => &["subtype", "kind", "status", "description", "summary"],
             _ => &["subtype"],
         },
         _ => &[],
@@ -266,6 +267,10 @@ mod tests {
             (
                 json!({ "type": "system", "subtype": "chat_suggestion", "message": "fix it", "title": "Fix", "project_path": "/p", "agent_kind": "claude", "attachments": [] }),
                 json!({ "type": "system", "subtype": "chat_suggestion", "message": "fix it", "title": "Fix" }),
+            ),
+            (
+                json!({ "type": "system", "subtype": "task_finished", "task_id": "a1", "kind": "agent", "status": "finished", "description": "Find callers", "summary": "Found three.", "parent_tool_use_id": "toolu_1", "agent_id": "a0" }),
+                json!({ "type": "system", "subtype": "task_finished", "kind": "agent", "status": "finished", "description": "Find callers", "summary": "Found three." }),
             ),
             (
                 json!({ "type": "system", "subtype": "init", "cwd": "/p", "tools": ["Bash", "Read"], "session_id": "s1" }),

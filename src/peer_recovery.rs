@@ -73,7 +73,8 @@ fn hand_over(peers: &[UnreadPeer]) -> Option<String> {
     let cap = body_cap(messages.iter().map(|(_, b)| b.len()), MAX_CONTEXT - fixed);
     let mut context = INTRO.to_string();
     for (head, body) in &messages {
-        context += &format!("\n\n{head}{}{CLOSE}", cut(body, cap));
+        let body = cut(body, cap, " - ask the sender to resend]\n");
+        context += &format!("\n\n{head}{body}{CLOSE}");
     }
     Some(context + "\n\n" + GUARD)
 }
@@ -94,13 +95,15 @@ fn body_cap(lens: impl IntoIterator<Item = usize>, budget: usize) -> usize {
     usize::MAX
 }
 
-fn cut(body: &str, cap: usize) -> String {
+/// `body` cut to `cap` bytes on a char boundary, then a `[cut by zucchini: N
+/// more chars` mark (N = chars cut) ended by `tail`.
+pub(crate) fn cut(body: &str, cap: usize, tail: &str) -> String {
     if body.len() <= cap {
         return body.to_string();
     }
     let (kept, gone) = body.split_at(body.floor_char_boundary(cap));
     let gone = gone.chars().count();
-    format!("{kept}\n[cut by zucchini: {gone} more chars - ask the sender to resend]\n")
+    format!("{kept}\n[cut by zucchini: {gone} more chars{tail}")
 }
 
 /// `text` that can't end its block early and add lines after it.
